@@ -14,7 +14,8 @@
  *
  * (由练习页右上角弹窗迁移而来;练习页入口改为跳转本面板)
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
 
 import { getPreferences, savePracticeSettings } from '@/api/memory'
 import { getMyModels } from '@/api/model_configs'
@@ -33,6 +34,7 @@ import type { LearningTopicDef } from '@/types/practice'
 // ============================================================
 // 状态
 // ============================================================
+const route = useRoute()
 const loading = ref(true)
 const loadError = ref('')
 /** 保存中(切换开关/思考模式/模型时) */
@@ -331,7 +333,16 @@ async function handleClear(includeQuestions: boolean): Promise<void> {
   }
 }
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+  // 知识点看板「知识点主题设置」深链进入:待表单渲染后滚动到学习主题区块
+  if (route.hash) {
+    await nextTick()
+    document
+      .getElementById(route.hash.slice(1))
+      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+})
 </script>
 
 <template>
@@ -475,7 +486,7 @@ onMounted(load)
       </div>
 
       <!-- 学习主题管理:内置 4 个(可停用)+ 自定义增删改 -->
-      <div class="setting-block">
+      <div id="learning-topics" class="setting-block">
         <span class="setting-title">学习主题</span>
         <span class="setting-desc">
           出题视角与自动分类的主题词表。停用的主题不再出新题,已有题目不受影响;
@@ -933,6 +944,11 @@ onMounted(load)
 }
 
 /* ---- 学习主题管理 ---- */
+/* 知识点看板深链定位锚点:留出呼吸,避免区块贴住滚动容器顶 */
+#learning-topics {
+  scroll-margin-top: var(--space-4);
+}
+
 .topic-manage-list {
   display: flex;
   flex-direction: column;

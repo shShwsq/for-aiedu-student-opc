@@ -10,8 +10,12 @@
  *   卡片「专项练习」→ 跳 /practice?topic=<key>(单知识点)
  * - 未知/已删除的主题 key 兜底「未分类」组排最后;停用主题照常成区
  *   (区头带「已停用」徽章,存量题不受影响,只是不再出新题)
+ * - 布局对齐练习页/设置页:取消标题,第一行常驻操作头(去练习 + 知识点主题设置 +
+ *   知识点数统计,在 .main 滚动区之外故不随内容滚动);左侧目录一个主题一项,
+ *   点击即展开该区并平滑定位,scrollspy 高亮当前主题;知识点主题设置
+ *   深链到 /settings/practice#learning-topics
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import AppHeader from '@/components/AppHeader.vue'
@@ -146,8 +150,110 @@ function buildSection(
   }
 }
 
-/** 卡片总数概览(页头统计行) */
+/** 卡片总数概览(操作头右侧统计) */
 const totalCount = computed(() => cards.value.length)
+
+// ============================================================
+// 左侧目录(主题锚点 + scrollspy)+ 折叠区受控展开
+// ============================================================
+/** 真正滚动的容器是 .main,IntersectionObserver 必须以它为 root */
+const mainRef = ref<HTMLElement | null>(null)
+/** 当前高亮的主题 key(目录项) */
+const activeKey = ref('')
+/** 各折叠区展开态(按 topicKey):缺省用 defaultOpen,用户/目录点击可覆盖 */
+const openMap = ref<Record<string, boolean>>({})
+let sectionObserver: IntersectionObserver | null = null
+
+/** 折叠区锚点 id(主题 key 可含下划线,统一加前缀保证合法且唯一) */
+function sectionAnchor(topicKey: string): string {
+  return `topic-${topicKey}`
+}
+
+/** 目录点击:即刻高亮 + 展开目标区(收起态只滚到区头看不到卡片)+ 平滑滚动 */
+function goSection(sec: TopicSection): void {
+  activeKey.value = sec.topicKey
+  openMap.value = { ...openMap.value, [sec.topicKey]: true }
+  nextTick(() => {
+    document
+      .getElementById(sectionAnchor(sec.topicKey))
+      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+}
+
+/** <details> 原生开合(toggle 事件)同步回受控状态 */
+function handleToggle(topicKey: string, e: Event): void {
+  const open = (e.target as HTMLDetailsElement).open
+  if (openMap.value[topicKey] !== open) {
+    openMap.value = { ...openMap.value, [topicKey]: open }
+  }
+}
+
+/** 段首判定线,与 .topic-section 的 scroll-margin-top 保持一致,避免高亮比滚动慢半拍 */
+const SECTION_GAP = 16
+
+/** 重算高亮:段首已越过判定线的区中取最靠下的那个(即正在阅读的区) */
+function updateActive(): void {
+  const root = mainRef.value
+  if (!root || sections.value.length === 0) return
+  const rootTop = root.getBoundingClientRect().top
+  let current = sections.value[0].topicKey
+  let currentTop = Number.NEGATIVE_INFINITY
+  for (const sec of sections.value) {
+    const el = document.getElementById(sectionAnchor(sec.topicKey))
+    if (!el) continue
+    const top = el.getBoundingClientRect().top - rootTop
+    if (top > SECTION_GAP) continue
+    if (top > currentTop) {
+      currentTop = top
+      current = sec.topicKey
+    }
+  }
+  activeKey.value = current
+}
+
+function teardownObserver(): void {
+  if (sectionObserver) {
+    sectionObserver.disconnect()
+    sectionObserver = null
+  }
+}
+
+function setupObserver(): void {
+  teardownObserver()
+  if (!mainRef.value) return
+  const targets = sections.value
+    .map((sec) => document.getElementById(sectionAnchor(sec.topicKey)))
+    .filter((el): el is HTMLElement => el !== null)
+  if (targets.length === 0) return
+  sectionObserver = new IntersectionObserver(updateActive, {
+    root: mainRef.value,
+    rootMargin: '0px 0px -70% 0px',
+    threshold: 0,
+  })
+  for (const el of targets) sectionObserver.observe(el)
+}
+
+// 卡片/主题异步到达后 sections 才成形,board 也需 loading=false 才渲染;
+// 监听两者变化:补齐新区缺省展开态、初始化高亮,并在渲染后重建观察器
+watch(
+  [loading, sections],
+  ([ld, secs]) => {
+    const next = { ...openMap.value }
+    let changed = false
+    for (const s of secs) {
+      if (!(s.topicKey in next)) {
+        next[s.topicKey] = s.defaultOpen
+        changed = true
+      }
+    }
+    if (changed) openMap.value = next
+    if (!ld && !activeKey.value && secs.length) activeKey.value = secs[0].topicKey
+    nextTick(setupObserver)
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(teardownObserver)
 
 // ============================================================
 // 交互
@@ -205,103 +311,132 @@ onMounted(() => {
     <div class="page-body">
       <WorkspaceSidebar v-if="!workspaceCollapsed" />
 
-      <main class="main">
-        <header class="page-head">
-          <div class="page-head-row">
-            <h1>知识点看板</h1>
-            <div class="page-head-actions">
-              <button class="board-back-btn" title="去自适应练习" @click="router.push({ name: 'practice' })">
+      <!-- 目录 + 内容整体居中(对齐练习页/设置页),目录不再贴左边缘 -->
+      <div class="board-shell">
+        <!-- 左侧目录:每个学习主题一项,点击展开并定位(scrollspy 高亮) -->
+        <nav class="board-nav" aria-label="主题目录">
+          <button
+            v-for="sec in sections"
+            :key="sec.topicKey"
+            type="button"
+            :class="['nav-item', { active: activeKey === sec.topicKey }]"
+            @click="goSection(sec)"
+          >
+            <span class="nav-label">{{ sec.name }}</span>
+            <span class="nav-node" aria-hidden="true" />
+          </button>
+        </nav>
+
+        <div class="content-column">
+          <!-- 第一行操作头(常驻在滚动区之外):左动作 + 右统计 -->
+          <div class="board-head">
+            <div class="head-actions">
+              <button class="btn-primary" title="进入自适应练习" @click="router.push({ name: 'practice' })">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M5 12h14" />
                   <path d="m12 5 7 7-7 7" />
                 </svg>
                 去练习
               </button>
+              <RouterLink
+                class="btn-ghost head-quiet-btn"
+                title="知识点主题设置"
+                :to="{ name: 'settings-practice', hash: '#learning-topics' }"
+              >知识点主题设置</RouterLink>
+            </div>
+            <div class="head-stats">
+              <span class="stat" title="按学习主题分组;点区头可练整个主题,点卡片可练单个知识点">
+                <span class="stat-num">{{ totalCount }}</span>
+                <span class="stat-name">知识点</span>
+              </span>
             </div>
           </div>
-          <p>共 {{ totalCount }} 个知识点 · 按学习主题分组 · 点区头可练整个主题,点卡片可练单个知识点</p>
-        </header>
 
-        <div v-if="loading" class="placeholder"><span class="status-spinner" /> 加载中...</div>
-        <div v-else-if="loadError" class="placeholder error-text">
-          加载失败: {{ loadError }}
-          <button class="btn-link" @click="loadBoard">重试</button>
-        </div>
-        <p v-else-if="totalCount === 0" class="panel-empty">
-          暂无知识点 — 到已完成审计任务的详情页生成并确认练习题后,知识点卡片会出现在这里
-        </p>
-
-        <!-- 主题折叠区:每区一个学习主题,区内知识点卡片网格 -->
-        <div v-else class="board">
-          <details
-            v-for="sec in sections"
-            :key="sec.topicKey"
-            :open="sec.defaultOpen"
-            class="topic-section"
-          >
-            <summary class="topic-head">
-              <span class="topic-name">
-                <svg class="chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="m9 18 6-6-6-6" />
-                </svg>
-                {{ sec.name }}
-                <span v-if="sec.disabled" class="badge badge-disabled" title="该主题已停用:不再出新题,已有题目不受影响">已停用</span>
-              </span>
-              <span class="topic-chips">
-                <span
-                  v-for="chip in sec.chips"
-                  :key="chip.status"
-                  :class="['chip', `chip-${chip.status}`]"
-                >{{ chip.label }} {{ chip.count }}</span>
-              </span>
-              <span class="topic-meta">
-                <span class="topic-count">{{ sec.cards.length }} 个知识点</span>
-                <button
-                  class="btn-secondary btn-small"
-                  :disabled="!sec.hasQuestions || sec.topicKey === UNCLASSIFIED"
-                  :title="sec.topicKey === UNCLASSIFIED ? '未知主题,无法发起主题练习' : (!sec.hasQuestions ? '该主题暂无入库题目' : `只练习「${sec.name}」主题的题目`)"
-                  @click.stop.prevent="startTopic(sec)"
-                >练这个主题</button>
-              </span>
-            </summary>
-
-            <div class="kp-grid">
-              <article
-                v-for="c in sec.cards"
-                :key="c.knowledge_key"
-                :class="['kp-card', { 'kp-card-weak': c.board_status === 'weak' }]"
-              >
-                <div class="kp-head">
-                  <span class="kp-name" :title="c.knowledge_name">{{ c.knowledge_name }}</span>
-                  <span :class="['status-badge', `status-${c.board_status}`]">{{ statusLabel(c.board_status) }}</span>
-                </div>
-                <div class="kp-keyline">
-                  <span class="kp-key">{{ c.knowledge_key }}</span>
-                </div>
-                <div v-if="c.languages.length > 0" class="kp-tags">
-                  <span v-for="lang in c.languages" :key="lang" class="tag tag-lang">{{ lang }}</span>
-                </div>
-                <div class="kp-stats">
-                  <span v-if="c.attempts > 0">
-                    正确率 {{ formatPercent(c.accuracy) }} · {{ c.attempts }} 次作答
-                  </span>
-                  <span v-else class="kp-muted">尚未作答</span>
-                  <span v-if="c.board_status === 'due'" class="kp-due">{{ formatDue(c.due_at) }}</span>
-                </div>
-                <div class="kp-foot">
-                  <span class="kp-count">{{ c.question_count }} 道题</span>
-                  <button
-                    class="btn-secondary btn-small"
-                    :disabled="c.question_count === 0"
-                    :title="c.question_count === 0 ? '该知识点暂无入库题目' : `只练习「${c.knowledge_name}」的题目`"
-                    @click="startFocus(c)"
-                  >专项练习</button>
-                </div>
-              </article>
+          <main ref="mainRef" class="main">
+            <div v-if="loading" class="placeholder"><span class="status-spinner" /> 加载中...</div>
+            <div v-else-if="loadError" class="placeholder error-text">
+              加载失败: {{ loadError }}
+              <button class="btn-link" @click="loadBoard">重试</button>
             </div>
-          </details>
+            <p v-else-if="totalCount === 0" class="panel-empty">
+              暂无知识点 — 到已完成审计任务的详情页生成并确认练习题后,知识点卡片会出现在这里
+            </p>
+
+            <!-- 主题折叠区:每区一个学习主题,区内知识点卡片网格 -->
+            <div v-else class="board">
+              <details
+                v-for="sec in sections"
+                :key="sec.topicKey"
+                :id="sectionAnchor(sec.topicKey)"
+                :open="openMap[sec.topicKey]"
+                class="topic-section"
+                @toggle="handleToggle(sec.topicKey, $event)"
+              >
+                <summary class="topic-head">
+                  <span class="topic-name">
+                    <svg class="chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="m9 18 6-6-6-6" />
+                    </svg>
+                    {{ sec.name }}
+                    <span v-if="sec.disabled" class="badge badge-disabled" title="该主题已停用:不再出新题,已有题目不受影响">已停用</span>
+                  </span>
+                  <span class="topic-chips">
+                    <span
+                      v-for="chip in sec.chips"
+                      :key="chip.status"
+                      :class="['chip', `chip-${chip.status}`]"
+                    >{{ chip.label }} {{ chip.count }}</span>
+                  </span>
+                  <span class="topic-meta">
+                    <span class="topic-count">{{ sec.cards.length }} 个知识点</span>
+                    <button
+                      class="btn-secondary btn-small"
+                      :disabled="!sec.hasQuestions || sec.topicKey === UNCLASSIFIED"
+                      :title="sec.topicKey === UNCLASSIFIED ? '未知主题,无法发起主题练习' : (!sec.hasQuestions ? '该主题暂无入库题目' : `只练习「${sec.name}」主题的题目`)"
+                      @click.stop.prevent="startTopic(sec)"
+                    >练这个主题</button>
+                  </span>
+                </summary>
+
+                <div class="kp-grid">
+                  <article
+                    v-for="c in sec.cards"
+                    :key="c.knowledge_key"
+                    :class="['kp-card', { 'kp-card-weak': c.board_status === 'weak' }]"
+                  >
+                    <div class="kp-head">
+                      <span class="kp-name" :title="c.knowledge_name">{{ c.knowledge_name }}</span>
+                      <span :class="['status-badge', `status-${c.board_status}`]">{{ statusLabel(c.board_status) }}</span>
+                    </div>
+                    <div class="kp-keyline">
+                      <span class="kp-key">{{ c.knowledge_key }}</span>
+                    </div>
+                    <div v-if="c.languages.length > 0" class="kp-tags">
+                      <span v-for="lang in c.languages" :key="lang" class="tag tag-lang">{{ lang }}</span>
+                    </div>
+                    <div class="kp-stats">
+                      <span v-if="c.attempts > 0">
+                        正确率 {{ formatPercent(c.accuracy) }} · {{ c.attempts }} 次作答
+                      </span>
+                      <span v-else class="kp-muted">尚未作答</span>
+                      <span v-if="c.board_status === 'due'" class="kp-due">{{ formatDue(c.due_at) }}</span>
+                    </div>
+                    <div class="kp-foot">
+                      <span class="kp-count">{{ c.question_count }} 道题</span>
+                      <button
+                        class="btn-secondary btn-small"
+                        :disabled="c.question_count === 0"
+                        :title="c.question_count === 0 ? '该知识点暂无入库题目' : `只练习「${c.knowledge_name}」的题目`"
+                        @click="startFocus(c)"
+                      >专项练习</button>
+                    </div>
+                  </article>
+                </div>
+              </details>
+            </div>
+          </main>
         </div>
-      </main>
+      </div>
     </div>
   </div>
 </template>
@@ -325,65 +460,193 @@ onMounted(() => {
   overflow: hidden;
 }
 
+/* ---- 目录 + 内容居中容器(照搬练习页:两侧留白自动均分,目录不贴左边缘) ---- */
+.board-shell {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 1180px;
+  margin: 0 auto;
+  overflow: hidden;
+}
+
+/* 内容列:操作头常驻 + 卡片滚动 */
+.content-column {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 .main {
   flex: 1;
   min-height: 0;
   min-width: 0;
-  max-width: 1280px;
-  margin: 0 auto;
   overflow-y: auto;
-  padding: var(--space-8) var(--space-6);
+  padding: var(--space-4) var(--space-6) var(--space-8);
 }
 
-.page-head {
-  margin-bottom: var(--space-6);
-}
-
-.page-head-row {
+/* ============ 第一行操作头(左动作右统计;透明无边框) ============ */
+/* 操作头在 .main 之外,不随卡片滚动 → 常驻第一行,无需 sticky */
+.board-head {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-3);
+  gap: var(--space-3) var(--space-5);
+  flex-wrap: wrap;
+  padding: var(--space-4) var(--space-6) var(--space-2);
 }
 
-.page-head h1 {
-  margin: 0 0 var(--space-1);
-  font-size: var(--fs-xl);
-  font-weight: var(--fw-semibold);
-  color: var(--color-text);
-}
-
-.page-head-actions {
+.head-actions {
   display: flex;
   align-items: center;
   gap: var(--space-2);
 }
 
-.board-back-btn {
-  display: inline-flex;
+/* 次要动作(RouterLink 版去掉下划线) */
+.head-quiet-btn {
+  text-decoration: none;
+}
+
+/* 统计簇:数值 + 标签;说明文案收进悬浮 title */
+.head-stats {
+  display: flex;
   align-items: center;
+  gap: var(--space-3);
+}
+
+.stat {
+  display: inline-flex;
+  align-items: baseline;
   gap: var(--space-1);
-  padding: var(--space-1) var(--space-3);
+  cursor: help;
+}
+
+.stat-num {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-name {
   font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+}
+
+/* ============ 左侧目录(主题锚点 + scrollspy,视觉对齐练习页/设置页导航) ============ */
+.board-nav {
+  flex-shrink: 0;
+  width: 168px;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-6) var(--space-4);
+  overflow-y: auto;
+}
+
+.nav-item {
+  position: relative;
+  display: block;
+  padding: 10px 36px 10px var(--space-3);
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
+  text-align: left;
   color: var(--color-text-secondary);
   background: transparent;
-  border: 1px solid var(--color-border);
+  border: none;
   border-radius: var(--radius-md);
   cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+/* 节点间的连接竖线(位于目录项右侧,与节点同心) */
+.nav-item::before {
+  content: '';
+  position: absolute;
+  right: 20px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--color-border);
+}
+
+/* 首尾项竖线各截去一半,使线只在节点之间延伸 */
+.nav-item:first-child::before {
+  top: 50%;
+}
+
+.nav-item:last-child::before {
+  bottom: 50%;
+}
+
+/* 状态节点:空心圆,当前项填充主色并带光环 */
+.nav-node {
+  position: absolute;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  box-sizing: border-box;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--color-border-strong);
+  border-radius: 50%;
+  background: var(--color-surface);
   transition: all var(--transition-fast);
 }
 
-.board-back-btn:hover {
-  color: var(--color-primary);
-  border-color: var(--color-primary);
-  background: var(--color-primary-light);
+.nav-item:hover {
+  color: var(--color-text);
+  background: var(--color-surface-alt);
 }
 
-.page-head p {
-  margin: 0;
-  font-size: var(--fs-sm);
+.nav-item.active {
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  font-weight: var(--fw-semibold);
+}
+
+.nav-item.active .nav-node {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-light);
+}
+
+/* ============ 操作头按钮(与练习页同款) ============ */
+.btn-primary,
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 28px;
+  padding: 0 var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all var(--transition-fast);
+}
+
+.btn-primary {
+  background: var(--color-primary);
+  color: var(--color-text-inverse);
+}
+
+.btn-primary:hover {
+  background: var(--color-primary-hover);
+}
+
+.btn-ghost {
+  background: transparent;
   color: var(--color-text-secondary);
+}
+
+.btn-ghost:hover {
+  color: var(--color-text);
+  background: var(--color-surface-alt);
 }
 
 .placeholder {
@@ -427,6 +690,8 @@ onMounted(() => {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
+  /* 目录定位/scrollspy 判定线,与 SECTION_GAP 保持一致 */
+  scroll-margin-top: 16px;
 }
 
 .topic-head {
@@ -669,18 +934,32 @@ onMounted(() => {
   to { transform: rotate(360deg); }
 }
 
-/* ---- 响应式:窄屏单列堆叠(auto-fill 自然降级) ---- */
+/* ---- 响应式:窄屏隐藏目录(退回「操作头 + 滚动」体验) ---- */
+@media (max-width: 900px) {
+  .board-nav {
+    display: none;
+  }
+}
+
+/* ---- 响应式:窄屏(手机)单列堆叠 ---- */
 @media (max-width: 640px) {
   .main {
     padding: var(--space-4) var(--space-3) var(--space-6);
   }
 
-  .topic-meta {
-    margin-left: 0;
+  /* 操作头换行后动作与统计各自成行 */
+  .board-head {
+    padding: var(--space-3) var(--space-3) var(--space-2);
+    align-items: flex-start;
+    row-gap: var(--space-2);
   }
 
-  .page-head-row {
+  .head-actions {
     flex-wrap: wrap;
+  }
+
+  .topic-meta {
+    margin-left: 0;
   }
 }
 </style>
