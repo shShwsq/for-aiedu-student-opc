@@ -7,14 +7,15 @@
  * - GET /tasks/{id}/workspace/file     读取文件
  * - GET /tasks/{id}/workspace/uploads/tree 沙箱过期后回退浏览用户上传文件树
  * - GET /tasks/{id}/workspace/uploads/file 回退读取上传文件内容
- * - POST /tasks/{id}/workspace/restore 过期工作区重新 clone
+ * - POST /tasks/{id}/workspace/restore 发起过期工作区重新 clone(后台执行)
+ * - GET  /tasks/{id}/workspace/restore/status 查询恢复进度(轮询)
  */
 import client from './client'
 import type {
   WorkspaceFileResponse,
   WorkspaceFilesResponse,
   WorkspaceInfo,
-  WorkspaceRestoreResponse,
+  WorkspaceRestoreStatus,
   WorkspaceTreeResponse,
   WorkspaceUploadsTreeResponse,
 } from '@/types/workspace'
@@ -82,10 +83,17 @@ export function readWorkspaceUploadsFile(
     .then((r) => r.data)
 }
 
-/** 恢复已过期清理的工作区:重新 clone 任务仓库(用户显式操作,同步等待)
+/** 发起工作区恢复(用户显式操作):后台重新 clone,立即返回 job 快照
  *
- * 做题页右侧代码栏在工作区不可用时展示「重新拉取代码」按钮调用。
+ * 不在本请求里等克隆完成:大仓库分钟级,而 api/client.ts 有 30s 全局超时,
+ * 旧版同步等会被当成"网络错误"报给用户(真实结果几分钟后才落)。
+ * 进度与终态走 getWorkspaceRestoreStatus 轮询。
  */
-export function restoreWorkspace(taskId: string): Promise<WorkspaceRestoreResponse> {
+export function startWorkspaceRestore(taskId: string): Promise<WorkspaceRestoreStatus> {
   return client.post(`/tasks/${taskId}/workspace/restore`).then((r) => r.data)
+}
+
+/** 查询恢复进度与终态(state: idle / running / done / failed) */
+export function getWorkspaceRestoreStatus(taskId: string): Promise<WorkspaceRestoreStatus> {
+  return client.get(`/tasks/${taskId}/workspace/restore/status`).then((r) => r.data)
 }

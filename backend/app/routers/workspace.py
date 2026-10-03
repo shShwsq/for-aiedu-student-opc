@@ -9,7 +9,8 @@
 - GET /tasks/{task_id}/workspace/file     读取文件内容(原始文本 + 分页,前端自行渲染行号)
 - GET /tasks/{task_id}/workspace/uploads/tree 沙箱过期后回退浏览用户上传文件树
 - GET /tasks/{task_id}/workspace/uploads/file 回退读取上传文件内容(同 workspace/file 形状)
-- POST /tasks/{task_id}/workspace/restore 过期工作区重新 clone(做题页代码栏一键恢复)
+- POST /tasks/{task_id}/workspace/restore 发起过期工作区重新 clone(后台执行,立即返回 job)
+- GET  /tasks/{task_id}/workspace/restore/status 查询恢复进度(前端轮询)
 
 session 生命周期:
 - 任务运行中:clone 完成后即可浏览
@@ -35,6 +36,7 @@ from app.database import get_db
 from app.deps import get_optional_user
 from app.models.task import Task
 from app.models.user import User
+from app.services import workspace_restore
 from app.services.upload_layout import (
     UploadSlot,
     compute_upload_layout,
@@ -412,24 +414,28 @@ def restore_workspace(
     db: Session = Depends(get_db),
     current_user: User | None = Depends(get_optional_user),
 ) -> dict:
-    """恢复已过期清理的工作区:重新 clone 任务仓库(用户显式操作)
+    """发起工作区恢复:后台重新 clone,立即返回 job 快照(进度轮询 status 端点)
 
     做题页右侧代码栏在沙箱 session 过期后展示「重新拉取代码」按钮调用。
     与出题时的自动恢复不同,此处为用户主动触发,不受
     restore_workspace_for_practice 开关限制。恢复的 session 属于已完成任务,
-    标记 completed 纳入 TTL 清理序列避免常驻泄漏。
+    后台线程会标记 completed 纳入 TTL 清理序列避免常驻泄漏。
 
-    - session 仍存活 → 直接返回当前工作区信息(幂等)
+    - session 仍存活且已 clone → 幂等返回 done(与旧版直接回工作区信息一致)
     - 任务无 repo_url → 400
-    - clone 失败 → 500(前端提示并保持不可用态)
+    - 已在克隆 → 返回进行中的 job(不重复排队)
+
+    不在本请求里等克隆完成:大仓库是分钟级操作,前端 axios 全局 30s 超时会把它
+    误报成"网络错误"(而真实结果几分钟后才落,反而没人看)。
+    两段式实现见 app/services/workspace_restore.py。
     """
     task = _check_task_access(task_id, db, current_user)
 
     info = sandbox_tools.get_workspace_info(str(task_id))
     if info and info.get("repo_path"):
         return {
-            "available": True,
-            "repo_path": info["repo_path"],
+            "state": "done", "percent": 100, "message": "工作区已就绪", "error": "",
+            "available": True, "repo_path": info["repo_path"],
             "mode": info.get("mode", ""),
         }
 
@@ -441,22 +447,32 @@ def restore_workspace(
     # 复用出题模块的 git token 解密逻辑(懒加载避免模块级循环引用)
     from app.services.practice.generator import _load_git_tokens
 
-    logger.info("[task=%s] 用户请求恢复工作区,重新 clone", task_id)
-    try:
-        sandbox_tools.clone_repo_with_fallback(
-            repo_url,
-            branch=params.get("branch"),
-            task_id=str(task_id),
-            git_tokens=_load_git_tokens(db, task.user_id),
-        )
-    except Exception as e:
-        logger.warning("[task=%s] 恢复工作区失败: %s", task_id, e)
-        raise HTTPException(status_code=500, detail=f"恢复工作区失败: {e}")
+    logger.info("[task=%s] 用户请求恢复工作区,后台重新 clone", task_id)
+    return workspace_restore.start(
+        str(task_id), repo_url, params.get("branch"),
+        _load_git_tokens(db, task.user_id),
+    )
 
-    sandbox_tools.mark_task_completed(str(task_id))
+
+@router.get("/tasks/{task_id}/workspace/restore/status")
+def restore_workspace_status(
+    task_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_user),
+) -> dict:
+    """查询恢复 job 进度与终态(state: running / done / failed)
+
+    无 job 时返回 idle:要么从未发起,要么后端重启把内存 job 表与沙箱 session
+    一起清掉了(此时前端重新检查可用性即可,用户可再点一次按钮)。
+    """
+    _check_task_access(task_id, db, current_user)
+
+    job = workspace_restore.status(str(task_id))
+    if job is not None:
+        return job
     info = sandbox_tools.get_workspace_info(str(task_id)) or {}
     return {
+        "state": "idle", "percent": 0, "message": "", "error": "",
         "available": bool(info.get("repo_path")),
-        "repo_path": info.get("repo_path", ""),
-        "mode": info.get("mode", ""),
+        "repo_path": info.get("repo_path", ""), "mode": info.get("mode", ""),
     }

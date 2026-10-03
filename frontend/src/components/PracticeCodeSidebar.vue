@@ -4,7 +4,7 @@
  *
  * 按题目的 source_task_id 打开对应任务的工作区,浏览文件树与文件内容,
  * 供用户在答题时阅读真实源码。工作区过期清理后展示「重新拉取代码」按钮
- * (POST /tasks/{id}/workspace/restore 重新 clone)。
+ * (POST .../workspace/restore 发起后台克隆,再轮询 .../restore/status 看进度)。
  *
  * 树加载策略:优先整树快照(/workspace/tree);快照截断时退回逐级懒加载
  * (/workspace/files)。文件内容复用 /workspace/file(原始文本 + 分页)。
@@ -19,8 +19,8 @@ import {
   getWorkspaceTree,
   listWorkspaceFiles,
   readWorkspaceFile,
-  restoreWorkspace,
 } from '@/api/workspace'
+import { useWorkspaceRestore } from '@/composables/useWorkspaceRestore'
 import { extractErrorMessage } from '@/utils/error'
 import { toWorkspaceRelative } from '@/utils/workspacePath'
 
@@ -48,8 +48,10 @@ const available = ref(false)
 const unavailableReason = ref('')
 /** 后端返回的工作区根绝对路径(把模型给的绝对路径剥成仓库相对路径用) */
 const repoPath = ref('')
-const restoring = ref(false)
-const restoreError = ref('')
+const {
+  restoring, restoreError, restorePercent, restoreMessage,
+  run: runRestore, reset: resetRestore,
+} = useWorkspaceRestore()
 
 // ============================================================
 // 文件树
@@ -319,7 +321,7 @@ async function init(): Promise<void> {
   available.value = false
   unavailableReason.value = ''
   repoPath.value = ''
-  restoreError.value = ''
+  resetRestore()
   selectedFile.value = null
   fileContent.value = ''
   highlightStart.value = null
@@ -355,19 +357,14 @@ async function applyLocate(): Promise<void> {
   await openFile(relPath, props.locateLine, props.locateLine)
 }
 
-/** 重新拉取代码(工作区过期后用户显式触发) */
+/** 重新拉取代码(工作区过期后用户显式触发):后台 job + 轮询进度
+ *
+ * 克隆分钟级,不能挂住请求同步等(旧版被 axios 30s 超时误报成"网络错误")。
+ */
 async function handleRestore(): Promise<void> {
-  if (!props.taskId || restoring.value) return
-  restoring.value = true
-  restoreError.value = ''
-  try {
-    await restoreWorkspace(props.taskId)
-    await init()
-  } catch (err) {
-    restoreError.value = extractErrorMessage(err)
-  } finally {
-    restoring.value = false
-  }
+  const taskId = props.taskId
+  if (!taskId) return
+  await runRestore(taskId, init)
 }
 
 // 任务切换:重新初始化
@@ -421,8 +418,11 @@ watch(
         沙箱默认保留 1 小时,过期后可重新拉取仓库代码。
       </p>
       <button class="cs-restore-btn" :disabled="restoring" @click="handleRestore">
-        {{ restoring ? '拉取中...(大仓库可能需数十秒)' : '重新拉取代码' }}
+        {{ restoring
+          ? (restorePercent > 0 ? `拉取中... ${restorePercent}%` : '正在发起克隆...')
+          : '重新拉取代码' }}
       </button>
+      <p v-if="restoring && restoreMessage" class="cs-unavailable-hint">{{ restoreMessage }}</p>
       <p v-if="restoreError" class="cs-restore-error">{{ restoreError }}</p>
     </div>
 

@@ -19,8 +19,8 @@ import {
   listWorkspaceFiles,
   readWorkspaceFile,
   readWorkspaceUploadsFile,
-  restoreWorkspace,
 } from '@/api/workspace'
+import { useWorkspaceRestore } from '@/composables/useWorkspaceRestore'
 import {
   deleteTask,
   listTasks,
@@ -506,29 +506,23 @@ const repoPath = ref('')
 
 /** 任务带 repo_url(纯上传任务无可恢复仓库,不显示按钮;由工作区信息返回) */
 const canRestore = ref(false)
-/** 重新克隆进行中 */
-const restoring = ref(false)
-/** 重新克隆失败信息(空=无错误) */
-const restoreError = ref('')
+const {
+  restoring, restoreError, restorePercent, restoreMessage,
+  run: runRestore, reset: resetRestore,
+} = useWorkspaceRestore()
 
-/** 重新克隆工作区:成功后重置文件树并重新检查可用性(自动加载新树) */
+/** 重新克隆工作区:后台 job + 轮询进度(大仓库分钟级,不能挂住请求等);
+ * 成功后重置文件树并重新检查可用性(自动加载新树) */
 async function handleRestore(): Promise<void> {
-  if (!selectedTaskId.value || restoring.value) return
   const taskId = selectedTaskId.value
-  restoring.value = true
-  restoreError.value = ''
-  try {
-    await restoreWorkspace(taskId)
+  if (!taskId) return
+  await runRestore(taskId, async () => {
     // 恢复期间用户可能已切走:仅仍停留在该任务时刷新树
     if (selectedTaskId.value === taskId) {
       resetFileTree()
       await checkAvailable()
     }
-  } catch (err) {
-    restoreError.value = extractErrorMessage(err)
-  } finally {
-    restoring.value = false
-  }
+  })
 }
 
 // ============================================================
@@ -633,9 +627,9 @@ function resetFileTree(): void {
   treeTruncated.value = false
   initialized = false
   filePanelHidden.value = false
-  // 重新克隆状态一并重置(切换任务时不残留上个任务的按钮/错误)
+  // 重新克隆状态一并重置(切换任务时不残留上个任务的按钮/错误,并终止其轮询)
   canRestore.value = false
-  restoreError.value = ''
+  resetRestore()
   // 上传回退状态一并重置(切换任务时不残留上个任务的上传树)
   hasUploads.value = false
   uploadsTreeRoot.value = null
@@ -1436,8 +1430,11 @@ defineExpose({ openTaskFile })
           <!-- 过期后重新克隆(纯上传任务无 repo_url 不显示;运行中等待自动 clone) -->
           <div v-if="!selectedTaskRunning && canRestore" class="restore-box">
             <button class="restore-btn" :disabled="restoring" @click="handleRestore">
-              {{ restoring ? '重新克隆中...(大仓库可能需数十秒)' : '重新克隆' }}
+              {{ restoring
+                ? (restorePercent > 0 ? `重新克隆中... ${restorePercent}%` : '正在发起克隆...')
+                : '重新克隆' }}
             </button>
+            <p v-if="restoring && restoreMessage" class="status-hint">{{ restoreMessage }}</p>
             <p v-if="restoreError" class="restore-error">{{ restoreError }}</p>
           </div>
           <!-- 会话过期但有 diff 产物:展示变更文件列表(点击跳主区 diff,内容不可浏览) -->

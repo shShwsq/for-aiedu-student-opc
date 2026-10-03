@@ -977,7 +977,13 @@ def _clone_repo_local(
     """
     repo_dir = _resolve_local_repo_dir(ctx, repo_name)
 
-    cmd = ["git", "clone", "--progress"] + (_clone_depth_args() if use_depth else [])
+    # Windows 默认 260 字符路径上限会让大仓库检出失败(error: unable to create
+    # file ...: Filename too long),而 local 模式的克隆根是
+    # %LOCALAPPDATA%\Temp\sandbox_local_xxxxxxxx\<repo>\... 这种长前缀目录。
+    # core.longpaths 让 git 走长路径 API(需系统开启 LongPathsEnabled,git-for-windows
+    # 自带 manifest 支持);非 Windows 不传,避免无谓的配置覆盖
+    longpaths = ["-c", "core.longpaths=true"] if os.name == "nt" else []
+    cmd = ["git", *longpaths, "clone", "--progress"] + (_clone_depth_args() if use_depth else [])
     if branch:
         cmd.extend(["--branch", branch])
     cmd.extend([clone_url, str(repo_dir)])

@@ -32,11 +32,28 @@ export interface WorkspaceInfo {
   can_restore?: boolean
 }
 
-/** 工作区恢复(POST /tasks/{id}/workspace/restore)的响应 */
-export interface WorkspaceRestoreResponse {
+/** 恢复 job 状态:idle=无 job(从未发起 / 后端重启清了), running=克隆中 */
+export type WorkspaceRestoreState = 'idle' | 'running' | 'done' | 'failed'
+
+/** 工作区恢复 job 快照
+ *
+ * POST .../workspace/restore 发起(立即返回),GET .../workspace/restore/status 轮询。
+ * 克隆是分钟级操作,旧版同步等请求被 axios 30s 超时打断后只能报"网络错误",
+ * 改成两段式后的进度与真实失败原因都在这里。
+ */
+export interface WorkspaceRestoreStatus {
+  state: WorkspaceRestoreState
   available: boolean
   repo_path: string
   mode: string
+  /** 克隆进度百分比(running 时实时更新) */
+  percent: number
+  /** 最近一条 git 进度行(展示用,可能为空) */
+  message: string
+  /** failed 时的真实原因(协议回退链聚合错误) */
+  error: string
+  /** 发起时间戳(后端 time.time(),前端只作参考) */
+  started_at?: number
 }
 
 /** 整树快照条目(相对仓库根的路径) */

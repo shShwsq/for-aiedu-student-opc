@@ -3,10 +3,11 @@
  *
  * 覆盖从 axios 错误 / Error 实例 / 未知值提取人类可读消息的优先级链:
  * 1. axios 错误 → 后端 detail 字段(字符串 / FastAPI 校验数组)
- * 2. 网络层错误(status=0 或无 response)→ 网络错误提示
- * 3. 其他 HTTP 状态 → "请求失败(status)"
- * 4. Error 实例 → message
- * 5. 兜底 → 未知错误
+ * 2. 客户端取消/超时 → 专属文案(与断网分开报)
+ * 3. 网络层错误(status=0 或无 response)→ 网络错误提示
+ * 4. 其他 HTTP 状态 → "请求失败(status)"
+ * 5. Error 实例 → message
+ * 6. 兜底 → 未知错误
  */
 import { describe, expect, it } from 'vitest'
 
@@ -96,6 +97,41 @@ describe('extractErrorMessage', () => {
   it('response.status=0(CORS/断网)返回网络错误提示', () => {
     const err = makeAxiosError(0, undefined)
     expect(extractErrorMessage(err)).toBe('网络错误,请检查网络连接后重试')
+  })
+
+  // ============================================================
+  // 客户端超时 / 取消(同样无 response,但不能报成断网)
+  // ============================================================
+
+  it('axios 超时(ECONNABORTED)返回超时提示而非网络错误', () => {
+    const err = {
+      isAxiosError: true,
+      code: 'ECONNABORTED',
+      message: 'timeout of 30000ms exceeded',
+      response: undefined,
+    }
+    expect(extractErrorMessage(err)).toBe(
+      '请求超时:后台可能仍在执行,请稍后刷新页面查看结果',
+    )
+  })
+
+  it('无 code 但消息形如 timeout of Xms exceeded 也按超时处理', () => {
+    const err = {
+      isAxiosError: true,
+      message: 'timeout of 5000ms exceeded',
+      response: undefined,
+    }
+    expect(extractErrorMessage(err)).toContain('请求超时')
+  })
+
+  it('主动取消(ERR_CANCELED)返回已取消', () => {
+    const err = {
+      isAxiosError: true,
+      code: 'ERR_CANCELED',
+      message: 'canceled',
+      response: undefined,
+    }
+    expect(extractErrorMessage(err)).toBe('请求已取消')
   })
 
   // ============================================================

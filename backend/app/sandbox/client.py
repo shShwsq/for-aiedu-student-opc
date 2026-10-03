@@ -439,8 +439,15 @@ class SandboxSession:
             except Exception as e:
                 logger.warning(f"关闭沙箱失败: {e}")
         elif self._local_dir:
-            # local 模式:清理临时目录(含 clone / workspace / memory 等全部子目录)
-            shutil.rmtree(self._local_dir, ignore_errors=True)
+            # local 模式:清理临时目录(含 clone / workspace / memory 等全部子目录)。
+            # 用 repo_cache.force_rmtree 而非 rmtree(ignore_errors=True):git 把
+            # .git/objects/pack/*.pack|*.idx 设为只读,普通 rmtree 在 Windows 上删
+            # 不动这种目录且默不作声 —— 临时目录会一直在 %TEMP% 里积下来
+            # 延迟导入避免模块级循环依赖(sandbox_tools / acp_base 都依赖本模块)
+            from app.services.repo_cache import force_rmtree
+
+            if not force_rmtree(self._local_dir):
+                logger.warning(f"本地临时目录未能删净,残留: {self._local_dir}")
 
     # ---------- sandbox 模式实现(SandboxSync 同步) ----------
 
