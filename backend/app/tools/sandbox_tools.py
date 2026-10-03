@@ -843,8 +843,10 @@ def _resolve_local_repo_dir(ctx: dict, repo_name: str) -> Path:
     `fatal: destination path '...' already exists and is not an empty directory`。
     按归属处置(sandbox 模式由 _clone_repo_sandbox 的 rm -rf 兜底):
     - 不存在/为空 → 原样可用(git 能往空目录里写)
-    - 本会话 clone 出来的工作区(clone_source + repo_path 同路径)→ 删除重建:
-      既然走到了真正的克隆,说明调用方要一份干净检出(如换分支),旧工作区就让位
+    - 本会话 clone 出来且完好(clone_source + repo_path 同路径 + 含 .git)→ 避让换名:
+      能走到真克隆说明调用方要另一份检出(显式换分支/换源),但旧检出里可能有
+      未提交的改动,不能由克隆动作抹掉(会话结束随临时目录一起回收)
+    - 本会话 clone 出来但已残缺(同路径无 .git)→ 删除重建:残缺检出无保留价值
     - 已记为 repo_path 但不是 clone 出来的(上传工作区)、含 .git 的外来目录
       (执行 agent 自行 clone 并编辑的成果)→ 避让换名,内容一律不删
     - 其余残留(kill 半途的半成品/空壳)→ 删除重建;仍删不掉则避让换名
@@ -857,10 +859,18 @@ def _resolve_local_repo_dir(ctx: dict, repo_name: str) -> Path:
     recorded = str(ctx.get("repo_path") or "")
     is_recorded = bool(recorded) and os.path.normcase(recorded) == os.path.normcase(str(repo_dir))
     if is_recorded and ctx.get("clone_source") is not None:
+        if (repo_dir / ".git").is_dir():
+            # 自己的完好检出:保留原目录,换个名字克隆
+            alt = _unique_repo_dir(local_dir, repo_name)
+            logger.warning(
+                f"[local] 保留 {repo_dir.name} 现有检出(可能有未提交改动),"
+                f"改为克隆到 {alt.name}"
+            )
+            return alt
         if _remove_local_tree(repo_dir):
-            logger.info(f"[local] 重新克隆,已清空本会话旧工作区: {repo_dir}")
+            logger.info(f"[local] 清理本会话残缺工作区(无 .git),重新克隆: {repo_dir}")
             return repo_dir
-        # 自己的旧工作区删不掉(句柄长期占用):只能避让,不能带着残留让 git 报错
+        # 删不掉(句柄长期占用):只能避让,不能带着残留让 git 报错
         alt = _unique_repo_dir(local_dir, repo_name)
         logger.warning(f"[local] 旧工作区删不掉,改为克隆到 {alt.name}")
         return alt
@@ -885,44 +895,55 @@ def _reuse_existing_clone(ctx: dict, repo_url: str, want_branch: str | None) -> 
     恢复入口按 repo_path 判空、失败后的重试、并发调用(排队那个)。重新 clone 不仅
     白花几分钟下载,local 模式还会先撞 git 的 "already exists"。
 
-    判断按"归一化 URL + 分支"而不是目录名:避让换名后工作区可能落在 overleaf-2,
-    按目录名找不回来就会再克隆一份(而且旧目录还在 → 一路 bar-3、bar-4 累加)。
+    判断按"归一化 URL + 分支 + 落盘路径"而不是目录名:避让换名后工作区可能落在
+    overleaf-2,按目录名找不回来就会再克隆一份(而且旧目录还在 → 一路 bar-3、bar-4
+    累加);把路径一并编进来源记录,则 repo_path 被别的流程改写(如上传工作区传输)
+    时不会把上传目录当成仓库返回。
     分支取宽松口径 —— 任一侧没写分支都算不冲突(远端默认分支与任务参数常对不上,
     严格判等会退化成重新克隆)。
+
+    完好性探测只对 local 模式做:sandbox 模式记的是容器内路径
+    (/home/user/repos/xxx),宿主机上必然不存在,探测会把复用变成死代码。
     """
     recorded = str(ctx.get("repo_path") or "")
     source = ctx.get("clone_source")
     if not recorded or source is None:
         return None
-    try:
-        recorded_path = Path(recorded)
-        if not recorded_path.is_dir():
-            return None
-        # local 按 .git 复核完好性;sandbox 路径无法本地探测,只能信任记录
-        if ctx.get("mode") == "local" and not (recorded_path / ".git").is_dir():
-            return None
-    except OSError:
+    recorded_url, recorded_branch, source_path = source
+    if os.path.normcase(source_path) != os.path.normcase(recorded):
         return None
-    recorded_url, recorded_branch = source
     if recorded_url != normalize_repo_url(repo_url):
         return None
     want, have = (want_branch or "").strip(), (recorded_branch or "").strip()
     if want and have and want != have:
         return None
+
     result: dict[str, Any] = {"path": recorded, "reused": True}
     if ctx.get("mode") == "local":
+        # local 能探盘:目录与 .git 都在才算完好(残缺返 None 走真克隆)
+        try:
+            recorded_path = Path(recorded)
+            if not recorded_path.is_dir() or not (recorded_path / ".git").is_dir():
+                return None
+        except (OSError, ValueError):
+            return None
         result["files_count"] = _count_repo_files(recorded_path)
+    # sandbox:只信记录(无容器内路径可探),files_count 需进容器统计,不为展示多走一次往返
     logger.info(f"[clone_fallback] 复用会话已 clone 的工作区: {recorded}")
     return result
 
 
-def _record_clone_source(ctx: dict, repo_url: str, branch: str | None) -> None:
-    """记下本次 clone 的来源(归一化 URL + 实际检出分支),供 _reuse_existing_clone 判断
+def _record_clone_source(
+    ctx: dict, repo_url: str, branch: str | None, repo_path: str,
+) -> None:
+    """记下本次 clone 的来源(归一化 URL + 实际检出分支 + 落盘路径)
 
+    供 _reuse_existing_clone 判断。路径一起记:避让换名后工作区不在目录名上,
+    而 repo_path 也可能被上传传输等流程改写,光比 URL 会认错工作区。
     写在 ctx 上随 session 一起销毁(_get_or_create_session 返回的就是 _sessions 里
     那个 dict,原地改即生效)。
     """
-    ctx["clone_source"] = (normalize_repo_url(repo_url), branch or "")
+    ctx["clone_source"] = (normalize_repo_url(repo_url), branch or "", str(repo_path))
 
 
 def _clone_repo_local(
@@ -3157,7 +3178,7 @@ def _clone_repo_fallback(
                     use_depth=False,
                 )
                 _set_repo_path(task_id, result["path"])
-                _record_clone_source(ctx, repo_url, branch)
+                _record_clone_source(ctx, repo_url, branch, result["path"])
                 logger.info(f"[clone_fallback] task={task_id} 缓存本地克隆成功")
                 return result
             except CloneSkippedError:
@@ -3181,7 +3202,7 @@ def _clone_repo_fallback(
                 use_depth=False,
             )
             _set_repo_path(task_id, result["path"])
-            _record_clone_source(ctx, repo_url, branch)
+            _record_clone_source(ctx, repo_url, branch, result["path"])
             logger.info(f"[clone_fallback] task={task_id} 缓存容器内克隆成功")
             return result
         except CloneSkippedError:
@@ -3230,7 +3251,7 @@ def _clone_repo_fallback(
                         cancellable=cancellable, progress_callback=progress_callback,
                     )
                 _set_repo_path(task_id, result["path"])
-                _record_clone_source(ctx, repo_url, attempt_branch)
+                _record_clone_source(ctx, repo_url, attempt_branch, result["path"])
                 logger.info(f"[clone_fallback] task={task_id} 克隆成功(协议 {safe_url})")
                 return result
             except CloneSkippedError:

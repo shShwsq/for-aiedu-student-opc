@@ -37,6 +37,19 @@ def _ctx(tmp_path, repo_path="", clone_source=None):
     return ctx
 
 
+def _sandbox_ctx(repo_path="/home/user/repos/bar", clone_source=None):
+    """sandbox 模式 ctx(repo_path 是容器内路径,宿主机上不存在)"""
+    ctx = {"mode": "sandbox", "repo_path": repo_path}
+    if clone_source is not None:
+        ctx["clone_source"] = clone_source
+    return ctx
+
+
+def _src(url: str = GITEE_URL, branch: str = "", path: str = ""):
+    """构造 clone_source 记录:归一化 URL + 检出分支 + 落盘路径"""
+    return (st.normalize_repo_url(url), branch, str(path))
+
+
 def _mk_junk(root: Path, name: str) -> Path:
     """无 .git 的残留目录(空壳/半成品工作树)"""
     d = root / name
@@ -118,15 +131,29 @@ def test_resolve_target_cleans_junk(tmp_path):
     assert not junk.exists()
 
 
-def test_resolve_target_recycles_own_clone(tmp_path):
-    """本会话 clone 出来的工作区:走到了真克隆就删除让位(如换分支重试)。"""
+def test_resolve_target_preserves_own_healthy_clone(tmp_path):
+    """自己 clone 的完好检出(含 .git):显式换分支/换源时保留原目录,换个名字克隆。
+
+    旧检出里可能有 agent 未提交的改动,克隆动作无权抹掉。
+    """
     repo = _mk_repo(tmp_path, "bar")
     ctx = _ctx(
-        tmp_path, repo_path=str(repo),
-        clone_source=(st.normalize_repo_url(GITEE_URL), "dev"),
+        tmp_path, repo_path=str(repo), clone_source=_src(branch="dev", path=repo),
     )
-    assert st._resolve_local_repo_dir(ctx, "bar") == repo
-    assert not repo.exists()
+    assert st._resolve_local_repo_dir(ctx, "bar") == tmp_path / "bar-2"
+    assert (repo / "README.md").exists()
+
+
+def test_resolve_target_recycles_own_broken_clone(tmp_path):
+    """自己 clone 但已残缺(同路径无 .git):无保留价值,删掉沿用原名重建。"""
+    broken = tmp_path / "bar"
+    broken.mkdir()
+    (broken / "partial.txt").write_text("x", encoding="utf-8")
+    ctx = _ctx(
+        tmp_path, repo_path=str(broken), clone_source=_src(branch="dev", path=broken),
+    )
+    assert st._resolve_local_repo_dir(ctx, "bar") == broken
+    assert not broken.exists()
 
 
 def test_resolve_target_never_deletes_upload_workspace(tmp_path):
@@ -154,13 +181,14 @@ def test_resolve_target_avoids_when_removal_fails(tmp_path, monkeypatch):
     assert st._resolve_local_repo_dir(_ctx(tmp_path), "bar") == tmp_path / "bar-2"
 
 
-def test_resolve_target_avoids_when_own_clone_undeletable(tmp_path, monkeypatch):
-    """自己的旧工作区删不掉也只能避让:带着残留让 git 报错是必然失败。"""
-    repo = _mk_repo(tmp_path, "bar")
+def test_resolve_target_avoids_when_own_broken_clone_undeletable(tmp_path, monkeypatch):
+    """残缺的自有工作区删不掉也只能避让:带着残留让 git 报错是必然失败。"""
+    broken = tmp_path / "bar"
+    broken.mkdir()
+    (broken / "partial.txt").write_text("x", encoding="utf-8")
     monkeypatch.setattr(st, "force_rmtree", lambda *a, **kw: False)
     ctx = _ctx(
-        tmp_path, repo_path=str(repo),
-        clone_source=(st.normalize_repo_url(GITEE_URL), "main"),
+        tmp_path, repo_path=str(broken), clone_source=_src(branch="main", path=broken),
     )
     assert st._resolve_local_repo_dir(ctx, "bar") == tmp_path / "bar-2"
 
@@ -184,7 +212,7 @@ def test_unique_repo_dir_reuses_empty_dir(tmp_path):
 
 
 # ============================================================
-# 幂等复用:按归一化 URL + 分支判断,与目录名无关
+# 幂等复用:按归一化 URL + 分支 + 落盘路径判断,与目录名无关
 # ============================================================
 
 
@@ -192,23 +220,44 @@ def test_reuse_existing_clone_same_source(tmp_path):
     """同一来源已 clone → 复用,且带 reused 标记与文件数。"""
     repo = _mk_repo(tmp_path, "bar")
     (repo / "a.py").write_text("x", encoding="utf-8")
-    ctx = _ctx(
-        tmp_path, repo_path=str(repo),
-        clone_source=(st.normalize_repo_url(GITEE_URL), "main"),
-    )
+    ctx = _ctx(tmp_path, repo_path=str(repo), clone_source=_src(branch="main", path=repo))
     result = st._reuse_existing_clone(ctx, GITEE_URL, "main")
     assert result["path"] == str(repo)
     assert result["reused"] is True
     assert result["files_count"] == 2  # README.md + a.py(不计 .git)
 
 
+def test_reuse_existing_clone_works_in_sandbox_mode(tmp_path):
+    """sandbox 模式也必须能复用:repo_path 是容器内路径,宿主机探不到。
+
+    回归用例:存在性探测曾无条件跑在 mode 判断之前,把 sandbox 复用变成死代码
+    —— 重复 clone 回到 rm -rf + 重下,顺带抹掉 agent 在容器里的工作区修改。
+    """
+    container_path = "/home/user/repos/bar"
+    ctx = _sandbox_ctx(
+        repo_path=container_path, clone_source=_src(branch="main", path=container_path),
+    )
+    result = st._reuse_existing_clone(ctx, GITEE_URL, "main")
+    assert result is not None
+    assert result["path"] == container_path
+    assert result["reused"] is True
+
+
+def test_reuse_existing_clone_rejects_when_repo_path_repointed(tmp_path):
+    """repo_path 已被别的流程改写(如上传工作区传输)时不能把那个目录当成仓库返回。"""
+    repo = _mk_repo(tmp_path, "bar")
+    uploads = tmp_path / "uploaded_files"
+    uploads.mkdir()
+    ctx = _ctx(
+        tmp_path, repo_path=str(uploads), clone_source=_src(branch="main", path=repo),
+    )
+    assert st._reuse_existing_clone(ctx, GITEE_URL, "main") is None
+
+
 def test_reuse_existing_clone_matches_ssh_form(tmp_path):
     """SSH / HTTPS 两种写法归一化后同键:不能因为调用方形态不同就重新克隆。"""
     repo = _mk_repo(tmp_path, "bar")
-    ctx = _ctx(
-        tmp_path, repo_path=str(repo),
-        clone_source=(st.normalize_repo_url(GITEE_URL), ""),
-    )
+    ctx = _ctx(tmp_path, repo_path=str(repo), clone_source=_src(path=repo))
     assert st._reuse_existing_clone(ctx, GITEE_SSH, None)["path"] == str(repo)
 
 
@@ -216,8 +265,7 @@ def test_reuse_existing_clone_finds_avoided_dir_name(tmp_path):
     """避让后工作区落在 bar-2:按目录名找不回来就会再克隆一份(bar-3、bar-4 累加)。"""
     repo = _mk_repo(tmp_path, "bar-2")
     ctx = _ctx(
-        tmp_path, repo_path=str(repo),
-        clone_source=(st.normalize_repo_url(GITEE_URL), "main"),
+        tmp_path, repo_path=str(repo), clone_source=_src(branch="main", path=repo),
     )
     assert st._reuse_existing_clone(ctx, GITEE_URL, "main")["path"] == str(repo)
 
@@ -225,50 +273,44 @@ def test_reuse_existing_clone_finds_avoided_dir_name(tmp_path):
 def test_reuse_existing_clone_rejects_different_repo(tmp_path):
     """同名不同源(github 的 overleaf)不能复用成 gitee 那份,得真去克隆。"""
     repo = _mk_repo(tmp_path, "overleaf")
-    ctx = _ctx(
-        tmp_path, repo_path=str(repo),
-        clone_source=(st.normalize_repo_url(GITEE_URL), ""),
-    )
-    assert st._reuse_existing_clone(ctx, "https://github.com/overleaf/overleaf.git", None) is None
+    ctx = _ctx(tmp_path, repo_path=str(repo), clone_source=_src(path=repo))
+    assert st._reuse_existing_clone(
+        ctx, "https://github.com/overleaf/overleaf.git", None,
+    ) is None
 
 
 def test_reuse_existing_clone_branch_rules(tmp_path):
     """分支:任一侧未指定算不冲突(远端默认分支常与参数不符);两侧都指定且不同则重克隆。"""
     repo = _mk_repo(tmp_path, "bar")
     ctx = _ctx(
-        tmp_path, repo_path=str(repo),
-        clone_source=(st.normalize_repo_url(GITEE_URL), "dev"),
+        tmp_path, repo_path=str(repo), clone_source=_src(branch="dev", path=repo),
     )
     assert st._reuse_existing_clone(ctx, GITEE_URL, "main") is None
     assert st._reuse_existing_clone(ctx, GITEE_URL, None) is not None
-    ctx2 = _ctx(
-        tmp_path, repo_path=str(repo),
-        clone_source=(st.normalize_repo_url(GITEE_URL), ""),
-    )
+    ctx2 = _ctx(tmp_path, repo_path=str(repo), clone_source=_src(path=repo))
     assert st._reuse_existing_clone(ctx2, GITEE_URL, "main") is not None
 
 
 def test_reuse_existing_clone_requires_healthy_workspace(tmp_path):
     """未记录来源 / 目录已不在 / local 下缺 .git(残缺检出)都不算可复用。"""
-    repo = _mk_repo(tmp_path, "bar")
-    source = (st.normalize_repo_url(GITEE_URL), "")
     assert st._reuse_existing_clone(_ctx(tmp_path), GITEE_URL, None) is None
+    gone = str(tmp_path / "gone")
     assert st._reuse_existing_clone(
-        _ctx(tmp_path, repo_path=str(tmp_path / "gone"), clone_source=source),
-        GITEE_URL, None,
+        _ctx(tmp_path, repo_path=gone, clone_source=_src(path=gone)), GITEE_URL, None,
     ) is None
     shell = tmp_path / "shell"
     shell.mkdir()
     assert st._reuse_existing_clone(
-        _ctx(tmp_path, repo_path=str(shell), clone_source=source), GITEE_URL, None,
+        _ctx(tmp_path, repo_path=str(shell), clone_source=_src(path=shell)),
+        GITEE_URL, None,
     ) is None
 
 
-def test_record_clone_source_key_and_branch(tmp_path):
-    """记录的是"归一化 URL + 实际检出分支",分支为空时存空串。"""
+def test_record_clone_source_key_branch_and_path(tmp_path):
+    """记录的是"归一化 URL + 实际检出分支 + 落盘路径",分支为空时存空串。"""
     ctx = _ctx(tmp_path)
-    st._record_clone_source(ctx, GITEE_SSH, None)
-    assert ctx["clone_source"] == (st.normalize_repo_url(GITEE_URL), "")
+    st._record_clone_source(ctx, GITEE_SSH, None, tmp_path / "bar")
+    assert ctx["clone_source"] == (st.normalize_repo_url(GITEE_URL), "", str(tmp_path / "bar"))
 
 
 # ============================================================
@@ -444,7 +486,9 @@ def test_fallback_reuses_existing_clone_without_second_git(monkeypatch, tmp_path
         first = st.clone_repo_with_fallback(
             GITEE_URL, branch="main", task_id=task_id,
         )
-        assert ctx["clone_source"] == (st.normalize_repo_url(GITEE_URL), "main")
+        assert ctx["clone_source"] == (
+            st.normalize_repo_url(GITEE_URL), "main", str(tmp_path / "overleaf"),
+        )
 
         def _boom(*a, **kw):
             raise AssertionError("已 clone 过的同一来源不应再启动克隆")
