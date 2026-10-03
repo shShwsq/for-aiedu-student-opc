@@ -659,7 +659,8 @@ react_agent 维护跨轮 plan 状态:
 | `/agent-policy` | AgentPolicyView | 协作策略(检查助手启用 / 轮次 / 验证授权模式 / 引用复核开关 / CLI 命令确认模式) |
 | `/practice` | PracticeView | 自适应练习(出题生成 / 练习会话 / 题库管理 / 错题回顾 / 练习记录;左侧目录锚点 + 常驻操作头布局) |
 | `/practice/history` | 重定向 `/practice#history` | 旧练习记录路径,保书签兼容(历史会话 + 每周正确率趋势已内嵌为练习首页「历史记录」段) |
-| `/practice/board` | KnowledgeBoardView | 知识点看板(薄弱/待复习/已巩固/学习中/未开始五栏,卡片发起专项练习) |
+| `/knowledge-board` | KnowledgeBoardView | 知识点看板(薄弱/待复习/已巩固/学习中/未开始五栏,卡片发起专项练习) |
+| `/practice/board` | 重定向 `/knowledge-board` | 旧看板路径,保书签兼容 |
 | `/skills` | SkillManagerView | 技能管理(上传 zip / 列表 / 在线编辑 SKILL.md / 删除) |
 | `/memory` | MemoryView | 记忆管理(用户偏好 / 全局记忆 / 项目记忆) |
 | `/settings` | SettingsView | 用户设置(改密码/Git 平台绑定 GitHub+Gitee/删除账号) |

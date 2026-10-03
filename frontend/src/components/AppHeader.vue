@@ -127,7 +127,7 @@ function handleCloseHelp(): void {
                 practiceDueCount > 99 ? '99+' : practiceDueCount
               }}</span>
             </RouterLink>
-            <RouterLink v-if="practiceEnabled" to="/practice/board">知识点看板</RouterLink>
+            <RouterLink v-if="practiceEnabled" to="/knowledge-board">知识点看板</RouterLink>
             <RouterLink to="/memory">记忆管理</RouterLink>
             <RouterLink to="/skills">技能管理</RouterLink>
           </slot>

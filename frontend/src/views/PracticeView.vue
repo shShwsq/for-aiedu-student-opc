@@ -245,7 +245,7 @@ function teardownSectionObserver(): void {
 }
 
 // ============================================================
-// 首页:统计(以工具条徽章呈现;薄弱点全景在知识点看板页 /practice/board)
+// 首页:统计(以工具条徽章呈现;薄弱点全景在知识点看板页 /knowledge-board)
 // ============================================================
 const stats = ref<PracticeStats | null>(null)
 const statsLoading = ref(true)
