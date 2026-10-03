@@ -71,11 +71,9 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
-    // 练习记录页(历史练习会话 + 学习趋势),从练习页「历史记录」入口进入
+    // 练习记录已内嵌进练习首页(左侧目录「历史记录」段),旧路径重定向保留书签兼容
     path: '/practice/history',
-    name: 'practice-history',
-    component: () => import('@/views/PracticeHistoryView.vue'),
-    meta: { requiresAuth: true },
+    redirect: '/practice#history',
   },
   {
     // 知识点看板页(知识点掌握全景 + 专项练习入口),从练习页「知识点看板」入口进入
@@ -155,10 +153,10 @@ router.beforeEach(async (to, from) => {
   }
 
   // 练习功能开关:后端关闭时直连练习相关页回退(入口已隐藏,此处兜底)
-  // —— /practice 与记录/看板页回首页;/settings/practice 回账户设置页
+  // —— /practice 与看板页回首页;/settings/practice 回账户设置页
+  // (旧 /practice/history 已重定向为 /practice#history,由 'practice' 分支覆盖)
   if (
     to.name === 'practice' ||
-    to.name === 'practice-history' ||
     to.name === 'practice-board' ||
     to.name === 'settings-practice'
   ) {

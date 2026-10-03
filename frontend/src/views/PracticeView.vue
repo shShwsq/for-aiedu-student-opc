@@ -2,27 +2,29 @@
 /**
  * 自适应练习页
  *
- * 两种界面(组件内切换,不走路由):
- * - 首页:练习统计(能力值/到期复习/正确率/题库规模)+ 开始练习入口 +
- *   错题回顾 + 题库管理(列表/归档)
- * - 会话:逐题作答(单选/判断),提交后即时判分 + 解析 + 知识点掌握度反馈;
- *   结束时显示本局统计
+ * 首页(左侧目录 + 操作头 + 滚动段落,布局对齐设置页):
+ * - 操作头一行常驻(在 .main 滚动区之外,无需 sticky):左动作(开始练习/出题进度/练习设置)
+ *   + 右统计(能力估计/到期待复习/累计正确率/题库题数);统计的说明文案走悬浮 title
+ * - 左侧目录 168px 三项锚点 + scrollspy:错题回顾 / 题库管理 / 历史记录
+ *   (历史记录由 PracticeHistoryPanel 内嵌,原 /practice/history 重定向到 #history)
+ * - 操作头与段落同在 content-column 里居中;左右两个抽屉仍是整页高(它们是列的兄弟节点)
+ * - 知识点看板不在本页入口,走顶栏主导航(与「自适应练习」并列)
  *
- * 历史练习会话与学习趋势拆到独立路由页(/practice/history),
- * 知识点掌握全景拆到 /practice/board(原首页薄弱点板块移入其薄弱栏),
- * 首页顶部按钮进入。带 ?topic=<知识点key> 进入时自动发起该知识点的专项练习
- * (知识点看板卡片「专项练习」入口)。
+ * 会话/局末态:操作头与目录全部不渲染,只保留 session-bar 与题目卡/本局统计。
  *
  * 组卷由后端 selector 完成(到期复习 > 薄弱点 > 难度匹配 > 新题),答案不下发。
  * 题目来源:审计任务详情页「生成练习题」产出并确认入库。
+ * 带 ?topic=<知识点key> / ?learningTopic=<主题key> 进入时自动发起对应专项练习
+ * (知识点看板卡片「专项练习」入口)。
  */
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
 import AppHeader from '@/components/AppHeader.vue'
 import PracticeCodeSidebar from '@/components/PracticeCodeSidebar.vue'
 import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
 import PracticeGenerateSidebar from '@/components/PracticeGenerateSidebar.vue'
+import PracticeHistoryPanel from '@/components/PracticeHistoryPanel.vue'
 import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
 import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import {
@@ -174,7 +176,76 @@ type ViewMode = 'home' | 'session' | 'summary'
 const mode = ref<ViewMode>('home')
 
 // ============================================================
-// 首页:统计(薄弱点全景已移至知识点看板页 /practice/board)
+// 左侧目录(仅首页):锚点跳转 + scrollspy 高亮
+// ============================================================
+/** 目录段顺序(锚点 id);段首越过滚动容器上边界即视为「已进入」 */
+const SECTION_IDS = ['mistakes', 'bank', 'history'] as const
+type SectionId = (typeof SECTION_IDS)[number]
+
+const navItems: { id: SectionId; label: string }[] = [
+  { id: 'mistakes', label: '错题回顾' },
+  { id: 'bank', label: '题库管理' },
+  { id: 'history', label: '历史记录' },
+]
+
+const activeSection = ref<SectionId>('mistakes')
+/** 真正滚动的容器是 .main(overflow-y: auto),观察器必须以它为 root */
+const mainRef = ref<HTMLElement | null>(null)
+let sectionObserver: IntersectionObserver | null = null
+
+/** 段首判定线:与 .anchor-section 的 scroll-margin-top 保持一致,避免高亮比滚动慢半拍 */
+const SECTION_GAP = 16
+
+function scrollToSection(id: SectionId): void {
+  // 点击即刻置高亮,不等观察器回调(平滑滚动过程中避免闪烁)
+  activeSection.value = id
+  // 操作头在 .main 之外,不会遮挡段首,直接交给 scrollIntoView + scroll-margin-top
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+/** 重算当前段:段首已到达判定线的段中取最靠下的那个(即正在阅读的段) */
+function updateActiveSection(): void {
+  const root = mainRef.value
+  if (!root) return
+  const rootTop = root.getBoundingClientRect().top
+  let current: SectionId | null = null
+  let currentTop = Number.NEGATIVE_INFINITY
+  for (const id of SECTION_IDS) {
+    const el = document.getElementById(id)
+    if (!el) continue
+    const top = el.getBoundingClientRect().top - rootTop
+    if (top > SECTION_GAP) continue
+    if (top > currentTop) {
+      currentTop = top
+      current = id
+    }
+  }
+  activeSection.value = current ?? SECTION_IDS[0]
+}
+
+function setupSectionObserver(): void {
+  teardownSectionObserver()
+  const targets = SECTION_IDS.map((id) => document.getElementById(id)).filter(
+    (el): el is HTMLElement => el !== null,
+  )
+  if (targets.length === 0) return
+  sectionObserver = new IntersectionObserver(updateActiveSection, {
+    root: mainRef.value,
+    rootMargin: '0px 0px -70% 0px',
+    threshold: 0,
+  })
+  for (const el of targets) sectionObserver.observe(el)
+}
+
+function teardownSectionObserver(): void {
+  if (sectionObserver) {
+    sectionObserver.disconnect()
+    sectionObserver = null
+  }
+}
+
+// ============================================================
+// 首页:统计(以工具条徽章呈现;薄弱点全景在知识点看板页 /practice/board)
 // ============================================================
 const stats = ref<PracticeStats | null>(null)
 const statsLoading = ref(true)
@@ -192,12 +263,48 @@ async function loadStats(): Promise<void> {
   }
 }
 
+/** 到期徽章悬浮说明:把原先占一整行的提示收进 tooltip */
+const dueBadgeTip = computed(() => {
+  if (!stats.value) return ''
+  return stats.value.due_count > 0
+    ? `有 ${stats.value.due_count} 个知识点到期待复习,本次组卷将优先安排复习题`
+    : '暂无到期待复习的知识点'
+})
+
 // ============================================================
-// 开始练习(count 可调;topic_filter 为空表示全部知识点)
+// 开始练习(题数由工具条气泡选;topic_filter 为空表示全部知识点)
 // ============================================================
 const sessionCount = ref(8)
 const starting = ref(false)
 const startError = ref('')
+
+/** 题数选择气泡(点「开始练习」只开关气泡,不直接组卷) */
+const countPopoverOpen = ref(false)
+/** 气泡与触发按钮的共同容器,用于判定「点击外部关闭」 */
+const startWrapRef = ref<HTMLElement | null>(null)
+
+function toggleCountPopover(): void {
+  countPopoverOpen.value = !countPopoverOpen.value
+  if (countPopoverOpen.value) startError.value = ''
+}
+
+async function handlePopoverConfirm(): Promise<void> {
+  await handleStartPractice()
+  // 组卷失败时保留气泡(错误文案就在气泡底部),否则错误会跟着气泡一起看不见;
+  // 成功时 mode 切到 session,由 watch(mode) 负责关
+  if (!startError.value) countPopoverOpen.value = false
+}
+
+function handlePopoverMouseDown(e: MouseEvent): void {
+  if (!countPopoverOpen.value) return
+  if (startWrapRef.value && !startWrapRef.value.contains(e.target as Node)) {
+    countPopoverOpen.value = false
+  }
+}
+
+function handlePopoverKeydown(e: KeyboardEvent): void {
+  if (e.key === 'Escape') countPopoverOpen.value = false
+}
 
 /** 会话数据 */
 const sessionId = ref('')
@@ -237,6 +344,11 @@ async function handleStartPractice(
     mode.value = 'session'
   } catch (err) {
     startError.value = extractErrorMessage(err)
+    // 气泡外的开局路径(错题重练 / 逐题重练 / ?topic 自动开局 / 再来一局)看不到
+    // 气泡内的 inline 错误,失败时用 toast 兜底;气泡内仍走 inline 展示
+    if (!countPopoverOpen.value) {
+      showToast(startError.value, 'error')
+    }
   } finally {
     starting.value = false
   }
@@ -411,23 +523,52 @@ function formatDifficulty(d: number): string {
   return Number.isInteger(d) ? String(d) : d.toFixed(1)
 }
 
-onMounted(() => {
-  loadStats()
+// 段落锚点随首页渲染才存在(且统计加载完成后才绘制三段),
+// 模式/加载态变化后重建观察器;离开首页则释放
+watch([mode, statsLoading], async () => {
+  if (mode.value !== 'home') {
+    teardownSectionObserver()
+    return
+  }
+  await nextTick()
+  setupSectionObserver()
+})
+
+// 离开首页(开局/局末)时题数气泡不留残;气泡浮在工具条上,模式切换后工具条不渲染
+watch(mode, () => {
+  countPopoverOpen.value = false
+})
+
+onMounted(async () => {
+  const statsReady = loadStats()
   loadQuestionBank()
   loadMistakes()
   // 出题进度:进页先拉一次,之后每 5 秒轮询发现运行中 job
   pollGenerateJobs()
   genPollTimer = setInterval(pollGenerateJobs, 5000)
+  document.addEventListener('mousedown', handlePopoverMouseDown)
+  document.addEventListener('keydown', handlePopoverKeydown)
+
   // 知识点看板跳转:带 ?topic=<知识点key> 进入时自动发起该知识点的专项练习;
   // 带 ?learningTopic=<主题key> 进入时自动发起主题级练习(知识点/主题级互斥,topic 优先)
   const topic = route.query.topic
   if (typeof topic === 'string' && topic) {
-    handleStartPractice(topic)
-  } else {
-    const learningTopic = route.query.learningTopic
-    if (typeof learningTopic === 'string' && learningTopic) {
-      handleStartPractice(undefined, undefined, learningTopic)
-    }
+    await handleStartPractice(topic)
+    return
+  }
+  const learningTopic = route.query.learningTopic
+  if (typeof learningTopic === 'string' && learningTopic) {
+    await handleStartPractice(undefined, undefined, learningTopic)
+    return
+  }
+
+  // 书签兼容:旧 /practice/history 重定向为 /practice#history,进首页后定位到对应段
+  // (自动开局已在上面 return,不会与此抢位置)
+  const hash = SECTION_IDS.find((id) => route.hash === `#${id}`)
+  if (hash) {
+    await statsReady
+    await nextTick()
+    scrollToSection(hash)
   }
 })
 
@@ -436,6 +577,9 @@ onBeforeUnmount(() => {
     clearInterval(genPollTimer)
     genPollTimer = null
   }
+  teardownSectionObserver()
+  document.removeEventListener('mousedown', handlePopoverMouseDown)
+  document.removeEventListener('keydown', handlePopoverKeydown)
 })
 </script>
 
@@ -455,7 +599,113 @@ onBeforeUnmount(() => {
     <div class="page-body">
       <WorkspaceSidebar v-if="!workspaceCollapsed" />
 
-      <main class="main">
+      <!-- 目录 + 内容整体居中(与设置页 .settings-shell 同款),目录不再贴左边 -->
+      <div class="practice-shell">
+        <!-- ============ 左侧目录(仅首页:锚点跳转 + scrollspy 高亮) ============ -->
+        <nav v-if="mode === 'home'" class="practice-nav" aria-label="练习页目录">
+          <button
+            v-for="item in navItems"
+            :key="item.id"
+            type="button"
+            :class="['nav-item', { active: activeSection === item.id }]"
+            @click="scrollToSection(item.id)"
+          >
+            <span class="nav-label">{{ item.label }}</span>
+            <span class="nav-node" aria-hidden="true" />
+          </button>
+        </nav>
+
+      <!-- 内容列:操作头常驻 + 段落滚动。右侧两个抽屉在本 shell 之外,保持原来的整页高度 -->
+      <div class="content-column">
+        <!-- ============ 首页操作头(左动作右统计,无背景;与段落同列宽) ============ -->
+        <div v-if="mode === 'home'" class="practice-head">
+          <div class="head-actions">
+            <!-- 开始练习:点开展开题数气泡,确认后才组卷 -->
+            <div ref="startWrapRef" class="start-wrap">
+              <button
+                class="btn-primary btn-small"
+                :disabled="!stats || stats.active_question_count === 0 || starting"
+                @click="toggleCountPopover"
+              >
+                开始练习
+                <span class="start-caret" aria-hidden="true">▾</span>
+              </button>
+
+              <div v-if="countPopoverOpen" class="count-popover" role="group" aria-label="选择题数">
+                <div class="popover-row">
+                  <span class="popover-label">题数</span>
+                  <div class="popover-modes">
+                    <button
+                      v-for="n in [4, 8, 12, 16]"
+                      :key="n"
+                      type="button"
+                      :class="['mode-btn', { active: sessionCount === n }]"
+                      @click="sessionCount = n"
+                    >{{ n }}</button>
+                  </div>
+                </div>
+                <button
+                  class="btn-primary btn-small popover-confirm"
+                  :disabled="starting"
+                  @click="handlePopoverConfirm"
+                >
+                  {{ starting ? '组卷中...' : '开始练习' }}
+                </button>
+                <p v-if="startError" class="action-error">{{ startError }}</p>
+              </div>
+            </div>
+
+            <button
+              :class="['btn-ghost', 'btn-small', 'head-quiet-btn', { 'head-btn-active': genSidebarOpen }]"
+              :title="genSidebarOpen ? '收起出题进度' : '查看出题进度'"
+              @click="toggleGenSidebar"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 20h9" />
+                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+              </svg>
+              出题进度
+              <span v-if="hasRunningGenJob" class="gen-pulse-dot" aria-hidden="true" />
+            </button>
+
+            <RouterLink
+              class="btn-ghost btn-small head-quiet-btn"
+              title="练习设置"
+              :to="{ name: 'settings-practice' }"
+            >练习设置</RouterLink>
+          </div>
+
+          <!-- 统计:数值 + 标签,组间细竖线分隔;说明文案全部收进悬浮 title -->
+          <div class="head-stats">
+            <span class="stat" title="按作答历史估计的题目难度,越高说明能答越难的题">
+              <span class="stat-num">{{ stats ? formatDifficulty(stats.ability) : '—' }}</span>
+              <span class="stat-name">能力估计</span>
+            </span>
+            <span class="stat-sep" aria-hidden="true" />
+            <span
+              :class="['stat', { 'stat-alert': stats && stats.due_count > 0 }]"
+              :title="dueBadgeTip"
+            >
+              <span class="stat-num">{{ stats ? stats.due_count : '—' }}</span>
+              <span class="stat-name">到期待复习</span>
+            </span>
+            <span class="stat-sep" aria-hidden="true" />
+            <span class="stat" :title="stats ? `累计 ${stats.total_attempts} 题` : ''">
+              <span class="stat-num">{{ stats ? formatPercent(stats.accuracy) : '—' }}</span>
+              <span class="stat-name">累计正确率</span>
+            </span>
+            <span class="stat-sep" aria-hidden="true" />
+            <span
+              class="stat"
+              :title="stats && stats.draft_question_count > 0 ? `另有 ${stats.draft_question_count} 题待确认` : ''"
+            >
+              <span class="stat-num">{{ stats ? stats.active_question_count : '—' }}</span>
+              <span class="stat-name">题库题数</span>
+            </span>
+          </div>
+        </div>
+
+      <main ref="mainRef" class="main">
       <!-- ============ 答题会话 ============ -->
       <template v-if="mode === 'session' && currentQuestion">
         <div class="session-bar">
@@ -610,126 +860,24 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
-      <!-- ============ 首页 ============ -->
+      <!-- ============ 首页(段落;操作头在 content-column 里常驻) ============ -->
       <template v-else>
-        <header class="page-head">
-          <div class="page-head-row">
-            <h1>自适应练习</h1>
-            <div class="page-head-actions">
-              <button
-                :class="['gen-toggle-btn', { 'gen-toggle-active': genSidebarOpen }]"
-                :title="genSidebarOpen ? '收起出题进度' : '查看出题进度'"
-                @click="toggleGenSidebar"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M12 20h9" />
-                  <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-                </svg>
-                出题进度
-                <span v-if="hasRunningGenJob" class="gen-pulse-dot" aria-hidden="true" />
-              </button>
-              <RouterLink
-                class="gen-toggle-btn"
-                title="知识点掌握全景:按薄弱/待复习/已巩固分栏,可发起专项练习"
-                :to="{ name: 'practice-board' }"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <rect x="3" y="3" width="5" height="8" rx="1" />
-                  <rect x="10" y="3" width="5" height="12" rx="1" />
-                  <rect x="17" y="3" width="4" height="6" rx="1" />
-                </svg>
-                知识点看板
-              </RouterLink>
-              <RouterLink
-                class="gen-toggle-btn"
-                title="查看历史练习会话与学习趋势"
-                :to="{ name: 'practice-history' }"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="12" cy="12" r="10" />
-                  <polyline points="12 6 12 12 16 14" />
-                </svg>
-                历史记录
-              </RouterLink>
-              <RouterLink
-                class="gen-toggle-btn"
-                title="练习设置"
-                :to="{ name: 'settings-practice' }"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="12" cy="12" r="3" />
-                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-                </svg>
-                练习设置
-              </RouterLink>
-            </div>
-          </div>
-          <p>题目来自审计任务的真实发现 · 到期复习优先,薄弱点强化,按能力匹配难度</p>
-        </header>
+        <p v-if="statsError" class="head-message head-message-error">
+          统计加载失败: {{ statsError }}
+          <button class="btn-link" @click="loadStats">重试</button>
+        </p>
+        <p v-else-if="!statsLoading && stats && stats.active_question_count === 0" class="head-message">
+          题库为空 — 请到已完成审计任务的详情页,点「结果清单」旁的「生成练习题」把真实发现转成题目
+        </p>
 
-        <!-- 加载中 / 失败 -->
+        <!-- 统计加载中:失败提示在上方,段落照常渲染(各自有数据源) -->
         <div v-if="statsLoading" class="placeholder">
           <span class="status-spinner" /> 加载中...
         </div>
-        <div v-else-if="statsError" class="placeholder error-text">
-          加载失败: {{ statsError }}
-          <button class="btn-link" @click="loadStats">重试</button>
-        </div>
 
-        <template v-else-if="stats">
-          <!-- 统计卡片 -->
-          <div class="stat-cards">
-            <div class="stat-card">
-              <span class="stat-value">{{ formatDifficulty(stats.ability) }}</span>
-              <span class="stat-label">能力估计</span>
-            </div>
-            <div :class="['stat-card', { 'stat-card-alert': stats.due_count > 0 }]">
-              <span class="stat-value">{{ stats.due_count }}</span>
-              <span class="stat-label">到期待复习知识点</span>
-            </div>
-            <div class="stat-card">
-              <span class="stat-value">{{ formatPercent(stats.accuracy) }}</span>
-              <span class="stat-label">累计正确率({{ stats.total_attempts }} 题)</span>
-            </div>
-            <div class="stat-card">
-              <span class="stat-value">{{ stats.active_question_count }}</span>
-              <span class="stat-label">题库题数<template v-if="stats.draft_question_count">(另有 {{ stats.draft_question_count }} 待确认)</template></span>
-            </div>
-          </div>
-
-          <!-- 开始练习 -->
-          <section class="panel">
-            <div class="start-row">
-              <div class="start-left">
-                <h2>开始练习</h2>
-                <p v-if="stats.active_question_count === 0" class="start-hint">
-                  题库为空 — 请到已完成审计任务的详情页,点「结果清单」旁的「生成练习题」把真实发现转成题目
-                </p>
-                <p v-else-if="stats.due_count > 0" class="start-hint">
-                  有 {{ stats.due_count }} 个知识点到期待复习,本次组卷将优先安排复习题
-                </p>
-              </div>
-              <div class="start-controls">
-                <label class="count-label">
-                  题数
-                  <select v-model.number="sessionCount" class="count-select" :disabled="starting">
-                    <option v-for="n in [4, 8, 12, 16]" :key="n" :value="n">{{ n }}</option>
-                  </select>
-                </label>
-                <button
-                  class="btn-primary"
-                  :disabled="starting || stats.active_question_count === 0"
-                  @click="handleStartPractice()"
-                >
-                  {{ starting ? '组卷中...' : '开始练习' }}
-                </button>
-              </div>
-            </div>
-            <p v-if="startError" class="action-error">{{ startError }}</p>
-          </section>
-
+        <template v-else>
           <!-- 错题回顾 -->
-          <section class="panel">
+          <section id="mistakes" class="panel anchor-section">
             <div class="bank-head">
               <h2>错题回顾</h2>
               <button
@@ -771,7 +919,7 @@ onBeforeUnmount(() => {
           </section>
 
           <!-- 题库管理 -->
-          <section class="panel">
+          <section id="bank" class="panel anchor-section">
             <div class="bank-head">
               <h2>题库管理</h2>
               <div class="bank-filters" role="group" aria-label="题库状态筛选">
@@ -822,9 +970,16 @@ onBeforeUnmount(() => {
               </div>
             </div>
           </section>
+
+          <!-- 历史记录(原 /practice/history 独立页内嵌为目录锚点段) -->
+          <div id="history" class="anchor-section">
+            <PracticeHistoryPanel @toast="showToast" />
+          </div>
         </template>
       </template>
       </main>
+      </div>
+      </div>
 
       <PracticeCodeSidebar
         v-if="mode === 'session' && codeSidebarOpen"
@@ -898,66 +1053,197 @@ onBeforeUnmount(() => {
   padding: var(--space-8) var(--space-6);
 }
 
-.page-head {
-  margin-bottom: var(--space-6);
+/* ---- 目录 + 内容居中容器(照搬设置页:两侧留白自动均分,目录不贴左边缘) ---- */
+.practice-shell {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 1180px;
+  margin: 0 auto;
+  overflow: hidden;
 }
 
-.page-head-row {
+/* ============ 内容列(操作头常驻 + 段落滚动) ============ */
+.content-column {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ============ 首页操作头(左动作右统计;无背景无边框,与段落同列宽) ============ */
+/* 操作头与段落之间的下边距要落在头自身上(常驻不滚走),
+   .main 的 padding-top 是滚动内容的一部分,滚下去就没了 */
+.practice-head {
+  flex-shrink: 0;
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+  padding: var(--space-3) var(--space-6) var(--space-4);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-3);
+  gap: var(--space-3) var(--space-5);
+  flex-wrap: wrap;
 }
 
-.page-head h1 {
-  margin: 0 0 var(--space-1);
-  font-size: var(--fs-xl);
-  font-weight: var(--fw-semibold);
-  color: var(--color-text);
-}
-
-/* 页头右侧操作区(「出题进度」+「练习设置」并排) */
-.page-head-actions {
+.head-actions {
   display: flex;
   align-items: center;
   gap: var(--space-2);
 }
 
-/* 页头右侧「出题进度」切换按钮(有运行中 job 时带呼吸小红点);「历史记录」与「练习设置」RouterLink 复用同款样式 */
-.gen-toggle-btn {
+/* 次要动作:ghost 无边框;相对定位供「出题进度」呼吸红点,RouterLink 版去掉下划线 */
+.head-quiet-btn {
   position: relative;
-  display: inline-flex;
+  text-decoration: none;
+}
+
+.head-btn-active {
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+
+/* 统计簇:数值 + 标签,组间细竖线分隔(取代原先一排卡片 / 胶囊) */
+.head-stats {
+  display: flex;
   align-items: center;
+  gap: var(--space-3);
+}
+
+/* 说明文案全部在悬浮 title 里,cursor 提示可悬停 */
+.stat {
+  display: inline-flex;
+  align-items: baseline;
   gap: var(--space-1);
-  padding: var(--space-1) var(--space-3);
+  cursor: help;
+}
+
+.stat-num {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-name {
   font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+}
+
+/* 有到期复习项时数值标主色(沿用原统计卡 alert 语义) */
+.stat-alert .stat-num {
+  color: var(--color-primary);
+}
+
+.stat-sep {
+  flex-shrink: 0;
+  width: 1px;
+  height: 12px;
+  background: var(--color-border);
+}
+
+/* 非常驻的临时提示行(统计失败 / 题库为空),与段落同宽放在 .main 内 */
+.head-message {
+  margin: 0 0 var(--space-4);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: var(--lh-relaxed);
+}
+
+.head-message-error {
+  color: var(--color-danger);
+}
+
+/* ============ 左侧目录(锚点 + scrollspy,视觉对齐设置页导航) ============ */
+.practice-nav {
+  flex-shrink: 0;
+  width: 168px;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-6) var(--space-4);
+  overflow-y: auto;
+}
+
+.nav-item {
+  position: relative;
+  display: block;
+  padding: 10px 36px 10px var(--space-3);
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
+  text-align: left;
   color: var(--color-text-secondary);
   background: transparent;
-  border: 1px solid var(--color-border);
+  border: none;
   border-radius: var(--radius-md);
   cursor: pointer;
-  text-decoration: none;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+/* 节点间的连接竖线(位于目录项右侧,与节点同心) */
+.nav-item::before {
+  content: '';
+  position: absolute;
+  right: 20px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--color-border);
+}
+
+/* 首尾项竖线各截去一半,使线只在节点之间延伸 */
+.nav-item:first-child::before {
+  top: 50%;
+}
+
+.nav-item:last-child::before {
+  bottom: 50%;
+}
+
+/* 状态节点:空心圆,当前段填充主色并带光环 */
+.nav-node {
+  position: absolute;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  box-sizing: border-box;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--color-border-strong);
+  border-radius: 50%;
+  background: var(--color-surface);
   transition: all var(--transition-fast);
 }
 
-.gen-toggle-btn:hover {
-  color: var(--color-primary);
-  border-color: var(--color-primary);
-  background: var(--color-primary-light);
-  text-decoration: none;
+.nav-item:hover {
+  color: var(--color-text);
+  background: var(--color-surface-alt);
 }
 
-.gen-toggle-active {
+.nav-item.active {
   color: var(--color-primary);
-  border-color: var(--color-primary);
   background: var(--color-primary-light);
+  font-weight: var(--fw-semibold);
 }
 
+.nav-item.active .nav-node {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-light);
+}
+
+/* 目录锚点段:滚到容器顶部时留一点呼吸 */
+.anchor-section {
+  scroll-margin-top: var(--space-4);
+}
+
+/* 「出题进度」有运行中 job 时的呼吸小红点(定位基准为 .head-quiet-btn) */
 .gen-pulse-dot {
   position: absolute;
-  top: 4px;
-  right: 4px;
+  top: 2px;
+  right: 2px;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -970,12 +1256,6 @@ onBeforeUnmount(() => {
   50% { opacity: 0.35; transform: scale(0.7); }
 }
 
-.page-head p {
-  margin: 0;
-  font-size: var(--fs-sm);
-  color: var(--color-text-secondary);
-}
-
 .placeholder {
   display: flex;
   align-items: center;
@@ -983,10 +1263,6 @@ onBeforeUnmount(() => {
   padding: var(--space-6);
   font-size: var(--fs-sm);
   color: var(--color-text-secondary);
-}
-
-.placeholder.error-text {
-  color: var(--color-danger);
 }
 
 .btn-link {
@@ -1001,43 +1277,6 @@ onBeforeUnmount(() => {
 
 .btn-link:hover {
   text-decoration: underline;
-}
-
-/* ============ 统计卡片 ============ */
-.stat-cards {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: var(--space-3);
-  margin-bottom: var(--space-6);
-}
-
-.stat-card {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  padding: var(--space-4);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-}
-
-.stat-card-alert {
-  border-color: var(--color-primary);
-}
-
-.stat-value {
-  font-size: var(--fs-xl);
-  font-weight: var(--fw-semibold);
-  color: var(--color-text);
-}
-
-.stat-card-alert .stat-value {
-  color: var(--color-primary);
-}
-
-.stat-label {
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
 }
 
 /* ============ 通用面板 ============ */
@@ -1070,48 +1309,56 @@ onBeforeUnmount(() => {
   color: var(--color-danger);
 }
 
-/* ============ 开始练习 ============ */
-.start-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-  flex-wrap: wrap;
+/* ============ 开始练习气泡(工具条内弹出) ============ */
+.start-wrap {
+  position: relative;
 }
 
-.start-left h2 {
-  margin-bottom: var(--space-1);
-}
-
-.start-hint {
-  margin: 0;
+.start-caret {
   font-size: var(--fs-xs);
-  color: var(--color-text-secondary);
-  max-width: 460px;
-  line-height: var(--lh-relaxed);
+  opacity: 0.7;
 }
 
-.start-controls {
+.count-popover {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  left: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+}
+
+.popover-row {
   display: flex;
   align-items: center;
   gap: var(--space-3);
 }
 
-.count-label {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+.popover-label {
   font-size: var(--fs-sm);
   color: var(--color-text-secondary);
 }
 
-.count-select {
-  padding: var(--space-1) var(--space-2);
-  font-size: var(--fs-sm);
-  color: var(--color-text);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+.popover-modes {
+  display: inline-flex;
+  background: var(--color-surface-alt);
   border-radius: var(--radius-md);
+  padding: 2px;
+  gap: 2px;
+}
+
+.popover-confirm {
+  align-self: flex-start;
+}
+
+.count-popover .action-error {
+  margin: 0;
 }
 
 /* ============ 题库管理 ============ */
@@ -1664,21 +1911,33 @@ onBeforeUnmount(() => {
   transform: translate(-50%, -12px);
 }
 
+/* ---- 响应式:窄屏隐藏目录(退回「工具条 + 滚动」体验) ---- */
+@media (max-width: 900px) {
+  .practice-nav {
+    display: none;
+  }
+}
+
 /* ---- 响应式:窄屏(手机) ---- */
 @media (max-width: 640px) {
   .main {
     padding: var(--space-4) var(--space-3) var(--space-6);
   }
 
-  /* 页头标题与操作区允许换行 */
-  .page-head-row {
+  /* 操作头换行后动作与统计各自成行 */
+  .practice-head {
+    padding: var(--space-3) var(--space-3) var(--space-4);
+    align-items: flex-start;
+    row-gap: var(--space-3);
+  }
+
+  .head-actions {
     flex-wrap: wrap;
   }
 
-  /* 统计卡 4→2 列 */
-  .stat-cards {
-    grid-template-columns: repeat(2, 1fr);
-    gap: var(--space-2);
+  .head-stats {
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
   }
 
   /* 会话顶栏允许换行 */

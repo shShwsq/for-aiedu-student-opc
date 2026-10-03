@@ -657,8 +657,8 @@ react_agent 维护跨轮 plan 状态:
 | `/models` | ModelSettingsView | LLM 模型配置(多厂商列表式管理) |
 | `/cli` | CliSettingsView | 外部 CLI 凭据配置(Qoder / DeepSeek / Codex) |
 | `/agent-policy` | AgentPolicyView | 协作策略(检查助手启用 / 轮次 / 验证授权模式 / 引用复核开关 / CLI 命令确认模式) |
-| `/practice` | PracticeView | 自适应练习(出题生成 / 练习会话 / 题库管理 / 统计趋势) |
-| `/practice/history` | PracticeHistoryView | 练习记录(历史会话 + 每周正确率趋势) |
+| `/practice` | PracticeView | 自适应练习(出题生成 / 练习会话 / 题库管理 / 错题回顾 / 练习记录;左侧目录锚点 + 常驻操作头布局) |
+| `/practice/history` | 重定向 `/practice#history` | 旧练习记录路径,保书签兼容(历史会话 + 每周正确率趋势已内嵌为练习首页「历史记录」段) |
 | `/practice/board` | KnowledgeBoardView | 知识点看板(薄弱/待复习/已巩固/学习中/未开始五栏,卡片发起专项练习) |
 | `/skills` | SkillManagerView | 技能管理(上传 zip / 列表 / 在线编辑 SKILL.md / 删除) |
 | `/memory` | MemoryView | 记忆管理(用户偏好 / 全局记忆 / 项目记忆) |
@@ -766,7 +766,7 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - `GET /practice/questions` + `POST /practice/questions/{id}/archive`(题库管理)+ `DELETE /practice/records`(清空记录)
 - 学习主题 CRUD(`backend/app/routers/learning_topics.py`,随 PRACTICE_ENABLED 注册):`GET /practice/topics`(懒播种内置 4 行,附每主题 kp_count)/ `POST /practice/topics`(自定义,名称用户内唯一,超限 400)/ `PATCH /practice/topics/{id}`(内置仅 enabled,自定义全字段;启用数不可归零 400)/ `DELETE /practice/topics/{id}`(仅自定义;有关联知识点 400 提示先停用)
 
-**前端**:`PracticeView.vue`(练习首页 / 会话答题 / 统计;`?topic=<key>` 进入自动发起专项练习,`?learningTopic=<key>` 自动发起主题级练习)、`KnowledgeBoardView.vue`(知识点看板,主题折叠区分组)、`PracticeHistoryView.vue`(练习记录)、`PracticeGenerateSidebar`(出题进度侧栏,与答题代码栏互斥,360px)、`PracticeGenerateDialog`(生成确认)、`PracticeSettingsPanel.vue` 练习设置面板含「学习主题」管理区(内置启停 + 自定义增删改)、`PracticeCodeSidebar`(答题时源码查阅);任务详情页结果区有「生成练习题」入口。
+**前端**:`PracticeView.vue`(练习首页 / 会话答题 / 统计;`?topic=<key>` 进入自动发起专项练习,`?learningTopic=<key>` 自动发起主题级练习)、`KnowledgeBoardView.vue`(知识点看板,主题折叠区分组)、`PracticeHistoryPanel`(练习记录段,内嵌练习首页「历史记录」锚点,旧 `/practice/history` 重定向 `/practice#history`)、`PracticeGenerateSidebar`(出题进度侧栏,与答题代码栏互斥,360px)、`PracticeGenerateDialog`(生成确认)、`PracticeSettingsPanel.vue` 练习设置面板含「学习主题」管理区(内置启停 + 自定义增删改)、`PracticeCodeSidebar`(答题时源码查阅);任务详情页结果区有「生成练习题」入口。
 
 **出题日志**:`backend/logs/practice_generate.log`(滚动 10MB×3),记录模型解析 / 工作区状态 / 每条 finding 的解析与丢弃原因,便于排查"一道题也没生成"。
 
