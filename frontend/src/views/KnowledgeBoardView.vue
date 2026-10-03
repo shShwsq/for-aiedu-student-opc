@@ -320,6 +320,7 @@ onMounted(() => {
             :key="sec.topicKey"
             type="button"
             :class="['nav-item', { active: activeKey === sec.topicKey }]"
+            :aria-current="activeKey === sec.topicKey ? 'location' : undefined"
             @click="goSection(sec)"
           >
             <span class="nav-label">{{ sec.name }}</span>

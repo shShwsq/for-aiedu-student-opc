@@ -611,6 +611,7 @@ onBeforeUnmount(() => {
             :key="item.id"
             type="button"
             :class="['nav-item', { active: activeSection === item.id }]"
+            :aria-current="activeSection === item.id ? 'location' : undefined"
             @click="scrollToSection(item.id)"
           >
             <span class="nav-label">{{ item.label }}</span>
