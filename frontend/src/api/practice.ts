@@ -23,6 +23,7 @@ import type {
   LearningTopicUpdateRequest,
   PracticeStats,
   PracticeSummary,
+  QuestionDetail,
   QuestionListItem,
   SessionDetail,
   SessionListItem,
@@ -140,6 +141,11 @@ export function listQuestions(params?: {
   mistake?: boolean
 }): Promise<QuestionListItem[]> {
   return client.get('/practice/questions', { params }).then((r) => r.data)
+}
+
+/** 题目完整信息(含正确答案与解析;列表项只有一行摘要,点开单行时按需拉取) */
+export function getQuestionDetail(questionId: string): Promise<QuestionDetail> {
+  return client.get(`/practice/questions/${questionId}`).then((r) => r.data)
 }
 
 /** 轻量汇总(导航徽章用):到期复习数 + 待确认 draft 数 */

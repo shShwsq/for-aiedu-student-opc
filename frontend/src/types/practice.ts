@@ -326,6 +326,41 @@ export interface QuestionListItem {
   created_at: string
 }
 
+/**
+ * 题目完整信息(GET /practice/questions/{id})
+ *
+ * 内容字段与候选题预览同构(含 answer_idx 与 explanation),另附状态 /
+ * 归类 / 溯源与本题作答统计,供题库管理与错题复盘使用。
+ * 仅在首页复盘场景下发,答题中的组卷题面(SessionQuestion)不含答案字段。
+ */
+export interface QuestionDetail {
+  id: string
+  qtype: 'single_choice' | 'true_false'
+  stem: string
+  code_snippet: string | null
+  options: string[]
+  answer_idx: number
+  explanation: string
+  difficulty: number
+  knowledge_key: string | null
+  knowledge_name: string | null
+  origin: 'repo' | 'synthetic'
+  languages: string[]
+  source_file: string | null
+  source_lines: string | null
+  status: 'draft' | 'active' | 'archived'
+  /** 知识点粗分类(如 injection / auth) */
+  category: string | null
+  /** 出题时归属的学习主题 key(老题为 null) */
+  learning_topic: string | null
+  /** 来源任务(跳任务详情页查源码用;老题为 null) */
+  source_task_id: string | null
+  attempts: number
+  correct_count: number
+  accuracy: number | null
+  created_at: string
+}
+
 // ---- 导航徽章 / 历史会话 / 趋势 ----
 
 /** 轻量汇总(导航徽章用) */

@@ -45,6 +45,7 @@ from app.schemas.practice import (
     KnowledgeStateResponse,
     KnowledgePointCardItem,
     PracticeSummaryResponse,
+    QuestionDetailResponse,
     QuestionListItem,
     SessionAttemptItem,
     SessionDetailResponse,
@@ -1168,6 +1169,64 @@ def list_questions(
             created_at=q.created_at,
         ))
     return items
+
+
+@router.get("/questions/{question_id}", response_model=QuestionDetailResponse)
+def get_question_detail(
+    question_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> QuestionDetailResponse:
+    """题目完整信息(题库管理 / 错题回顾 / 历史明细点开单行时按需拉取)
+
+    含 answer_idx 与 explanation,因此只用于首页复盘;组卷端点
+    (POST /practice/sessions)仍走不下发答案的 SessionQuestionResponse。
+    已归档题同样可读(归档只是退出组卷,题目内容仍需回看)。
+    """
+    question = db.query(Question).filter(
+        Question.id == question_id,
+        Question.user_id == current_user.id,
+    ).first()
+    if not question:
+        raise HTTPException(status_code=404, detail="题目不存在")
+
+    kp = db.query(KnowledgePoint).filter(
+        KnowledgePoint.id == question.knowledge_point_id
+    ).first()
+    attempts, correct = db.query(
+        sa_func.count(Attempt.id),
+        sa_func.sum(cast(Attempt.is_correct, Integer)),
+    ).filter(
+        Attempt.question_id == question.id,
+        Attempt.user_id == current_user.id,
+    ).one()
+    attempts = attempts or 0
+    correct = correct or 0
+
+    return QuestionDetailResponse(
+        id=question.id,
+        qtype=question.qtype.value,
+        stem=question.stem,
+        code_snippet=question.code_snippet,
+        options=question.options,
+        answer_idx=question.answer_idx,
+        explanation=question.explanation,
+        difficulty=question.difficulty,
+        knowledge_key=kp.key if kp else None,
+        knowledge_name=kp.name if kp else None,
+        origin=question.origin or "repo",
+        languages=(kp.languages if kp else None) or [],
+        source_file=question.source_file,
+        source_lines=question.source_lines,
+        status=question.status.value,
+        category=kp.category if kp else None,
+        learning_topic=question.learning_topic,
+        source_task_id=question.source_task_id,
+        attempts=attempts,
+        correct_count=correct,
+        accuracy=(correct / attempts) if attempts else None,
+        created_at=question.created_at,
+    )
 
 
 @router.post("/questions/{question_id}/archive")

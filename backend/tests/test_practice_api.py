@@ -432,6 +432,83 @@ def test_generate_job_of_other_user_404(ctx, ctx_b):
 
 
 # ============================================================
+# 题目详情(完整题面按需拉取:题库管理 / 错题回顾 / 历史明细点开单行)
+# ============================================================
+
+
+def test_question_detail_returns_full_content(ctx):
+    """详情携带选项/正确答案/解析/出处与本题作答统计;列表项保持摘要"""
+    ctx.login()
+    _generate_and_confirm(ctx)
+    qid = ctx.client.get("/practice/questions").json()[0]["id"]
+
+    # 列表只给一行摘要:全量内容不下发(整库带 options+解析会让 payload 翻几倍)
+    item = ctx.client.get("/practice/questions").json()[0]
+    assert "options" not in item and "answer_idx" not in item and "explanation" not in item
+
+    # 强制用该题组一局并答对,详情应体现统计
+    session = ctx.client.post(
+        "/practice/sessions", json={"count": 1, "question_ids": [qid]}
+    ).json()
+    answered = ctx.client.post(
+        f"/practice/sessions/{session['session_id']}/answers",
+        json={"question_id": qid, "chosen_idx": 0},
+    ).json()
+    assert answered["is_correct"] is True
+
+    d = ctx.client.get(f"/practice/questions/{qid}").json()
+    assert d["id"] == qid
+    assert d["options"] == ["甲", "乙", "丙", "丁"]
+    assert d["answer_idx"] == 0
+    assert d["explanation"] == "解析"
+    assert d["difficulty"] == 1.5
+    assert d["status"] == "active"
+    assert d["origin"] == "repo"
+    assert d["code_snippet"] is None
+    assert d["knowledge_key"].startswith("CWE-")
+    assert d["category"] == "cwe"
+    assert d["source_task_id"] == str(ctx.task.id)
+    assert d["attempts"] == 1 and d["correct_count"] == 1
+    assert d["accuracy"] == 1.0
+    assert d["created_at"]
+
+    # 组卷端点仍不下发答案(与详情端点的职责分离)
+    q = ctx.client.post("/practice/sessions", json={"count": 1}).json()["questions"][0]
+    assert "answer_idx" not in q and "explanation" not in q
+
+
+def test_question_detail_covers_draft_and_archived(ctx):
+    """draft 可在转正前校对题面;归档题仍可回看(只是退出组卷)"""
+    ctx.login()
+    r = ctx.client.post("/practice/generate", json={"task_id": str(ctx.task.id)})
+    job = _wait_job(ctx.client, r.json()["job_id"])
+    qid = job["questions"][0]["id"]
+
+    assert ctx.client.get(f"/practice/questions/{qid}").json()["status"] == "draft"
+
+    ctx.client.post("/practice/questions/activate", json={"question_ids": [qid]})
+    assert ctx.client.get(f"/practice/questions/{qid}").json()["status"] == "active"
+
+    ctx.client.post(f"/practice/questions/{qid}/archive")
+    d = ctx.client.get(f"/practice/questions/{qid}").json()
+    assert d["status"] == "archived"
+    assert d["options"] == ["甲", "乙", "丙", "丁"]
+
+
+def test_question_detail_isolation(ctx, ctx_b):
+    """越权/不存在 404,未登录 401(与归档、会话明细同一归属校验口径)"""
+    ctx.login()
+    _generate_and_confirm(ctx)
+    qid = ctx.client.get("/practice/questions").json()[0]["id"]
+
+    assert ctx_b.client.get(f"/practice/questions/{qid}").status_code == 404
+    assert ctx.client.get(f"/practice/questions/{uuid.uuid4()}").status_code == 404
+
+    ctx.logout()
+    assert ctx.client.get(f"/practice/questions/{qid}").status_code == 401
+
+
+# ============================================================
 # 清空练习记录
 # ============================================================
 

@@ -90,10 +90,12 @@ class GenerateJobsResponse(BaseModel):
     jobs: list[GenerateJobSummary] = []
 
 
-class DraftQuestionResponse(BaseModel):
-    """生成的候选题(draft 状态,待用户预览确认)
+class QuestionContent(BaseModel):
+    """题目完整内容(题干 / 选项 / 正确答案 / 解析 / 代码 / 源码出处)
 
-    预览阶段即下发 answer_idx 与 explanation,供用户校对题目质量。
+    草稿预览与题库详情共用同一套内容字段:两处都需要 answer_idx 与
+    explanation 供用户校对题目质量或事后复盘。答题中的组卷下发用的是
+    SessionQuestionResponse(不含本模型的答案字段),两者保持分离。
     """
 
     id: uuid.UUID
@@ -110,11 +112,18 @@ class DraftQuestionResponse(BaseModel):
     origin: str = "repo"
     # 知识点编程语言标签(如 ["python", "sql"];来自知识点累积)
     languages: list[str] = []
-    # 题目引用的源码定位(预览时校对出处用;老题为 None)
+    # 题目引用的源码定位(校对出处用;老题为 None)
     source_file: str | None = None
     source_lines: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+class DraftQuestionResponse(QuestionContent):
+    """生成的候选题(draft 状态,待用户预览确认)
+
+    预览阶段即下发 answer_idx 与 explanation,供用户校对题目质量。
+    """
 
 
 class GenerateResponse(BaseModel):
@@ -338,6 +347,29 @@ class QuestionListItem(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class QuestionDetailResponse(QuestionContent):
+    """题目完整信息(GET /practice/questions/{question_id})
+
+    列表项只带一行摘要(整库下发全量内容会让 payload 翻几倍),
+    点开某题时再按需拉本题全量:内容字段同草稿预览,另附状态、
+    知识点归类与该题作答统计,供题库管理与错题复盘使用。
+    """
+
+    # draft=待确认 / active=已入库 / archived=已归档
+    status: str
+    # 知识点粗分类(如 injection / auth;看板与筛选展示用)
+    category: str | None = None
+    # 出题时归属的学习主题(learning_topics.key;老题为 None)
+    learning_topic: str | None = None
+    # 来源任务(前端跳任务详情页查源码用;老题/手工导入为 None)
+    source_task_id: uuid.UUID | None = None
+    # 该题作答统计(无记录 attempts=0、accuracy=None)
+    attempts: int = 0
+    correct_count: int = 0
+    accuracy: float | None = None
+    created_at: datetime
 
 
 # ============================================================

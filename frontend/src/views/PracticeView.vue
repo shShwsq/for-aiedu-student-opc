@@ -7,6 +7,7 @@
  *   + 右统计(能力估计/到期待复习/累计正确率/题库题数);统计的说明文案走悬浮 title
  * - 左侧目录 168px 三项锚点 + scrollspy:错题回顾 / 题库管理 / 历史记录
  *   (历史记录由 PracticeHistoryPanel 内嵌,原 /practice/history 重定向到 #history)
+ * - 题目行可点开 PracticeQuestionDetailDialog 看完整题面(列表只下发一行摘要)
  * - 操作头与段落同在 content-column 里居中;左右两个抽屉仍是整页高(它们是列的兄弟节点)
  * - 知识点看板不在本页入口,走顶栏主导航(与「自适应练习」并列)
  *
@@ -25,6 +26,7 @@ import PracticeCodeSidebar from '@/components/PracticeCodeSidebar.vue'
 import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
 import PracticeGenerateSidebar from '@/components/PracticeGenerateSidebar.vue'
 import PracticeHistoryPanel from '@/components/PracticeHistoryPanel.vue'
+import PracticeQuestionDetailDialog from '@/components/PracticeQuestionDetailDialog.vue'
 import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
 import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import {
@@ -37,6 +39,12 @@ import {
   submitAnswer,
 } from '@/api/practice'
 import { extractErrorMessage } from '@/utils/error'
+import {
+  formatDate,
+  formatDifficulty,
+  formatPercent,
+  qtypeLabel,
+} from '@/utils/practiceFormat'
 import type {
   GenerateJobSummary,
   PracticeStats,
@@ -500,27 +508,20 @@ function handleStartMistakeSession(): void {
 }
 
 // ============================================================
-// 展示辅助
+// 题目详情弹窗(题库管理与错题回顾共用)
 // ============================================================
-function formatPercent(v: number | null | undefined, digits = 0): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return '—'
-  return `${(v * 100).toFixed(digits)}%`
+const questionDetailOpen = ref(false)
+const questionDetailId = ref<string | null>(null)
+
+/** 点开题目行:拉取完整题面(模态弹窗遮住列表,无需担心与转正/归档并发) */
+function openQuestionDetail(id: string): void {
+  questionDetailId.value = id
+  questionDetailOpen.value = true
 }
 
-function formatDate(iso: string | null | undefined): string {
-  if (!iso) return '—'
-  try {
-    const d = new Date(iso)
-    if (Number.isNaN(d.getTime())) return iso
-    return d.toLocaleDateString('zh-CN')
-  } catch {
-    return iso
-  }
-}
-
-/** 难度展示(保留 1 位小数,整数不带小数) */
-function formatDifficulty(d: number): string {
-  return Number.isInteger(d) ? String(d) : d.toFixed(1)
+function closeQuestionDetail(): void {
+  questionDetailOpen.value = false
+  questionDetailId.value = null
 }
 
 // 段落锚点随首页渲染才存在(且统计加载完成后才绘制三段),
@@ -535,8 +536,10 @@ watch([mode, statsLoading], async () => {
 })
 
 // 离开首页(开局/局末)时题数气泡不留残;气泡浮在工具条上,模式切换后工具条不渲染
+// (题目详情弹窗是模态的,遮罩已挡住「开始练习」;此处一并关闭作防御)
 watch(mode, () => {
   countPopoverOpen.value = false
+  closeQuestionDetail()
 })
 
 onMounted(async () => {
@@ -894,7 +897,12 @@ onBeforeUnmount(() => {
             </p>
             <div v-else class="bank-list">
               <div v-for="q in mistakes" :key="q.id" class="bank-item">
-                <div class="bank-item-main">
+                <button
+                  type="button"
+                  class="bank-item-main"
+                  title="查看完整题面、选项与解析"
+                  @click="openQuestionDetail(q.id)"
+                >
                   <span class="bank-stem">{{ q.stem }}</span>
                   <span class="bank-meta">
                     <span v-if="q.knowledge_name" class="tag tag-kp">{{ q.knowledge_name }}</span>
@@ -904,10 +912,10 @@ onBeforeUnmount(() => {
                       class="tag tag-lang"
                     >{{ lang }}</span>
                     <span v-if="q.origin === 'synthetic'" class="tag tag-synthetic" title="智能体原创的虚构代码,脱离原仓库">改编</span>
-                    <span>{{ q.qtype === 'true_false' ? '判断' : '单选' }}</span>
+                    <span>{{ qtypeLabel(q.qtype) }}</span>
                     <span>作答 {{ q.attempts }} 次 · 正确率 {{ formatPercent(q.accuracy) }}</span>
                   </span>
-                </div>
+                </button>
                 <button
                   class="btn-secondary btn-small"
                   :disabled="starting"
@@ -936,7 +944,12 @@ onBeforeUnmount(() => {
             <p v-else-if="bankQuestions.length === 0" class="panel-empty">该状态下暂无题目</p>
             <div v-else class="bank-list">
               <div v-for="q in bankQuestions" :key="q.id" class="bank-item">
-                <div class="bank-item-main">
+                <button
+                  type="button"
+                  class="bank-item-main"
+                  title="查看完整题面、选项与解析"
+                  @click="openQuestionDetail(q.id)"
+                >
                   <span class="bank-stem">{{ q.stem }}</span>
                   <span class="bank-meta">
                     <span v-if="q.knowledge_name" class="tag tag-kp">{{ q.knowledge_name }}</span>
@@ -946,14 +959,14 @@ onBeforeUnmount(() => {
                       class="tag tag-lang"
                     >{{ lang }}</span>
                     <span v-if="q.origin === 'synthetic'" class="tag tag-synthetic" title="智能体原创的虚构代码,脱离原仓库">改编</span>
-                    <span>{{ q.qtype === 'true_false' ? '判断' : '单选' }}</span>
+                    <span>{{ qtypeLabel(q.qtype) }}</span>
                     <span>难度 {{ formatDifficulty(q.difficulty) }}</span>
                     <template v-if="q.attempts > 0">
                       <span>作答 {{ q.attempts }} 次 · 正确率 {{ formatPercent(q.accuracy) }}</span>
                     </template>
                     <span class="bank-date">{{ formatDate(q.created_at) }}</span>
                   </span>
-                </div>
+                </button>
                 <template v-if="q.status === 'draft'">
                   <button
                     class="btn-secondary btn-small"
@@ -1006,6 +1019,13 @@ onBeforeUnmount(() => {
       :task-id="practiceDialogTaskId"
       @close="handlePracticeDialogClose"
       @confirmed="handlePracticeDialogClose"
+    />
+
+    <!-- ============ 题目详情弹窗(题库管理 / 错题回顾点开单行) ============ -->
+    <PracticeQuestionDetailDialog
+      :open="questionDetailOpen"
+      :question-id="questionDetailId"
+      @close="closeQuestionDetail"
     />
 
     <!-- ============ 浮动提示 ============ -->
@@ -1423,6 +1443,22 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+  /* 题目行整体是个按钮(点开看详情):去掉按钮默认外观,保留列排版与左对齐 */
+  padding: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.bank-item-main:hover .bank-stem {
+  color: var(--color-primary);
+}
+
+.bank-item-main:focus-visible {
+  outline: 2px solid var(--color-primary-border);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
 .bank-stem {

@@ -8,12 +8,17 @@
  * 原为独立路由页 /practice/history,现内嵌进练习首页作为左侧目录的锚点段。
  * 数据由本组件挂载时自加载;清空练习记录(在练习设置内)后回到首页会随重挂载刷新。
  * 明细拉取失败通过 toast 事件上抛给宿主展示,避免两份 toast 实现。
+ *
+ * 逐题明细行可点开 PracticeQuestionDetailDialog 看完整题面(含选项/正确答案/解析),
+ * 并把当次作答传进去,标出「你选的」是哪一个。
  */
 import { computed, onMounted, ref } from 'vue'
 
+import PracticeQuestionDetailDialog from '@/components/PracticeQuestionDetailDialog.vue'
 import { getSessionDetail, getPracticeTrend, listPracticeSessions } from '@/api/practice'
 import { extractErrorMessage } from '@/utils/error'
-import type { SessionDetail, SessionListItem, TrendPoint } from '@/types/practice'
+import { formatDateTime, formatPercent, optionLetter } from '@/utils/practiceFormat'
+import type { SessionAttemptItem, SessionDetail, SessionListItem, TrendPoint } from '@/types/practice'
 
 const emit = defineEmits<{
   (e: 'toast', msg: string, type: 'success' | 'error'): void
@@ -110,30 +115,25 @@ async function handleSessionDetailToggle(s: SessionListItem, e: Event): Promise<
 }
 
 // ============================================================
-// 展示辅助
+// 题目详情弹窗(点开逐题明细行)
 // ============================================================
-function formatPercent(v: number | null | undefined, digits = 0): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return '—'
-  return `${(v * 100).toFixed(digits)}%`
+const detailOpen = ref(false)
+/** 当前查看的那一次作答(题目 id 由它携带,避免两个状态走歪) */
+const activeAttempt = ref<SessionAttemptItem | null>(null)
+
+function openQuestionDetail(a: SessionAttemptItem): void {
+  activeAttempt.value = a
+  detailOpen.value = true
 }
 
-/** 日期时间(历史会话列表用,含时分) */
-function formatDateTime(iso: string | null | undefined): string {
-  if (!iso) return '—'
-  try {
-    const d = new Date(iso)
-    if (Number.isNaN(d.getTime())) return iso
-    return d.toLocaleString('zh-CN', {
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    })
-  } catch {
-    return iso
-  }
+function closeQuestionDetail(): void {
+  detailOpen.value = false
+  activeAttempt.value = null
 }
 
+// ============================================================
+// 生命周期
+// ============================================================
 onMounted(() => {
   loadTrend()
   loadSessions()
@@ -206,21 +206,32 @@ onMounted(() => {
           <span class="status-spinner" /> 加载明细...
         </div>
         <div v-else-if="sessionDetails[s.id]" class="attempt-list">
-          <div
+          <button
             v-for="(a, idx) in sessionDetails[s.id].attempts"
             :key="idx"
+            type="button"
             :class="['attempt-row', a.is_correct ? 'attempt-correct' : 'attempt-wrong']"
+            title="查看完整题面、选项与解析"
+            @click="openQuestionDetail(a)"
           >
             <span class="attempt-mark">{{ a.is_correct ? '✓' : '✗' }}</span>
             <span class="attempt-stem">{{ a.stem }}</span>
             <span class="attempt-answer">
-              你选 {{ String.fromCharCode(65 + a.chosen_idx) }} · 正确答案 {{ String.fromCharCode(65 + a.correct_idx) }}
+              你选 {{ optionLetter(a.chosen_idx) }} · 正确答案 {{ optionLetter(a.correct_idx) }}
             </span>
-          </div>
+          </button>
         </div>
       </details>
     </div>
   </section>
+
+  <!-- 题目详情弹窗(完整题面 + 本次作答标记) -->
+  <PracticeQuestionDetailDialog
+    :open="detailOpen"
+    :question-id="activeAttempt?.question_id ?? null"
+    :attempt="activeAttempt"
+    @close="closeQuestionDetail"
+  />
 </template>
 
 <style scoped>
@@ -363,6 +374,23 @@ onMounted(() => {
   padding: var(--space-1) 0 var(--space-1) var(--space-4);
   font-size: var(--fs-xs);
   color: var(--color-text-secondary);
+  /* 整行是个按钮(点开题目详情):去掉按钮默认外观,保留左对齐 */
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.attempt-row:hover {
+  background: var(--color-surface-alt);
+}
+
+.attempt-row:focus-visible {
+  outline: 2px solid var(--color-primary-border);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
 }
 
 .attempt-mark {
