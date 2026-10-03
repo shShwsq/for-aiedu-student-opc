@@ -76,10 +76,10 @@ const routes: RouteRecordRaw[] = [
     redirect: '/practice#history',
   },
   {
-    // 知识点看板页(知识点掌握全景 + 专项练习入口),顶栏一级导航「知识点看板」进入;
-    // 与「自适应练习」并列,路径为一级;name 保持 practice-board(功能开关守卫按名匹配)
+    // 知识点看板页(知识点掌握全景 + 专项练习入口),顶栏一级导航「知识点看板」进入,
+    // 与「自适应练习」并列;name 与路径同为 knowledge-board,守卫按名匹配
     path: '/knowledge-board',
-    name: 'practice-board',
+    name: 'knowledge-board',
     component: () => import('@/views/KnowledgeBoardView.vue'),
     meta: { requiresAuth: true },
   },
@@ -163,7 +163,7 @@ router.beforeEach(async (to, from) => {
   // (旧 /practice/history、/practice/board 均已重定向,由各自目标分支覆盖)
   if (
     to.name === 'practice' ||
-    to.name === 'practice-board' ||
+    to.name === 'knowledge-board' ||
     to.name === 'settings-practice'
   ) {
     await ensureFeaturesLoaded()
