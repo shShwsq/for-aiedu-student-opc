@@ -15,8 +15,6 @@
      body: { model, input: [{ type: 'text', text }], encoding_format: 'float', dimensions?: 1024 }
    - 部分模型通过 dimensions 参数指定输出维度
    - OpenAI 兼容路径会校验返回向量维度与 expected_dimension 一致,不一致抛异常
-
-设计参考:C:\\Users\\njwjx\\Documents\\BaiduSyncdisk\\course_大四\\pro\\ai-plugin\\lib\\embedding.js
 """
 import time
 from typing import Any

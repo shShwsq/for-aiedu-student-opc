@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
@@ -59,6 +60,25 @@ _tree_cache: dict[str, tuple[float, dict]] = {}
 _CLEANUP_SCAN_INTERVAL = 60.0
 _last_cleanup_scan = 0.0
 _cleanup_scan_lock = threading.Lock()
+
+# 同任务克隆互斥锁:task_id -> RLock
+# 同一任务的 clone 入口不止一个(orchestrator 预克隆、降级后的 clone_repo 工具、
+# 工作区恢复路由、出题前工作区恢复)。并发时两个调用都看到 repo_path 为空,并向
+# 同一个会话目录动手 —— 后者必撞 git 的 "already exists"。用可重入锁把同任务
+# 的克隆排成"一次真克隆 + 一次幂等复用"(同线程重入不会自锁)。
+_clone_locks: dict[str, threading.RLock] = {}
+_clone_locks_guard = threading.Lock()
+
+
+def _get_clone_lock(task_id: str) -> threading.RLock:
+    """取(或建)该任务的克隆互斥锁;session 关闭时随 close_session 一并清除"""
+    with _clone_locks_guard:
+        lock = _clone_locks.get(task_id)
+        if lock is None:
+            lock = threading.RLock()
+            _clone_locks[task_id] = lock
+        return lock
+
 
 # 项目记忆文件固定路径(沙箱内绝对路径,不分 project_id;每任务启动时覆盖为当前项目记忆)
 # 智能体不知道 project_id,固定路径降低认知负担;"分项目"靠每任务只写当前项目记忆实现。
@@ -256,6 +276,7 @@ def close_session(task_id: str, save_diff: bool = False) -> None:
                 logger.warning(f"[task={task_id}] 清理前兜底保存 diff 失败(忽略): {e}")
     ctx = _sessions.pop(task_id)
     _tree_cache.pop(task_id, None)
+    _clone_locks.pop(task_id, None)
     session: SandboxSession = ctx["session"]
     try:
         # 延迟导入避免循环依赖(acp_base 依赖 sandbox_tools)
@@ -751,6 +772,126 @@ def _pause_checkpoint(task_id: str, deadline: float) -> float:
     return deadline + paused_for
 
 
+def _count_repo_files(repo_dir: Path) -> int:
+    """仓库内文件数(不计 .git 下的对象文件)"""
+    return sum(
+        1
+        for _ in repo_dir.rglob("*")
+        if _.is_file() and ".git" not in _.parts
+    )
+
+
+def _dir_has_entries(path: Path) -> bool:
+    """目录存在且非空(git 正是按这个判定拒绝克隆的)
+
+    不存在或空目录返回 False —— 空目录 git 能直接写入,无需处置。
+    """
+    if not path.exists():
+        return False
+    if not path.is_dir():
+        return True  # 同名文件占用(极罕见),按非空处理
+    try:
+        next(path.iterdir())
+    except StopIteration:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _remove_local_tree(path: Path, retries: int = 3) -> bool:
+    """删除本地目录树并确认真的删掉了;失败返回 False(不抛)
+
+    不用 shutil.rmtree(ignore_errors=True):那种写法"删一半失败"也静默返回,
+    残留目录会继续卡住下一次 git clone。Windows 上刚被 kill 的 git 子进程与杀软
+    实时扫描会短暂占用句柄,故退避重试;仍失败说明被长期占用,由调用方避让。
+    """
+    err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as e:
+            err = e
+        if attempt < retries - 1:
+            time.sleep(0.25 * (attempt + 1))
+    logger.warning(f"[local] 删除残留目录失败(重试 {retries} 次): {path} -> {err}")
+    return False
+
+
+def _unique_repo_dir(local_dir: Path, repo_name: str) -> Path:
+    """{repo_name} 被占用且不便删除时取 {repo_name}-2、-3…(首个空闲候选)"""
+    for i in range(2, 21):
+        cand = local_dir / f"{repo_name}-{i}"
+        if not _dir_has_entries(cand):
+            return cand
+    # 20 个候选都被占(理论上不会):随机后缀保证不撞
+    return local_dir / f"{repo_name}-{uuid.uuid4().hex[:6]}"
+
+
+def _resolve_local_repo_dir(ctx: dict, repo_name: str) -> tuple[Path, bool]:
+    """确定 local clone 的目标目录,顺带处置残留,返回 (目标目录, 是否可直接复用)
+
+    local 模式的会话临时目录在整个任务生命周期内固定,而 clone 会被多次触发
+    (协议回退的每个候选、分支回退、跳过预克隆后的自主 clone、工作区恢复入口),
+    上一次留下的目录会让 git 直接
+    `fatal: destination path '...' already exists and is not an empty directory`。
+    按残留形态分别处置(sandbox 模式由 _clone_repo_sandbox 的 rm -rf 兜底):
+    - 已是本会话成功 clone 过的仓库 → 复用(True):重复 clone 既没必要,
+      重新拉取还会抹掉执行 agent 在仓库里已有的改动
+    - 是个 git 仓库但不是本会话 clone 的 → 避让换名,绝不删除(可能是执行
+      agent 自行 clone 并编辑的成果)
+    - 其余残留(kill 半途的半成品/空壳)→ 删除重建;删不掉则避让换名
+    """
+    local_dir: Path = ctx["local_dir"]
+    repo_dir = local_dir / repo_name
+    if not _dir_has_entries(repo_dir):
+        return repo_dir, False
+
+    recorded = str(ctx.get("repo_path") or "")
+    is_repo = (repo_dir / ".git").is_dir()
+    if (
+        is_repo
+        and recorded
+        and os.path.normcase(recorded) == os.path.normcase(str(repo_dir))
+    ):
+        logger.info(f"[local] 工作区已含该仓库,复用现有 clone: {repo_dir}")
+        return repo_dir, True
+    if is_repo:
+        alt = _unique_repo_dir(local_dir, repo_name)
+        logger.warning(
+            f"[local] {repo_dir.name} 已存在非本会话 clone 的仓库,"
+            f"避免覆盖,改为克隆到 {alt.name}"
+        )
+        return alt, False
+    if _remove_local_tree(repo_dir):
+        logger.info(f"[local] 已清理上次克隆残留目录: {repo_dir}")
+        return repo_dir, False
+    return _unique_repo_dir(local_dir, repo_name), False
+
+
+def _cleanup_local_leftover(ctx: dict, repo_name: str) -> None:
+    """清理一次克隆尝试留下的半成品目录(失败与跳过路径都要做)
+
+    留着它,下一次尝试(换协议 / 换分支 / 降级为自主 clone)会直接撞
+    `fatal: destination path ... already exists`,把真实的首因错误淹没在
+    级联错误里。删除失败不抛:避让逻辑兜底,且清理动作不应盖掉原始克隆错误。
+    """
+    if ctx.get("mode") != "local":
+        return
+    local_dir = ctx.get("local_dir")
+    if not local_dir:
+        return
+    leftover = Path(local_dir) / repo_name
+    if leftover.exists():
+        _remove_local_tree(leftover)
+
+
 def _clone_repo_local(
     ctx: dict, clone_url: str, repo_name: str, branch: str | None,
     task_id: str = "", cancellable: bool = False,
@@ -773,11 +914,15 @@ def _clone_repo_local(
     cancellable=True 时(仅 orchestrator 预克隆路径),轮询中检查跳过标志,
     用户请求跳过预克隆时 kill 进程并抛 CloneSkippedError。
 
+    目标目录经 _resolve_local_repo_dir 处置(已 clone 则幂等复用,残留则清理/避让),
+    否则同一会话目录上的重试会直接撞 git 的 "already exists"  fatal。
+
     use_depth=False 时不拼 --depth(本地路径克隆对 depth 仅告警且无意义,
     bare 缓存路径恒全量)。
     """
-    local_dir: Path = ctx["local_dir"]
-    repo_dir = local_dir / repo_name
+    repo_dir, reusable = _resolve_local_repo_dir(ctx, repo_name)
+    if reusable:
+        return {"path": str(repo_dir), "files_count": _count_repo_files(repo_dir)}
 
     cmd = ["git", "clone", "--progress"] + (_clone_depth_args() if use_depth else [])
     if branch:
@@ -853,11 +998,7 @@ def _clone_repo_local(
         stderr_text = "".join(stderr_lines)[-500:]
         raise RuntimeError(f"git clone 失败: {stderr_text}")
 
-    files_count = sum(
-        1
-        for _ in repo_dir.rglob("*")
-        if _.is_file() and ".git" not in _.parts
-    )
+    files_count = _count_repo_files(repo_dir)
     # local 模式下,path 返回本地路径(后续 read/search 工具会用 Python 直接读)
     return {"path": str(repo_dir), "files_count": files_count}
 
@@ -2838,6 +2979,27 @@ def clone_repo_with_fallback(
     git_tokens: dict | None = None, cancellable: bool = False,
     progress_callback: Callable[[int, str], None] | None = None,
 ) -> dict:
+    """克隆仓库(同任务串行的对外入口,实际回退流程见 _clone_repo_fallback)
+
+    同一 task_id 的并发克隆会各自看到 repo_path 为空,并向同一个会话目录动手
+    (预克隆与降级后的 clone_repo、工作区恢复路由、出题前工作区恢复之间都可能
+    撞上)—— 后者必报 git 的 "already exists",把先一个调用的真实结果淹没在
+    级联错误里。按 task_id 加可重入锁,把它们排成"一次真克隆 + 一次幂等复用"。
+    """
+    # task_id 为空(脱离任务的调用)没有共享会话目录可争,不必排队
+    lock = _get_clone_lock(task_id) if task_id else nullcontext()
+    with lock:
+        return _clone_repo_fallback(
+            repo_url, branch=branch, task_id=task_id, git_tokens=git_tokens,
+            cancellable=cancellable, progress_callback=progress_callback,
+        )
+
+
+def _clone_repo_fallback(
+    repo_url: str, branch: str | None = None, task_id: str = "",
+    git_tokens: dict | None = None, cancellable: bool = False,
+    progress_callback: Callable[[int, str], None] | None = None,
+) -> dict:
     """克隆仓库(协议回退:HTTPS+token → SSH → HTTPS 匿名)
 
     供 orchestrator 在 agent2 评估前主动调用,也供 clone_repo 工具委托。
@@ -2929,6 +3091,9 @@ def clone_repo_with_fallback(
                 logger.info(f"[clone_fallback] task={task_id} 缓存本地克隆成功")
                 return result
             except CloneSkippedError:
+                # kill 半途的目录必须清掉:降级为自主 clone 后走的是同一个会话
+                # 目录,不清则下一次尝试必撞 git 的 "already exists"
+                _cleanup_local_leftover(ctx, repo_name)
                 raise
             except Exception as e:
                 logger.warning(
@@ -2936,9 +3101,7 @@ def clone_repo_with_fallback(
                     f"降级远程克隆: {str(e)[:200]}"
                 )
                 # 清理半成品目录(与原链同规则),避免下方重试撞目录
-                leftover = Path(ctx["local_dir"]) / repo_name
-                if leftover.exists():
-                    shutil.rmtree(leftover, ignore_errors=True)
+                _cleanup_local_leftover(ctx, repo_name)
     elif mode == "sandbox" and ctx.get("cache_key") == repo_cache_key(repo_url):
         # 会话创建时已把本任务仓库的 bare 缓存只读挂载进容器 → 容器内本地克隆
         try:
@@ -3003,7 +3166,9 @@ def clone_repo_with_fallback(
                 logger.info(f"[clone_fallback] task={task_id} 克隆成功(协议 {safe_url})")
                 return result
             except CloneSkippedError:
-                # 用户主动跳过:直接向上传播,不进协议回退/错误聚合
+                # 用户主动跳过:不进协议回退/错误聚合,但必须清掉 kill 半途的
+                # 目录 —— 降级后的自主 clone 复用同一会话目录
+                _cleanup_local_leftover(ctx, repo_name)
                 raise
             except Exception as e:
                 err_msg = str(e)[:300]
@@ -3012,14 +3177,7 @@ def clone_repo_with_fallback(
                     f"[clone_fallback] task={task_id} 协议 {safe_url} 克隆失败: {err_msg}"
                 )
                 # 清理可能残留的半成品目录(local 模式),避免下次重试撞目录
-                if mode == "local":
-                    local_dir: Path = ctx["local_dir"]
-                    leftover = local_dir / repo_name
-                    if leftover.exists():
-                        try:
-                            shutil.rmtree(leftover, ignore_errors=True)
-                        except Exception:
-                            pass
+                _cleanup_local_leftover(ctx, repo_name)
 
     raise RuntimeError(
         f"仓库克隆失败(已尝试 {len(candidates)} 种协议 x {len(branch_attempts)} 种分支策略):\n"

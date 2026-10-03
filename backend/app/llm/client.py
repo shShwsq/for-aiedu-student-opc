@@ -13,8 +13,6 @@
 - content_delta:正式回答增量
 - tool_call_delta:工具调用增量(累积 index + arguments 片段)
 所有 LLM 调用统一走流式,前端通过 SSE 实时看到思考过程。
-
-设计参考:C:\\Users\\njwjx\\Documents\\BaiduSyncdisk\\course_大四\\pro\\ai-plugin\\lib\\llm.js
 """
 import json
 import logging
