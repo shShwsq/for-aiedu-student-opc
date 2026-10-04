@@ -18,10 +18,12 @@ import type {
   ProjectListResponse,
   ProjectOut,
   SaveAgentPolicyRequest,
+  SaveMemorySettingsRequest,
   SavePracticeSettingsRequest,
   SaveProjectRequest,
   SaveUserMemoryRequest,
   SaveUserPreferenceRequest,
+  StructureDefaults,
   UserMemoryOut,
   UserPreferenceOut,
 } from '@/types/memory'
@@ -50,6 +52,18 @@ export function savePracticeSettings(
 /** 保存/更新 agent 策略配置(agent2 启停、验证权限等) */
 export function saveAgentPolicy(body: SaveAgentPolicyRequest): Promise<UserPreferenceOut> {
   return client.put('/memory/preferences/agent_policy', body).then((r) => r.data)
+}
+
+/** 保存/更新记忆生成设置(总开关 / 归纳模型 / 结构模式 / 思考模式 / 注入上限) */
+export function saveMemorySettings(
+  body: SaveMemorySettingsRequest,
+): Promise<UserPreferenceOut> {
+  return client.put('/memory/preferences/memory_settings', body).then((r) => r.data)
+}
+
+/** 获取系统默认结构化类别(内置静态常量;供面板对照与「恢复系统默认」) */
+export function getStructureDefaults(): Promise<StructureDefaults> {
+  return client.get('/memory/preferences/structure_defaults').then((r) => r.data)
 }
 
 // ============================================================

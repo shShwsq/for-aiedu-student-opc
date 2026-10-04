@@ -17,11 +17,100 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.models.memory_settings import (
+    DEFAULT_MEMORY_INJECT_MAX_CHARS,
+    DEFAULT_MEMORY_STRUCTURE_MODE,
+    MAX_MEMORY_CATEGORIES,
+)
 from app.models.practice import (
     THINKING_MODE_FOLLOW,
     THINKING_MODE_OFF,
     THINKING_MODE_ON,
 )
+from app.prompts.memory_curator import (
+    DEFAULT_GLOBAL_CATEGORY_DEFS,
+    DEFAULT_PROJECT_CATEGORY_DEFS,
+)
+
+
+class MemoryCategoryDef(BaseModel):
+    """结构化类别定义(标题 + 描述)。
+
+    描述用于指导归纳模型归类;类别列按顺序即优先级,末位为杂项桶。
+    允许 title 为空(表格编辑态的临时空行),保存时由后端 _normalize_categories 过滤。
+    """
+
+    title: str = Field(default="", max_length=64)
+    description: str = Field(default="", max_length=300)
+
+
+class MemorySettingsOut(BaseModel):
+    """记忆生成设置响应(嵌在 UserPreferenceOut.memory_settings 内)
+
+    项目/全局结构化类别在建行时即播种为内置默认,故响应里的类别列就是生效值。
+    (内置默认列表本身不随本响应携带——它是全体用户共享的静态常量,
+    由 GET /memory/preferences/structure_defaults 单独提供,供前端对照与恢复。)
+    """
+
+    memory_enabled: bool = True
+    # 记忆归纳/精简专用模型(UserLLMConfig 配置 id;None=未指定,回退 env 默认)
+    curator_llm_config_id: str | None = None
+    # 归纳/精简思考模式(follow/on/off,默认 follow)
+    thinking_mode: str = THINKING_MODE_FOLLOW
+    # 结构化预设模式:structured / freeform
+    structure_mode: str = DEFAULT_MEMORY_STRUCTURE_MODE
+    # 结构化类别(项目/全局各一套;按顺序即优先级,末位为杂项桶)
+    project_categories: list[MemoryCategoryDef] = Field(
+        default_factory=lambda: [MemoryCategoryDef(**d) for d in DEFAULT_PROJECT_CATEGORY_DEFS]
+    )
+    global_categories: list[MemoryCategoryDef] = Field(
+        default_factory=lambda: [MemoryCategoryDef(**d) for d in DEFAULT_GLOBAL_CATEGORY_DEFS]
+    )
+    # 精简版记忆注入字符上限(超出调 LLM 精简/截断)
+    inject_max_chars: int = DEFAULT_MEMORY_INJECT_MAX_CHARS
+
+    model_config = {"from_attributes": True}
+
+
+class StructureDefaultsOut(BaseModel):
+    """系统默认结构化类别(GET /memory/preferences/structure_defaults)
+
+    内置默认是全体用户共享的静态常量(与 prompts/memory_curator.py 的 DEFAULT_*_CATEGORY_DEFS 同源);
+    单独一个轻量只读端点提供,避免塑进每次 preferences 响应。
+    """
+
+    project_categories: list[MemoryCategoryDef] = Field(
+        default_factory=lambda: [MemoryCategoryDef(**d) for d in DEFAULT_PROJECT_CATEGORY_DEFS]
+    )
+    global_categories: list[MemoryCategoryDef] = Field(
+        default_factory=lambda: [MemoryCategoryDef(**d) for d in DEFAULT_GLOBAL_CATEGORY_DEFS]
+    )
+
+
+class SaveMemorySettingsRequest(BaseModel):
+    """保存记忆设置请求(PUT /memory/preferences/memory_settings)
+
+    - memory_enabled:自动归纳总开关
+    - curator_llm_config_id:记忆专用模型配置 id;None=本次不修改,空串=清空(回退 env)
+      (归属校验:必须是当前用户已保存的 LLM 配置)
+    - thinking_mode / structure_mode / inject_max_chars:None 表示本次不修改
+    - project_categories / global_categories:None 表示本次不修改;传列表则整体覆盖
+      (最多 MAX_MEMORY_CATEGORIES 个;空列表表示清空,服务层会回退内置默认)
+    """
+
+    memory_enabled: bool = True
+    curator_llm_config_id: str | None = Field(default=None, max_length=36)
+    thinking_mode: Literal[
+        THINKING_MODE_FOLLOW, THINKING_MODE_ON, THINKING_MODE_OFF,
+    ] | None = None
+    structure_mode: Literal["structured", "freeform"] | None = None
+    inject_max_chars: int | None = Field(default=None, ge=200, le=8000)
+    project_categories: list[MemoryCategoryDef] | None = Field(
+        default=None, max_length=MAX_MEMORY_CATEGORIES
+    )
+    global_categories: list[MemoryCategoryDef] | None = Field(
+        default=None, max_length=MAX_MEMORY_CATEGORIES
+    )
 
 
 class UserPreferenceOut(BaseModel):
@@ -42,6 +131,8 @@ class UserPreferenceOut(BaseModel):
     force_default_llm: bool = False
     # 出题思考模式覆盖(follow=跟随模型配置/on=强制开/off=强制关,默认 follow)
     thinking_mode_for_practice: str = THINKING_MODE_FOLLOW
+    # 记忆生成设置(总是返回;未配置行时为预置默认,供前端播种类别编辑器)
+    memory_settings: MemorySettingsOut = Field(default_factory=MemorySettingsOut)
     # 最后更新时间(可空 — 未配置时为 None;FastAPI 序列化为 ISO 字符串)
     updated_at: datetime | None = None
 

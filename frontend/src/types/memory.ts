@@ -30,12 +30,23 @@ export interface UserPreferenceOut {
   force_default_llm: boolean
   /** 出题思考模式覆盖(follow=跟随模型配置/on=强制开/off=强制关,默认 follow) */
   thinking_mode_for_practice: PracticeThinkingMode
+  /** 记忆生成设置(后端总是返回;未配置时为预置默认) */
+  memory_settings: MemorySettingsOut
   /** 最后更新时间(ISO 字符串,未配置时为 null) */
   updated_at: string | null
 }
 
 /** 出题思考模式(覆盖出题模型配置的思考开关) */
 export type PracticeThinkingMode = 'follow' | 'on' | 'off'
+
+/** 记忆结构化预设模式 */
+export type MemoryStructureMode = 'structured' | 'freeform'
+
+/** 结构化类别定义(标题 + 描述;描述用于指导归纳模型归类,可空) */
+export interface MemoryCategoryDef {
+  title: string
+  description: string
+}
 
 /** 保存 User Profile 请求(PUT /memory/preferences body) */
 export interface SaveUserPreferenceRequest {
@@ -92,6 +103,50 @@ export interface UserMemoryOut {
 /** 保存全局长期记忆请求(PUT /memory/global body) */
 export interface SaveUserMemoryRequest {
   content: string
+}
+
+/**
+ * 记忆生成设置(嵌在 UserPreferenceOut.memory_settings 内)
+ *
+ * 控制任务完成后自动归纳记忆的行为:总开关 / 归纳模型 / 结构模式 / 思考模式 / 注入上限。
+ * 后端总是返回;类别列在建行时即播种为内置默认(可增删改)。系统默认列表另走
+ * getStructureDefaults()一次性拉取(全体用户一致),不随本响应携带。
+ */
+export interface MemorySettingsOut {
+  /** 是否启用自动归纳(关闭则任务完成不再写记忆) */
+  memory_enabled: boolean
+  /** 记忆归纳/精简专用模型 id(null=未指定,回退 env 默认) */
+  curator_llm_config_id: string | null
+  /** 归纳/精简思考模式(follow/on/off,默认 follow) */
+  thinking_mode: PracticeThinkingMode
+  /** 结构化预设模式 */
+  structure_mode: MemoryStructureMode
+  /** 结构化类别(项目/全局各一套;按顺序即优先级,末位为杂项桶) */
+  project_categories: MemoryCategoryDef[]
+  global_categories: MemoryCategoryDef[]
+  /** 精简版记忆注入字符上限 */
+  inject_max_chars: number
+}
+
+/** 系统默认结构化类别(GET /memory/preferences/structure_defaults;供对照与恢复) */
+export interface StructureDefaults {
+  project_categories: MemoryCategoryDef[]
+  global_categories: MemoryCategoryDef[]
+}
+
+/** 保存记忆设置请求(PUT /memory/preferences/memory_settings body)
+ *
+ * thinking_mode / structure_mode / inject_max_chars / 类别列表 可选,不传表示本次不修改(后端 None 语义);
+ * curator_llm_config_id 传空串表示清空(回退 env 默认);类别空列表会被后端回退内置默认。
+ */
+export interface SaveMemorySettingsRequest {
+  memory_enabled: boolean
+  curator_llm_config_id?: string | null
+  thinking_mode?: PracticeThinkingMode
+  structure_mode?: MemoryStructureMode
+  inject_max_chars?: number
+  project_categories?: MemoryCategoryDef[]
+  global_categories?: MemoryCategoryDef[]
 }
 
 /**

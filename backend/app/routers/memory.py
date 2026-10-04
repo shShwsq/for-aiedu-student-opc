@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.deps import get_current_user
 from app.models.agent_policy import AgentPolicy
+from app.models.memory_settings import MemorySettings
 from app.models.practice import (
     DEFAULT_THINKING_MODE,
     PracticeSettings,
@@ -36,14 +37,22 @@ from app.models.user import User
 from app.models.user_llm_config import UserLLMConfig
 from app.models.user_memory import UserMemory
 from app.models.user_preference import UserPreference
+from app.prompts.memory_curator import (
+    DEFAULT_GLOBAL_CATEGORY_DEFS,
+    DEFAULT_PROJECT_CATEGORY_DEFS,
+)
 from app.schemas.memory import (
+    MemoryCategoryDef,
+    MemorySettingsOut,
     ProjectListResponse,
     ProjectOut,
     SaveAgentPolicyRequest,
+    SaveMemorySettingsRequest,
     SavePracticeSettingsRequest,
     SaveProjectRequest,
     SaveUserMemoryRequest,
     SaveUserPreferenceRequest,
+    StructureDefaultsOut,
     UserMemoryOut,
     UserPreferenceOut,
 )
@@ -183,6 +192,142 @@ def save_agent_policy(
     return _build_preference_out(db, current_user.id)
 
 
+@router.put("/preferences/memory_settings", response_model=UserPreferenceOut)
+def save_memory_settings(
+    req: SaveMemorySettingsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UserPreferenceOut:
+    """保存/更新记忆生成设置(总开关 / 归纳模型 / 结构模式 / 思考模式 / 注入上限)
+
+    存于 memory_settings 独立表(1:1),get_or_create:无行时自动创建。
+    curator_llm_config_id 传 None=不修改,空串=清空(回退 env 默认);传值需属于当前用户
+    已保存的 LLM 配置。thinking_mode / structure_mode / inject_max_chars 传 None=不修改。
+    """
+    # 记忆模型归属校验:必须是当前用户已保存的 LLM 配置
+    if req.curator_llm_config_id:
+        cfg_row = (
+            db.query(UserLLMConfig)
+            .filter(UserLLMConfig.user_id == current_user.id)
+            .first()
+        )
+        ids = {c.get("id") for c in (cfg_row.llm_configs or [])} if cfg_row else set()
+        if req.curator_llm_config_id not in ids:
+            raise HTTPException(
+                status_code=400,
+                detail="记忆模型配置不存在或不属于当前用户",
+            )
+    row = (
+        db.query(MemorySettings)
+        .filter(MemorySettings.user_id == current_user.id)
+        .first()
+    )
+    if row is None:
+        row = MemorySettings(
+            user_id=current_user.id,
+            memory_enabled=req.memory_enabled,
+            # 建行即播种结构化类别默认(避免开关型保存落出 [] 空列导致面板显空)
+            project_categories=[dict(d) for d in DEFAULT_PROJECT_CATEGORY_DEFS],
+            global_categories=[dict(d) for d in DEFAULT_GLOBAL_CATEGORY_DEFS],
+        )
+        db.add(row)
+    else:
+        row.memory_enabled = req.memory_enabled
+    if req.curator_llm_config_id is not None:
+        row.curator_llm_config_id = req.curator_llm_config_id or None
+    if req.thinking_mode is not None:
+        row.thinking_mode = req.thinking_mode
+    if req.structure_mode is not None:
+        row.structure_mode = req.structure_mode
+    if req.inject_max_chars is not None:
+        row.inject_max_chars = req.inject_max_chars
+    if req.project_categories is not None:
+        row.project_categories = _normalize_categories(
+            req.project_categories, DEFAULT_PROJECT_CATEGORY_DEFS,
+        )
+    if req.global_categories is not None:
+        row.global_categories = _normalize_categories(
+            req.global_categories, DEFAULT_GLOBAL_CATEGORY_DEFS,
+        )
+    db.commit()
+    db.refresh(row)
+    logger.info(
+        "用户 %s 更新记忆设置: enabled=%s curator_llm=%s structure=%s thinking=%s inject_max=%s",
+        current_user.id, row.memory_enabled, row.curator_llm_config_id,
+        row.structure_mode, row.thinking_mode, row.inject_max_chars,
+    )
+    return _build_preference_out(db, current_user.id)
+
+
+@router.get("/preferences/structure_defaults", response_model=StructureDefaultsOut)
+def get_structure_defaults(
+    current_user: User = Depends(get_current_user),
+) -> StructureDefaultsOut:
+    """返回系统默认结构化类别(内置静态常量,全体用户一致)
+
+    供记忆设置面板一次性拉取,用于展示对照与「恢复系统默认」;
+    不塑进 /memory/preferences 响应。
+    """
+    return StructureDefaultsOut()
+
+
+def _memory_settings_out(row: MemorySettings | None) -> MemorySettingsOut:
+    """MemorySettings 行 → MemorySettingsOut。
+
+    - 无行 → 全默认(类别为内置种子)。
+    - 存量行但类别列为空(早期仅保存开关时落库的空列)→ 回退内置默认,
+      保证前端始终能看到系统默认类别。
+    - default_* 始终为内置种子(供前端对照与恢复)。
+    """
+    if row is None:
+        return MemorySettingsOut()
+    pcats = _cat_defs(row.project_categories, DEFAULT_PROJECT_CATEGORY_DEFS)
+    gcats = _cat_defs(row.global_categories, DEFAULT_GLOBAL_CATEGORY_DEFS)
+    return MemorySettingsOut(
+        memory_enabled=row.memory_enabled,
+        curator_llm_config_id=row.curator_llm_config_id,
+        thinking_mode=row.thinking_mode,
+        structure_mode=row.structure_mode,
+        project_categories=pcats,
+        global_categories=gcats,
+        inject_max_chars=row.inject_max_chars,
+    )
+
+
+def _cat_defs(stored, defaults) -> list[MemoryCategoryDef]:
+    """存量 JSONB 类别列 → MemoryCategoryDef 列表;为空回退内置默认。
+
+    逐项取 title/description(容忍缺键),过滤无 title 的脏项。
+    """
+    out: list[MemoryCategoryDef] = []
+    for c in stored or []:
+        if not isinstance(c, dict):
+            continue
+        title = (c.get("title") or "").strip()
+        if not title:
+            continue
+        out.append(MemoryCategoryDef(title=title, description=(c.get("description") or "").strip()))
+    if out:
+        return out
+    return [MemoryCategoryDef(**d) for d in defaults]
+
+
+def _normalize_categories(cats, defaults) -> list[dict]:
+    """规范化结构化类别列表:去空标题/去重(保留首个),空结果回退内置默认。
+
+    cats 为 list[MemoryCategoryDef];返回 [{title, description}] 供 JSONB 列存储。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    for c in cats or []:
+        title = (c.title or "").strip()
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        out.append({"title": title, "description": (c.description or "").strip()})
+    return out or [dict(d) for d in defaults]
+
+
 # ============================================================
 # 全局长期记忆(1:1)
 # ============================================================
@@ -282,7 +427,7 @@ def save_project(
     row.note = req.note
     row.memory_content = req.memory_content
     # 重新生成精简版(用户手改 memory_content 后,旧 summary 可能失效)
-    row.memory_summary = _regen_memory_summary(req.memory_content)
+    row.memory_summary = _regen_memory_summary(db, current_user.id, req.memory_content)
     db.commit()
     db.refresh(row)
     logger.info("用户 %s 手动更新了项目记忆 %s", current_user.id, project_id)
@@ -347,10 +492,15 @@ def _build_preference_out(
             .filter(PracticeSettings.user_id == user_id)
             .first()
         )
-    if pref_row is None and policy_row is None and settings_row is None:
+    memory_row = (
+        db.query(MemorySettings)
+        .filter(MemorySettings.user_id == user_id)
+        .first()
+    )
+    if pref_row is None and policy_row is None and settings_row is None and memory_row is None:
         return UserPreferenceOut()
     updated_at = None
-    for r in (pref_row, policy_row, settings_row):
+    for r in (pref_row, policy_row, settings_row, memory_row):
         if r is not None and r.updated_at is not None:
             if updated_at is None or r.updated_at > updated_at:
                 updated_at = r.updated_at
@@ -371,6 +521,7 @@ def _build_preference_out(
             settings_row.thinking_mode_for_practice
             if settings_row else DEFAULT_THINKING_MODE
         ),
+        memory_settings=_memory_settings_out(memory_row),
         updated_at=updated_at,
     )
 
@@ -410,21 +561,34 @@ def _project_to_out(row: Project) -> ProjectOut:
     )
 
 
-def _regen_memory_summary(memory_content: str) -> str:
-    """重新生成精简版项目记忆(PUT 编辑后调用)。
+def _regen_memory_summary(db: Session, user_id, memory_content: str) -> str:
+    """重新生成精简版项目记忆(PUT 手改后调用,与自动归纳同源)。
 
     尝试用 env 默认 LLM 生成(>2000 时);LLM 不可用或失败 → generate_memory_summary
     内部兜底硬截断。任何异常都不影响请求,最差返回硬截断串。
     """
     try:
-        from app.llm.client import LLMClient
-        from app.services.memory_summarize import generate_memory_summary
+        from app.services.memory_summarize import (
+            generate_memory_summary,
+            load_memory_settings,
+            resolve_memory_llm_client,
+        )
 
+        settings_row = load_memory_settings(db, user_id)
+        inject_max = (
+            settings_row.inject_max_chars if settings_row and settings_row.inject_max_chars
+            else 2000
+        )
+        structured = not (settings_row and settings_row.structure_mode == "freeform")
+        thinking_mode = settings_row.thinking_mode if settings_row else "follow"
         try:
-            llm = LLMClient()  # env 默认配置
+            llm, _src = resolve_memory_llm_client(db, user_id)
         except Exception:
             llm = None  # 未配置 env LLM → 走硬截断兜底
-        return generate_memory_summary(memory_content, llm)
+        return generate_memory_summary(
+            memory_content, llm, max_chars=inject_max,
+            thinking_mode=thinking_mode, structured=structured,
+        )
     except Exception as e:
         logger.warning("重新生成精简记忆失败,回退硬截断: %s", e)
         # 兜底:直接硬截断

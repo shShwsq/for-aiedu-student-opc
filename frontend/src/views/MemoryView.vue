@@ -14,6 +14,7 @@
  * Agent 策略配置已迁移至 /agent-policy(AgentPolicyView),本页仅管理记忆文本。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 
@@ -33,6 +34,8 @@ import {
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 import { extractErrorMessage } from '@/utils/error'
 import type { ProjectOut, UserPreferenceOut } from '@/types/memory'
+
+const router = useRouter()
 
 // ============================================================
 // 默认模板(后端初始为空,前端在内容为空时预填模板作为引导)
@@ -595,11 +598,22 @@ onMounted(() => {
             </li>
           </ul>
 
-          <!-- 底栏:未保存提示 + 刷新 -->
+          <!-- 底栏:未保存提示 + 记忆设置 + 刷新 -->
           <div class="sidebar-footer-hint">
             <template v-if="hasAnyDirty">
               <span class="dirty-dot" /> <span>有未保存改动</span>
             </template>
+            <button
+              v-if="!loading && !loadError"
+              class="btn-icon footer-settings"
+              title="记忆设置(归纳模型 / 结构化类别 / 自动开关)"
+              @click="router.push('/settings/memory')"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
             <button
               v-if="!loading && !loadError"
               class="btn-icon footer-refresh"
@@ -975,8 +989,13 @@ onMounted(() => {
   color: var(--color-text-muted);
 }
 
-.sidebar-footer-hint .footer-refresh {
+.sidebar-footer-hint .footer-settings {
   margin-left: auto;
+  width: 22px;
+  height: 22px;
+}
+
+.sidebar-footer-hint .footer-refresh {
   width: 22px;
   height: 22px;
 }

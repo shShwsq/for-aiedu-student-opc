@@ -47,6 +47,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'models', name: 'settings-models', component: () => import('@/views/settings/ModelSettingsPanel.vue') },
       { path: 'cli', name: 'settings-cli', component: () => import('@/views/settings/CliSettingsPanel.vue') },
       { path: 'policy', name: 'settings-policy', component: () => import('@/views/settings/AgentPolicyPanel.vue') },
+      { path: 'memory', name: 'settings-memory', component: () => import('@/views/settings/MemorySettingsPanel.vue') },
       { path: 'practice', name: 'settings-practice', component: () => import('@/views/settings/PracticeSettingsPanel.vue') },
     ],
   },

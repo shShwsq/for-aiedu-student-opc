@@ -159,10 +159,17 @@ def build_react_agent_memory_section(
     if not memory_text:
         return ""
 
-    header = (
-        "The following is your known issues and historical memory for this project, "
-        "organized by category. Prioritize checking Hard Constraints and Known Issues:"
-    )
+    # 结构化记忆(含 ## 类别头)用"优先检查 Hard Constraints/Known Issues"引导;
+    # freeform 散文无类别头,改用中性文案避免误导 agent 去找不存在的分类。
+    if "## " in memory_text:
+        header = (
+            "The following is your known issues and historical memory for this project, "
+            "organized by category. Prioritize the earlier-listed categories:"
+        )
+    else:
+        header = (
+            "The following is your known issues and historical memory for this project:"
+        )
     if alias:
         header += f"\nProject alias: {alias}"
     # 完整记忆已写入沙箱文件,提示 agent 可 read_file 查阅突破字数限制

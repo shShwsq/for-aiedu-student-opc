@@ -60,6 +60,7 @@ export const SETTINGS_NAV: SettingsNavItem[] = [
     childMode: 'switch',
   },
   { path: '/settings/policy', label: '协作策略' },
+  { path: '/settings/memory', label: '记忆设置' },
   {
     path: '/settings/practice',
     label: '练习设置',

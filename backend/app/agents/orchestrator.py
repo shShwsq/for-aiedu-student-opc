@@ -412,10 +412,10 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             # 预压缩早期历史:用户下一轮追问直接命中缓存(失败兜底)
             _precompress_history_safely(task, db, len(react_summaries), react_client)
 
-            # 记忆归纳(失败兜底,不影响任务完成)
+            # 记忆归纳(失败兜底,不影响任务完成;模型/结构走用户「记忆设置」独立解析)
             try:
                 from app.services.memory_summarize import summarize_and_save_memory
-                summarize_and_save_memory(task, db, llm_client)
+                summarize_and_save_memory(task, db)
             except Exception as mem_err:
                 logger.warning(f"[task={task.id}] 归纳写入记忆失败(忽略): {mem_err}")
 
@@ -1061,10 +1061,10 @@ def _run_background_review(
             )
             return
 
-        # 任务成功完成:自动归纳写入长期记忆(失败兜底,不影响任务完成)
+        # 任务成功完成:自动归纳写入长期记忆(失败兜底,不影响任务完成;模型/结构走用户「记忆设置」)
         try:
             from app.services.memory_summarize import summarize_and_save_memory
-            summarize_and_save_memory(task, db, llm_client)
+            summarize_and_save_memory(task, db)
         except Exception as mem_err:
             logger.warning(f"[task={task.id}] 归纳写入记忆失败(忽略): {mem_err}")
 
@@ -1999,10 +1999,10 @@ def _finish_resume(
     # 预压缩早期历史:用户下一轮追问直接命中缓存(失败兜底)
     _precompress_history_safely(task, db, round_idx, react_client)
 
-    # 重启完成:自动归纳写入长期记忆(失败兑底,不影响;client 用默认,归纳是简单任务)
+    # 重启完成:自动归纳写入长期记忆(失败兑底,不影响;模型/结构走用户「记忆设置」独立解析)
     try:
         from app.services.memory_summarize import summarize_and_save_memory
-        summarize_and_save_memory(task, db, None)
+        summarize_and_save_memory(task, db)
     except Exception as mem_err:
         logger.warning(f"[task={task.id}] 归纳写入记忆失败(忽略): {mem_err}")
 

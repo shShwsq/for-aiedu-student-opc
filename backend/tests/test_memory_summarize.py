@@ -2,11 +2,17 @@
 
 覆盖 _merge_structured / _clean_items / _parse_summary_json / generate_memory_summary。
 """
-from app.prompts.memory_curator import PROJECT_CATEGORIES
+from app.prompts.memory_curator import (
+    DEFAULT_PROJECT_CATEGORY_DEFS,
+    PROJECT_CATEGORIES,
+    categories_titles,
+    render_categories_with_desc,
+)
 from app.services.memory_summarize import (
     MAX_PROJECT_MEM_INJECT,
     MAX_PROJECT_MEM_STORE,
     _clean_items,
+    _merge_freeform,
     _merge_structured,
     _parse_summary_json,
     generate_memory_summary,
@@ -268,3 +274,75 @@ def test_generate_memory_summary_none_llm_truncates():
     result = generate_memory_summary(content, None)
     assert len(result) == MAX_PROJECT_MEM_INJECT
     assert result == content[:MAX_PROJECT_MEM_INJECT]
+
+
+def test_generate_memory_summary_custom_max_chars():
+    """max_chars 参数生效:短于上限直接返回,长于上限截到 max_chars。"""
+    short = "## Hard Constraints\n- rule"
+    assert generate_memory_summary(short, _MockLLM(), max_chars=500) == short
+    long = "X" * 600
+    assert generate_memory_summary(long, None, max_chars=500) == long[:500]
+
+
+def test_generate_memory_summary_freeform_skips_llm():
+    """structured=False(freeform)→ 超长直接截断,不调 LLM。"""
+    content = "prose " * 1000
+    llm = _MockLLM(chunks=[_MockChunk("SHOULD NOT BE USED", "stop")])
+    result = generate_memory_summary(content, llm, max_chars=500, structured=False)
+    assert result == content.strip()[:500]
+    assert "SHOULD NOT BE USED" not in result
+
+
+# ---------- _merge_freeform ----------
+
+def test_merge_freeform_append_new_after_existing():
+    """旧内容 + 新段落拼接,旧内容在前不丢(含用户手写)。"""
+    existing = "用户手写的旧笔记"
+    result = _merge_freeform(existing, "新一轮归纳的散文", 8000)
+    assert result.startswith("用户手写的旧笔记")
+    assert "新一轮归纳的散文" in result
+
+
+def test_merge_freeform_empty_new_returns_existing():
+    assert _merge_freeform("old", "  ", 8000) == "old"
+
+
+def test_merge_freeform_dedup_when_substring():
+    """新内容已包含于旧内容 → 原样返回(近似去重,调用方据此跳过写入)。"""
+    existing = "第一段经验\n第二段已知问题"
+    assert _merge_freeform(existing, "第二段已知问题", 8000) == existing
+
+
+def test_merge_freeform_truncate_keeps_tail():
+    """超长时删头部旧内容,保留尾部新内容。"""
+    existing = "X" * 5000
+    result = _merge_freeform(existing, "NEW_TAIL", 1000)
+    assert "NEW_TAIL" in result
+    assert len(result) <= 1000
+
+
+# ---------- 自定义结构化类别 ----------
+
+def test_invalid_category_falls_back_to_last_category():
+    """非法类别归入类别列表末位(自定义类别无 Lessons Learned 时的回退)。"""
+    cats = ["Alpha", "Beta"]
+    result = _merge_structured("", [{"category": "Nope", "item": "x"}], cats, 8000)
+    assert "## Beta\n- x" in result
+
+
+def test_categories_titles_and_render_desc():
+    """categories_titles 提取非空标题;render 输出 "- title: desc" 行。"""
+    defs = [
+        {"title": "A", "description": "first"},
+        {"title": "", "description": "skip"},
+        {"title": "B", "description": ""},
+    ]
+    assert categories_titles(defs) == ["A", "B"]
+    rendered = render_categories_with_desc(defs)
+    assert "- A: first" in rendered
+    assert "- B" in rendered
+
+
+def test_project_categories_titles_derived_from_defaults():
+    """PROJECT_CATEGORIES 默认标题列与 DEFAULT_PROJECT_CATEGORY_DEFS 一致。"""
+    assert PROJECT_CATEGORIES == categories_titles(DEFAULT_PROJECT_CATEGORY_DEFS)
