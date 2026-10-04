@@ -2483,7 +2483,7 @@ function toggleResult(id: string): void {
         <RouterLink to="/tasks/new">提交新任务</RouterLink>
       </div>
 
-      <!-- 任务详情(主区聚焦协作对话流;结果清单/覆盖度看板在右侧栏) -->
+      <!-- 任务详情(主区聚焦协作对话流;任务概览/任务清单/动态验证/检查助手核查/重点与知识点均在右侧栏) -->
       <template v-else-if="task">
         <!-- 协作对话流(无外框,顶部仅在运行时显示实时徽标) -->
         <section
@@ -2859,7 +2859,7 @@ function toggleResult(id: string): void {
       </div>
     </main>
 
-    <!-- 右侧:任务详情 + 覆盖度看板(抽屉把手式;展开时顶部条带标题+折叠按钮,折叠时悬浮把手在 page-body 右上角) -->
+    <!-- 右侧:任务详情侧栏(抽屉把手式;展开时顶部条带标题+折叠按钮,折叠时悬浮把手在 page-body 右上角) -->
     <aside v-if="task && !detailCollapsed" class="detail-sidebar">
       <div class="detail-sidebar-header">
         <span class="detail-sidebar-title">任务详情</span>
@@ -3642,7 +3642,7 @@ function toggleResult(id: string): void {
   margin-bottom: var(--space-6);
 }
 
-/* 右侧栏分区标题(结果清单,与覆盖度区块一致) */
+/* 右侧栏分区标题("重点与知识点"区块;原"覆盖度"区块已随覆盖度清单功能移除) */
 .sidebar-results h2 {
   display: flex;
   align-items: center;

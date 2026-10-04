@@ -190,7 +190,7 @@ agent2 是**幕后质检者**(agent1 是台前回答者):其核查过程与知�
 - **审查终止条件**:agent2 确定的审查维度均有明确结论(有 / 无 / 无法确定),每个维度至少触及一个关键检查点;审查为一次性完成,无追问轮次上限概念(原"协作总轮次 max_rounds"已移除)
 - **审查状态**:`review_status` = running / done / failed;审查失败保留 agent1 临时结果,任务仍 COMPLETED
 
-**用户驱动多轮(resume)**:用户在任务完成后追加消息、或点击建议卡片的「深挖」按钮,可触发新一轮执行。**追问直达 agent1,不等老审查**:老审查(若仍在跑)与新轮 agent1 并行,各自落库自己轮次的知识点,任务终止事件(done/finish)仅由最后活跃流推送(事件活跃期机制);前端 SSE 不断线,新轮事件经现有连接续达。用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述;agent1 跨轮历史由自身的历史记忆注入提供),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。多轮完全由用户驱动,无自动轮次上限。重启时不复用旧 plan,让 LLM 根据新消息重新规划。
+**用户驱动多轮(resume)**:用户在任务完成后追加消息、或点击建议卡片的「深挖」按钮,可触发新一轮执行。**追问直达 agent1,不等老审查**:老审查(若仍在跑)与新轮 agent1 并行,各自落库自己轮次的知识点,任务终止事件(done/finish)仅由最后活跃流推送(事件活跃期机制);前端 SSE 不断线,新轮事件经现有连接续达。用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述;agent1 跨轮历史由自身的历史记忆注入提供),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。多轮完全由用户驱动,无自动轮次上限。**重启会复用上一轮的 plan**(`task.params["_plan"]` 加载为 `previous_plan`):已完成项保持 done,只推进未完成项;追问若改变方向,LLM 可在 `<plan>` 更新中新增/调整步骤。
 
 ### 3.7 任务暂停/恢复
 用户可暂停运行中的任务:
@@ -260,7 +260,8 @@ Conversation(对话)
   - task_id
   - round_idx: 协作轮次(从 1 起;存量数据可能含 round 0 的旧版初始评估)
   - role: user / agent1 / agent2 / system
-  - type: question / evaluation / followup / thinking / tool_call / tool_result / summary / suggestions(agent2 建议深挖方向) / error / message / answer(存量数据:旧版澄清提问的回答)
+  - type: 现行流程产出 question(首轮提问)/ message(运行中补充与追问)/ thinking / tool_call / tool_result / summary / review(agent2 后台审查结论)/ suggestions(建议深挖方向)/ error,另有 history_compress(跨轮历史压缩缓存,不外显)
+    存量旧任务可能含 `evaluation`(旧版逐轮协作评估)/ `followup`(旧版 agent2 追问)/ `answer`(旧版澄清提问的回答):新流程不再产生,导出报告的对话轨迹已不再处理这些类型(仅 agent2 跨轮自记忆与 react_agent 历史注入仍按 review/evaluation 两代兼容读取存量数据)
   - content: 消息内容
   - reasoning: 思考链(仅 type=thinking 有,模型 reasoning_content)
   - created_at
@@ -590,12 +591,15 @@ Result(任务结果项,通用)
 
 ### 9.2 ACP Bridge(HTTP ↔ stdio 桥接)
 
-外部 CLI 执行器(如 Qoder CLI)通过 ACP(Agent Communication Protocol)协议通信:
+外部 CLI 执行器(如 Qoder CLI)通过 ACP(Agent Client Protocol)协议通信:
 - 沙箱内启动 CLI 进作为长驻服务(`run_command_background`)
 - ACP Bridge 作为 HTTP ↔ stdio 桥:后端发 HTTP 请求 → bridge 转 stdio 写入 CLI 进程 → 读取 stdout 返回
 - Bridge 支持流式响应(SSE):将 CLI 的 streaming 输出逐 chunk 转发
 - 事件翻译:将外部 CLI 的 ACP 事件映射为系统内部 SSE 事件(conversation / thinking_delta / tool_call 等)
 - 凭证注入:从 `user_agent_configs` 加载用户保存的 CLI token,注入沙箱环境变量
+- **bridge 驻留复用**:每任务的 bridge + ACP session 缓存在 `_bridge_cache`,追问/续跑命中时跳过「启 CLI 环境 → 起 bridge → initialize → session/new」重建链路(~25s),CLI 侧对话上下文随 session 延续;沙箱重建/agent 类型或启动指纹变化/健康检查不过则降级全新链路(失效判定与回收见 agent 架构文档 §4.3)
+- **local 模式**:仅当 `SANDBOX_LOCAL_ALLOW_CLI=true`(默认开)时允许跑外部 CLI,bridge/CLI 直接跑在宿主机(无隔离边界,仅开发调试)
+- **挂死/崩溃兜底**:prompt 期间按活动工具状态分级 idle 超时;CLI 崩溃或连接中断走同款善后——用已累积输出收尾本轮并在 summary 标注"本轮提前终止",不把崩溃当正常完成、不 fail 任务
 
 ### 9.3 跨轮记忆(结构化注入 + 三级压缩)
 
@@ -608,25 +612,29 @@ react_agent 在多轮 ReAct 迭代中,LLM 上下文会越来越长。跨轮历�
 
 ### 9.4 循环检测
 
-react_agent 内置循环检测机制,防止 LLM 陷入重复调用:
-- **连续相同调用检测**:滑动窗口内连续 N 次相同 tool_call + 相同 arguments → 强制终止
-- **交替循环检测**:检测 A→B→A→B 模式的交替循环 → 强制终止
-- 检测到循环后推送 SSE 事件,react_agent 输出当前总结并退出
+react_agent 内置循环检测机制,防止 LLM 陷入重复调用(参数:滑动窗口保留最近 `MAX_RECENT_CALLS=10` 条调用签名):
+- **连续相同调用检测**:最近 `MAX_SAME_CALLS=3` 次完全相同的 tool_call + arguments → 判定循环
+- **交替循环检测**:最近 `LOOP_WINDOW_SIZE=6` 次调用中不同签名 ≤ `LOOP_MIN_DISTINCT=2` → 判定循环(覆盖 A→B→A→B 与 A,A,B,A,A,B 这类低多样性重复)
+- 判定为循环后**不直接退出循环**:落库一条"检测到调用循环,强制转入总结"的 thinking(经 conversation 事件推前端),并向 messages 注入 `LOOP_BREAK_PROMPT`(提示停止调用工具、用自然语言总结已确认发现);下一迭代 LLM 不再发工具调用,经"无 tool_calls"的正常结束路径退出
 
 ### 9.5 Plan 状态管理
 
 react_agent 维护跨轮 plan 状态:
-- 首轮 LLM 生成 plan(任务分解清单),存入 `Conversation(type=plan)`
+- 首轮 LLM 在 thinking 里输出 `<plan>` 清单(复杂任务可选),代码提取为 `current_plan`
 - 后续轮次注入 `previous_plan`,LLM 可续接未完成项,避免重复规划
-- 每轮结束时输出 `final_plan`(可能含已完成/未完成标记),orchestrator 持久化到 `task.params["_plan"]`,resume 时加载为 `previous_plan`——追问/续跑跨轮保持 plan 连续(已完成项保持 done,只推进未完成项)
-- 前端通过 SSE `plan` 事件实时展示计划状态
+- 每轮结束时输出 `final_plan`(可能含已完成/未完成标记),orchestrator 持久化到 `task.params["_plan"]`(每轮**覆盖写**,空 plan 也写入以清上轮残留),resume 时加载为 `previous_plan`——追问/续跑跨轮保持 plan 连续(已完成项保持 done,只推进未完成项)
+- 前端通过 SSE `plan` 事件实时展示计划状态(按轮覆盖式更新)
+- **展示层不单独落库**:不存在 `Conversation(type=plan)` 记录,也不在 `GET /tasks/{id}` 快照字段里。刷新后由前端从已落库对话重建——内置侧解析 `type=thinking` content 里的 `<plan>` 块,CLI 侧解析 TodoList `tool_call` 的入参 JSON(`extractPlanFromHistory`);仅靠 ACP `plan` 通知表达清单、且两者皆无的 CLI,其 plan 只存在于事件总线内存历史(最近 500 条,resume 时 `reset_task_bus` 清空),后端重启或跨轮后刷新不可还原
 
 ### 9.6 工作区浏览
 
-前端可浏览已 clone 仓库的文件结构和内容:
-- 后端提供 workspace API,列出沙箱内文件树
-- 前端树形展示,支持查看文件内容
-- 用于用户确认审计范围、理解 react_agent 的分析上下文
+前端可浏览已 clone 仓库的文件结构和内容(`backend/app/routers/workspace.py`,session 生命周期:运行中 clone 完成即可浏览 / 完成后保留 1 小时 TTL / 超时惰性清理):
+- 端点:`GET /tasks/{id}/workspace`(工作区信息:available / repo_path / mode / has_uploads / **can_restore**)、`.../tree`(整树快照,首屏一次拉取 + 短 TTL 缓存)、`.../files`(单层懒加载树)、`.../file`(原文 + offset/maxLines 分页,行号前端自行渲染)
+- **沙箱过期后的两条回退路径**(工作区不可用时):
+  - 仓库代码——可重新 clone:`POST /tasks/{id}/workspace/restore` 发起后台 job **立即返回**(不在本请求里等克隆)+ `GET .../restore/status` 前端轮询进度的终态。改为“发起 + 轮询”的原因:clone 是分钟级操作,而 axios 客户端有全局 30s 超时——旧同步实现会先被打断并假报“网络错误”,真实结果几分钟后才落。进度不能走 event_bus(任务早已结束、总线已 finish,`clone_progress` 会被丢弃);job 表在进程内存(沿用单 worker 部署假设),进程重启后 status 返 idle 可重新发起。用户主动触发,不受出题侧 `restore_workspace_for_practice` 开关限制
+  - 用户上传——不可再生:回退直接从上传存储(local 目录 / S3)按 `upload_layout` 布局拼出与沙箱树同构的文件树,不经沙箱——`GET .../workspace/uploads/tree` + `.../uploads/file`(`upload_id` 只从 `task.params` 解析,不接受前端指定,防 IDOR;已被 GC 的上传以“已清理”占位)
+- **只读代码展示组件 `FileContentViewer.vue`**(取代旧版手写逐行渲染):只读 CodeMirror(行号槽按页起始行偏移显示真实文件行号、软换行、按后缀经 `@codemirror/language-data` 惰性加载语法高亮),Markdown 文件额外提供「源码 / 预览」切换(marked + DOMPurify 净化);父组件加载完某页内容后调 `focusRange(真实起止行)` 做区间高亮 + 滚动到中间,分页仍由父组件负责。被 `WorkspaceSidebar.vue`(任务详情源码查阅)与 `PracticeCodeSidebar.vue`(答题时源码查阅)复用
+- 用于用户确认审计范围、理解 agent1 的分析上下文
 
 ### 9.7 SSE 事件体系(完整)
 
@@ -654,16 +662,19 @@ react_agent 维护跨轮 plan 状态:
 | `/` | HomeView | 首页/任务列表 |
 | `/tasks/new` | TaskCreateView | 创建新任务(选场景/仓库/skill/模型) |
 | `/tasks/:id` | TaskDetailView | 任务详情(SSE 实时流 + 对话 + 报告) |
-| `/models` | ModelSettingsView | LLM 模型配置(多厂商列表式管理) |
-| `/cli` | CliSettingsView | 外部 CLI 凭据配置(Qoder / DeepSeek / Codex) |
-| `/agent-policy` | AgentPolicyView | 协作策略(检查助手启用 / 轮次 / 验证授权模式 / 引用复核开关 / CLI 命令确认模式) |
+| `/settings` | settings/SettingsLayout | 设置页外壳(嵌套路由父组件):AppHeader + 历史任务侧栏 + 左侧**两级设置目录** + 右侧 RouterView;空路径重定向 `/settings/account` |
+| `/settings/account` | settings/AccountSettingsPanel | 账号设置(改密码 / 邮箱验证 / Git 平台绑定 GitHub+Gitee / 删除账号) |
+| `/settings/models` | settings/ModelSettingsPanel | LLM 模型配置(多厂商列表式管理) |
+| `/settings/cli` | settings/CliSettingsPanel | 外部 CLI 凭据配置(按 registry 动态列出 agent 类型;二级目录 `childMode='switch'`,与面板内 tab 栏双向同步) |
+| `/settings/policy` | settings/AgentPolicyPanel | 协作策略(检查助手启用 / 验证授权模式 / 引用复核开关 / CLI 命令确认模式;原“协作轮次”设置已随后台审查移除) |
+| `/settings/practice` | settings/PracticeSettingsPanel | 练习设置(出题偏好 / 学习主题管理 / 数据管理;二级目录 `childMode='anchor'`,同页锚点 + scrollspy;练习功能开关关闭时隐藏入口) |
 | `/practice` | PracticeView | 自适应练习(出题生成 / 练习会话 / 题库管理 / 错题回顾 / 练习记录;左侧目录锚点 + 常驻操作头布局) |
 | `/practice/history` | 重定向 `/practice#history` | 旧练习记录路径,保书签兼容(历史会话 + 每周正确率趋势已内嵌为练习首页「历史记录」段) |
 | `/knowledge-board` | KnowledgeBoardView | 知识点看板(薄弱/待复习/已巩固/学习中/未开始五栏,卡片发起专项练习) |
 | `/practice/board` | 重定向 `/knowledge-board` | 旧看板路径,保书签兼容 |
 | `/skills` | SkillManagerView | 技能管理(上传 zip / 列表 / 在线编辑 SKILL.md / 删除) |
 | `/memory` | MemoryView | 记忆管理(用户偏好 / 全局记忆 / 项目记忆) |
-| `/settings` | SettingsView | 用户设置(改密码/Git 平台绑定 GitHub+Gitee/删除账号) |
+| `/models`、`/cli`、`/agent-policy` | 重定向 `/settings/models` / `/settings/cli` / `/settings/policy` | 旧顶层设置路径,保书签兼容(设置已收敛为 `/settings` 两级导航) |
 | `/login` | LoginView | 登录(邮箱密码 + GitHub / Gitee OAuth) |
 | `/auth/github/callback` | OAuthCallbackView | GitHub OAuth 回调(登录/绑定共用) |
 | `/auth/gitee/callback` | OAuthCallbackView | Gitee OAuth 回调(登录/绑定共用) |
@@ -671,6 +682,8 @@ react_agent 维护跨轮 plan 状态:
 | `/auth/password/reset` | ResetPasswordView | 重置密码 |
 
 路由守卫:受保护路由未登录跳 `/login?redirect=...`;已登录访问 `/login` 跳首页;页面刷新时自动 `fetchMe` 恢复会话。
+
+> 两级目录实现拆分:`data/settingsNav.ts`(目录模型 `SETTINGS_NAV`,一级/二级声明式)与 `utils/settingsNav.ts`(激活态工具函数 `isNavItemActive` / `resolveActiveChildId` / `resolveNavChildren`),SettingsLayout 同时引用两者。二级项统一用 URL hash 表达(不新增路由记录);展开态是路由的纯函数(无本地展开状态);高亮走计算出的 is-active而非 `router-link-active`(Vue Router 只比 path、忽略 hash)。
 
 ### 9.9 验证智能体(verifier_agent,实验性)
 
@@ -743,7 +756,7 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - **选题优先级**:agent2 标记的学习点(`metadata.practice_worthy=true`)优先且保持标记顺序,不足 `max_findings` 再按 created_at 补未标记的;无标记(单 agent 模式 / 老任务)行为与按 created_at 取前 N 条一致,向后兼容。含 `learning_note` 的发现注入出题提示,引导题目聚焦值得学的点
 - **源码注入**:沙箱未销毁时(默认保留 1 小时),出题过程可注入相关源码文件内容
 - **迷你工具循环**:generator 内置轻量循环(read_file / search_code / find_files,`MAX_TOOL_ROUNDS=6`,结果截断 3000 字符)增强出题质量,不复用重型 react_agent
-- **工作区恢复**:沙箱过期后支持重新 clone 仓库(默认关闭,避免意外拉取大仓库)
+- **工作区恢复**:沙箱过期后支持重新 clone 仓库。**两条路径不同语义**:出题侧自动恢复受用户级开关 `restore_workspace_for_practice` 控制(默认关闭,避免意外拉取大仓库);做题页的“重新拉取代码”为用户主动触发,不受该开关限制,且走“发起 job + 轮询状态”的异步链路(见 §9.6)
 
 **出题模型三级解析**(`generator.resolve_llm_client`):`task.llm_config_id`(任务级)> `practice_settings.default_llm_config_id`(用户级默认)> env 默认(`LLM_PROVIDER` / `LLM_MODEL`),任一级缺失或失效逐级回退。
 
@@ -764,10 +777,10 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - `POST /practice/sessions` + `POST /practice/sessions/{id}/answers`(组卷与判分,答案不下发;`topic_filter` 知识点专项练习 / `learning_topic` 主题级练习,二者互斥,同传 422;`learning_topic` 为 `learning_topics.key`,格式非法 422、无匹配 404)
 - `GET /practice/summary` / `GET /practice/trend` / `GET /practice/stats`(统计与趋势)
 - `GET /practice/knowledge-points`(知识点看板卡片列表)
-- `GET /practice/questions` + `POST /practice/questions/{id}/archive`(题库管理)+ `DELETE /practice/records`(清空记录)
+- `GET /practice/questions` + `GET /practice/questions/{id}`(单题全量详情:选项/正确答案/解析/源码出处 —— 列表 payload 不含答案与选项,避免整库下发内容膨胀)+ `POST /practice/questions/{id}/archive`(题库管理)+ `DELETE /practice/records`(清空记录)
 - 学习主题 CRUD(`backend/app/routers/learning_topics.py`,随 PRACTICE_ENABLED 注册):`GET /practice/topics`(懒播种内置 4 行,附每主题 kp_count)/ `POST /practice/topics`(自定义,名称用户内唯一,超限 400)/ `PATCH /practice/topics/{id}`(内置仅 enabled,自定义全字段;启用数不可归零 400)/ `DELETE /practice/topics/{id}`(仅自定义;有关联知识点 400 提示先停用)
 
-**前端**:`PracticeView.vue`(练习首页 / 会话答题 / 统计;`?topic=<key>` 进入自动发起专项练习,`?learningTopic=<key>` 自动发起主题级练习)、`KnowledgeBoardView.vue`(知识点看板,主题折叠区分组)、`PracticeHistoryPanel`(练习记录段,内嵌练习首页「历史记录」锚点,旧 `/practice/history` 重定向 `/practice#history`)、`PracticeGenerateSidebar`(出题进度侧栏,与答题代码栏互斥,360px)、`PracticeGenerateDialog`(生成确认)、`PracticeSettingsPanel.vue` 练习设置面板含「学习主题」管理区(内置启停 + 自定义增删改)、`PracticeCodeSidebar`(答题时源码查阅);任务详情页结果区有「生成练习题」入口。
+**前端**:`PracticeView.vue`(练习首页 / 会话答题 / 统计;`?topic=<key>` 进入自动发起专项练习,`?learningTopic=<key>` 自动发起主题级练习)、`KnowledgeBoardView.vue`(知识点看板,主题折叠区分组)、`PracticeHistoryPanel`(练习记录段,内嵌练习首页「历史记录」锚点,旧 `/practice/history` 重定向 `/practice#history`)、`PracticeGenerateSidebar`(出题进度侧栏,与答题代码栏互斥,360px)、`PracticeGenerateDialog`(生成确认)、`PracticeSettingsPanel.vue`(= `/settings/practice`,含「学习主题」管理区:内置启停 + 自定义增删改)、`PracticeCodeSidebar`(答题时源码查阅,经 `useWorkspaceRestore` 发起“重新拉取代码”并轮询进度,内容用 `FileContentViewer` 渲染)、`PracticeQuestionDetailDialog`(题目详情弹窗:完整题面 + 正确答案 + 解析 + 源码出处 + 作答统计;题库管理 / 错题回顾不传 attempt,历史明细传当次作答额外标出“你选的”并给出本次判分;答题会话中不启用——`SessionQuestion` 不含答案);任务详情页结果区有「生成练习题」入口。
 
 **出题日志**:`backend/logs/practice_generate.log`(滚动 10MB×3),记录模型解析 / 工作区状态 / 每条 finding 的解析与丢弃原因,便于排查"一道题也没生成"。
 

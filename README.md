@@ -9,7 +9,7 @@ SecondLook runs every task with two collaborating agents:
 - **Agent 1 — Executor (shown as "AI Assistant" in the UI)**: performs the actual code analysis. Either the built-in LLM-driven `react_agent` or an external CLI executor (Qoder CLI / DeepSeek Harness CLI / Codex CLI).
 - **Agent 2 — Inspector (shown as "Inspector" in the UI)**: a rigorous quality reviewer, verify-first and review-only (it never modifies code). It ① runs a single complete background review once Agent 1 finishes (verifying findings against real source code, defining its own review dimensions from the task description), ② runs PoC verifications when a test environment is configured (verification actions: `http_request` / `run_python_code`, with `per_action` / `direct` authorization modes), ③ spot-checks external references cited by Agent 1 (CVE / advisories / official docs — existence, source authority, SSRF-hardened fetching), ④ tags the most learning-worthy findings (`practice_worthy`) so practice generation prioritizes them, and ⑤ turns genuine gaps it cannot resolve itself into "suggested deep-dive directions" (suggestions) the user can trigger with one click.
 
-Agent 1 starts executing directly on the user's task description; the task is marked complete as soon as Agent 1 finishes. Agent 2 then runs a single complete review in the background (reading code, running PoCs, checking references), producing "key points & knowledge" plus "suggested deep-dive directions" — it verifies on its own and never asks follow-up questions, turning genuine gaps into suggestions the user can trigger with one click ("deep dive"). The collaboration policy page configures the inspector toggle, verification permissions, and more; disabling Agent 2 falls back to single-agent mode (no background review). Multiple rounds are user-driven (follow-up messages / clicking a suggestion).
+Agent 1 starts executing directly on the user's task description; the task is marked complete as soon as Agent 1 finishes. Agent 2 then runs a single complete review in the background (reading code, running PoCs, checking references), producing "key points & knowledge" plus "suggested deep-dive directions" — it verifies on its own and never asks follow-up questions, turning genuine gaps into suggestions the user can trigger with one click ("deep dive"). The Settings page (a single shell with two-level navigation — account / model settings / CLI credentials / collaboration policy / practice settings) configures the inspector toggle, verification permissions, and more; disabling Agent 2 falls back to single-agent mode (no background review). Multiple rounds are user-driven (follow-up messages / clicking a suggestion).
 
 ## Key Features
 
@@ -208,7 +208,7 @@ Both GitHub and Gitee are supported; configure as needed. Platforms left empty w
 | `LLM_ENABLE_THINKING` | Enable thinking (toggleable for hybrid-thinking models) | `true` |
 | `LLM_RATE_LIMIT_MAX_RETRIES` | Backoff retries after a 429 rate-limit error (exponential backoff + jitter; 0 = no retry) | `3` |
 
-> In production / multi-user scenarios, LLM config is managed by users on the "Model Settings" page; these env vars serve only as a dev fallback.
+> In production / multi-user scenarios, LLM config is managed by users on the Settings → Models page (`/settings/models`); these env vars serve only as a dev fallback.
 
 #### Repo Cloning
 

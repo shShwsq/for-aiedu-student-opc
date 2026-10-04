@@ -123,7 +123,7 @@ def run_react_agent(
 
     返回:(results 列表, summary 文本, final_plan)
         results: [{"title": str, "content": str, "metadata": dict}](始终为空,
-            结构化结果由 agent2 在 done 时通过 scenario.extract_results 提取)
+            结构化结果(重点与知识点)由 agent2 后台审查完成时经 results 字段输出)
         summary: react_agent 的总结说明
         final_plan: 本轮结束时的 plan 状态(可能为空 list),供 orchestrator
             传给下一轮实现跨轮延续
@@ -653,8 +653,8 @@ def run_react_agent(
         except Exception as e:
             logger.error(f"[task={task.id}] 最终总结失败: {e}")
 
-    # react_agent 不再落库 results(由 agent2 在 done 时调
-    # scenario.extract_results 提取并落库)
+    # react_agent 不再落库 results(重点与知识点由 agent2 审查完成时
+    # 经 results 字段输出并落库)
     if not summary:
         summary = "执行完成"
 

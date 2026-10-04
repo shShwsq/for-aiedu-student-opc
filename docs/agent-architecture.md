@@ -132,9 +132,9 @@ def run_agent2(
 
 ### 2.4 上下文构造
 
-#### System Prompt（`AGENT2_SYSTEM_PROMPT`）
+#### System Prompt（`AGENT2_REVIEW_PROMPT`）
 
-固定模板，包含「质检基准维度」一节（提示 agent2 根据用户意图自行确定审查维度并在 reasoning 中说明）。
+固定模板，包含「质检基准维度」一节（提示 agent2 根据用户意图自行确定审查维度并在 reasoning 中说明）。`AGENT2_SYSTEM_PROMPT` 仅作为它的兼容别名导出，实际消费的是前者（见 §2.2）。
 
 末尾追加 **长期记忆段**（`build_agent2_memory_section`）：
 - User Profile（用户偏好，自由文本，≤2000 字符）
@@ -143,16 +143,16 @@ def run_agent2(
 
 #### User Message
 
-**审查轮（有 react_agent_summaries）**：
+**审查轮（有 `agent1_summaries`）**：
 ```
-用户原始意图：{user_intent}
+用户原始意图:{user_intent}
 
-[你之前各轮的评估记录(保持覆盖度判断连续性)]
+[你之前各轮的评估记录(保持质检判断连续性)]        ← 第 2 次审查起才有(_build_agent2_history)
 === 第 1 轮 agent2 评估 ===
-{history_prefix from _build_agent2_history}
+{history_prefix 逐轮 reasoning}
 
-以下是 react_agent 已执行的 N 轮自然语言总结:
-### 第 1 轮 react_agent 自然语言总结
+以下是 agent1 已执行的 N 轮自然语言总结:
+### 第 1 轮 agent1 自然语言总结
 {summary}
 ...
 
@@ -162,8 +162,11 @@ def run_agent2(
 任务已完成,请对以上执行结果做完整审查:核查覆盖情况与结论质量,
 提炼重点与知识点(results),并对确属缺失且无法自查的方向给出
 建议深挖方向(suggestions)。
-[记忆提示] 上面已附上你之前各轮的评估记录，请保持覆盖度判断的连续性...
+[记忆提示] 上面已附上你之前各轮的评估记录,请保持审查判断的连续性:
+之前已标 covered 的类别,若 agent1 未推翻结论,继续保持 covered。
 ```
+
+> `agent1_summaries` 为空时走兜底分支（异常/降级路径）：只带意图 + 要求“基于意图给出审查结论，results 可为空、suggestions 建议补充执行”。
 
 > 轮次 summary 注入有长度上限(与 react_agent 侧历史压缩同常数):单条截断
 > `MAX_HISTORY_MSG_CHARS=3000`,总量超 `MAX_HISTORY_TOTAL_CHARS=12000` 时从
@@ -298,11 +301,11 @@ def run_react_agent(
 [assistant] {第 N 轮 react_agent 执行总结}
 [system]    [系统注入|评审反馈|第 N 轮] {agent2 审查反馈}
 —— 历史结束,本轮编排注入 ——
-[system] [系统注入|续跑指引](+ 仓库路径,工作区有文件时)
+[system] [系统注入|续跑指引](工作区有文件时同条消息内追加 [系统注入|工作区路径])
 [user] {followup_query 原文}
 ```
 
-编排注入与用户原话以 `[系统注入|来源]` 标记区分（防注入内容被当成用户指令）；落库的 question 即用户可见原文，无需事后剥离。
+编排注入与用户原话以 `[系统注入|来源]` 标记区分（防注入内容被当成用户指令）；落库的 question 即用户可见原文，无需事后剥离。工作区路径提示只在工作区确实有文件时注入（`sandbox_tools.workspace_has_files`），措辞统一用中性的“任务工作区”而不区分仓库/上传（与 §4.4 只对真实仓库声称“已 clone”的口径一致）。
 
 ### 3.4 跨轮记忆（`_build_history_messages`，结构化 + 三级压缩）
 
@@ -329,12 +332,12 @@ def run_react_agent(
 
 每个迭代：
 1. **暂停检查点**：`wait_if_paused(task.id)`（粗粒度，工具调用前还有细粒度检查点）
-2. **用户补充消息注入**：`drain_user_messages(task.id)` 取用户在运行中/暂停中追加的消息，合并为一条 user 消息注入 `messages`
+2. **用户补充消息注入**：`drain_user_messages(task.id)` 取用户在运行中/暂停中追加的消息：先按 `message_id` 查回已落库的 Conversation 逐条补推 `conversation` 事件（待处理条目转入对话流，推送失败仅记日志）；若本批消息带附件，先把新 `upload_ids` **全量累积**写入 `params.followup_upload_ids`（先落库再传输，保证与沙箱回收重放/工作区回退浏览同一布局）并 `add_uploads_to_workspace` 传进 `followup_uploads/`，拼接 `FOLLOWUP_ATTACHMENT_NOTE` 目录提示；最后经 `format_injected_user_messages` 合并为一条 user 消息注入 `messages`（附件传输失败 catch+log，不中断本轮，文字消息照常注入）
 3. **流式调 LLM**：`_stream_llm_response` 返回 `reasoning_full / content_full / tool_calls_full / finish_reason`
 4. **落库 thinking**：`type=thinking, publish_event=False`（流式卡片已展示，避免重复推 SSE）
 5. **提取 plan**：`_extract_plan(content_full)`（[runtime/plan.py](../backend/app/agents/runtime/plan.py) `extract_plan`，与 CLI 侧共用）从 `<plan>...</plan>` 块解析，`_merge_plan` 合并到 `current_plan`
 6. **tool_calls 兜底**：结构化 `tool_calls_full` 为空时，从 content 文本解析 `<tool_call>` 块
-7. **结束判断**：`not tool_calls_full and finish_reason != "length"` → 真正结束，`content_full` 作为 summary
+7. **结束判断**：`not tool_calls_full` 时先看遗留消息守卫 `has_pending_messages(task.id)`——本迭代 drain 之后、最终答案生成期间到达的消息 → **不结束，`continue` 下一迭代顶部 drain 后同轮处理**；无遗留则结束（`finish_reason=length` 只记 warning 降级，同样用 `content_full` 作 summary 退出，不会重试补完）
 8. **执行工具**：`execute_tool(fn_name, fn_args)`，结果以 `role=tool` 消息加回 `messages`
    - 工具调用签名记录到 `recent_calls`（循环检测）
    - plan 推进：`_infer_step_from_tool` 根据 tool_name 关键词匹配 step.text，标 `in_progress`
@@ -476,43 +479,92 @@ ExecutorAgent (ABC)
 #### 通用运行流程（`run_acp_agent`）
 
 ```
-1. set_current_task(task_id_str, task.scenario)
-2. 校验 agent_type 已注册 + SANDBOX_MODE != "local"
-3. _load_credentials(db, user_id, agent_type)
-   → 从 UserAgentConfig 加载加密凭证,decrypt_secret 解密
-4. credential_env_builder(credentials) 或 _build_credential_envs(credentials, agent_type)
-   → 按 registry.credential_env 映射为环境变量 dict
-5. sandbox_tools._get_or_create_session(task_id_str)
-   → 复用 orchestrator 预 clone 的沙箱会话
-6. _load_project_memory_summary(db, task) + _load_global_memory(db, task)
-   → 项目记忆委托 memory_injection.load_project_memory_brief(与内置侧同源,含 content 截断回退)
-7. _ensure_cli_env(session, agent_type)
-   → 创建 bridge 脚本目录 + 写入 bridge 脚本 + 检查 CLI(不可用则安装)
-8. pre_bridge_hook(session, credentials, agent_type)  [wrapper 钩子]
-   → Codex 用此写 ~/.codex/config.toml
-9. _start_acp_bridge(session, credential_envs, task, agent_type)
-   → 后台启动:python3 acp_bridge.py --port 8088 --bin {cli_bin} --args '{json}'
-   → 凭证经 envs 注入 bridge 进程,CLI 子进程继承
-10. _wait_for_bridge_ready(session, execution_id, endpoint_url, ...)
+1.  set_current_task(task_id_str, task.scenario)
+2.  校验 agent_type 已注册 + 沙箱模式闸门:
+    SANDBOX_MODE=local 时需 SANDBOX_LOCAL_ALLOW_CLI=true 才放行(默认 True),
+    放行时记 warning(bridge/CLI 直接跑在宿主机真实环境,无隔离边界,勿用于生产);
+    为 false 则抛错提示改用 sandbox 模式。测试连接链路同此闸门
+3.  _load_credentials(db, task.user_id, agent_type)
+    → 从 UserAgentConfig 加载加密凭证,decrypt_secret 解密
+4.  credential_env_builder(credentials, task) 或 _build_credential_envs(credentials, agent_type)
+    → 按 registry.credential_env 映射为环境变量 dict
+      (deepseek 经 builder 按 task.params._executor_command_confirm 动态加 DSH_PERMISSION_MODE)
+5.  sandbox_tools._get_or_create_session(task_id_str)
+    → 复用 orchestrator 预 clone 的沙箱会话,取 repo_path
+6.  _load_project_memory_summary(db, task) + _load_global_memory(db, task)
+    → 项目记忆委托 memory_injection.load_project_memory_brief(与内置侧同源,含 content 截断回退)
+    → 每轮重新读取(上一轮任务完成后归纳的新记忆应可用于下一轮,与内置侧口径一致)
+7.  【bridge 复用判定】fingerprint = _bridge_fingerprint(_get_acp_args(task, agent_type), credential_envs)
+    reused = _try_reuse_bridge(task_id_str, session, agent_type, fingerprint)
+    → 复用条件(须同时满足):同一沙箱会话对象(容器未重建)+ agent_type 一致 +
+      启动配置指纹一致 + GET /health 通过;任一不满足则清缓存走全新链路
+    → agent_type 或指纹变化时先 _stop_acp_bridge 停旧 bridge(防端口冲突)再清缓存
+    → 命中时跳过步骤 8-13 与 15-16 的重建链路(实测省 ~25s),perf 事件 acp_bridge_reuse(hit)
+      (步骤 14 的 recorder/ACPClient 每轮仍新建,仅底层 bridge 进程与 ACP session 复用)
+8.  [全新链路] _ensure_cli_env(session, agent_type)
+    → 创建 bridge 脚本目录 + 写入 bridge 脚本 + 检查 CLI(不可用则安装)
+9.  [全新链路] _inject_git_credentials_to_cache(session, db, task)
+    → git token 注入沙箱内 credential helper cache(不进环境变量/磁盘文件/命令行),
+      让 CLI 能克隆/拉取私有仓库
+10. [全新链路] pre_bridge_hook(session, credentials, agent_type, task)  [wrapper 钩子]
+    → Codex 用此写 ~/.codex/config.toml;钩子可返回额外 envs 合并进 bridge 环境
+      (如 codex local 模式的 CODEX_HOME)
+11. [全新链路] _start_acp_bridge(session, credential_envs, task, agent_type)
+    → 后台启动:python3 acp_bridge.py --port 8088 --bin {cli_bin} --args '{json}'
+    → 凭证经 envs 注入 bridge 进程,CLI 子进程继承;sandbox 模式固定 ACP_BRIDGE_PORT,
+      local 模式动态分配端口(返回值第二位)
+12. endpoint_url / endpoint_headers:
+    → 复用路径直接取缓存值,跳过 session.get_endpoint(SDK 端口转发,resume 场景实测最长 ~70s)
+    → 全新路径 session.get_endpoint(bridge_port)
+13. [全新链路] _wait_for_bridge_ready(session, bridge_exec_id, endpoint_url, ...)
     → 健康检查轮询(30s 超时,失败时读 bridge 日志辅助排查)
-11. ACPClient(endpoint_url, endpoint_headers, recorder=_ACPRecorder(...))
-12. client.initialize()
-    → 跳过 authenticate(凭证经环境变量自动认证)
-13. client.new_session(cwd=repo_path or "/home/user")
-14. post_session_setup(client, session_id, task)  [wrapper 钩子]
+14. recorder = _ACPRecorder(task.id, round_idx)
+    client = ACPClient(endpoint_url, endpoint_headers, recorder=..., permission_handler=...)
+    → _permission_handler:CLI 关闭 yolo 时发来 request_permission(危险命令)
+      → 推 command_confirm 事件 + 阻塞等前端 CommandConfirmDialog 决议
+      → 同意返回 {outcome:selected, option_id:allow_once}(不记忆),拒绝返回 {outcome:rejected}
+15. [全新链路] client.initialize() → 跳过 authenticate(凭证经环境变量已自动认证;
+    沙箱无 TTY 时 authenticate 会静默挂起)
+    → client.new_session(cwd=repo_path or BRIDGE_WORK_DIR;local 模式回退 session.local_dir)
+    [复用链路] 直接用缓存的 acp_session_id(不经 initialize/session_new)
+16. [全新链路] post_session_setup(client, acp_session_id, task)  [wrapper 钩子]
     → deepseek_cli 用此调 set_config_option(model / reasoning_effort)
-15. _build_base_prompt(纯指令,落库) → 幂等查重后 _add_conversation
-    → 再拼 _build_repo_context_section(按上传/clone 选变体) + _build_memory_section
-      = 完整发送 user_msg(各段文案收敛于 prompts/executor.py,见 §4.4)
-16. _add_conversation(role=user, type=question, content=base_msg)
-17. collector = _ACPCollector(task, db, round_idx)
-18. client.prompt(session_id, [{"type":"text","text":user_msg}], on_event=collector)
-19. recorder.close() + collector.close()
-20. client.close() + _stop_acp_bridge(session, bridge_exec_id)
-21. summary = collector.content_full or "执行完成(...)"
-22. current_plan = _extract_plan(collector.content_full) or previous_plan
-23. return [], summary, current_plan
+    → 之后把 session/bridge_exec_id/endpoint/acp_session_id/fingerprint 写入 _bridge_cache
+17. _build_base_prompt(纯指令) → 按 (task_id, round_idx, role=user, type=question) 幂等查重,
+    无记录才 _add_conversation 落库(首轮提问已在 create_task 时落库,此处跳过避免重复)
+18. user_msg = base_msg
+    + _build_repo_context_section(仅首轮传 repo_context,按 clone/upload 选变体)
+    + _build_memory_section(memory_summary, global_memory)
+    (后两段只进发送内容不落库;各段文案收敛于 prompts/executor.py,见 §4.4)
+19. collector = _ACPCollector(task, db, round_idx, agent_type=agent_type)
+20. with session.auto_renew():  # prompt 期间 CLI 用自带 bash 不访问后端,单轮长执行可能拖过沙箱 TTL,
+                                # 后台线程周期性 renew 沙箱
+      client.prompt(acp_session_id, [{"type":"text","text":user_msg}],
+                    on_event=collector, idle_probe=lambda: collector.has_active_tools)
+    → 挂死兜底:按活动工具状态分级 idle 超时 → session/cancel + 置 last_prompt_truncated → 返回空结果
+    → 流异常兜底:CLI 崩溃/连接中断(ACPStreamAborted)走同款善后,不把崩溃当正常完成、不 fail 任务
+21. finally: recorder.close() + collector.close() → client.close()
+22. 外层 finally: **bridge 保持运行**(已在 _bridge_cache),不再每轮停止,供后续轮次/resume 复用;
+    仅当未入缓存(初始化阶段失败)时 _stop_acp_bridge,避免残留坏进程
+    → prompt 抛连接层异常(httpx.HTTPError / ConnectionError)时清缓存(bridge/CLI 已死),
+      下次走全新链路;ACP 业务错误保留缓存(session 仍有效)
+    → 沙箱会话关闭 / 任务删除时由 stop_task_bridge(task_id) 主动停止并清缓存
+23. summary = collector.content_full or "执行完成({agent_type},{n} 次工具调用)"
+    若 client.last_prompt_truncated:推 phase=error 事件「[本轮提前终止: ...]」
+    并在 summary 追加截断标注(让 agent2 审查时知道输出不完整)
+24. current_plan = _extract_plan(collector.content_full) or previous_plan
+25. return [], summary, current_plan
 ```
+
+#### bridge 驻留与复用（`_bridge_cache`）
+
+模块级 `{task_id: 条目}` 缓存（`_bridge_cache_lock` 保护），条目含沙箱会话对象 / `bridge_exec_id` / `endpoint_url+headers` / `acp_session_id` / 启动配置指纹。意义：
+
+- **省时**：命中时跳过「准备 CLI 环境 → 启 bridge → initialize → session/new」整条链路（~25s），并跳过 `session.get_endpoint` 端口转发（resume 场景实测最长 ~70s）
+- **会话延续**：CLI 进程不退出，ACP session 存于进程内，追问/续跑共用同一 session → CLI 自身能看到之前的对话（这是 CLI 侧跨轮记忆的首要手段，见 §4.4）
+- **失效判定**：沙箱会话对象变了（容器重建）/ `agent_type` 变了 / 指纹（acp_args + 凭证 env）变了 / `GET /health` 不通过 → 清缓存走全新链路（类型/指纹变化时先停旧 bridge 防端口冲突）
+- **生命周期**：正常轮次结束 **不** 停 bridge；仅初始化失败（未入缓存）时停掉防残留，或连接层异常时清缓存，或由 `stop_task_bridge(task_id)`（沙箱会话关闭/任务删除）主动回收
+- **并发边界**：ACP over stdio 是串行协议（bridge 侧锁保护 send+collect 全程，同一时刻仅一个 prompt）；agent2 后台审查不经 bridge（它是进程内 LLM 调用），它与新轮 CLI 执行共享的是**同一沙箱会话**（只读核查 / verifier PoC 侧），详见 §1.2 并行世代门控
 
 ### 4.4 Prompt 消息构造（`_build_base_prompt` + 共享段落工厂）
 
@@ -533,21 +585,24 @@ CLI 侧每轮构造单条 user 文本：**纯指令**（`_build_base_prompt`，�
 **追问轮**（核心指引文本与内置侧共享 `FOLLOWUP_CORE_GUIDANCE`，两侧仅包装不同）：
 ```
 基于之前的执行进度,请处理以下新消息(用户追问可直接回答,新需求/修正则执行对应工作,续跑则接着完成,均不要重做已完成的部分):
-仓库路径(已 clone): {repo_path}
+仓库路径(已 clone,无需再 clone): {repo_path}    ← 仅当 params.repo_url 存在 + 有 repo_path + 工作区确实有文件时附带
 
 [本轮补充要求]
 {followup_query}
 ```
+
+> “仓库路径”行两个条件缺一不可：纯上传任务的 `repo_path` 指向 `uploaded_files/`，称其“已 clone 的仓库”会误导（工作区文件路径已由 session cwd 提供）；预 clone/上传传输可能降级为空目录，此时声称“已就位”会让执行器跳过获取动作。内置侧同样不区分仓库/上传，统一用中性的“工作区路径”措辞（见 §3.3）。
 
 **每轮末尾追加**（与内置 react_agent system prompt 行为一致）：
 - 若有 `previous_plan`：`format_plan_reminder(previous_plan, variant="cli")`（中立措辞，兼容 CLI 原生 TodoList 等计划工具）
 - 若有 `memory_summary`：`[项目记忆摘要] ... 完整项目记忆可 read_file /home/user/.agent_memory/project_memory.md 查阅`（数据经 `memory_injection.load_project_memory_brief` 单源加载，summary 为空回退 memory_content 截断——与内置侧回退行为一致）
 - 若有 `global_memory`：跨项目通用经验段
 
-> **注意**：CLI agent 不像内置 react_agent 那样维护 `messages` 列表，每次 prompt 都是独立的 user 消息。跨轮记忆主要依赖：
-> 1. `previous_plan` 注入（plan 状态续接）
-> 2. 项目记忆 + 全局记忆（每轮注入）
-> 3. CLI 自身的会话恢复机制（如 Codex 的 `codex exec resume <thread_id>`）
+> **注意**：CLI agent 不像内置 react_agent 那样维护 `messages` 列表，每轮 prompt 都是独立的 user 文本。跨轮记忆主要依赖：
+> 1. **bridge + ACP session 复用**（首要）：同一任务的 bridge/CLI 进程随沙箱会话存活，后续轮次/resume 用缓存的 `acp_session_id` 直接发 prompt，**CLI 侧对话上下文随 session 在进程内延续**（见 §4.3 步骤 7/15）；沙箱重建或指纹变化时降级为全新链路，会话上下文丢失
+> 2. `previous_plan` 注入（plan 状态续接）
+> 3. 项目记忆 + 全局记忆（每轮重新拼接）
+> 4. CLI 自身的会话恢复机制（如 Codex 的 `codex exec resume <thread_id>`，由 codex_bridge 在进程内维护）
 
 ### 4.5 wrapper 层差异
 
@@ -727,6 +782,7 @@ list of `{label, header_name, header_value}`：
 | agent1（内置 react_agent）跨轮自记忆 | `_build_history_messages` 结构化注入（逐轮 user 原话/assistant 总结/system 反馈）+ 三级压缩 | token 预算 8000（`HISTORY_TOKEN_BUDGET` 可覆盖;Level 2 LLM 压缩,后台预压缩） |
 | agent1 → agent2 | agent1 落库 `type=thinking` 的 content（即 summary），agent2 通过 `react_summaries` 接收 | - |
 | agent2 → agent1 | agent2 落库 `type=review` 的 reasoning（旧版任务为 `type=evaluation`），内置 react_agent 经 `_build_history_messages` 加载 | - |
+| CLI agent 跨轮会话延续 | bridge + ACP session 复用（`_bridge_cache`，按会话对象/agent_type/指纹/健康检查命中）——CLI 进程不退出，对话上下文随 session 在进程内延续；降级为全新链路时丢失 | - |
 | 长期记忆 → agent2 | `build_agent2_memory_section` 注入 system prompt | 各段 2000 |
 | 长期记忆 → agent1（内置） | `build_react_agent_memory_section` + `build_global_memory_section` 注入 system prompt | 各段 2000 |
 | 长期记忆 → CLI agent | `_load_project_memory_summary`（委托 `memory_injection.load_project_memory_brief` 单源加载）+ `_load_global_memory` 注入 prompt 末尾 | 各段 2000 |
