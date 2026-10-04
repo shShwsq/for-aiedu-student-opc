@@ -336,9 +336,10 @@ def browse_files(task_id: str, subdir: str = "") -> dict:
 def workspace_has_files(task_id: str) -> bool:
     """轻量探测工作区根目录是否有实际条目
 
-    供追问轮决定是否注入"仓库已 clone"的路径提示:预 clone 可能失败
-    降级为空目录(见预克隆失败降级处理),此时声称"已 clone"会误导
-    执行 agent 跳过 clone。任何异常(session 过期 / 未 clone / 目录
+    供追问轮决定是否注入工作区路径提示(react_agent 中性措辞"文件已就位";
+    acp_base 仅对真实仓库任务附"已 clone")。预 clone 可能失败
+    降级为空目录(见预克隆失败降级处理),此时声称"已就位"会误导
+    执行 agent 跳过获取动作。任何异常(session 过期 / 未 clone / 目录
     不存在 / 沙箱命令失败)均视为无文件。
     """
     try:

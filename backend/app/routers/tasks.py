@@ -1533,15 +1533,9 @@ def _append_result_html(
 #    报告侧按此约定合成「提交结果」条目
 # 3. 存量数据里追问轮 question 可能整段落库了拼进提示词的
 #    "[之前轮次的对话记忆]" 块(新数据已在落库侧拆分),报告侧裁剪兼容历史任务
-# 4. 存量旧任务(agent2 逐轮评估):第 r 轮评估的追问驱动第 r+1 轮,详细对话
-#    把这类评估归位到下一轮展示为追问,避免与落库的样板 question 重复
-#    (新流程已改后台审查,不再产生 evaluation)
 
 _CONVERSATION_TRACE_TYPES = {
     "question",    # 用户某轮发言(首轮以 question 落库,后续轮为 message)
-    "answer",      # 用户对追问的回答(存量旧任务,新流程不再产出)
-    "evaluation",  # agent2 评估(存量旧任务逐轮评估,新流程已改为后台审查)
-    "followup",    # agent2 追问(存量旧任务,新流程不再产出)
     "submit",      # agent1 提交结果(按轮从 thinking 合成)
     "review",      # agent2 后台审查结论(reasoning 存完整 covered/missing/判断)
     "suggestions", # agent2 建议深挖方向(JSON,报告渲染为列表)
@@ -1562,31 +1556,8 @@ _FOLLOWUP_SECTION_LABELS = (
     "[本轮 agent2 追问]", "[本轮追问]",
 )
 
-# agent2 评估中的非追问内容标记(_record_agent2 落库约定):
-# 这类评估是结论/动作记录而非驱动下一轮的问题,详细对话中保留在原轮
-# ("请求用户澄清"为旧版澄清提问机制的落库文案,保留以兼容存量数据)
-_UA_EVAL_NON_FOLLOWUP_MARKERS = ("评估完成,无需追问", "(未给出追问)", "请求用户澄清")
-
-
-def _is_ua_followup_evaluation(c) -> bool:
-    """判断 agent2 评估是否为追问类(其 content 即驱动下一轮的问题)
-
-    _record_agent2 落库约定:非 done 时 content 就是
-    followup_query 本身;done/无追问时为固定标记文案。
-    """
-    if c.role != "agent2" or c.type != "evaluation":
-        return False
-    content = (c.content or "").strip()
-    return bool(content) and not any(
-        content.startswith(m) for m in _UA_EVAL_NON_FOLLOWUP_MARKERS
-    )
-
-
 _CONVERSATION_TYPE_LABELS = {
     "question": "用户提问",
-    "answer": "用户回答",
-    "evaluation": "评估",
-    "followup": "追问",
     "submit": "提交结果",
     "review": "审查结论",
     "suggestions": "建议深挖方向",
@@ -1643,13 +1614,13 @@ def _trace_content(c) -> str:
     """结论类对话的展示正文(按 type 归一化)
 
     - question:裁掉存量数据里的跨轮历史记忆块
-    - review / evaluation:reasoning 存完整正文(审查 covered/missing/判断),优先用它
+    - review:reasoning 存完整审查正文(covered/missing/判断),优先用它
     - suggestions:JSON 渲染为列表
     - 其他:content 原文
     """
     if c.type == "question":
         return _strip_question_memory_block(c.content)
-    if c.type in ("review", "evaluation"):
+    if c.type == "review":
         return (c.reasoning or c.content or "").strip() or "(无内容)"
     if c.type == "suggestions":
         return _format_suggestions(c.content)
@@ -1707,17 +1678,12 @@ def _collect_conversation_trace(task: Task) -> list[dict[str, Any]]:
     - 追问轮去重:同轮已有干净的 user message(用户原话)时,该轮的编排
       样板 question(react/acp 注入的"基于之前的执行进度…仓库路径…[本轮补充要求]"
       包装体,与 message 内容重复且易误导)跳过,仅保留 message
-
-    存量旧任务的 agent2 逐轮评估归位(新流程改为后台审查,不再产生 evaluation):
-    - 第 r 轮评估的追问驱动第 r+1 轮 → 归位到 r+1 轮展示为追问(role=agent2),
-      含 round_idx=0 的旧版初始评估;相应跳过该轮落库的样板 question 以免重复
     """
     convs = [
         c for c in task.conversations
         if c.type in _CONVERSATION_TRACE_TYPES
     ]
     submits = _collect_react_summaries(task)
-    submit_rounds = {it["round_idx"] for it in submits}
 
     # 有干净 user message 的轮:该轮的编排样板 question 与之重复,跳过
     # (首轮只有 question、无 message,它就是本轮的用户发言,正常保留)
@@ -1726,47 +1692,13 @@ def _collect_conversation_trace(task: Task) -> list[dict[str, Any]]:
         if c.role == "user" and c.type == "message"
     }
 
-    # agent2 启用判定:存在 agent2 评估即为双 agent 协作
-    # (单 agent 模式 agent2 完全关闭,不会有评估落库)
-    ua_enabled = any(
-        c.role == "agent2" and c.type == "evaluation" for c in convs
-    )
-
     items: list[dict[str, Any]] = []
-    # 追问类评估归位:第 r 轮评估 → 第 r+1 轮的提问/追问
-    # (仅当 r+1 轮确实有 react_agent 执行时才归位,末尾轮的结论性评估留在原轮)
-    moved_question_rounds: set[int] = set()
-    if ua_enabled:
-        for c in convs:
-            if (
-                _is_ua_followup_evaluation(c)
-                and (c.round_idx + 1) in submit_rounds
-            ):
-                moved_question_rounds.add(c.round_idx + 1)
-                items.append({
-                    "round_idx": c.round_idx + 1,
-                    "role": c.role,
-                    "type": "followup",
-                    "type_label": "提问" if c.round_idx == 0 else "追问",
-                    "content": c.content,
-                    "created_at": c.created_at,
-                })
-
     for c in convs:
         if (
             c.role == "user" and c.type == "question"
             and c.round_idx in message_rounds
         ):
             continue  # 追问轮:编排样板 question 与干净 message 重复,保留 message
-        if ua_enabled and _is_ua_followup_evaluation(c) and c.round_idx + 1 in moved_question_rounds:
-            continue  # 已归位到下一轮作为提问/追问
-        if ua_enabled and c.role == "user" and c.type == "question":
-            # 存量旧任务:后续轮 question 主体是编排样板,真实追问已由上一轮评估
-            # 归位覆盖,故跳过;若该轮没有归位追问(异常/降级路径),保留原 question
-            if c.round_idx == 1 and 1 in moved_question_rounds:
-                continue
-            if c.round_idx >= 2 and c.round_idx in moved_question_rounds:
-                continue
         items.append({
             "round_idx": c.round_idx,
             "role": c.role,

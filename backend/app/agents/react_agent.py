@@ -208,8 +208,8 @@ def run_react_agent(
 
         ws_info = sandbox_tools.get_workspace_info(task_id_str)
         repo_path = ""
-        # 只有工作区确实有文件才声称"已 clone":预 clone 可能失败降级为
-        # 空目录,此时若断言已 clone 会误导 react_agent 跳过 clone
+        # 只有工作区确实有文件才注入路径提示:预 clone/上传传输可能失败
+        # 降级为空目录,此时提示"已就位"会误导 react_agent 跳过获取动作
         if (
             ws_info and ws_info.get("repo_path")
             and sandbox_tools.workspace_has_files(task_id_str)
@@ -233,13 +233,15 @@ def run_react_agent(
         # 用户追问原文:零包装独立成条(P0-2),落库与发送内容一致
         user_msg = followup_query
 
-        # 编排指引 + 仓库路径提示:系统注入消息,与用户原话分离(P0-3)
+        # 编排指引 + 工作区路径提示:系统注入消息,与用户原话分离(P0-3)
+        # 措辞中性:repo 任务该路径是克隆目录,纯上传任务是 uploaded_files/,
+        # 统称为"工作区"避免误导(与 acp_base 只对真实仓库说"已 clone"口径一致)
         guidance_parts = [FOLLOWUP_GUIDANCE]
         if repo_path:
             guidance_parts.append(
-                f"{SYSTEM_INJECT_MARKER}仓库路径]\n"
-                f"仓库已 clone 在 {repo_path},直接用 read_file/search_code/"
-                f"list_files 等工具访问该路径,不要重新 clone。"
+                f"{SYSTEM_INJECT_MARKER}工作区路径]\n"
+                f"任务工作区(文件已就位)在 {repo_path},直接用 read_file/"
+                f"search_code/list_files 等工具访问该路径,不要重复 clone 或上传。"
             )
         context_system_messages = [
             {"role": "system", "content": "\n\n".join(guidance_parts)}
