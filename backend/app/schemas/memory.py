@@ -85,6 +85,8 @@ class StructureDefaultsOut(BaseModel):
     global_categories: list[MemoryCategoryDef] = Field(
         default_factory=lambda: [MemoryCategoryDef(**d) for d in DEFAULT_GLOBAL_CATEGORY_DEFS]
     )
+    # 结构化类别数量上限(与保存校验同源,前端据此限制添加)
+    max_categories: int = MAX_MEMORY_CATEGORIES
 
 
 class SaveMemorySettingsRequest(BaseModel):

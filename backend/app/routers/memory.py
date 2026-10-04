@@ -580,7 +580,7 @@ def _regen_memory_summary(db: Session, user_id, memory_content: str) -> str:
             else 2000
         )
         structured = not (settings_row and settings_row.structure_mode == "freeform")
-        thinking_mode = settings_row.thinking_mode if settings_row else "follow"
+        thinking_mode = settings_row.thinking_mode if settings_row else DEFAULT_THINKING_MODE
         try:
             llm, _src = resolve_memory_llm_client(db, user_id)
         except Exception:

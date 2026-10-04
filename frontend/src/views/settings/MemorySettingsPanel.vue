@@ -110,6 +110,7 @@ async function load(): Promise<void> {
     const defs = await getStructureDefaults()
     defaultProjectCats.value = defs.project_categories.map((c) => ({ ...c }))
     defaultGlobalCats.value = defs.global_categories.map((c) => ({ ...c }))
+    if (defs.max_categories > 0) maxCats.value = defs.max_categories
   } catch {
     // 静默失败：无默认数据时「恢复系统默认」不可用，不影响主流程
   }
@@ -204,13 +205,14 @@ async function commitInjectMax(event: Event): Promise<void> {
 function catList(scope: 'project' | 'global') {
   return scope === 'project' ? projectCats : globalCats
 }
-const MAX_CATS = 12
+/** 类别数量上限(默认 12,加载后以后端 structure_defaults.max_categories 为准) */
+const maxCats = ref(12)
 
 function addCat(scope: 'project' | 'global'): void {
   if (busy.value) return
   const list = catList(scope)
-  if (list.value.length >= MAX_CATS) {
-    showToast(`类别数量上限 ${MAX_CATS} 个`, 'error')
+  if (list.value.length >= maxCats.value) {
+    showToast(`类别数量上限 ${maxCats.value} 个`, 'error')
     return
   }
   list.value.push({ title: '', description: '' })

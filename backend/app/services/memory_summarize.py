@@ -28,6 +28,7 @@ from app.models.memory_settings import (
     MemorySettings,
 )
 from app.models.practice import (
+    THINKING_MODE_FOLLOW,
     THINKING_MODE_OFF,
     THINKING_MODE_ON,
 )
@@ -153,7 +154,7 @@ def summarize_and_save_memory(
             settings_row.structure_mode if settings_row
             else DEFAULT_MEMORY_STRUCTURE_MODE
         )
-        thinking_mode = settings_row.thinking_mode if settings_row else "follow"
+        thinking_mode = settings_row.thinking_mode if settings_row else THINKING_MODE_FOLLOW
         inject_max = (
             settings_row.inject_max_chars if settings_row and settings_row.inject_max_chars
             else DEFAULT_MEMORY_INJECT_MAX_CHARS
@@ -280,7 +281,7 @@ def _curate_freeform(
     if not update:
         return
 
-    proj_text = (update.get("project_memory_update") or "").strip()
+    proj_text = _as_text(update.get("project_memory_update"))
     if proj_text:
         proj = _get_or_create_project(db, task.user_id, repo_url)
         if proj is not None:
@@ -298,7 +299,7 @@ def _curate_freeform(
                     f"[task={task.id}] 已更新项目记忆(freeform, project={proj.id})"
                 )
 
-    global_text = (update.get("global_memory_update") or "").strip()
+    global_text = _as_text(update.get("global_memory_update"))
     if global_text:
         mem = (
             db.query(UserMemory)
@@ -364,7 +365,9 @@ def generate_memory_summary(
             memory_content=content,
             inject_categories=inject_categories,
         )
-        summary = _chat(llm, prompt, thinking_mode)
+        # max_tokens 随 max_chars 缩放:英文≈chars/4 token、CJK≈1 token/char,
+        # 取 max(2048, max_chars) 保证大注入上限不被输出长度提前截断。
+        summary = _chat(llm, prompt, thinking_mode, max_tokens=max(2048, max_chars))
 
         if not summary:
             return content[:max_chars]
@@ -380,6 +383,15 @@ def generate_memory_summary(
 # ============================================================
 # 辅助函数
 # ============================================================
+
+
+def _as_text(val) -> str:
+    """容错取文本:仅当为 str 时 strip 返回;list/dict 等误返回按空处理。
+
+    freeform 模式下归纳模板要求字符串,但模型偶尔会回吐结构化数组——
+    直接 .strip() 会抛 AttributeError 使整次归纳(项目+全局)被外层 catch 后全部跳过。
+    """
+    return val.strip() if isinstance(val, str) else ""
 
 
 def _clean_items(raw) -> list[dict]:

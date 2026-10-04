@@ -132,6 +132,8 @@ export interface MemorySettingsOut {
 export interface StructureDefaults {
   project_categories: MemoryCategoryDef[]
   global_categories: MemoryCategoryDef[]
+  /** 类别数量上限(与后端保存校验同源) */
+  max_categories: number
 }
 
 /** 保存记忆设置请求(PUT /memory/preferences/memory_settings body)

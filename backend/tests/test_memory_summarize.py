@@ -11,6 +11,7 @@ from app.prompts.memory_curator import (
 from app.services.memory_summarize import (
     MAX_PROJECT_MEM_INJECT,
     MAX_PROJECT_MEM_STORE,
+    _as_text,
     _clean_items,
     _merge_freeform,
     _merge_structured,
@@ -33,14 +34,19 @@ class _MockChunk:
 
 
 class _MockLLM:
-    """模拟 LLMClient:按预设 chunks 产出;fail=True 时 chat_stream 抛异常"""
+    """模拟 LLMClient:按预设 chunks 产出;fail=True 时 chat_stream 抛异常。
+
+    记录最后一次调用的 max_tokens,供断言缩放行为。
+    """
 
     def __init__(self, chunks=None, fail=False):
         self._chunks = chunks or []
         self._fail = fail
         self.enable_thinking = True  # generate_memory_summary 会改它
+        self.last_max_tokens = None
 
     def chat_stream(self, messages, max_tokens=2048):
+        self.last_max_tokens = max_tokens
         if self._fail:
             raise RuntimeError("LLM 调用失败(模拟)")
         for c in self._chunks:
@@ -346,3 +352,34 @@ def test_categories_titles_and_render_desc():
 def test_project_categories_titles_derived_from_defaults():
     """PROJECT_CATEGORIES 默认标题列与 DEFAULT_PROJECT_CATEGORY_DEFS 一致。"""
     assert PROJECT_CATEGORIES == categories_titles(DEFAULT_PROJECT_CATEGORY_DEFS)
+
+
+# ---------- max_tokens 随 max_chars 缩放 ----------
+
+def test_generate_memory_summary_scales_max_tokens_with_max_chars():
+    """超长走 LLM 精简时,max_tokens 随 max_chars 缩放(大上限不被 2048 提前截断)。"""
+    content = "X" * 6000  # > max_chars
+    llm = _MockLLM(chunks=[_MockChunk("## Hard Constraints\n- ok", "stop")])
+    generate_memory_summary(content, llm, max_chars=5000)
+    assert llm.last_max_tokens == 5000  # max(2048, 5000)
+
+
+def test_generate_memory_summary_max_tokens_floor_2048():
+    """小 max_chars 时 max_tokens 不低于 2048(取默认下限)。"""
+    content = "X" * 2500  # > max_chars=1500
+    llm = _MockLLM(chunks=[_MockChunk("## Hard Constraints\n- ok", "stop")])
+    generate_memory_summary(content, llm, max_chars=1500)
+    assert llm.last_max_tokens == 2048  # max(2048, 1500)
+
+
+# ---------- _as_text 类型守卫 ----------
+
+def test_as_text_str_returns_stripped():
+    assert _as_text("  hi  ") == "hi"
+
+
+def test_as_text_non_string_returns_empty():
+    # 模型误返回结构化数组/字典 → 按空处理(避免 .strip() 抛错使整次归纳被跳过)
+    assert _as_text([{"category": "x", "item": "y"}]) == ""
+    assert _as_text({"k": "v"}) == ""
+    assert _as_text(None) == ""
