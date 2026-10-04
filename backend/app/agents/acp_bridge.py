@@ -35,6 +35,38 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+# bridge 能力版本:后端据此判断能否安全使用会话恢复。
+# 2 = 会排空恢复回放通知(见 _drain_queue)。老 bridge 无此字段(视为 1),
+# 后端遇到老 bridge 时不会尝试 session/load 与 session/resume。
+# 常量与 backend/app/agents/runtime/acp_session.py 的
+# BRIDGE_PROTOCOL_REPLAY_SAFE 需保持一致;本脚本独立跑在沙箱内,
+# 不得依赖 app 包,因此就地定义而非导入。
+BRIDGE_PROTOCOL = 2
+
+# ACP 会话恢复方法:响应前先以 session/update 通知回放历史,响应后
+# 仍可能残留尾巴行。这些历史属于"往轮",必须在本请求内排空,
+# 否则会被下一个请求(session/prompt)当成本轮输出。
+_RESTORE_METHODS = ("session/load", "session/resume")
+
+
+def _drain_queue(q: "queue.Queue", *, quiet_seconds: float = 0.35, max_seconds: float = 5.0) -> int:
+    """取空队列残留行并丢弃,返回丢弃条数
+
+    持续取,直到连续 quiet_seconds 无新行或累计超过 max_seconds(两者取先到达
+    者)——回放尾巴靠"静默窗口"界定,不用固定 sleep 赌时长。
+    哨兵行(end/error)同样丢弃:它们属于已结束的上一请求。
+    """
+    dropped = 0
+    deadline = time.monotonic() + max_seconds
+    while time.monotonic() < deadline:
+        try:
+            q.get(timeout=quiet_seconds)
+        except queue.Empty:
+            break
+        dropped += 1
+    return dropped
+
+
 # ============================================================
 # ACP CLI 进程管理(通用,不绑定具体 CLI)
 # ============================================================
@@ -179,11 +211,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
         print(f"[bridge] {msg}", file=sys.stderr, flush=True)
 
     def do_GET(self):
-        """GET /health:健康检查"""
+        """GET /health:健康检查(附 bridge_protocol 供后端判定恢复能力)"""
         if self.path == "/health":
             alive = _cli is not None and _cli.alive
             status_code = 200 if alive else 503
-            body = json.dumps({"status": "ok" if alive else "cli_not_running"})
+            body = json.dumps({
+                "status": "ok" if alive else "cli_not_running",
+                "bridge_protocol": BRIDGE_PROTOCOL,
+            })
             self._send_json(status_code, body)
         else:
             self._send_json(404, json.dumps({"error": "not found"}))
@@ -353,6 +388,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
                             break
                     except json.JSONDecodeError:
                         continue
+
+                if request_method in _RESTORE_METHODS:
+                    # 会话恢复(session/load / session/resume):CLI 会把历史以
+                    # session/update 通知回放,尾巴可能拖到最终响应之后。无论请求
+                    # 正常收尾还是异常断开(后端 120s 读超时先断 → BrokenPipe),
+                    # 都在仍持有 _rpc_lock 时把残留行取空丢弃 —— 否则它们会涌进
+                    # 下一个请求(session/prompt)的流里,往轮历史会被当成本轮
+                    # 输出重复入库/推前端。
+                    dropped = _drain_queue(_cli._stdout_q)
+                    if dropped:
+                        print(
+                            f"[bridge] {request_method} 回放残留通知已排空({dropped} 行)",
+                            file=sys.stderr, flush=True,
+                        )
 
                 if not got_final:
                     # 流在收到最终响应前结束(读失败/EOF/CLI 退出/客户端断开):

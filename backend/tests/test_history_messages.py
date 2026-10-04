@@ -217,6 +217,33 @@ def test_build_history_messages_empty(monkeypatch):
     assert _build_history_messages(MagicMock(), "t", 5) == []
 
 
+def test_build_history_messages_forwards_since_round(monkeypatch):
+    """since_round(CLI 恢复链路的增量回放下界)透传给 _load_rounds_data;
+    默认 0 保持内置侧行为不变。"""
+    captured = {}
+
+    def fake_load(db, task_id, before_round, since_round=0):
+        captured["args"] = (before_round, since_round)
+        return []
+
+    monkeypatch.setattr(react_agent, "_load_rounds_data", fake_load)
+    _build_history_messages(MagicMock(), "t", 5, since_round=3)
+    assert captured["args"] == (5, 3)
+    _build_history_messages(MagicMock(), "t", 5)
+    assert captured["args"] == (5, 0)
+
+
+def test_load_rounds_data_since_round_bounds():
+    """since_round 已追平 before_round(-1)→ 开区间为空,不查库直接返回 []。"""
+    from app.agents.react_agent import _load_rounds_data
+
+    db = MagicMock()
+    assert _load_rounds_data(db, "t", before_round=5, since_round=4) == []
+    assert _load_rounds_data(db, "t", before_round=5, since_round=5) == []
+    assert _load_rounds_data(db, "t", before_round=1, since_round=0) == []
+    db.query.assert_not_called()
+
+
 def test_build_history_messages_level0_when_under_budget(monkeypatch):
     """总量在预算内 → Level 0(含工具摘要)"""
     rounds = [

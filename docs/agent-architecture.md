@@ -525,17 +525,37 @@ ExecutorAgent (ABC)
       → 同意返回 {outcome:selected, option_id:allow_once}(不记忆),拒绝返回 {outcome:rejected}
 15. [全新链路] client.initialize() → 跳过 authenticate(凭证经环境变量已自动认证;
     沙箱无 TTY 时 authenticate 会静默挂起)
-    → client.new_session(cwd=repo_path or BRIDGE_WORK_DIR;local 模式回退 session.local_dir)
-    [复用链路] 直接用缓存的 acp_session_id(不经 initialize/session_new)
+    → plan_session_open(init_result, 持久化会话记录, bridge_protocol, cwd) 判定怎么开会话
+      (runtime/acp_session.py;四项前置条件全过才恢复:CLI 声明能力 + 本任务该 CLI 有
+      prompt_accepted 的记录 + bridge 会排空回放通知 + cwd 与记录一致):
+      - 可恢复 → client.restore_session("session/resume"|"session/load", sessionId, cwd)
+        历史由 CLI 从自己磁盘 transcript 复原;通知一律丢弃,尾巴由 bridge 排空
+      - 不可恢复/恢复失败 → client.new_session(cwd);失败清记录**仅限 JSON-RPC 业务
+        错误**(会话确已不存在),传输层瞬时失败(httpx 超时/bridge 瞬断/ACPStreamAborted)
+        保留记录下轮再试——磁盘会话多半仍完好,清了就永久退回低保真文本回放
+    [复用链路] 直接用缓存的 acp_session_id(不经 initialize/开会话)
 16. [全新链路] post_session_setup(client, acp_session_id, task)  [wrapper 钩子]
     → deepseek_cli 用此调 set_config_option(model / reasoning_effort)
     → 之后把 session/bridge_exec_id/endpoint/acp_session_id/fingerprint/
-      injected_context_hash({},本 session 尚未注入过系统段)写入 _bridge_cache
+      injected_context_hash/prompt_accepted/last_accepted_round 写入 _bridge_cache
+      —— 新建 session:三项为 {} / False / 0,只在 prompt 成功返回后回写(步骤 20),
+        用来描述"这个 session 实际收到过什么",不能提前置真(此时 prompt 尚未发出);
+        恢复成功的 session:三项初始就是记录里的指纹 / True / 记录 round_idx(磁盘上已复原,
+        transcript 覆盖到该轮为止)
 17. _build_base_prompt(纯指令) → 按 (task_id, round_idx, role=user, type=question) 幂等查重,
     无记录才 _add_conversation 落库(首轮提问已在 create_task 时落库,此处跳过避免重复)
-18. _resolve_injection_plan(reused, 仓库上下文段, 记忆段)
-    → 复用同一 session 且某段逐字未变 → 该段置空(上一轮已发过,重发只是重复占 token)
-    → 走全新链路 → 两段全量注入,并 need_replay=True → _load_history_replay 回放之前轮次
+18. _resolve_injection_plan(injection_state, 仓库上下文段, 记忆段, round_idx)
+    → injection_state:复用命中→缓存条目;恢复成功→用记录指纹拼出的同构 dict;
+      新建 session→None。返回 (注入段, 注入段, 回放下界, 指纹),下界 None=不回放 /
+      0=全量回放 / k=增量回放(k < 轮次 < round_idx)
+    → 复用"已送达过"的 session 且某段逐字未变 → 该段置空(上一轮已发过,重发只是重复占 token)
+    → 走全新链路 **或复用一个 prompt 从未成功送达的空 session**(缓存条目
+      prompt_accepted 为假,见 _session_has_context)→ 两段全量注入 + 全量回放
+    → 复用/恢复的 session 有上下文,但 last_accepted_round 落后于 round_idx-1
+      (恢复 transcript 只覆盖到记录轮次,其后失败轮的提问进了 DB 却没进 transcript;
+      重试消息 build_retry_message 不复述原提问)→ **增量回放**补发缺失轮次,
+      注入段仍按指纹去重(更早轮次给过的段不重发)——否则失败轮提问静默丢失
+    → _load_history_replay(回放下界经 since_round 透传给 _build_history_messages)
       (数据源与内置侧同一条 _build_history_messages,渲染成单条 text;不传 client,
        CLI 执行链不依赖后端 LLM,超预算由兜底截断保留最近轮次)
     → 返回按"原内容"计算的注入段指纹(裁剪后的空内容不参与,下一轮仍可命中去重)
@@ -546,15 +566,28 @@ ExecutorAgent (ABC)
                                 # 后台线程周期性 renew 沙箱
       client.prompt(acp_session_id, [{"type":"text","text":user_msg}],
                     on_event=collector, idle_probe=lambda: collector.has_active_tools)
-    → 成功后 _remember_injected_context(task_id, 指纹) 写回缓存,供同 session 下一轮去重
-      (发送失败不记录 → 下一轮重新注入,不会漏上下文)
+    → 成功后 _record_prompt_accepted(task_id, 指纹, round_idx) 写回缓存:同时置
+      injected_context_hash / prompt_accepted=True / last_accepted_round → 下一轮
+      才能去重注入段并判定"还缺哪些轮次"
+    → 同时 save_session_record 把 sessionId/cwd/指纹/round_idx 写入
+      task.params["_acp_session"](仿 "_plan" 的跨轮持久化约定)——后端重启 /
+      bridge 重建后仍可凭 sessionId 让 CLI 恢复会话,而不是退回文本回放。
+      **截断兜底轮不推进记录**(build_session_record(truncated=True) 返回 None):
+      该轮内容可能没被 CLI 写进磁盘 transcript,round_idx 留在上一次干净轮,
+      恢复后的增量回放才能把它补上
+    → 发送失败(包括 JSON-RPC 业务错误 RuntimeError)不进这两行:缓存三事实都保持
+      "未送达"状态且不留下会话记录 → 下一轮全量重发注入段 + 重新回放历史(不漏上下文的保证)
+      注:idle 挂死超时与 ACPStreamAborted 在 prompt() 内部已降级为截断收尾并正常
+      返回 → 缓存侧记为已送达属正确行为(进程内 session 确实收到过该 prompt),
+      但持久化记录不推进(见上)
     → 挂死兜底:按活动工具状态分级 idle 超时 → session/cancel + 置 last_prompt_truncated → 返回空结果
     → 流异常兜底:CLI 崩溃/连接中断(ACPStreamAborted)走同款善后,不把崩溃当正常完成、不 fail 任务
 21. finally: recorder.close() + collector.close() → client.close()
 22. 外层 finally: **bridge 保持运行**(已在 _bridge_cache),不再每轮停止,供后续轮次/resume 复用;
     仅当未入缓存(初始化阶段失败)时 _stop_acp_bridge,避免残留坏进程
     → prompt 抛连接层异常(httpx.HTTPError / ConnectionError)时清缓存(bridge/CLI 已死),
-      下次走全新链路;ACP 业务错误保留缓存(session 仍有效)
+      下次走全新链路;ACP 业务错误保留缓存 —— 但保留的 session 未必持有上下文,
+      因此条目另有 prompt_accepted 标记(步骤 16/20),下一轮据此判定是否回放
     → 沙箱会话关闭 / 任务删除时由 stop_task_bridge(task_id) 主动停止并清缓存
 23. summary = collector.content_full or "执行完成({agent_type},{n} 次工具调用)"
     若 client.last_prompt_truncated:推 phase=error 事件「[本轮提前终止: ...]」
@@ -570,7 +603,7 @@ ExecutorAgent (ABC)
 - **省时**：命中时跳过「准备 CLI 环境 → 启 bridge → initialize → session/new」整条链路（~25s），并跳过 `session.get_endpoint` 端口转发（resume 场景实测最长 ~70s）
 - **会话延续**：CLI 进程不退出，ACP session 存于进程内，追问/续跑共用同一 session → CLI 自身能看到之前的对话（这是 CLI 侧跨轮记忆的首要手段，见 §4.4）
 - **失效判定**：沙箱会话对象变了（容器重建）/ `agent_type` 变了 / 指纹（acp_args + 凭证 env）变了 / `GET /health` 不通过 → 清缓存走全新链路（类型/指纹变化时先停旧 bridge 防端口冲突）
-- **失效后的补偿**：降为全新链路时新 session 对之前轮次一无所知 → 本轮回放历史（`_load_history_replay`，仅 `round_idx > 1`，构造异常则不注入，见 §4.4）
+- **失效后的补偿**：降为全新链路时,先按 `task.params["_acp_session"]` 里持久化的 sessionId 让 CLI 恢复自己的会话(需 CLI 声明能力 + bridge_protocol>=2 + cwd 一致,见 §4.4 归档);恢复不可用或失败才把之前轮次执行记录文本回放（`_load_history_replay`，仅 `round_idx > 1`，构造异常则不注入，见 §4.4）；复用命中但条目 `prompt_accepted=False`（上一轮业务性失败留下的空 session）同样走回放
 - **生命周期**：正常轮次结束 **不** 停 bridge；仅初始化失败（未入缓存）时停掉防残留，或连接层异常时清缓存，或由 `stop_task_bridge(task_id)`（沙箱会话关闭/任务删除）主动回收
 - **并发边界**：ACP over stdio 是串行协议（bridge 侧锁保护 send+collect 全程，同一时刻仅一个 prompt）；agent2 后台审查不经 bridge（它是进程内 LLM 调用），它与新轮 CLI 执行共享的是**同一沙箱会话**（只读核查 / verifier PoC 侧），详见 §1.2 并行世代门控
 
@@ -617,16 +650,16 @@ CLI 侧每轮构造单条 user 文本，由 `_compose_send_text` 按**稳定注�
 - 若有 `memory_summary`：`[项目记忆摘要] ... 完整项目记忆可 read_file /home/user/.agent_memory/project_memory.md 查阅`（数据经 `memory_injection.load_project_memory_brief` 单源加载，summary 为空回退 memory_content 截断——与内置侧回退行为一致）
 - 若有 `global_memory`：跨项目通用经验段
 
-> 记忆/仓库上下文两段在同一 session 内**不逐轮重发**：`_resolve_injection_plan` 按段各自比对指纹（`_context_sections_hash`，对齐 Codex `reference_context_item` 的 diff 思路），未变则跳过，变化（如归纳出新约束）则重新注入并在发送成功后回写指纹。
+> 记忆/仓库上下文两段在同一 session 内**不逐轮重发**：`_resolve_injection_plan` 按段各自比对指纹（`_context_sections_hash`，对齐 Codex `reference_context_item` 的 diff 思路），未变则跳过，变化（如归纳出新约束）则重新注入并在发送成功后回写指纹。去重与回放均仅对**确实送达过**的 session 生效：条目的 `prompt_accepted` 标记只在 `client.prompt()` 成功返回后置真，上一轮业务性失败留下的空 session 会被当作新 session 全量注入 + 回放（否则历史回放永不补发——2026-10 代码审查发现的失忆窗口，已修复）。
 
 > **注意**：CLI agent 不像内置 react_agent 那样维护 `messages` 列表，每轮 prompt 都是独立的 user 文本。跨轮记忆主要依赖：
 > 1. **bridge + ACP session 复用**（首要）：同一任务的 bridge/CLI 进程随沙箱会话存活，后续轮次/resume 用缓存的 `acp_session_id` 直接发 prompt，**CLI 侧对话上下文随 session 在进程内延续**（见 §4.3 步骤 7/15）
-> 2. **新 session 的历史回放**（兼容降级）：沙箱重建或指纹变化导致会话上下文丢失时，把之前轮次执行记录渲染成文本回放给 CLI（数据源与内置侧 `_build_history_messages` 同源，经 `build_cli_history_replay_section` 输出带 `[系统注入|此前轮次执行记录]` 标记的整段，防被当成新指令）
+> 2. **会话恢复优先,文本回放兜底**：重建链路时先试让 CLI 恢复自己磁盘上的 transcript(见下方归档),零 token 成本且含工具调用与思考过程;不可恢复(无能力/老 bridge/沙箱重建)或恢复失败时才把之前轮次执行记录渲染成文本回放给 CLI(数据源与内置侧 `_build_history_messages` 同源,经 `build_cli_history_replay_section` 输出带 `[系统注入|此前轮次执行记录]` 标记的整段,防被当成新指令)。“需回放”按条目 `prompt_accepted` 判定,因此上一轮业务性失败后的重试同样会回放
 > 3. `previous_plan` 注入（plan 状态续接）
 > 4. 项目记忆 + 全局记忆（同 session 内内容未变则不重发，见上方注入段去重）
-> 5. CLI 自身的会话恢复机制（如 Codex 的 `codex exec resume <thread_id>`，由 codex_bridge 在进程内维护；Qoder/dsh 的 ACP 级会话恢复探查见下方归档）
+> 5. CLI 自身的会话恢复机制：**Qoder / dsh 已经由后端接入 ACP 级恢复**(见下方归档);Codex 仍靠 `codex exec resume <thread_id>`，由 codex_bridge 在进程内维护(重启即失,尚未跨进程接入)
 
-> **会话持久化恢复（session/load / session/resume）——探查结论归档（2026-10，未接入）**：三个 CLI 的磁盘持久化与恢复能力经实测（Qoder）与源码核对（dsh、codex）确认如下，可作为后续"后端重启后按 sessionId 恢复会话"的接入依据（替代该场景下的文本回放：CLI 自身 transcript 保真度更高且零 token 成本）：
+> **会话持久化恢复（session/load / session/resume）——探查结论与接入实现（2026-10，Qoder + dsh 已接入，Codex 未接入）**：三个 CLI 的磁盘持久化与恢复能力经实测（Qoder）与源码核对（dsh、codex）确认如下。恢复成功时历史由 CLI 从自己磁盘 transcript 复原，保真度高于文本回放且零 token 成本，因此重建链路优先尝试恢复，失败才降级 `session/new` + 文本回放（两者互补）：
 >
 > | | Qoder CLI 1.1.65 | deepseek-harness (dsh) | Codex（codex_bridge） |
 > |---|---|---|---|
@@ -636,8 +669,15 @@ CLI 侧每轮构造单条 user 文本，由 `_compose_send_text` 按**稳定注�
 >
 > - `sessionCapabilities: {list, resume, close}` 扩展族已被 `@agentclientprotocol/sdk` 1.4.0 收编，Qoder 与 dsh 声明一致；统一走 `session/resume` 即可覆盖 Qoder + dsh，Qoder 另支持标准 `session/load`
 > - 恢复的会话**按 cwd 定位项目**：cwd 必须与原会话一致；沙箱重建后磁盘状态随容器销毁，resume 不可用——文本回放仍是必要兜底，两者互补
-> - 接入要点：① `acp_session_id` 与注入段指纹（`injected_context_hash`）需持久化到 DB——恢复的会话上下文已包含此前注入的仓库/记忆段，指纹不同步恢复会造成重复注入；② resume 后 CLI 会异步回放历史 `session/update` 通知（实测可持续到下一个请求期间），须在 `_ACPCollector` 创建前调用并排空，防止历史被当成本轮输出重复入库/推前端；③ resume 失败一律降级 `session/new` + 文本回放
-> - 已知缺口（2026-10 代码审查记录在案，未修复）：全新链路首轮 prompt 以业务性异常失败时（仅连接类异常清缓存），缓存条目保留，下一轮复用该从未收到过消息的空 session 时 `need_replay=False` 不回放——历史回放机制在此窗口失效；上述 sessionId 持久化 + resume 接入可一并解决该缺口
+> - 接入实现(2026-10):上述三个要点已全部落地。判定与记录读写在 [runtime/acp_session.py](../backend/app/agents/runtime/acp_session.py)(`plan_session_open` / `parse_restore_method` / `build_session_record` / `load_session_record` / `save`与`clear`),协议调用在 `ACPClient.restore_session`(通知丢弃,不接 on_event),执行侧降级链路在 `_restore_or_new_session`。具体门控：
+>   1. **能力探测不硬编码**：只看 `initialize` 响应的 `agentCapabilities`(`loadSession` / `sessionCapabilities.resume`),优先走 `session/resume`(Qoder + dsh 声明一致),次选 `session/load`;codex_bridge 返回空 capabilities → 自动走原来的 session/new 路径
+>   2. **记录持久化**：`prompt` 成功后才写 `task.params["_acp_session"]`(sessionId / cwd / `injected_context_hash` / round_idx),失败轮不留指针;任务中途换执行器时按 `agent_type` 隔离,不拿别家的 sessionId 去恢复
+>   3. **回放通知排空**：`acp_bridge.py` 对 `session/load` / `session/resume` 在流结束后(正常收尾或后端超时先断均可)继续按"静默窗口"取空残留行并丢弃(仍持 `_rpc_lock`),并在 `/health` 上报 `bridge_protocol=2`;后端只对 `bridge_protocol >= 2` 的 bridge 启用恢复 —— 沙箱内存活的旧 bridge(无该字段,视为 1)不会触发恢复,避免往轮历史串进下一个请求的流里重复入库/推前端
+>   4. **恢复失败的兜底**：业务错误清过期记录(不每轮撞同一死会话)+ `session/new` + 文本回放;传输层瞬时失败保留记录下轮再试(磁盘会话多半仍完好)
+>   5. **恢复的 session 当作"已有上下文"**：注入段指纹随记录一并恢复,`_resolve_injection_plan` 不重发已给过的仓库/记忆段;记录的 `round_idx` 兼作 `last_accepted_round`,落后于当前轮次时对缺失轮次做**增量回放**(见步骤 18)——恢复 transcript 只覆盖到记录轮次,其后失败轮的提问不补发就会随重试静默丢失
+>   6. **截断兜底轮不推进持久化记录**：idle 挂死/流中断被 prompt() 内部降级收尾时,该轮内容可能没被 CLI 写进磁盘 transcript,`build_session_record(truncated=True)` 返回 None,记录的 round_idx 留在上一次干净轮——之后恢复 + 增量回放才能把它补上(缓存侧照常记"已送达":进程内 session 确实收到过该 prompt)
+> - 尚未接入：Codex(`thread_id` 仍困在 codex_bridge 进程内存,需先透出并持久化 sessionId→thread_id 映射才能跳进程恢复)
+> - 已修复的缺口（2026-10 代码审查发现，同日修复）：全新链路首次 prompt 以业务性异常失败时（仅连接类异常清缓存），缓存条目保留，下一轮复用该从未收到过消息的空 session 时 `need_replay=False` 不回放——历史回放机制在此窗口失效。现由条目的 `prompt_accepted` 标记兜住：只在 `client.prompt()` 成功返回后置真（与注入段指纹同批回写），`_resolve_injection_plan` 对缺该标记为假的复用条目走全量注入 + 回放（旧格式条目缺 key 视为已送达，保持兼容）；回归测试见 `tests/test_acp_history_replay.py`。本节的 sessionId 持久化 + resume 接入已同步完成(见上方"接入实现"),同一场景现在拿到的是 CLI 自己的完整 transcript;**恢复/复用路径的同类缺口**(transcript 覆盖不到其后的失败轮,而重试消息不复述原提问)由 `last_accepted_round` 增量回放兜住(同轮审查发现的 major 问题,同批修复)
 
 ### 4.5 wrapper 层差异
 

@@ -1,10 +1,12 @@
 """CLI(ACP)执行器的跨轮上下文注入单测(纯函数,不连 DB / 不连沙箱)。
 
-覆盖三项修复(对齐 Codex 的上下文装配思路):
+覆盖三项修复(对齐 Codex 的上下文装配思路)+ 审查问题 A 的回归:
 - build_cli_history_replay_section:结构化历史消息 → CLI 单条 text 回放段
 - _load_history_replay:走全新 session 时回放之前轮次(异常/首轮降级为空)
-- _resolve_injection_plan + _remember_injected_context:同一 session 内
+- _resolve_injection_plan + _record_prompt_accepted:同一 session 内
   未变化的系统注入段不重复发送(按段独立指纹)
+- _session_has_context:上一轮 prompt 业务性失败留下的空 session 不得被当成
+  "有上下文",必须重新全量注入 + 回放(否则跨轮历史静默丢失)
 """
 from unittest.mock import MagicMock
 
@@ -13,8 +15,9 @@ import app.agents.react_agent as react_agent
 from app.agents.acp_base import (
     _context_sections_hash,
     _load_history_replay,
-    _remember_injected_context,
+    _record_prompt_accepted,
     _resolve_injection_plan,
+    _session_has_context,
 )
 from app.prompts.executor import SYSTEM_INJECT_MARKER, build_cli_history_replay_section
 from app.prompts.executor import build_cli_memory_section
@@ -153,17 +156,21 @@ def test_sections_hash_is_content_stable_and_distinguishes_change():
 
 
 def test_new_session_injects_everything_and_requests_replay():
-    """走全新链路:注入段全量发送 + 需要历史回放。"""
-    repo, mem, need_replay, _ = _resolve_injection_plan(None, "REPO", "MEM")
-    assert (repo, mem, need_replay) == ("REPO", "MEM", True)
+    """走全新链路:注入段全量发送 + 全量历史回放(replay_from=0)。"""
+    repo, mem, replay_from, _ = _resolve_injection_plan(None, "REPO", "MEM", round_idx=2)
+    assert (repo, mem, replay_from) == ("REPO", "MEM", 0)
 
 
 def test_reused_session_skips_unchanged_sections():
-    """复用 session 且注入段未变 → 两段都跳过,不再要求回放。"""
+    """复用已送达过的 session 且注入段未变 → 两段都跳过,不再要求回放。"""
     _, _, _, ctx_hash = _resolve_injection_plan(None, "REPO", "MEM")
-    reused = {"injected_context_hash": ctx_hash}
-    repo, mem, need_replay, again = _resolve_injection_plan(reused, "REPO", "MEM")
-    assert (repo, mem, need_replay) == ("", "", False)
+    reused = {
+        "injected_context_hash": ctx_hash,
+        "prompt_accepted": True,
+        "last_accepted_round": 3,
+    }
+    repo, mem, replay_from, again = _resolve_injection_plan(reused, "REPO", "MEM", round_idx=4)
+    assert (repo, mem, replay_from) == ("", "", None)
     # 指纹按原内容计算(被裁剪的段不参与),下一轮仍可继续命中
     assert again == ctx_hash
 
@@ -171,56 +178,166 @@ def test_reused_session_skips_unchanged_sections():
 def test_reused_session_reinjects_only_changed_section():
     """只有记忆段变化 → 记忆段重发,仓库上下文段仍跳过(分桶指纹)。"""
     _, _, _, first = _resolve_injection_plan(None, "REPO", "MEM1")
-    reused = {"injected_context_hash": first}
-    repo, mem, need_replay, _ = _resolve_injection_plan(reused, "REPO", "MEM2")
+    reused = {
+        "injected_context_hash": first,
+        "prompt_accepted": True,
+        "last_accepted_round": 3,
+    }
+    repo, mem, replay_from, _ = _resolve_injection_plan(reused, "REPO", "MEM2", round_idx=4)
     assert repo == ""
     assert mem == "MEM2"
-    assert need_replay is False
+    assert replay_from is None
 
 
 def test_reused_session_without_hash_record_injects_sections():
     """缓存里没有指纹(旧 entry / 首次记录前)→ 正常注入,不抛异常。"""
-    repo, mem, need_replay, _ = _resolve_injection_plan(
-        {"injected_context_hash": None}, "REPO", "MEM",
+    repo, mem, replay_from, _ = _resolve_injection_plan(
+        {"injected_context_hash": None, "prompt_accepted": True}, "REPO", "MEM", round_idx=2,
     )
-    assert (repo, mem, need_replay) == ("REPO", "MEM", False)
+    assert (repo, mem, replay_from) == ("REPO", "MEM", None)
     # 缺 key 同样安全
     repo, mem, _, _ = _resolve_injection_plan({}, "REPO", "MEM")
     assert (repo, mem) == ("REPO", "MEM")
 
 
-def test_remember_injected_context_updates_entry(monkeypatch):
-    """发送成功后把指纹写回 session 缓存,供下一轮去重。"""
-    cache = {"t1": {"acp_session_id": "s1"}}
+def test_record_prompt_accepted_updates_entry(monkeypatch):
+    """prompt 成功后同时回写指纹、"已收下"标记与送达轮次。"""
+    cache = {"t1": {"acp_session_id": "s1", "prompt_accepted": False}}
     monkeypatch.setattr(acp_base, "_bridge_cache", cache)
     ctx_hash = _context_sections_hash("REPO", "MEM")
-    _remember_injected_context("t1", ctx_hash)
+    _record_prompt_accepted("t1", ctx_hash, 3)
     assert cache["t1"]["injected_context_hash"] == ctx_hash
+    assert cache["t1"]["prompt_accepted"] is True
+    assert cache["t1"]["last_accepted_round"] == 3
 
 
-def test_remember_injected_context_tolerates_missing_entry(monkeypatch):
+def test_record_prompt_accepted_tolerates_missing_entry(monkeypatch):
     """缓存已被清(连接层失败/sandbox 销毁)→ 静默跳过,不抛 KeyError。"""
     monkeypatch.setattr(acp_base, "_bridge_cache", {})
-    _remember_injected_context("absent-task", _context_sections_hash("R", "M"))
+    _record_prompt_accepted("absent-task", _context_sections_hash("R", "M"), 1)
+
+
+# ============================================================
+# 业务性失败后的空 session 不得被当成"有上下文"(审查问题 A 回归)
+# ============================================================
+
+
+def test_failed_send_leaves_session_unmarked():
+    """prompt 抛异常时不走 _record_prompt_accepted → 标记仍为 False。"""
+    # 条目初态(全新链路写入值):未送达且无指纹
+    entry = {"acp_session_id": "s1", "injected_context_hash": {}, "prompt_accepted": False}
+    assert _session_has_context(entry) is False
+
+
+def test_unaccepted_reused_session_replays_and_reinjects():
+    """复用一个从未成功收到 prompt 的 session → 等同新链路:全量注入 + 全量回放。"""
+    reused = {
+        "acp_session_id": "s1", "injected_context_hash": {},
+        "prompt_accepted": False, "last_accepted_round": 0,
+    }
+    repo, mem, replay_from, _ = _resolve_injection_plan(reused, "REPO", "MEM", round_idx=2)
+    assert (repo, mem, replay_from) == ("REPO", "MEM", 0)
+
+
+def test_unaccepted_session_recovers_after_retry(monkeypatch):
+    """失忆窗口完整回归:业务失败轮不标记 → 重试轮全量回放 → 该轮成功后才收敛。"""
+    monkeypatch.setattr(acp_base, "perf_log", lambda *a, **kw: None)
+    db, task = MagicMock(), _mk_task()
+    replay_calls = []
+
+    def fake_build(_db, task_id, round_idx, *a, **kw):
+        replay_calls.append((round_idx, kw.get("since_round", 0)))
+        return [{"role": "user", "content": "第 2 轮原话"}]
+
+    monkeypatch.setattr(react_agent, "_build_history_messages", fake_build)
+    # 轮 2:全新链路 → 全量回放;prompt 业务性失败(未调 _record_prompt_accepted)
+    _, _, replay_from2, _ = _resolve_injection_plan(None, "REPO", "MEM", round_idx=2)
+    assert replay_from2 == 0
+    assert "第 2 轮原话" in _load_history_replay(db, task, 2, since_round=replay_from2)
+    entry = {
+        "acp_session_id": "s1", "injected_context_hash": {},
+        "prompt_accepted": False, "last_accepted_round": 0,
+    }
+    # 轮 3:用户重试 → _try_reuse_bridge 命中同一个空 session
+    repo3, mem3, replay_from3, _ = _resolve_injection_plan(entry, "", "MEM", round_idx=3)
+    assert replay_from3 == 0, "空 session 必须重新回放,否则第 1~2 轮历史静默丢失"
+    assert mem3 == "MEM", "该 session 从未收到过记忆段,不能指纹去重"
+    _load_history_replay(db, task, 3, since_round=replay_from3)
+    assert replay_calls == [(2, 0), (3, 0)]
+    # 本轮发送成功 → 标记+指纹+轮次回写,后续轮回到正常去重路径
+    entry["injected_context_hash"] = _context_sections_hash("", "MEM")
+    entry["prompt_accepted"] = True
+    entry["last_accepted_round"] = 3
+    repo4, mem4, replay_from4, _ = _resolve_injection_plan(entry, "", "MEM", round_idx=4)
+    assert (repo4, mem4, replay_from4) == ("", "", None)
+    assert replay_calls == [(2, 0), (3, 0)]  # 第 4 轮不再回放
+
+
+def test_incremental_replay_covers_rounds_missing_from_restored_session(monkeypatch):
+    """恢复会话的失忆窗口回归(审查 major 问题):transcript 只覆盖到记录轮次,
+    其后失败轮的提问必须增量补发,否则重试轮的提问(不复述原话)静默丢失。"""
+    monkeypatch.setattr(acp_base, "perf_log", lambda *a, **kw: None)
+    db, task = MagicMock(), _mk_task()
+    replay_ranges = []
+
+    def fake_build(_db, _task_id, round_idx, *a, **kw):
+        replay_ranges.append((kw.get("since_round", 0), round_idx))
+        return [{"role": "user", "content": f"第 {round_idx - 1} 轮原话"}]
+
+    monkeypatch.setattr(react_agent, "_build_history_messages", fake_build)
+    # 第 3 轮成功 → 记录 round_idx=3;第 4 轮恢复成功后 prompt 业务性失败
+    # (缓存条目保留 prompt_accepted=True + last_accepted_round=3)
+    entry = {
+        "acp_session_id": "s1", "injected_context_hash": _context_sections_hash("", "MEM"),
+        "prompt_accepted": True, "last_accepted_round": 3,
+    }
+    # 第 5 轮:用户重试(合成重试消息,不复述第 4 轮提问)→ 复用命中
+    repo, mem, replay_from, _ = _resolve_injection_plan(entry, "", "MEM", round_idx=5)
+    assert replay_from == 3, "transcript 只到第 3 轮,第 4 轮提问必须增量补发"
+    assert mem == "", "第 3 轮已给过记忆段,增量回放轮不重复注入"
+    replay = _load_history_replay(db, task, 5, since_round=replay_from)
+    assert "第 4 轮原话" in replay
+    assert "第 2 轮原话" not in replay, "≤3 轮已在 transcript 里,不在增量回放范围"
+    assert replay_ranges == [(3, 5)]
+    # 增量回放轮发送成功 → 轮次推进到 5,下一轮不再回放
+    entry["last_accepted_round"] = 5
+    _, _, replay_from_next, _ = _resolve_injection_plan(entry, "", "MEM", round_idx=6)
+    assert replay_from_next is None
+
+
+def test_restored_session_up_to_date_needs_no_replay():
+    """恢复/复用的会话已覆盖到 round_idx-1 → 不回放(正常追问轮)。"""
+    entry = {"injected_context_hash": {}, "prompt_accepted": True, "last_accepted_round": 4}
+    _, _, replay_from, _ = _resolve_injection_plan(entry, "", "MEM", round_idx=5)
+    assert replay_from is None
+
+
+def test_legacy_entry_without_marker_is_treated_as_accepted():
+    """旧条目缺 prompt_accepted key → 视为已送达(不因热更新遗留条目白白多回放)。"""
+    assert _session_has_context({"injected_context_hash": {}}) is True
+    repo, mem, replay_from, _ = _resolve_injection_plan(
+        {"injected_context_hash": {}}, "REPO", "MEM", round_idx=3,
+    )
+    assert (repo, mem, replay_from) == ("REPO", "MEM", None)
 
 
 def test_dedup_round_trip_over_two_rounds():
     """模拟同 session 连续两轮:第 2 轮不再重复发送记忆段。"""
     memory = build_cli_memory_section("PROJECT_MEM", "GLOBAL_MEM")
     # 第 1 轮:新 session,全量注入
-    repo1, mem1, _, hash1 = _resolve_injection_plan(None, "REPO", memory)
+    repo1, mem1, _, hash1 = _resolve_injection_plan(None, "REPO", memory, round_idx=1)
     assert mem1 == memory
-    reused = {"injected_context_hash": hash1}
+    reused = {"injected_context_hash": hash1, "prompt_accepted": True, "last_accepted_round": 1}
     # 第 2 轮(追问轮:预 clone 段不再拼,记忆段逐字未变)
-    repo2, mem2, need_replay, _ = _resolve_injection_plan(reused, "", memory)
-    assert repo2 == "" and mem2 == "" and need_replay is False
+    repo2, mem2, replay_from, _ = _resolve_injection_plan(reused, "", memory, round_idx=2)
+    assert repo2 == "" and mem2 == "" and replay_from is None
     # 记忆内容发生变化(如归纳出新约束)→ 重新注入
-    _, mem3, _, _ = _resolve_injection_plan(reused, "", memory + "\n新约束")
+    _, mem3, _, _ = _resolve_injection_plan(reused, "", memory + "\n新约束", round_idx=2)
     assert "新约束" in mem3
 
 
 def test_replay_is_one_shot_per_session(monkeypatch):
-    """回放只在新 session 首轮发生:同 session 后续轮(need_replay=False)不重发。"""
+    """回放只在新 session 首轮发生:同 session 后续轮(replay_from=None)不重发。"""
     monkeypatch.setattr(acp_base, "perf_log", lambda *a, **kw: None)
     calls = []
 
@@ -230,14 +347,19 @@ def test_replay_is_one_shot_per_session(monkeypatch):
 
     monkeypatch.setattr(react_agent, "_build_history_messages", fake_build)
     db, task = MagicMock(), _mk_task()
-    # 轮 3 走全新链路 → 回放;轮 4 复用同一 session → 不回放
-    _, _, need_replay3, _ = _resolve_injection_plan(None, "REPO", "MEM")
-    if need_replay3:
-        _load_history_replay(db, task, 3)
-    _, _, need_replay4, _ = _resolve_injection_plan(
-        {"injected_context_hash": _context_sections_hash("REPO", "MEM")}, "REPO", "MEM",
+    # 轮 3 走全新链路 → 回放;轮 4 复用同一 session(轮次已追平)→ 不回放
+    _, _, replay_from3, _ = _resolve_injection_plan(None, "REPO", "MEM", round_idx=3)
+    assert replay_from3 == 0
+    _load_history_replay(db, task, 3, since_round=replay_from3)
+    _, _, replay_from4, _ = _resolve_injection_plan(
+        {
+            "injected_context_hash": _context_sections_hash("REPO", "MEM"),
+            "prompt_accepted": True,
+            "last_accepted_round": 3,
+        },
+        "REPO", "MEM", round_idx=4,
     )
-    assert need_replay4 is False
-    replay4 = _load_history_replay(db, task, 4) if need_replay4 else ""
+    assert replay_from4 is None
+    replay4 = _load_history_replay(db, task, 4) if replay_from4 is not None else ""
     assert replay4 == ""
     assert calls == [3]  # 只有轮 3 真正构造过历史

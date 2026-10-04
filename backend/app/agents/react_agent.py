@@ -854,6 +854,7 @@ def _estimate_tokens(text: str) -> int:
 def _build_history_messages(
     db: Session, task_id, current_round_idx: int,
     client: LLMClient | None = None,
+    since_round: int = 0,
 ) -> list[dict[str, Any]]:
     """构造之前轮次的结构化对话记忆(保留角色边界),三级压缩控制 token 成本
 
@@ -866,6 +867,10 @@ def _build_history_messages(
       反馈,模型能区分"谁说的";用户原话首次进入历史(旧版只有总结,
       原始任务指令在追问轮会丢失)
     - 系统注入内容(工具摘要/评审反馈)带 [系统注入|...] 边界标记
+
+    since_round(仅 CLI 恢复链路使用,内置侧恒 0):只装载
+    (since_round, current_round_idx) 开区间内的轮次——恢复出来的 CLI
+    会话已自带 ≤ since_round 的 transcript,增量回放只补它没见过的轮次。
 
     三级压缩(按 _estimate_tokens 粗估预算):
     - Level 0(完整):用户原话 + 工具调用摘要 + 执行总结 + 评审反馈
@@ -887,7 +892,9 @@ def _build_history_messages(
 
     返回 messages 列表(可能为空)。第 1 轮(current_round_idx=1)无历史。
     """
-    rounds_data = _load_rounds_data(db, task_id, before_round=current_round_idx)
+    rounds_data = _load_rounds_data(
+        db, task_id, before_round=current_round_idx, since_round=since_round,
+    )
     if not rounds_data:
         return []
 
@@ -957,14 +964,15 @@ def _build_history_messages(
 
 
 def _load_rounds_data(
-    db: Session, task_id, before_round: int,
+    db: Session, task_id, before_round: int, since_round: int = 0,
 ) -> list[dict[str, Any]]:
-    """加载 before_round 之前各轮的结构化数据(历史注入与预压缩共用)
+    """加载 (since_round, before_round) 开区间内各轮的结构化数据(历史注入与预压缩共用)
 
     每轮提取:question(用户原话)/ tool_summary(工具调用摘要)/
     assistant_summary(执行总结)/ review(评审反馈)/ priority(降级优先级)。
+    区间为空(含 since_round 已追平 before_round)时返回 []。
     """
-    if before_round <= 1:
+    if before_round <= 1 or since_round >= before_round - 1:
         return []
 
     # 查询目标轮次之前的所有对话(排除 history_compress 缓存记录)
@@ -973,6 +981,7 @@ def _load_rounds_data(
         .filter(
             Conversation.task_id == task_id,
             Conversation.round_idx < before_round,
+            Conversation.round_idx > since_round,
             Conversation.type != "history_compress",
         )
         .order_by(Conversation.round_idx, Conversation.created_at)

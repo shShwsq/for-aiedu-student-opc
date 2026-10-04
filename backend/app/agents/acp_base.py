@@ -12,7 +12,8 @@
 4. 将 acp_bridge.py 写入沙箱/local 临时目录,后台启动
    (sandbox:沙箱内固定 ACP_BRIDGE_PORT;local:宿主机动态端口),凭证经 envs 注入
 5. 通过 get_endpoint(port) 获取转发地址 + headers(local 直接 127.0.0.1:port)
-6. ACP 客户端:initialize → session/new → [post_session_setup],随后写入缓存
+6. ACP 客户端:initialize → 打开会话(优先恢复 CLI 自己落盘的会话
+   session/resume / session/load,否则 session/new)→ [post_session_setup],随后写入缓存
 7. session/prompt 流式接收 session/update 通知,翻译为 event_bus 事件
 8. 收集最终 summary,提取 plan,返回 (results, summary, plan)
 
@@ -20,10 +21,23 @@ bridge 不在每轮结束时停止:进程随沙箱会话存活,供后续轮次/r
 (省去 ensure_cli_env/start_bridge/initialize/new_session 合计 ~25s);
 沙箱会话销毁(close_session)时经 stop_task_bridge 清缓存,容器销毁连带回收进程。
 
-上下文注入两个约定(详见 _load_history_replay / _context_sections_hash):
+上下文注入三个约定(详见 _resolve_injection_plan / _load_history_replay / _session_has_context):
 - 走全新链路(新 session)的追问轮会把之前轮次执行记录回放给 CLI
   —— 新 session 看不到上一轮的对话,否则只剩"基于之前的执行进度"无从续接
 - 复用同一 session 时,未变化的注入段(仓库上下文/记忆段)不重发,避免重复占 token
+- 只有 prompt 成功返回才记"该 session 已收下上下文";上一轮业务性失败留下的空
+  session 会被当作新 session 全量注入 + 回放(否则历史永不补发)
+
+会话恢复(保真度优于文本回放,两者互补,详见 runtime/acp_session.py):
+- prompt 成功后把 sessionId/cwd/注入段指纹/round_idx 持久化到 task.params["_acp_session"]
+- 重建链路时,若 CLI 在 initialize 里声明了恢复能力且 bridge 会排空回放通知
+  (bridge_protocol >= 2),先恢复会话(历史由 CLI 从磁盘 transcript 复原);
+  恢复时通知一律丢弃,尾巴由 bridge 排空,否则会污染本轮落库
+- 恢复/复用的会话只覆盖到 last_accepted_round:其后失败轮的提问进了 DB 却
+  没进 transcript(重试消息不复述原提问),按 last_accepted_round **增量回放**
+  补发缺失轮次;截断兜底轮不推进记录(内容可能没落 CLI 磁盘)
+- 恢复失败/能力不具备(如 codex_bridge)→ session/new + 全量文本回放,行为与原先一致;
+  恢复仅因 JSON-RPC 业务错误清持久化记录,传输层瞬时失败保留记录下轮再试
 
 各 wrapper 的差异通过回调/参数注入:
 - post_session_setup(client, session_id, task):session/new 之后、prompt 之前执行
@@ -60,6 +74,14 @@ from app.agents.registry import get_agent_meta, get_sandbox_config
 # 对话落库 + SSE 推送:runtime 统一实现(与 react_agent / agent2 / verifier
 # 同源;别名保持 _add_conversation 模块名,存量 monkeypatch 兼容面不变)
 from app.agents.runtime.conversation import record_conversation as _add_conversation
+# ACP 会话持久化与恢复决策(依赖 CLI 自己落盘的会话,见该模块 docstring)
+from app.agents.runtime.acp_session import (
+    build_session_record,
+    clear_session_record,
+    load_session_record,
+    plan_session_open,
+    save_session_record,
+)
 from app.config import settings
 from app.event_bus import publish
 from app.models.task import Conversation, Task
@@ -554,6 +576,32 @@ class ACPClient:
         if not session_id:
             raise RuntimeError(f"ACP session/new 未返回 sessionId: {result}")
         return session_id
+
+    def restore_session(
+        self,
+        method: str,
+        session_id: str,
+        cwd: str,
+        timeout: httpx.Timeout | float | None = 120,
+    ) -> dict:
+        """按 sessionId 恢复 CLI 自己持久化的会话(session/load / session/resume)
+
+        与 session/new 的区别:上下文由 CLI 从磁盘 transcript 复原(含工具调用与
+        思考过程),比后端把历史渲染成文本回放保真度更高且不占 prompt token。
+        params 按 ACP 必须含 sessionId/cwd/mcpServers(CLI 按 cwd 定位项目会话)。
+
+        通知一律丢弃(不传 on_event):恢复时 CLI 会把历史以 session/update 回放,
+        那些是"往轮"内容,已落库过一次,绝不能再进本轮 collector;回放拖到
+        最终响应之后的尾巴由 bridge 排空(_drain_queue),因此调用方仅对
+        bridge_protocol >= 2 的 bridge 启用本方法。
+        失败(会话不存在/磁盘状态已丢/CLI 不支持)由调用方降级 session/new。
+        """
+        return self._rpc({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": {"sessionId": session_id, "cwd": cwd, "mcpServers": []},
+            "id": self._next_id(),
+        }, timeout=timeout)
 
     def set_config_option(
         self, session_id: str, config_id: str, value: str
@@ -1059,9 +1107,11 @@ def _start_acp_bridge(
 def _wait_for_bridge_ready(
     session, execution_id: str, endpoint_url: str, endpoint_headers: dict[str, str],
     agent_type: str = "",
-) -> None:
-    """等待 bridge HTTP 服务就绪(健康检查轮询)
+) -> dict[str, Any]:
+    """等待 bridge HTTP 服务就绪(健康检查轮询),返回 /health payload
 
+    payload 含 bridge_protocol(会话恢复排空能力的版本门控,见
+    runtime/acp_session.BRIDGE_PROTOCOL_REPLAY_SAFE)。
     超时(BRIDGE_STARTUP_TIMEOUT 秒)未就绪时,读取 bridge 日志辅助排查并抛错。
     """
     deadline = time.time() + BRIDGE_STARTUP_TIMEOUT
@@ -1093,7 +1143,7 @@ def _wait_for_bridge_ready(
                     data = resp.json()
                     if data.get("status") == "ok":
                         logger.info(f"[{agent_type}] ACP bridge 就绪")
-                        return
+                        return data
                     else:
                         logger.debug(f"[{agent_type}] health 200 但状态非 ok: {data}")
                 else:
@@ -1260,17 +1310,33 @@ def _bridge_fingerprint(acp_args: list[str], credential_envs: dict[str, str]) ->
     )
 
 
-def _bridge_alive(endpoint_url: str, endpoint_headers: dict[str, str]) -> bool:
-    """健康检查:缓存的 bridge 及其 CLI 进程是否仍存活"""
+def _bridge_health(endpoint_url: str, endpoint_headers: dict[str, str]) -> dict[str, Any]:
+    """健康检查:返回 {"alive": bool, "protocol": int}
+
+    protocol 取自 /health 的 bridge_protocol;无该字段(或请求失败)视为 1,
+    即不会排空会话恢复的回放通知 → 不得尝试 session/load / session/resume
+    (否则往轮历史会被当成本轮输出污染落库)。常量含义见
+    runtime/acp_session.BRIDGE_PROTOCOL_REPLAY_SAFE。
+    """
     try:
         with httpx.Client(headers=endpoint_headers, timeout=5) as hc:
             resp = hc.get(f"{endpoint_url}/health")
-            return (
-                resp.status_code == 200
-                and (resp.json() or {}).get("status") == "ok"
-            )
+            if resp.status_code != 200:
+                return {"alive": False, "protocol": 1}
+            payload = resp.json() or {}
+            alive = payload.get("status") == "ok"
+            try:
+                protocol = int(payload.get("bridge_protocol") or 1)
+            except (TypeError, ValueError):
+                protocol = 1
+            return {"alive": alive, "protocol": protocol}
     except Exception:
-        return False
+        return {"alive": False, "protocol": 1}
+
+
+def _bridge_alive(endpoint_url: str, endpoint_headers: dict[str, str]) -> bool:
+    """健康检查:缓存的 bridge 及其 CLI 进程是否仍存活"""
+    return _bridge_health(endpoint_url, endpoint_headers)["alive"]
 
 
 def _try_reuse_bridge(
@@ -2306,49 +2372,147 @@ def _context_sections_hash(
     }
 
 
-def _remember_injected_context(task_id: str, ctx_hash: dict[str, str]) -> None:
-    """把本轮注入段指纹写回 session 缓存(缓存不在则静默跳过)"""
+def _record_prompt_accepted(
+    task_id: str, ctx_hash: dict[str, str], round_idx: int,
+) -> None:
+    """prompt 成功送达后的善后:回写注入段指纹 + "已收下消息"标记 + 送达轮次
+
+    三个事实一起记是有意为之:指纹只判"内容是否已给过这个 session",
+    last_accepted_round 判"transcript 覆盖到哪一轮",而业务性失败轮不走到
+    这里 → 一起保持在"尚未送达"状态,下一轮全量重发 + 回放历史。
+    缓存不在(已清/已停)则静默跳过。
+    """
     with _bridge_cache_lock:
         entry = _bridge_cache.get(task_id)
         if entry is not None:
             entry["injected_context_hash"] = ctx_hash
+            entry["prompt_accepted"] = True
+            entry["last_accepted_round"] = round_idx
+
+
+def _session_has_context(reused: dict[str, Any]) -> bool:
+    """该 session 是否真的已持有之前的对话上下文(至少成功收下过一次 prompt)
+
+    为何需要这个标记:条目在 session/new 后、prompt 前就写入缓存,而 prompt 抛
+    JSON-RPC 业务错误(RuntimeError)时保留缓存 —— 此时 CLI 进程仍存活、/health
+    通过,下一轮会复用一个从未收到过消息的空 session。若仅凭 reused 非空就判定
+    "上下文随 session 延续",跨轮历史回放永不执行(失忆窗口)。
+    旧条目缺该 key 时视为已送达(写入时已显式置 False,只有历史遗留条目会走到
+    默认分支 —— 它们旧版链路总是先写缓存紧接发 prompt,session 确实有上下文)。
+    """
+    return bool(reused.get("prompt_accepted", True))
 
 
 def _resolve_injection_plan(
     reused: dict[str, Any] | None,
     repo_ctx_section: str,
     memory_section: str,
-) -> tuple[str, str, bool, dict[str, str]]:
-    """决定本轮的系统注入内容(注入策略集中在此,便于单测)
+    round_idx: int = 0,
+) -> tuple[str, str, int | None, dict[str, str]]:
+    """决定本轮的系统注入与历史回放内容(注入策略集中在此,便于单测)
 
-    返回 (实际注入的仓库上下文段, 实际注入的记忆段, 是否需要历史回放, 注入段指纹):
+    返回 (实际注入的仓库上下文段, 实际注入的记忆段, 回放下界, 注入段指纹)。
+    回放下界 replay_from:None=不回放;0=全量回放(轮次 < round_idx);
+    k>0=增量回放(k < 轮次 < round_idx,session 已覆盖 ≤k 的轮次)。
 
-    - 复用同一 session(reused 非空)且某注入段逐字未变 → 该段置空:上一轮已
-      发过,内容已在 CLI 侧对话上下文里,重发只是重复占 token(对齐 Codex
-      reference_context_item 的 diff 思路);另一段变化不影响本判定
     - 走全新链路(reused 为空,含沙箱重建/后端重启/启动参数或凭证变化)→
-      session 对之前轮次一无所知,需回放历史,且注入段全量重发
+      session 对之前轮次一无所知,全量回放,且注入段全量重发
+    - 复用 session 但上一轮 prompt 从未成功送达(缓存条目 prompt_accepted 为假,
+      如 JSON-RPC 业务错误保留缓存而 CLI 仍存活)→ 同全新链路处理:注入段全量
+      重发 + 全量回放(否则第 1~N-1 轮上下文会静默丢失)
+    - 复用/恢复已送达过的 session,但 last_accepted_round 落后于 round_idx-1
+      (恢复会话只覆盖到记录轮次,其后失败轮的提问从没进过 transcript;重试消息
+      build_retry_message 不复述原提问)→ 对缺失轮次做**增量回放**;注入段仍按
+      指纹去重(更早轮次给过的段不重发)
+    - 复用已送达过的 session 且某注入段逐字未变 → 该段置空:上一轮已发过,
+      内容已在 CLI 侧对话上下文里,重发只是重复占 token(对齐 Codex
+      reference_context_item 的 diff 思路);另一段变化不影响本判定
     - 指纹永远按未裁剪的原内容计算:内容变化时指纹变化 → 下一轮重新注入
+    - 旧格式条目缺 last_accepted_round 时视为"不缺轮次"(热更新遗留条目,
+      与接入前行为一致,不凭空多回放)
     """
     ctx_hash = _context_sections_hash(repo_ctx_section, memory_section)
-    if reused is None:
-        return repo_ctx_section, memory_section, True, ctx_hash
+    if reused is None or not _session_has_context(reused):
+        # 新 session / 复用一个实际空白的 session:全量注入 + 全量回放
+        return repo_ctx_section, memory_section, 0, ctx_hash
 
     previous = reused.get("injected_context_hash") or {}
-    return (
-        "" if previous.get("repo") == ctx_hash["repo"] else repo_ctx_section,
-        "" if previous.get("memory") == ctx_hash["memory"] else memory_section,
-        False,
-        ctx_hash,
-    )
+    repo_out = "" if previous.get("repo") == ctx_hash["repo"] else repo_ctx_section
+    mem_out = "" if previous.get("memory") == ctx_hash["memory"] else memory_section
+
+    last_round = reused.get("last_accepted_round")
+    if isinstance(last_round, int) and round_idx >= 1 and last_round < round_idx - 1:
+        # session 有上下文但缺 (last_round, round_idx) 的轮次:增量补发
+        return repo_out, mem_out, last_round, ctx_hash
+    return repo_out, mem_out, None, ctx_hash
 
 
-def _load_history_replay(db: Session, task: Task, round_idx: int) -> str:
-    """构造"之前轮次执行记录"回放段(仅新建 ACP session 时需要)
+def _restore_or_new_session(
+    client: ACPClient,
+    decision: dict[str, Any],
+    *,
+    db: Session,
+    task: Task,
+    agent_type: str,
+    session,
+    bridge_exec_id: str,
+    cwd: str,
+) -> tuple[str, bool, str]:
+    """按恢复决策打开 ACP 会话,返回 (acp_session_id, 是否恢复成功, 结果标记)
+
+    decision 来自 runtime.acp_session.plan_session_open;结果标记供日志/perf 定位
+    本轮到底走了哪条链路("restored" / "new" / "restore_failed_new")。
+
+    - decision 无 method → 直接 session/new(下游靠 _load_history_replay 文本回放)
+    - 恢复失败(会话已被清理 / 磁盘状态随沙箱销毁 / CLI 实际不支持)→ 降级新建,
+      并删除过期记录,避免每轮都撞一次;**仅 JSON-RPC 业务错误清记录**——
+      传输层瞬时失败(httpx 超时/bridge 瞬断/ACPStreamAborted)磁盘会话多半仍
+      完好,保留记录下轮再试,不清就永久退回低保真文本回放
+    - session/new 失败时把 bridge 里的 CLI stderr 附进异常:-32603 Internal error
+      的 JSON-RPC 响应只有泛化消息,真实异常在 CLI stderr(经 _pump_stderr 转发)
+    """
+    if decision.get("method"):
+        try:
+            client.restore_session(
+                decision["method"], decision["session_id"], decision["cwd"],
+            )
+            return str(decision["session_id"]), True, "restored"
+        except Exception as e:
+            transient = isinstance(
+                e, (httpx.HTTPError, ConnectionError, ACPStreamAborted)
+            )
+            logger.warning(
+                f"[{agent_type}] 会话恢复失败({decision['method']}, "
+                f"sessionId={decision['session_id']}, "
+                f"{'传输层瞬时失败,保留记录下轮再试' if transient else '业务错误,清除记录'}),"
+                f"降级 session/new: {e}"
+            )
+            if not transient:
+                clear_session_record(db, task, agent_type)
+
+    try:
+        return client.new_session(cwd=cwd), False, (
+            "restore_failed_new" if decision.get("method") else "new"
+        )
+    except RuntimeError as e:
+        bridge_detail = _extract_bridge_error(session, bridge_exec_id, agent_type)
+        if bridge_detail:
+            raise RuntimeError(f"{e}\n\n[CLI 日志]\n{bridge_detail}") from e
+        raise
+
+
+def _load_history_replay(
+    db: Session, task: Task, round_idx: int, since_round: int = 0,
+) -> str:
+    """构造"之前轮次执行记录"回放段(仅新建/恢复的 ACP session 需要)
 
     背景:ACP session 复用时,之前轮次的对话上下文留在 CLI 进程内自然延续;
     但沙箱重建 / 后端重启 / 启动参数或凭证变化都会走全新链路(session/new),
     新 session 对之前轮次一无所知,追问轮只剩"基于之前的执行进度"就无从续接。
+
+    since_round:增量回放下界(= 恢复/复用会话已覆盖的最后一轮)。全量回放
+    传 0(装载全部 < round_idx 的轮次);恢复的会话只缺最近失败轮时传
+    last_accepted_round,只补它没见过的轮次。
 
     数据源与内置 react_agent 完全同源(_build_history_messages:同一张
     Conversation 表 + 三级压缩 + token 预算),此处只多一步"结构化消息 →
@@ -2367,7 +2531,9 @@ def _load_history_replay(db: Session, task: Task, round_idx: int) -> str:
         # 函数级导入:CLI 侧不在模块加载期依赖内置 agent
         from app.agents.react_agent import _build_history_messages
 
-        messages = _build_history_messages(db, task.id, round_idx)
+        messages = _build_history_messages(
+            db, task.id, round_idx, since_round=since_round,
+        )
     except Exception as e:
         logger.warning(f"[task={task.id}] 构造跨轮历史回放失败(忽略,本轮不注入): {e}")
         return ""
@@ -2375,7 +2541,7 @@ def _load_history_replay(db: Session, task: Task, round_idx: int) -> str:
     # [perf] 跨轮历史回放构造(走新 session 的追问轮才执行,含 DB 查询)
     perf_log(
         task.id, "acp_history_replay", time.perf_counter() - _t0,
-        round_idx=round_idx, replay_chars=len(section),
+        round_idx=round_idx, since_round=since_round, replay_chars=len(section),
     )
     return section
 
@@ -2470,6 +2636,15 @@ def run_acp_agent(
     session = ctx["session"]
     repo_path = ctx.get("repo_path", "")
 
+    # 会话工作目录(新建/恢复都用同一个值,并随会话记录持久化):
+    # CLI 按 cwd 定位自己的项目会话目录(如 ~/.qoder/projects/<cwd>/...),
+    # 不一致时恢复必然失败,因此判定与持久化都用这一个口径。
+    # local 模式 fallback 用 local_dir(宿主机上无 /home/user)
+    if getattr(session, "mode", "") == "local":
+        cwd = repo_path or str(session.local_dir)
+    else:
+        cwd = repo_path or BRIDGE_WORK_DIR
+
     # ---- 加载项目记忆精简版(注入 CLI prompt,完整记忆已在沙箱文件中) ----
     memory_summary = _load_project_memory_summary(db, task)
     # ---- 加载全局长期记忆(跨项目通用经验,影响执行方式) ----
@@ -2529,13 +2704,23 @@ def run_acp_agent(
         endpoint_url, endpoint_headers = session.get_endpoint(bridge_port)
         perf_log(task.id, "acp_get_endpoint", time.perf_counter() - _t0, agent_type=agent_type)
 
+    # 会话恢复相关状态(复用链路不恢复,保持默认值)
+    session_restored = False
+    restored_hash: dict[str, str] = {}
+    restored_round = 0
+    restore_method_used: str | None = None
+
     try:
         if reused is None:
             _t0 = time.perf_counter()
-            _wait_for_bridge_ready(
+            bridge_health = _wait_for_bridge_ready(
                 session, bridge_exec_id, endpoint_url, endpoint_headers, agent_type
             )
             perf_log(task.id, "acp_wait_bridge_ready", time.perf_counter() - _t0, agent_type=agent_type)
+            try:
+                bridge_protocol = int(bridge_health.get("bridge_protocol") or 1)
+            except (TypeError, ValueError):
+                bridge_protocol = 1
 
         # ---- ACP 通信 ----
         recorder = _ACPRecorder(task.id, round_idx)
@@ -2588,26 +2773,30 @@ def run_acp_agent(
                         f"authMethods={[m.get('id') for m in auth_methods]}"
                     )
 
-                # 创建会话(cwd 设为仓库路径)
-                # local 模式 fallback 用 local_dir(宿主机上无 /home/user)
-                if getattr(session, "mode", "") == "local":
-                    cwd = repo_path or str(session.local_dir)
-                else:
-                    cwd = repo_path or BRIDGE_WORK_DIR
+                # 打开会话:优先让 CLI 恢复自己磁盘上持久化的会话(含工具调用与
+                # 思考过程,保真度高于文本回放且不占 prompt token);判定不满足或
+                # 恢复失败则新建 session(新建后由 _load_history_replay 文本回放兜底)
+                restore = plan_session_open(
+                    init_result=init_result,
+                    record=load_session_record(task.params, agent_type),
+                    bridge_protocol=bridge_protocol,
+                    cwd=cwd,
+                )
                 _t0 = time.perf_counter()
-                try:
-                    acp_session_id = client.new_session(cwd=cwd)
-                except RuntimeError as e:
-                    # session/new 失败时提取 bridge 日志中的 CLI stderr(含 Python traceback),
-                    # -32603 Internal error 时 JSON-RPC 响应只有泛化消息,
-                    # 真实异常在 CLI 的 stderr 里(经 bridge _pump_stderr 转发)
-                    bridge_detail = _extract_bridge_error(
-                        session, bridge_exec_id, agent_type
-                    )
-                    if bridge_detail:
-                        raise RuntimeError(f"{e}\n\n[CLI 日志]\n{bridge_detail}") from e
-                    raise
-                perf_log(task.id, "acp_new_session", time.perf_counter() - _t0, agent_type=agent_type)
+                acp_session_id, session_restored, open_outcome = _restore_or_new_session(
+                    client, restore,
+                    db=db, task=task, agent_type=agent_type,
+                    session=session, bridge_exec_id=bridge_exec_id, cwd=cwd,
+                )
+                if session_restored:
+                    restored_hash = restore["injected_context_hash"]
+                    restored_round = int(restore.get("round_idx") or 0)
+                    restore_method_used = restore["method"]
+                perf_log(
+                    task.id, "acp_session_open", time.perf_counter() - _t0,
+                    agent_type=agent_type, outcome=open_outcome,
+                    decision=restore.get("method") or restore.get("reason") or "",
+                )
 
                 # ---- wrapper 层钩子:session/new 后的自定义设置 ----
                 # deepseek 在此调 set_config_option(model/reasoning_effort) 等
@@ -2626,8 +2815,13 @@ def run_acp_agent(
                         "endpoint_headers": endpoint_headers,
                         "acp_session_id": acp_session_id,
                         "fingerprint": fingerprint,
-                        # 本 session 已注入过的系统段指纹(新 session 尚未注入)
-                        "injected_context_hash": {},
+                        # 本 session 已注入过的系统段指纹 + 是否至少成功收下过一次
+                        # prompt(两者只在 prompt 成功后回写,见 _record_prompt_accepted)。
+                        # 恢复成功的 session 例外:它已从磁盘复原了上下文与既往注入段,
+                        # 因此初始就是“已送达”+记录里的指纹+记录覆盖到的轮次
+                        "injected_context_hash": restored_hash,
+                        "prompt_accepted": session_restored,
+                        "last_accepted_round": restored_round,
                     }
 
             # ---- 构造 prompt 消息 ----
@@ -2666,8 +2860,23 @@ def run_acp_agent(
                 _repo_ctx_variant,
             )
             raw_memory = _build_memory_section(memory_summary, global_memory)
-            repo_ctx_section, memory_section, need_replay, ctx_hash = _resolve_injection_plan(
-                reused, raw_repo_ctx, raw_memory,
+            # 判定用的 session 状态:
+            # - 复用进程内 session → 直接用缓存条目
+            # - 恢复成功的 session → CLI 已从磁盘复原上下文(含既往注入段),
+            #   按"复用"口径处理:不重发未变化的注入段;transcript 只覆盖到
+            #   记录的 round_idx,其后若有失败轮(提问进了 DB 但没进
+            #   transcript),按 last_accepted_round 增量回放补齐
+            # - 新建 session → None → 全量注入 + 全量文本回放
+            injection_state = reused if reused is not None else (
+                {
+                    "injected_context_hash": restored_hash,
+                    "prompt_accepted": True,
+                    "last_accepted_round": restored_round,
+                }
+                if session_restored else None
+            )
+            repo_ctx_section, memory_section, replay_from, ctx_hash = _resolve_injection_plan(
+                injection_state, raw_repo_ctx, raw_memory, round_idx=round_idx,
             )
             if (raw_repo_ctx and not repo_ctx_section) or (
                 raw_memory and not memory_section
@@ -2678,7 +2887,21 @@ def run_acp_agent(
                     f"skipped_repo={bool(raw_repo_ctx and not repo_ctx_section)}, "
                     f"skipped_memory={bool(raw_memory and not memory_section)}"
                 )
-            history_replay = _load_history_replay(db, task, round_idx) if need_replay else ""
+            history_replay = ""
+            if replay_from is not None:
+                history_replay = _load_history_replay(
+                    db, task, round_idx, since_round=replay_from,
+                )
+                if replay_from > 0:
+                    logger.info(
+                        f"[task={task.id}] {agent_type} 会话上下文只覆盖到第 {replay_from} 轮,"
+                        f"增量回放第 {replay_from + 1}~{round_idx - 1} 轮(补发失败轮的提问)"
+                    )
+            elif session_restored:
+                logger.info(
+                    f"[task={task.id}] {agent_type} 已恢复 CLI 持久化会话"
+                    f"({restore_method_used}, sessionId={acp_session_id}),本轮不回放文本历史"
+                )
 
             user_msg = _compose_send_text(
                 base_msg, repo_ctx_section, memory_section, history_replay,
@@ -2703,8 +2926,26 @@ def run_acp_agent(
                         # 挂死兜底:按活动工具状态分级 idle 超时(见 PromptIdleTimeout)
                         idle_probe=lambda: collector.has_active_tools,
                     )
-                    # 记住本轮已注入的注入段指纹,供同 session 下一轮去重
-                    _remember_injected_context(task_id_str, ctx_hash)
+                    # 本轮 prompt 已送达:记录注入段指纹与"session 有上下文"标记,
+                    # 供同 session 下一轮去重与回放判定(业务错误异常不会走到这里,
+                    # 下一轮因此仍会全量注入 + 回放,不会复用空 session 而丢历史)
+                    _record_prompt_accepted(task_id_str, ctx_hash, round_idx)
+                    # 会话记录持久化:后端重启 / bridge 重建后仍可凭 sessionId 让
+                    # CLI 恢复上下文(指纹一并存,恢复后才知道哪些注入段已给过)。
+                    # 截断兜底轮(idle 挂死/流中断降级收尾)不推进记录:该轮内容
+                    # 可能没被 CLI 写进磁盘 transcript,记录留在上一次干净轮,
+                    # 恢复后的增量回放才能把它补上
+                    _session_record = build_session_record(
+                        agent_type=agent_type,
+                        session_id=acp_session_id,
+                        cwd=cwd,
+                        injected_context_hash=ctx_hash,
+                        round_idx=round_idx,
+                        restore_method=restore_method_used,
+                        truncated=bool(client.last_prompt_truncated),
+                    )
+                    if _session_record is not None:
+                        save_session_record(db, task, _session_record)
 
             except Exception as e:
                 logger.exception(f"[task={task.id}] ACP prompt 失败 ({agent_type})")
