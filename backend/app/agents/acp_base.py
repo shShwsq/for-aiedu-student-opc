@@ -2189,13 +2189,16 @@ def _load_global_memory(db: Session, task: Task) -> str:
 
     委托 build_global_memory_section(与 react_agent 共用同一注入逻辑)。
     匿名任务 / 无全局记忆 / 查询异常 → 返回 ""(不注入)。
+
+    show_pointer=False:外部 CLI 的"查全量"指针由 build_cli_memory_section 按运行模式
+    统一产出(避免双指针 + local 模式失效的 /home/user 路径),此处只回纯内容。
     """
     try:
         if task.user_id is None:
             return ""
         from app.services.memory_injection import build_global_memory_section
 
-        return build_global_memory_section(db, task.user_id)
+        return build_global_memory_section(db, task.user_id, show_pointer=False)
     except Exception as e:
         logger.warning(f"[task={task.id}] 加载全局记忆失败(忽略): {e}")
         return ""
@@ -2307,14 +2310,23 @@ def _build_repo_context_section(
     return build_cli_repo_context_section(repo_context, variant)
 
 
-def _build_memory_section(memory_summary: str = "", global_memory: str = "") -> str:
+def _build_memory_section(
+    memory_summary: str = "", global_memory: str = "",
+    *,
+    project_file_path: str = "/home/user/.agent_memory/project_memory.md",
+    global_file_path: str = "/home/user/.agent_memory/global_memory.md",
+) -> str:
     """构造记忆注入段(拼在发送给 CLI 的 prompt 末尾,不落库不展示)
 
     文案实现收敛于 app/prompts/executor.py 的 build_cli_memory_section
     (与内置 react_agent 侧的包装同源集中管理)。
     两部分都为空时返回空串。
+    project_file_path/global_file_path 由调用处按运行模式传入(见 resolve_agent_memory_file_path)。
     """
-    return build_cli_memory_section(memory_summary, global_memory)
+    return build_cli_memory_section(
+        memory_summary, global_memory,
+        project_file_path=project_file_path, global_file_path=global_file_path,
+    )
 
 
 # ============================================================
@@ -2859,7 +2871,22 @@ def run_acp_agent(
                 repo_context if followup_query is None else None,
                 _repo_ctx_variant,
             )
-            raw_memory = _build_memory_section(memory_summary, global_memory)
+            # 记忆"查全量"指针按运行模式给出 CLI 可直达的绝对路径(后端 read_file 对
+            # /home/user 的映射仅内置侧有效,外部 CLI 用各自的 Read 工具读不到)
+            from app.services.memory_injection import resolve_agent_memory_file_path
+
+            _mem_mode = getattr(session, "mode", "") or ctx.get("mode", "")
+            _mem_local_dir = ctx.get("local_dir")
+            _project_mem_path = resolve_agent_memory_file_path(
+                _mem_mode, _mem_local_dir, sandbox_tools._MEMORY_FILE,
+            )
+            _global_mem_path = resolve_agent_memory_file_path(
+                _mem_mode, _mem_local_dir, sandbox_tools._GLOBAL_MEMORY_FILE,
+            )
+            raw_memory = _build_memory_section(
+                memory_summary, global_memory,
+                project_file_path=_project_mem_path, global_file_path=_global_mem_path,
+            )
             # 判定用的 session 状态:
             # - 复用进程内 session → 直接用缓存条目
             # - 恢复成功的 session → CLI 已从磁盘复原上下文(含既往注入段),

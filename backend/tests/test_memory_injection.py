@@ -3,6 +3,7 @@
 覆盖 build_react_agent_memory_section / build_agent2_memory_section /
 build_global_memory_section。
 """
+import os
 from unittest.mock import MagicMock
 
 from app.services.memory_injection import (
@@ -11,6 +12,7 @@ from app.services.memory_injection import (
     build_react_agent_memory_section,
     build_agent2_memory_section,
     load_project_memory_brief,
+    resolve_agent_memory_file_path,
 )
 
 
@@ -314,3 +316,46 @@ def test_global_section_truncated_appends_file_hint():
     mem2.content = "## Tech Stack\n- FastAPI"
     result2 = build_global_memory_section(_mock_db(first_result=mem2), 1)
     assert "global_memory.md" not in result2
+
+
+def test_global_section_show_pointer_false_omits_hint():
+    """show_pointer=False(外部 CLI 侧):即使截断也不内联 /home/user 文件提示。
+
+    指针改由 build_cli_memory_section 按运行模式统一产出,避免双指针 + local
+    模式下失效的 Linux 路径。
+    """
+    from app.services.memory_injection import MAX_GLOBAL_MEM_CHARS
+
+    mem = MagicMock()
+    mem.content = "X" * (MAX_GLOBAL_MEM_CHARS + 500)
+    result = build_global_memory_section(
+        _mock_db(first_result=mem), 1, show_pointer=False,
+    )
+    assert "The following is general experience" in result  # 内容仍在
+    assert "global_memory.md" not in result                 # 但不含指针
+
+
+def test_resolve_agent_memory_file_path_local_mode():
+    """local 模式:返回 <local_dir>/.agent_memory/<file>,不含 /home/user。"""
+    p = resolve_agent_memory_file_path(
+        "local", "/tmp/sandbox_local_abc", "global_memory.md",
+    )
+    assert p == os.path.join("/tmp/sandbox_local_abc", ".agent_memory", "global_memory.md")
+    assert "/home/user" not in p
+
+
+def test_resolve_agent_memory_file_path_sandbox_mode():
+    """sandbox / 其他模式:回落沙箱绝对路径 /home/user/.agent_memory/<file>。"""
+    assert (
+        resolve_agent_memory_file_path("sandbox", None, "global_memory.md")
+        == "/home/user/.agent_memory/global_memory.md"
+    )
+    # 非 local(含空 mode / local 但无 local_dir)一律回落沙箱路径
+    assert (
+        resolve_agent_memory_file_path("", None, "project_memory.md")
+        == "/home/user/.agent_memory/project_memory.md"
+    )
+    assert (
+        resolve_agent_memory_file_path("local", "", "project_memory.md")
+        == "/home/user/.agent_memory/project_memory.md"
+    )

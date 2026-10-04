@@ -365,13 +365,21 @@ USER_FOLLOWUP_MSG_LABEL = "[用户追加消息]"
 
 def build_cli_memory_section(
     memory_summary: str = "", global_memory: str = "",
+    *,
+    project_file_path: str = "/home/user/.agent_memory/project_memory.md",
+    global_file_path: str = "/home/user/.agent_memory/global_memory.md",
 ) -> str:
     """构造记忆注入段(拼在发送给 CLI 的 prompt 末尾,不落库不展示)
 
-    - 项目记忆精简版 + 完整记忆文件路径提示(供 CLI read_file 查阅)
+    - 项目记忆精简版 + 完整记忆文件路径提示
     - 全局长期记忆段(跨项目通用经验)+ 完整记忆文件路径提示
 
     两部分都为空时返回空串。每轮注入(与 react_agent system prompt 行为一致)。
+
+    project_file_path/global_file_path 由调用方按运行模式传入(sandbox=/home/user;
+    local=真实 <local_dir>/.agent_memory/...),措辞工具中立:外部 CLI 用各自的 Read
+    工具、访问不到后端 read_file 对 /home/user 虚拟路径的映射,故不写 read_file。
+    默认值保持 /home/user(行为中性 + 保护直接调用/现有测试)。
     """
     section = ""
 
@@ -381,16 +389,16 @@ def build_cli_memory_section(
         section += (
             "\n\n[项目记忆摘要]\n"
             + summary
-            + "\n\n完整项目记忆可 read_file /home/user/.agent_memory/project_memory.md 查阅"
+            + f"\n\n完整项目记忆见文件 {project_file_path}(用你的文件读取工具查看)"
         )
 
     # 全局长期记忆(跨项目通用经验,影响执行方式;与 react_agent system prompt 行为一致)
-    # 完整文件在任务启动时已写入沙箱,超截断上限时 CLI 可 read_file 查全量
+    # 完整文件在任务启动时已写入沙箱/local 目录,超截断上限时 CLI 可用自身工具查全量
     gmem = (global_memory or "").strip()
     if gmem:
         section += (
             "\n\n" + gmem
-            + "\n\n完整全局记忆可 read_file /home/user/.agent_memory/global_memory.md 查阅"
+            + f"\n\n完整全局记忆见文件 {global_file_path}(用你的文件读取工具查看)"
         )
 
     return section

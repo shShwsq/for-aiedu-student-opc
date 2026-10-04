@@ -243,6 +243,43 @@ def test_memory_section_empty_when_no_memories():
     assert _build_memory_section("   ", "") == ""
 
 
+def test_memory_section_local_paths_and_tool_neutral():
+    """local 模式:指针用传入的真实路径,措辞工具中立(不写 read_file)、不出现 /home/user。"""
+    local_project = "C:\\Temp\\sandbox_local_x\\.agent_memory\\project_memory.md"
+    local_global = "C:\\Temp\\sandbox_local_x\\.agent_memory\\global_memory.md"
+    section = _build_memory_section(
+        "PROJECT_MEM", "GLOBAL_MEM",
+        project_file_path=local_project, global_file_path=local_global,
+    )
+    assert local_project in section
+    assert local_global in section
+    assert "/home/user" not in section
+    assert "read_file" not in section
+
+
+def test_memory_section_adds_single_global_pointer():
+    """_build_memory_section 为全局记忆恰好补一处文件指针(与 loader show_pointer=False 配合)。"""
+    section = _build_memory_section("", "GLOBAL_BODY")
+    assert section.count("global_memory.md") == 1
+
+
+def test_load_global_memory_omits_pointer_for_cli():
+    """CLI 侧加载器:_load_global_memory 用 show_pointer=False,内容仍在但不含指针。"""
+    from app.agents.acp_base import _load_global_memory
+    from app.services.memory_injection import MAX_GLOBAL_MEM_CHARS
+
+    mem = MagicMock()
+    mem.content = "X" * (MAX_GLOBAL_MEM_CHARS + 500)
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = mem
+    task = MagicMock()
+    task.user_id = 1
+    task.id = "t1"
+    out = _load_global_memory(db, task)
+    assert "The following is general experience" in out
+    assert "/home/user/.agent_memory/global_memory.md" not in out
+
+
 def test_prompt_message_equals_sections_plus_base():
     """发送装配 == 预 clone 上下文段 + 记忆段 + 纯指令(发送完整,落库纯净)。
 

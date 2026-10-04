@@ -9,6 +9,8 @@
 
 user_id 为 None(匿名任务)或无配置 → 返回空串(不注入),保证匿名任务不受影响。
 """
+import os
+
 from sqlalchemy.orm import Session
 
 from app.models.project import Project
@@ -171,7 +173,9 @@ def build_react_agent_memory_section(
     return header + "\n" + memory_text
 
 
-def build_global_memory_section(db: Session, user_id) -> str:
+def build_global_memory_section(
+    db: Session, user_id, *, show_pointer: bool = True,
+) -> str:
     """构造全局长期记忆段(注入 react_agent / CLI 执行侧)。
 
     跨项目通用经验(Hard Constraints / Tech Stack / Lessons Learned 等),
@@ -181,6 +185,9 @@ def build_global_memory_section(db: Session, user_id) -> str:
     user_id 为 None(匿名任务)或无全局记忆 → 返回空串(不注入)。
     截断到 MAX_GLOBAL_MEM_CHARS;被截断时附完整记忆文件路径提示(任务启动时
     已写入沙箱 global_memory.md),引导 agent 用 read_file 查阅全量。
+
+    show_pointer=False 时不内联该路径提示(供外部 CLI 侧使用:其"查全量"指针由
+    build_cli_memory_section 按运行模式统一产出,避免双指针与失效的 /home/user 路径)。
     """
     if user_id is None:
         return ""
@@ -195,9 +202,30 @@ def build_global_memory_section(db: Session, user_id) -> str:
         + truncated
     )
     # 被截断时提示可 read_file 查全量(文件在任务启动时写入沙箱)
-    if truncated != content:
+    # show_pointer=False:外部 CLI 执行器用各自 Read 工具、访问不到后端对
+    # /home/user 虚拟路径的映射,指针改由 build_cli_memory_section 按模式产出(去双指针)
+    if show_pointer and truncated != content:
         section += (
             "\n\nFull memory available via read_file "
             "/home/user/.agent_memory/global_memory.md"
         )
     return section
+
+
+def resolve_agent_memory_file_path(mode: str, local_dir, filename: str) -> str:
+    """计算执行智能体可真正打开的记忆文件绝对路径(按运行模式)。
+
+    - sandbox 模式:/home/user/.agent_memory/<filename> —— 容器内真实路径,
+      外部 CLI 在其中运行,可直接读取,与后端虚拟路径恰好一致
+    - local 模式:<local_dir>/.agent_memory/<filename> —— 宿主机上无 /home/user;
+      write_*_memory_file 即写此处,而外部 CLI(Qoder/codex/dsh)用各自的 Read 工具,
+      访问不到后端 read_file 对 /home/user 虚拟路径的映射,故必须给真实绝对路径
+
+    仅外部 CLI 执行器需要本函数(其"查全量"指针按此模式感知生成);内置 react_agent
+    走后端 read_file,继续用 /home/user 虚拟路径即可。
+    """
+    from app.tools import sandbox_tools
+
+    if str(mode) == "local" and local_dir:
+        return os.path.join(str(local_dir), ".agent_memory", filename)
+    return f"{sandbox_tools._MEMORY_DIR_SANDBOX}/{filename}"
