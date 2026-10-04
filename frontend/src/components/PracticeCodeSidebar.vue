@@ -311,14 +311,15 @@ async function openFile(
     fileStartLine.value = res.start_line
     fileTotalLines.value = res.total_lines
     fileTruncated.value = res.truncated
-    await nextTick()
-    applyFocus()
   } catch (err) {
     fileContent.value = `读取失败: ${extractErrorMessage(err)}`
     fileStartLine.value = 0
     fileTotalLines.value = 0
   } finally {
     loadingFile.value = false
+    // 成功与失败都重新定位:失败时定位行落在当前页外,applyFocus 会自动清高亮
+    await nextTick()
+    applyFocus()
   }
 }
 
@@ -648,6 +649,8 @@ watch(
   width: 5px;
   z-index: 6;
   cursor: col-resize;
+  /* 触屏:阻止浏览器把 pointermove 当滚动手势接管(641px+ 平板/触屏本仍可见手柄) */
+  touch-action: none;
   background: transparent;
   transition: background var(--transition-fast);
 }

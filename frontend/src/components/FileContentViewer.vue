@@ -98,10 +98,17 @@ function lineNumbersExt(startLine: number) {
   return lineNumbers({ formatNumber: (lineNo: number) => String(lineNo + offset) })
 }
 
-/** 按后缀惰性加载语法高亮(language-data 未收录时回退无高亮) */
+/** 按后缀惰性加载语法高亮(language-data 未收录时回退无高亮)
+ *
+ * 语言包为异步动态 import:连续切文件 A→B 时,A 的 load 可能晚于 B resolve,
+ * 会把 A 的语法装到 B 的文档上。用 langToken 单调自增标记「当前文件」,
+ * 回调里比对 token 确保只有最新一次切换才生效(view 实例跨文件复用不会变)。
+ */
+let langToken = 0
 function applyLanguage(filename: string | null): void {
   const v = view.value
   if (!v) return
+  const token = ++langToken
   const desc = filename ? LanguageDescription.matchFilename(languages, filename) : null
   if (!desc) {
     v.dispatch({ effects: languageCompartment.reconfigure([]) })
@@ -109,7 +116,8 @@ function applyLanguage(filename: string | null): void {
   }
   const target = v
   desc.load().then((support) => {
-    if (view.value === target) {
+    // 仍是最新一次切换(token 未被后续切换作废)且编辑器未销毁时才装配语法
+    if (token === langToken && view.value === target) {
       target.dispatch({ effects: languageCompartment.reconfigure(support) })
     }
   }).catch(() => {
