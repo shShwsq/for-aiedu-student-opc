@@ -2,19 +2,24 @@
 /**
  * CLI 智能体设置面板(嵌套在 SettingsLayout 内)
  *
- * 顶部选项卡动态加载后端所有已注册 agent 类型(GET /agents/types),
+ * 顶部选项卡动态加载后端所有已注册 agent 类型(GET /agents/types,走共享缓存),
  * 下方平铺当前 agent 的内联配置表单(AgentConfigPanel)。
+ *
+ * 与设置页二级目录双向同步:侧栏子项与顶部 tab 都只改 URL hash(#agent_type),
+ * 实际切换统一由 route.hash 的 watch 落到 activateTab——单向数据流,
+ * 既保证两处高亮一致,也不会互相触发回环。tab 栏保留(不因为有了二级目录而移除)。
  */
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import AgentConfigPanel from '@/components/AgentConfigPanel.vue'
 import {
   deleteAgentConfig,
   getAgentConfig,
-  getAgentTypes,
   saveAgentConfig,
   testAgentConfig,
 } from '@/api/agent_configs'
+import { agentTypes, ensureAgentTypesLoaded } from '@/composables/useAgentTypes'
 import { extractErrorMessage } from '@/utils/error'
 import type {
   AgentConfigDetailOut,
@@ -38,7 +43,11 @@ function showToast(msg: string, type: 'success' | 'error'): void {
 // ============================================================
 // agent 类型 + 按类型隔离的状态
 // ============================================================
-const agentTypes = ref<AgentTypeMeta[]>([])
+const route = useRoute()
+const router = useRouter()
+
+// agentTypes 为模块级共享缓存(useAgentTypes):设置目录的二级项读同一份,
+// /agents/types 在「布局渲染二级目录 + 面板渲染表单」之间只请求一次
 const agentTypesLoading = ref(true)
 /** 当前激活的 agent_type */
 const activeType = ref<string>('')
@@ -106,17 +115,17 @@ onUnmounted(() => {
 async function loadAgentTypes(): Promise<void> {
   agentTypesLoading.value = true
   try {
-    const types = await getAgentTypes()
-    agentTypes.value = types
+    const types = await ensureAgentTypesLoaded()
     // 为每个 agent 预初始化独立状态(模板遍历时 state 一定存在)
     for (const meta of types) {
       if (!states[meta.agent_type]) {
         states[meta.agent_type] = createAgentState()
       }
     }
-    // 默认激活第一个 tab
-    if (types.length > 0) {
-      activateTab(types[0])
+    // 默认激活:hash 命中的 agent(书签/深链),否则第一个;首屏不写 hash,保持 URL 干净
+    const initial = pickAgentByHash(route.hash) ?? types[0]
+    if (initial) {
+      activateTab(initial)
     }
   } catch (err) {
     showToast(`加载 agent 类型失败: ${extractErrorMessage(err)}`, 'error')
@@ -141,8 +150,14 @@ async function loadDetail(type: string): Promise<void> {
 }
 
 // ============================================================
-// 选项卡切换
+// 选项卡切换(hash 为唯一入口,tab 栏与侧栏二级目录共用)
 // ============================================================
+/** 取 hash('#agent_type') 命中的 agent;未知 hash 与空 hash 一样回退第一个,与目录高亮规则一致 */
+function pickAgentByHash(hash: string | undefined): AgentTypeMeta | null {
+  const id = (hash ?? '').startsWith('#') ? (hash as string).slice(1) : (hash ?? '')
+  return agentTypes.value.find((meta) => meta.agent_type === id) ?? agentTypes.value[0] ?? null
+}
+
 function activateTab(meta: AgentTypeMeta): void {
   activeType.value = meta.agent_type
   activated.add(meta.agent_type)
@@ -156,6 +171,27 @@ function activateTab(meta: AgentTypeMeta): void {
     tabRefs.value[idx]?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
   })
 }
+
+/** tab 栏点击:只负责把 hash 写进 URL,真正的切换交给下面的 route.hash watch */
+function selectAgent(meta: AgentTypeMeta): void {
+  if (meta.agent_type === activeType.value) return
+  router.push({ hash: `#${meta.agent_type}` })
+}
+
+// 侧栏二级目录 / tab 栏 / 浏览器前进后退都只改 hash,统一落到 activateTab:
+// 两处入口共用一条路径,既保持同步又不会回环(目标与当前一致时不动作)。
+// 未知 hash 回退第一个 agent(空 hash 即「点已选中的一级项回默认子项」同样走此分支)。
+watch(
+  () => route.hash,
+  (hash) => {
+    // 只在 CLI 页响应(离开后 route 仍可能短暂持有旧 hash)
+    if (!route.path.startsWith('/settings/cli')) return
+    const meta = pickAgentByHash(hash)
+    if (meta && meta.agent_type !== activeType.value) {
+      activateTab(meta)
+    }
+  },
+)
 
 // ============================================================
 // 保存 / 清除 / 测试(均操作 states[type],回调闭包绑定到对应 entry)
@@ -281,7 +317,7 @@ async function handleTest(type: string): Promise<void> {
             role="tab"
             :aria-selected="activeType === meta.agent_type"
             :tabindex="activeType === meta.agent_type ? 0 : -1"
-            @click="activateTab(meta)"
+            @click="selectAgent(meta)"
           >
             {{ meta.display_name }}
           </button>

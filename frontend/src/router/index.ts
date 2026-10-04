@@ -9,6 +9,8 @@
  * - 受保护路由未登录 → 跳 /login?redirect=原始路径
  * - 已登录访问 /login → 跳 / (避免重复登录)
  * - 有 token 但 user 未加载(页面刷新)→ 先 fetchMe 恢复会话
+ *
+ * scrollBehavior:同路由只改 hash 不跳顶(设置页二级目录靠 hash 驱动)。
  */
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 
@@ -124,7 +126,10 @@ const routes: RouteRecordRaw[] = [
 const router = createRouter({
   history: createWebHistory(),
   routes,
-  scrollBehavior() {
+  scrollBehavior(to, from) {
+    // 同一路由仅 hash 变化(设置页二级目录):交给页面自己处理
+    // (锚点滚动 / 面板内视图切换),这里返 false 抢页面跳顶
+    if (to.hash && to.path === from.path) return false
     // 切换页面时滚到顶部
     return { top: 0 }
   },

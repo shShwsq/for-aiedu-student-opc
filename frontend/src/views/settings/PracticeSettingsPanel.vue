@@ -12,10 +12,14 @@
  *   停用的主题不再出新题(存量不动)
  * 另含危险操作:清空练习记录 / 清空全部数据(均二次确认,不可逆)。
  *
+ * 页面按设置页二级目录分三段(出题偏好 / 学习主题 / 数据管理),
+ * 三个分组标题的 id 即 `data/settingsNav` 里声明的二级项 id:
+ * 点侧栏子项滚动定位,手动滚动则把当前段同步回 URL hash 使侧栏高亮跟随。
+ *
  * (由练习页右上角弹窗迁移而来;练习页入口改为跳转本面板)
  */
-import { computed, nextTick, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import { getPreferences, savePracticeSettings } from '@/api/memory'
 import { getMyModels } from '@/api/model_configs'
@@ -26,6 +30,8 @@ import {
   listLearningTopics,
   updateLearningTopic,
 } from '@/api/practice'
+import { matchHashSectionId, settingsScrollRootKey, useSectionNav } from '@/composables/useSectionNav'
+import { PRACTICE_SECTION_IDS } from '@/data/settingsNav'
 import { extractErrorMessage } from '@/utils/error'
 import type { LLMConfigItemOut } from '@/types/model_configs'
 import type { PracticeThinkingMode } from '@/types/memory'
@@ -35,6 +41,7 @@ import type { LearningTopicDef } from '@/types/practice'
 // 状态
 // ============================================================
 const route = useRoute()
+const router = useRouter()
 const loading = ref(true)
 const loadError = ref('')
 /** 保存中(切换开关/思考模式/模型时) */
@@ -333,15 +340,53 @@ async function handleClear(includeQuestions: boolean): Promise<void> {
   }
 }
 
+// ============================================================
+// 设置页二级目录(侧栏子项):锚点跳转 + scrollspy 高亮
+// ============================================================
+/** 滚动容器在布局侧(SettingsLayout 的 .settings-content),观察根经 inject 取 */
+const scrollRoot = inject(settingsScrollRootKey, ref<HTMLElement | null>(null))
+
+const {
+  activeId: activeSection,
+  scrollToSection,
+  setup: setupSections,
+  teardown: teardownSections,
+} = useSectionNav({
+  ids: PRACTICE_SECTION_IDS,
+  getRoot: () => scrollRoot.value,
+})
+
+// 侧栏子项点击 / 深链 / 前进后退:hash 命中段落就滚过去
+// (与当前段一致时跳过——那是下面 scrollspy 自己 replace 上去的,避免回环)
+watch(
+  () => route.hash,
+  (hash) => {
+    // 只在练习设置页响应(离开时 route 仍可能短暂持有旧 hash)
+    if (!route.path.startsWith('/settings/practice')) return
+    // 空 hash(点已选中的「练习设置」回默认段)与未知 hash 都落到第一段
+    const id = matchHashSectionId(PRACTICE_SECTION_IDS, hash) || PRACTICE_SECTION_IDS[0]
+    if (id === activeSection.value) return
+    scrollToSection(id)
+  },
+)
+
+// 手动滚动改变当前段:同步回 URL(replace 不新增历史记录),让侧栏二级目录跟着高亮
+watch(activeSection, (id) => {
+  if (id && route.hash !== `#${id}`) router.replace({ hash: `#${id}` })
+})
+
 onMounted(async () => {
   await load()
-  // 知识点看板「知识点主题设置」深链进入:待表单渲染后滚动到学习主题区块
-  if (route.hash) {
-    await nextTick()
-    document
-      .getElementById(route.hash.slice(1))
-      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  }
+  await nextTick()
+  // 段落进入 DOM 后再接目录;知识点看板「知识点主题设置」等深链进入先定位到 hash 段
+  const target = matchHashSectionId(PRACTICE_SECTION_IDS, route.hash)
+  if (target) scrollToSection(target)
+  // 加载失败时段落不在 DOM,setup 自行空跑
+  setupSections()
+})
+
+onBeforeUnmount(() => {
+  teardownSections()
 })
 </script>
 
@@ -369,8 +414,11 @@ onMounted(async () => {
       <button class="btn-link" @click="load">重试</button>
     </div>
 
-    <!-- 设置表单 -->
+    <!-- 设置表单(三个分组 id 对应设置页二级目录项) -->
     <section v-else class="practice-form">
+      <!-- ===== 出题偏好 ===== -->
+      <h2 id="generation" class="section-title">出题偏好</h2>
+
       <!-- 自动生成练习题 -->
       <div class="setting-row">
         <div class="setting-info">
@@ -485,9 +533,9 @@ onMounted(async () => {
         </div>
       </div>
 
-      <!-- 学习主题管理:内置 4 个(可停用)+ 自定义增删改 -->
-      <div id="learning-topics" class="setting-block">
-        <span class="setting-title">学习主题</span>
+      <!-- ===== 学习主题:内置 4 个(可停用)+ 自定义增删改 ===== -->
+      <h2 id="learning-topics" class="section-title">学习主题</h2>
+      <div class="setting-block">
         <span class="setting-desc">
           出题视角与自动分类的主题词表。停用的主题不再出新题,已有题目不受影响;
           自定义主题的出题质量取决于描述的具体程度
@@ -592,7 +640,8 @@ onMounted(async () => {
         </div>
       </div>
 
-      <!-- 危险操作:数据清空不可逆,均需二次确认 -->
+      <!-- ===== 数据管理:危险操作(数据清空不可逆,均需二次确认) ===== -->
+      <h2 id="data" class="section-title">数据管理</h2>
       <div class="danger-block">
         <span class="setting-title danger-title">危险操作</span>
 
@@ -782,6 +831,19 @@ onMounted(async () => {
   gap: var(--space-4);
 }
 
+/* ---- 分组标题(设置页二级目录的锚点;id 即二级项 id) ---- */
+.section-title {
+  /* 组间靠上边距拉开(段内仍走 .practice-form 的 gap) */
+  margin: var(--space-3) 0 0;
+  padding-bottom: var(--space-2);
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text);
+  border-bottom: 1px solid var(--color-border);
+  /* 段首定位留呼吸,且与 useSectionNav 的 gap(16px)判定线保持一致 */
+  scroll-margin-top: var(--space-4);
+}
+
 .setting-row {
   display: flex;
   align-items: flex-start;
@@ -944,11 +1006,6 @@ onMounted(async () => {
 }
 
 /* ---- 学习主题管理 ---- */
-/* 知识点看板深链定位锚点:留出呼吸,避免区块贴住滚动容器顶 */
-#learning-topics {
-  scroll-margin-top: var(--space-4);
-}
-
 .topic-manage-list {
   display: flex;
   flex-direction: column;

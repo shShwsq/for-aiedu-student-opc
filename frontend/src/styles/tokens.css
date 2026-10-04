@@ -141,6 +141,9 @@
   /* ---- 布局 ---- */
   --content-width: 1200px;
   --auth-card-width: 420px;
+  /* 设置页目录宽度(两级:二级项需容纳后端 agent 展示名) */
+  --settings-nav-w: 208px;
+  --settings-nav-w-sm: 176px;
 }
 
 /*

@@ -38,6 +38,7 @@ import {
   startSession,
   submitAnswer,
 } from '@/api/practice'
+import { matchHashSectionId, useSectionNav } from '@/composables/useSectionNav'
 import { extractErrorMessage } from '@/utils/error'
 import {
   formatDate,
@@ -196,61 +197,21 @@ const navItems: { id: SectionId; label: string }[] = [
   { id: 'history', label: '历史记录' },
 ]
 
-const activeSection = ref<SectionId>('mistakes')
 /** 真正滚动的容器是 .main(overflow-y: auto),观察器必须以它为 root */
 const mainRef = ref<HTMLElement | null>(null)
-let sectionObserver: IntersectionObserver | null = null
 
-/** 段首判定线:与 .anchor-section 的 scroll-margin-top 保持一致,避免高亮比滚动慢半拍 */
-const SECTION_GAP = 16
-
-function scrollToSection(id: SectionId): void {
-  // 点击即刻置高亮,不等观察器回调(平滑滚动过程中避免闪烁)
-  activeSection.value = id
-  // 操作头在 .main 之外,不会遮挡段首,直接交给 scrollIntoView + scroll-margin-top
-  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-}
-
-/** 重算当前段:段首已到达判定线的段中取最靠下的那个(即正在阅读的段) */
-function updateActiveSection(): void {
-  const root = mainRef.value
-  if (!root) return
-  const rootTop = root.getBoundingClientRect().top
-  let current: SectionId | null = null
-  let currentTop = Number.NEGATIVE_INFINITY
-  for (const id of SECTION_IDS) {
-    const el = document.getElementById(id)
-    if (!el) continue
-    const top = el.getBoundingClientRect().top - rootTop
-    if (top > SECTION_GAP) continue
-    if (top > currentTop) {
-      currentTop = top
-      current = id
-    }
-  }
-  activeSection.value = current ?? SECTION_IDS[0]
-}
-
-function setupSectionObserver(): void {
-  teardownSectionObserver()
-  const targets = SECTION_IDS.map((id) => document.getElementById(id)).filter(
-    (el): el is HTMLElement => el !== null,
-  )
-  if (targets.length === 0) return
-  sectionObserver = new IntersectionObserver(updateActiveSection, {
-    root: mainRef.value,
-    rootMargin: '0px 0px -70% 0px',
-    threshold: 0,
-  })
-  for (const el of targets) sectionObserver.observe(el)
-}
-
-function teardownSectionObserver(): void {
-  if (sectionObserver) {
-    sectionObserver.disconnect()
-    sectionObserver = null
-  }
-}
+// 锚点跳转 + scrollspy 算法抽到 useSectionNav(与设置页二级目录的 anchor 语义共用同一实现)
+const {
+  activeId: activeSection,
+  scrollToSection,
+  setup: setupSectionObserver,
+  teardown: teardownSectionObserver,
+} = useSectionNav({
+  ids: SECTION_IDS,
+  getRoot: () => mainRef.value,
+  // 段首判定线:与 .anchor-section 的 scroll-margin-top 保持一致,避免高亮比滚动慢半拍
+  gap: 16,
+})
 
 // ============================================================
 // 首页:统计(以工具条徽章呈现;薄弱点全景在知识点看板页 /knowledge-board)
@@ -567,7 +528,7 @@ onMounted(async () => {
 
   // 书签兼容:旧 /practice/history 重定向为 /practice#history,进首页后定位到对应段
   // (自动开局已在上面 return,不会与此抢位置)
-  const hash = SECTION_IDS.find((id) => route.hash === `#${id}`)
+  const hash = matchHashSectionId(SECTION_IDS, route.hash)
   if (hash) {
     await statsReady
     await nextTick()
