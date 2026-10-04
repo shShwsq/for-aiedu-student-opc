@@ -28,6 +28,7 @@ import {
 } from '@/api/task'
 import { extractErrorMessage } from '@/utils/error'
 import { toWorkspaceRelative } from '@/utils/workspacePath'
+import FileContentViewer from './FileContentViewer.vue'
 import type { TaskListItem, TaskStatus } from '@/types/task'
 import type {
   WorkspaceEntry,
@@ -593,18 +594,17 @@ const fileTotalLines = ref(0)
 const fileTruncated = ref(false)
 const loadingFile = ref(false)
 const fileOffset = ref(1)
-/** 文件内容容器引用,用于行号滚动定位 */
-const fileContentRef = ref<HTMLElement | null>(null)
 /** 高亮行号(由结果清单点击跳转设置,滚动定位后保留高亮) */
 const highlightLine = ref<number | null>(null)
 /** 文件查看面板是否被手动隐藏(点击隐藏按钮后为 true,重新选文件时重置) */
 const filePanelHidden = ref(false)
 
-/** 文件内容按行拆分(用于行号渲染 + 高亮定位) */
-const fileContentLines = computed<string[]>(() => {
-  if (!fileContent.value) return []
-  return fileContent.value.split('\n')
-})
+/** FileContentViewer 暴露的定位接口(局部类型,避免依赖 SFC 实例类型推导) */
+interface FileContentViewerHandle {
+  focusRange: (start: number | null, end: number | null) => void
+  clearHighlight: () => void
+}
+const fileViewerRef = ref<FileContentViewerHandle | null>(null)
 
 // ---- 错误提示 ----
 const errorMsg = ref('')
@@ -974,6 +974,21 @@ async function loadFileContent(): Promise<void> {
   } finally {
     loadingFile.value = false
   }
+  // 内容/分页刷新后按当前 highlightLine 重新定位(FileContentViewer 内部换算真实行→文档行)
+  await nextTick()
+  applyFileFocus()
+}
+
+/** 按 highlightLine 在文件查看器上高亮定位;落在当前页外则清除高亮 */
+function applyFileFocus(): void {
+  const v = fileViewerRef.value
+  if (!v) return
+  const line = highlightLine.value
+  if (line != null && line >= fileStartLine.value && line <= fileEndLine.value) {
+    v.focusRange(line, line)
+  } else {
+    v.clearHighlight()
+  }
 }
 
 async function loadNextPage(): Promise<void> {
@@ -1101,18 +1116,18 @@ async function expandToPath(filePath: string): Promise<TreeNode | null> {
   return null
 }
 
-/** 跳转到指定行:翻到该行所在分页,滚动 + 高亮 */
+/** 跳转到指定行:翻到该行所在分页,由查看器滚动 + 高亮 */
 async function jumpToLine(line: number): Promise<void> {
   highlightLine.value = line
   const pageSize = 500
   const targetOffset = Math.floor((line - 1) / pageSize) * pageSize + 1
   if (fileOffset.value !== targetOffset) {
     fileOffset.value = targetOffset
-    await loadFileContent()
+    await loadFileContent() // 分页变化:加载后内部会重新定位
+  } else {
+    await nextTick()
+    applyFileFocus()
   }
-  await nextTick()
-  const el = fileContentRef.value?.querySelector(`[data-line="${line}"]`)
-  el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
 }
 
 /**
@@ -1827,23 +1842,18 @@ defineExpose({ openTaskFile })
           </svg>
         </button>
       </div>
-      <div ref="fileContentRef" class="file-content">
+      <div class="file-content">
         <div v-if="loadingFile" class="file-loading">
           <span class="spinner-sm" /> 加载中...
         </div>
-        <div v-else-if="fileContentLines.length > 0" class="code-lines">
-          <div
-            v-for="(line, i) in fileContentLines"
-            :key="fileStartLine + i"
-            :data-line="fileStartLine + i"
-            class="code-line"
-            :class="{ 'code-line-highlight': highlightLine === fileStartLine + i }"
-          >
-            <span class="line-no">{{ fileStartLine + i }}</span>
-            <span class="line-content">{{ line }}</span>
-          </div>
-        </div>
-        <pre v-else><code>(空文件)</code></pre>
+        <FileContentViewer
+          ref="fileViewerRef"
+          class="file-viewer"
+          :content="fileContent"
+          :filename="selectedFilePath"
+          :start-line="fileStartLine"
+          placeholder="(空文件)"
+        />
       </div>
     </section>
 
@@ -2660,69 +2670,39 @@ defineExpose({ openTaskFile })
   color: var(--color-danger);
 }
 
+/* 内容容器:定位基准供加载浮层;查看器自带滚动 */
 .file-content {
   flex: 1;
-  overflow: auto;
-  padding: var(--space-2) 0;
-}
-
-.file-content pre {
-  margin: 0;
-  padding: 0 var(--space-4);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--color-text);
-  white-space: pre;
-}
-
-/* ---- 按行渲染(行号 + 高亮) ---- */
-.code-lines {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.code-line {
+  min-height: 0;
+  position: relative;
   display: flex;
-  align-items: baseline;
-  padding: 0 var(--space-2) 0 0;
-  transition: background var(--transition-fast);
+  flex-direction: column;
+  overflow: hidden;
 }
 
-.code-line:hover {
-  background: var(--color-surface-alt);
-}
-
-.code-line-highlight {
-  background: var(--color-warning-light);
-  /* 高亮持续到手动选其他文件;不随 hover 失效 */
-}
-
-.line-no {
-  flex-shrink: 0;
-  width: 48px;
-  text-align: right;
-  padding-right: var(--space-3);
-  color: var(--color-text-muted);
-  user-select: none;
-  font-variant-numeric: tabular-nums;
-}
-
-.line-content {
-  white-space: pre;
+/* 只读 CodeMirror 查看器填充容器 */
+.file-viewer {
   flex: 1;
-  min-width: 0;
-  color: var(--color-text);
+  min-height: 0;
 }
 
+/* 加载浮层:不拆掉查看器(避免分页时反复重挂 CodeMirror) */
 .file-loading {
-  display: flex;
+  position: absolute;
+  top: var(--space-2);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-4);
+  padding: var(--space-1) var(--space-3);
   font-size: var(--fs-sm);
   color: var(--color-text-secondary);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
 }
 
 .spinner-sm {

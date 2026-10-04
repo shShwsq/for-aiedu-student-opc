@@ -2,18 +2,22 @@
 /**
  * 做题页右侧「源码查阅」栏
  *
+ * 布局:文件树在左、文件内容在右(横向 IDE 分栏),栏左缘可拖拽调宽。
  * 按题目的 source_task_id 打开对应任务的工作区,浏览文件树与文件内容,
  * 供用户在答题时阅读真实源码。工作区过期清理后展示「重新拉取代码」按钮
  * (POST .../workspace/restore 发起后台克隆,再轮询 .../restore/status 看进度)。
  *
  * 树加载策略:优先整树快照(/workspace/tree);快照截断时退回逐级懒加载
- * (/workspace/files)。文件内容复用 /workspace/file(原始文本 + 分页)。
+ * (/workspace/files)。文件内容复用 /workspace/file(原始文本 + 分页),
+ * 交给 FileContentViewer 以只读 CodeMirror 渲染(IDE 行号 + 语法高亮,
+ * Markdown 文件可切「预览」)。
  *
  * 定位:父组件传入 locateFile/locateLine(来自当前题的 source_file/source_lines),
  * 变化时自动展开对应目录、打开文件并滚动高亮。
  */
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
+import FileContentViewer from './FileContentViewer.vue'
 import {
   getWorkspaceInfo,
   getWorkspaceTree,
@@ -39,6 +43,58 @@ const emit = defineEmits<{
   (e: 'close'): void
   (e: 'switch-task', taskId: string): void
 }>()
+
+// ============================================================
+// 栏宽:横向分栏需足够宽度,左缘拖拽调宽(窄屏改为覆盖抽屉,不启用)
+// ============================================================
+const MIN_WIDTH = 480
+const MAX_WIDTH = 1200
+const DEFAULT_WIDTH = 760
+const sidebarWidth = ref(DEFAULT_WIDTH)
+const resizing = ref(false)
+/** 窄屏(<=640px):栏内回退为纵向堆叠,宽度交给 CSS,不应用内联宽度 */
+const isNarrow = ref(false)
+let resizeStartX = 0
+let resizeStartW = 0
+let mql: MediaQueryList | null = null
+
+function onResizeStart(e: PointerEvent): void {
+  resizing.value = true
+  resizeStartX = e.clientX
+  resizeStartW = sidebarWidth.value
+  window.addEventListener('pointermove', onResizeMove)
+  window.addEventListener('pointerup', onResizeEnd)
+  e.preventDefault()
+}
+
+function onResizeMove(e: PointerEvent): void {
+  if (!resizing.value) return
+  // 栏靠右,左缘往左拖(=x 变小)应变宽
+  const w = resizeStartW + (resizeStartX - e.clientX)
+  sidebarWidth.value = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, w))
+}
+
+function onResizeEnd(): void {
+  resizing.value = false
+  window.removeEventListener('pointermove', onResizeMove)
+  window.removeEventListener('pointerup', onResizeEnd)
+}
+
+function onNarrowChange(): void {
+  isNarrow.value = mql?.matches ?? false
+}
+
+onMounted(() => {
+  mql = window.matchMedia('(max-width: 640px)')
+  isNarrow.value = mql.matches
+  mql.addEventListener('change', onNarrowChange)
+})
+
+onBeforeUnmount(() => {
+  onResizeEnd()
+  mql?.removeEventListener('change', onNarrowChange)
+  mql = null
+})
 
 // ============================================================
 // 工作区可用性
@@ -226,9 +282,16 @@ const loadingFile = ref(false)
 /** 高亮行号区间(题目 source_lines 定位用) */
 const highlightStart = ref<number | null>(null)
 const highlightEnd = ref<number | null>(null)
-const fileContentEl = ref<HTMLElement | null>(null)
 
-const fileLines = computed(() => fileContent.value.split('\n'))
+/** FileContentViewer 暴露的定位接口(局部类型,避免依赖 SFC 实例类型推导) */
+interface FileContentViewerHandle {
+  focusRange: (start: number | null, end: number | null) => void
+  clearHighlight: () => void
+}
+const fileViewerRef = ref<FileContentViewerHandle | null>(null)
+
+const fileLineCount = computed(() => (fileContent.value ? fileContent.value.split('\n').length : 0))
+const pageEndLine = computed(() => fileStartLine.value + fileLineCount.value - 1)
 const fileOffset = computed(() => fileStartLine.value)
 
 async function openFile(
@@ -249,7 +312,7 @@ async function openFile(
     fileTotalLines.value = res.total_lines
     fileTruncated.value = res.truncated
     await nextTick()
-    scrollToHighlight(targetLine)
+    applyFocus()
   } catch (err) {
     fileContent.value = `读取失败: ${extractErrorMessage(err)}`
     fileStartLine.value = 0
@@ -271,6 +334,8 @@ async function pageFile(delta: number): Promise<void> {
     fileStartLine.value = res.start_line
     fileTotalLines.value = res.total_lines
     fileTruncated.value = res.truncated
+    await nextTick()
+    applyFocus()
   } catch {
     // 翻页失败保持当前内容
   } finally {
@@ -278,22 +343,19 @@ async function pageFile(delta: number): Promise<void> {
   }
 }
 
-function isHighlighted(lineNo: number): boolean {
-  if (highlightStart.value === null) return false
-  const end = highlightEnd.value ?? highlightStart.value
-  return lineNo >= highlightStart.value && lineNo <= end
-}
-
-function scrollToHighlight(line: number | null): void {
-  if (!line || !fileContentEl.value) return
-  const idx = line - fileStartLine.value
-  const target = fileContentEl.value.querySelector<HTMLElement>(`[data-line-idx="${Math.max(0, idx)}"]`)
-  if (target) {
-    target.scrollIntoView({ block: 'center' })
-  } else if (line > fileStartLine.value + PAGE_LINES) {
-    // 目标行不在当前页:加载目标行所在页
-    openFile(selectedFile.value!, line, highlightEnd.value)
+/** 高亮当前题目定位行(若落在本页)并滚动到中间;否则清空高亮 */
+function applyFocus(): void {
+  const v = fileViewerRef.value
+  if (!v) return
+  const s = highlightStart.value
+  if (s == null) {
+    v.clearHighlight()
+    return
   }
+  const pageStart = fileStartLine.value
+  const pageEnd = pageStart + fileLineCount.value - 1
+  if (s >= pageStart && s <= pageEnd) v.focusRange(s, highlightEnd.value)
+  else v.clearHighlight()
 }
 
 // ============================================================
@@ -382,7 +444,20 @@ watch(
 </script>
 
 <template>
-  <aside class="code-sidebar" aria-label="源码查阅">
+  <aside
+    class="code-sidebar"
+    :class="{ 'cs-resizing': resizing }"
+    :style="isNarrow ? undefined : { width: `${sidebarWidth}px` }"
+    aria-label="源码查阅"
+  >
+    <!-- 桌面态左缘拖拽调宽手柄(窄屏隐藏) -->
+    <div
+      v-if="!isNarrow"
+      class="cs-resize-handle"
+      title="拖动调整宽度"
+      @pointerdown="onResizeStart"
+    />
+
     <div class="cs-head">
       <h3 class="cs-title">源码查阅</h3>
       <select
@@ -431,8 +506,8 @@ watch(
       该题目无来源任务信息,无法浏览代码
     </div>
 
-    <!-- 可用:文件树 + 文件内容 -->
-    <template v-else>
+    <!-- 可用:左树右内容(横向 IDE 分栏) -->
+    <div v-else class="cs-body">
       <div class="cs-tree" role="tree" aria-label="工作区文件树">
         <template v-if="visibleNodes.length">
           <div
@@ -441,15 +516,61 @@ watch(
             class="cs-tree-node"
             role="treeitem"
             :aria-expanded="item.node.type === 'dir' ? item.node.expanded : undefined"
-            :class="{ 'cs-node-active': selectedFile === item.node.path }"
-            :style="{ paddingLeft: `${8 + item.depth * 14}px` }"
+            :class="[
+              item.node.type === 'dir' ? 'tree-dir' : 'tree-file',
+              { 'cs-node-active': selectedFile === item.node.path },
+            ]"
+            :style="{ paddingLeft: `${item.depth * 14 + 8}px` }"
             @click="toggleNode(item.node)"
           >
-            <span v-if="item.node.type === 'dir'" class="cs-node-arrow">
-              {{ item.node.loading ? '…' : item.node.expanded ? '▾' : '▸' }}
+            <span class="tree-icon">
+              <!-- 文件夹:chevron(展开旋转 90°)+ 文件夹图标,与历史任务左侧栏一致 -->
+              <template v-if="item.node.type === 'dir'">
+                <svg
+                  class="tree-chevron"
+                  :class="{ expanded: item.node.expanded }"
+                  viewBox="0 0 24 24"
+                  width="10"
+                  height="10"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
+                <svg
+                  viewBox="0 0 24 24"
+                  width="13"
+                  height="13"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                </svg>
+              </template>
+              <!-- 文件 -->
+              <svg
+                v-else
+                viewBox="0 0 24 24"
+                width="13"
+                height="13"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+              </svg>
             </span>
-            <span v-else class="cs-node-arrow cs-node-arrow-empty" />
-            <span class="cs-node-name">{{ item.node.name }}</span>
+            <span class="tree-name">{{ item.node.name }}</span>
+            <span v-if="item.node.loading" class="tree-loading">...</span>
           </div>
         </template>
         <div v-else-if="treeRoot.loading" class="cs-placeholder">
@@ -458,59 +579,53 @@ watch(
         <div v-else class="cs-placeholder">仓库为空</div>
       </div>
 
-      <!-- 文件内容区 -->
+      <!-- 文件内容区(只读 CodeMirror + Markdown 预览) -->
       <div class="cs-file">
         <template v-if="selectedFile">
           <div class="cs-file-head">
-            <span class="cs-file-path" :title="selectedFile">{{ selectedFile }}</span>
+            <span class="cs-file-path" :title="selectedFile">
+              {{ selectedFile }}
+              <span v-if="loadingFile" class="cs-file-loading">读取中…</span>
+            </span>
             <div class="cs-file-pager">
               <button
                 class="cs-pager-btn"
-                :disabled="fileOffset <= 1"
+                :disabled="fileOffset <= 1 || loadingFile"
                 title="上一页"
                 @click="pageFile(-1)"
               >↑</button>
               <span class="cs-pager-info">
-                {{ fileStartLine }}-{{ fileStartLine + fileLines.length - 1 }}/{{ fileTotalLines }}
+                {{ fileStartLine }}-{{ pageEndLine }}/{{ fileTotalLines }}
               </span>
               <button
                 class="cs-pager-btn"
-                :disabled="fileStartLine + fileLines.length - 1 >= fileTotalLines"
+                :disabled="pageEndLine >= fileTotalLines || loadingFile"
                 title="下一页"
                 @click="pageFile(1)"
               >↓</button>
             </div>
           </div>
-          <div ref="fileContentEl" class="cs-file-body">
-            <div v-if="loadingFile" class="cs-placeholder">
-              <span class="cs-spinner" /> 读取中...
-            </div>
-            <template v-else>
-              <div
-                v-for="(line, idx) in fileLines"
-                :key="idx"
-                class="cs-line"
-                :class="{ 'cs-line-highlight': isHighlighted(fileStartLine + idx) }"
-                :data-line-idx="idx"
-              >
-                <span class="cs-line-no">{{ fileStartLine + idx }}</span>
-                <span class="cs-line-text">{{ line }}</span>
-              </div>
-            </template>
-          </div>
+          <FileContentViewer
+            ref="fileViewerRef"
+            class="cs-viewer"
+            :content="fileContent"
+            :filename="selectedFile"
+            :start-line="fileStartLine"
+          />
         </template>
         <div v-else class="cs-placeholder cs-file-empty">
           点击左侧文件树查看源码<template v-if="locateFile">(题目引用:{{ locateFile }})</template>
         </div>
       </div>
-    </template>
+    </div>
   </aside>
 </template>
 
 <style scoped>
 .code-sidebar {
+  position: relative;
   flex-shrink: 0;
-  width: 420px;
+  width: 760px;
   border-left: 1px solid var(--color-border);
   background: var(--color-surface);
   display: flex;
@@ -518,7 +633,31 @@ watch(
   overflow: hidden;
 }
 
-/* 手机窄屏:代码侧栏改为右侧覆盖式抽屉(定位基准为宿主 .page-body) */
+/* 拖拽调宽时禁用文本选中,避免拖动选到正文 */
+.code-sidebar.cs-resizing {
+  user-select: none;
+  cursor: col-resize;
+}
+
+/* 左缘拖拽手柄(桌面态):悬停显主色 */
+.cs-resize-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 5px;
+  z-index: 6;
+  cursor: col-resize;
+  background: transparent;
+  transition: background var(--transition-fast);
+}
+
+.cs-resize-handle:hover {
+  background: var(--color-primary-light);
+}
+
+/* 手机窄屏:代码侧栏改为右侧覆盖式抽屉(定位基准为宿主 .page-body);
+   横向分栏放不下,回退为纵向堆叠 */
 @media (max-width: 640px) {
   .code-sidebar {
     position: absolute;
@@ -528,6 +667,21 @@ watch(
     z-index: 30;
     width: min(420px, 92vw);
     box-shadow: var(--shadow-xl);
+  }
+
+  .cs-resize-handle {
+    display: none;
+  }
+
+  .cs-body {
+    flex-direction: column;
+  }
+
+  .cs-tree {
+    width: auto;
+    max-height: 42%;
+    border-right: none;
+    border-bottom: 1px solid var(--color-border);
   }
 }
 
@@ -652,56 +806,108 @@ watch(
   color: var(--color-danger);
 }
 
-/* ---- 文件树 ---- */
+/* ---- 横向分栏容器:左树右内容 ---- */
+.cs-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+/* ---- 文件树(左列):样式对齐历史任务左侧栏 WorkspaceSidebar ---- */
 .cs-tree {
   flex-shrink: 0;
-  max-height: 42%;
+  width: 220px;
   overflow-y: auto;
-  border-bottom: 1px solid var(--color-border);
-  padding: var(--space-2) 0;
+  border-right: 1px solid var(--color-border);
+  padding: var(--space-2);
 }
 
 .cs-tree-node {
   display: flex;
   align-items: center;
-  gap: var(--space-1);
-  padding: 2px var(--space-2);
-  font-size: var(--fs-xs);
-  color: var(--color-text-secondary);
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
   cursor: pointer;
+  font-size: var(--fs-sm);
+  color: var(--color-text);
+  border-radius: var(--radius-md);
+  transition: background var(--transition-fast);
+  white-space: nowrap;
+  overflow: hidden;
+  line-height: 1.6;
   user-select: none;
 }
 
 .cs-tree-node:hover {
-  background: var(--color-bg-secondary);
+  background: var(--color-surface-alt);
 }
 
-.cs-node-active {
-  color: var(--color-primary);
-  background: var(--color-primary-light);
-}
-
-.cs-node-arrow {
+.tree-icon {
   flex-shrink: 0;
-  width: 12px;
-  font-size: 10px;
-  text-align: center;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-text-secondary);
+}
+
+/* 文件夹行:次级文字色 + muted 图标(hover 提亮) */
+.tree-dir {
+  color: var(--color-text-secondary);
+}
+
+.tree-dir .tree-icon {
   color: var(--color-text-muted);
 }
 
-.cs-node-arrow-empty {
-  visibility: hidden;
+.tree-dir:hover .tree-icon {
+  color: var(--color-text);
 }
 
-.cs-node-name {
+.tree-dir .tree-name {
+  font-weight: var(--fw-medium);
+}
+
+.tree-file .tree-icon {
+  color: var(--color-text-muted);
+}
+
+.tree-chevron {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+  transition: transform var(--transition-fast);
+}
+
+.tree-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.tree-name {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-/* ---- 文件内容 ---- */
+.tree-loading {
+  color: var(--color-text-muted);
+  font-size: 10px;
+}
+
+/* 选中行(当前打开的文件):置于末尾以保证主色优先级 */
+.cs-node-active {
+  background: var(--color-primary-light) !important;
+  color: var(--color-primary);
+  font-weight: var(--fw-semibold);
+}
+
+.cs-node-active .tree-icon {
+  color: var(--color-primary);
+}
+
+/* ---- 文件内容(右列) ---- */
 .cs-file {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -724,6 +930,13 @@ watch(
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.cs-file-loading {
+  margin-left: var(--space-2);
+  font-size: var(--fs-xs);
+  font-family: var(--font-sans);
+  color: var(--color-text-muted);
 }
 
 .cs-file-pager {
@@ -764,41 +977,13 @@ watch(
   white-space: nowrap;
 }
 
-.cs-file-body {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: var(--space-2) 0;
-  background: var(--color-bg);
-}
-
 .cs-file-empty {
   flex: 1;
 }
 
-.cs-line {
-  display: flex;
-  gap: var(--space-2);
-  padding: 0 var(--space-2);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.6;
-}
-
-.cs-line-highlight {
-  background: var(--color-primary-light);
-}
-
-.cs-line-no {
-  flex-shrink: 0;
-  min-width: 32px;
-  text-align: right;
-  color: var(--color-text-muted);
-  user-select: none;
-}
-
-.cs-line-text {
-  white-space: pre;
-  color: var(--color-text);
+/* FileContentViewer 填充右列剩余高度 */
+.cs-viewer {
+  flex: 1;
+  min-height: 0;
 }
 </style>
