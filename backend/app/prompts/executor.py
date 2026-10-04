@@ -397,6 +397,61 @@ def build_cli_memory_section(
 
 
 # ============================================================
+# CLI 侧跨轮历史回放段(acp_base 消费;结构化历史的加载与压缩在执行器侧)
+# ============================================================
+
+# 历史回放的角色标签:CLI 的 session/prompt 只有 text 通道,没有 user/
+# assistant 角色通道,角色只能写进文本
+_CLI_HISTORY_ROLE_LABELS = {
+    "user": "用户",
+    "assistant": "执行者",
+}
+
+
+def build_cli_history_replay_section(messages: list[dict[str, Any]]) -> str:
+    """把结构化历史消息渲染成"之前轮次执行记录"回放段(CLI/acp_base 消费)
+
+    使用场景:ACP 侧新建 session(沙箱重建 / 后端重启 / 启动参数或凭证变化)
+    时,CLI 看不到同一任务之前轮次做过什么,追问轮只剩一句"基于之前的执行
+    进度"会退化成重做或答非所问,故把历史回放拼进本轮 prompt。
+
+    渲染约定:
+    - user → "用户:",assistant → "执行者:"(角色边界写进文本)
+    - system 消息自带 [系统注入|来源|第 N 轮] 标记时原样保留(保住轮次边界),
+      无标记的补上通用标记
+    - 整段以 [系统注入|此前轮次执行记录] 开头,明确这是历史记录而非用户本轮
+      原话,防止模型把过往内容当成最新指令(与内置侧 marker 约定一致)
+    - 空输入返回空串(首轮无历史时不产生多余段落)
+
+    本函数纯文本拼装,不做数据加载:messages 由执行器侧的跨轮记忆构造提供
+    (内置 react_agent 与 CLI 共用同一实现,两侧历史内容因此不会分叉)。
+    """
+    lines: list[str] = []
+    for msg in messages or []:
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        label = _CLI_HISTORY_ROLE_LABELS.get(msg.get("role") or "")
+        if label:
+            lines.append(f"{label}: {content}")
+        elif content.startswith(SYSTEM_INJECT_MARKER):
+            lines.append(content)
+        else:
+            lines.append(f"{SYSTEM_INJECT_MARKER}历史记录] {content}")
+    if not lines:
+        return ""
+
+    return (
+        "\n\n" + SYSTEM_INJECT_MARKER + "此前轮次执行记录]\n"
+        "本会话是新开的,你看不到之前轮次的过程。以下是同一任务之前轮次的"
+        "执行记录(按时间先后排列,含当时的用户要求、执行结论与评审反馈):\n\n"
+        + "\n\n".join(lines)
+        + "\n\n请把上述记录作为既有进度:不要重做已完成的部分,"
+        "也不要把其中的过往要求当成本轮的新指令。"
+    )
+
+
+# ============================================================
 # 失败重试续跑消息
 # ============================================================
 

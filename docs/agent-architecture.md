@@ -529,18 +529,25 @@ ExecutorAgent (ABC)
     [复用链路] 直接用缓存的 acp_session_id(不经 initialize/session_new)
 16. [全新链路] post_session_setup(client, acp_session_id, task)  [wrapper 钩子]
     → deepseek_cli 用此调 set_config_option(model / reasoning_effort)
-    → 之后把 session/bridge_exec_id/endpoint/acp_session_id/fingerprint 写入 _bridge_cache
+    → 之后把 session/bridge_exec_id/endpoint/acp_session_id/fingerprint/
+      injected_context_hash({},本 session 尚未注入过系统段)写入 _bridge_cache
 17. _build_base_prompt(纯指令) → 按 (task_id, round_idx, role=user, type=question) 幂等查重,
     无记录才 _add_conversation 落库(首轮提问已在 create_task 时落库,此处跳过避免重复)
-18. user_msg = base_msg
-    + _build_repo_context_section(仅首轮传 repo_context,按 clone/upload 选变体)
-    + _build_memory_section(memory_summary, global_memory)
-    (后两段只进发送内容不落库;各段文案收敛于 prompts/executor.py,见 §4.4)
+18. _resolve_injection_plan(reused, 仓库上下文段, 记忆段)
+    → 复用同一 session 且某段逐字未变 → 该段置空(上一轮已发过,重发只是重复占 token)
+    → 走全新链路 → 两段全量注入,并 need_replay=True → _load_history_replay 回放之前轮次
+      (数据源与内置侧同一条 _build_history_messages,渲染成单条 text;不传 client,
+       CLI 执行链不依赖后端 LLM,超预算由兜底截断保留最近轮次)
+    → 返回按"原内容"计算的注入段指纹(裁剪后的空内容不参与,下一轮仍可命中去重)
+    → user_msg = _compose_send_text(base_msg, repo_ctx_section, memory_section, history_replay)
+      装配顺序:历史回放 + 仓库/上传上下文 + 记忆段 + 本轮指令(稳定段在前,易变指令置后)
 19. collector = _ACPCollector(task, db, round_idx, agent_type=agent_type)
 20. with session.auto_renew():  # prompt 期间 CLI 用自带 bash 不访问后端,单轮长执行可能拖过沙箱 TTL,
                                 # 后台线程周期性 renew 沙箱
       client.prompt(acp_session_id, [{"type":"text","text":user_msg}],
                     on_event=collector, idle_probe=lambda: collector.has_active_tools)
+    → 成功后 _remember_injected_context(task_id, 指纹) 写回缓存,供同 session 下一轮去重
+      (发送失败不记录 → 下一轮重新注入,不会漏上下文)
     → 挂死兜底:按活动工具状态分级 idle 超时 → session/cancel + 置 last_prompt_truncated → 返回空结果
     → 流异常兜底:CLI 崩溃/连接中断(ACPStreamAborted)走同款善后,不把崩溃当正常完成、不 fail 任务
 21. finally: recorder.close() + collector.close() → client.close()
@@ -563,12 +570,24 @@ ExecutorAgent (ABC)
 - **省时**：命中时跳过「准备 CLI 环境 → 启 bridge → initialize → session/new」整条链路（~25s），并跳过 `session.get_endpoint` 端口转发（resume 场景实测最长 ~70s）
 - **会话延续**：CLI 进程不退出，ACP session 存于进程内，追问/续跑共用同一 session → CLI 自身能看到之前的对话（这是 CLI 侧跨轮记忆的首要手段，见 §4.4）
 - **失效判定**：沙箱会话对象变了（容器重建）/ `agent_type` 变了 / 指纹（acp_args + 凭证 env）变了 / `GET /health` 不通过 → 清缓存走全新链路（类型/指纹变化时先停旧 bridge 防端口冲突）
+- **失效后的补偿**：降为全新链路时新 session 对之前轮次一无所知 → 本轮回放历史（`_load_history_replay`，仅 `round_idx > 1`，构造异常则不注入，见 §4.4）
 - **生命周期**：正常轮次结束 **不** 停 bridge；仅初始化失败（未入缓存）时停掉防残留，或连接层异常时清缓存，或由 `stop_task_bridge(task_id)`（沙箱会话关闭/任务删除）主动回收
 - **并发边界**：ACP over stdio 是串行协议（bridge 侧锁保护 send+collect 全程，同一时刻仅一个 prompt）；agent2 后台审查不经 bridge（它是进程内 LLM 调用），它与新轮 CLI 执行共享的是**同一沙箱会话**（只读核查 / verifier PoC 侧），详见 §1.2 并行世代门控
 
 ### 4.4 Prompt 消息构造（`_build_base_prompt` + 共享段落工厂）
 
-CLI 侧每轮构造单条 user 文本：**纯指令**（`_build_base_prompt`，落库展示）+ **预 clone/上传上下文段** + **记忆注入段**（后两段只进发送内容）。各段文案实现收敛于 [app/prompts/executor.py](../backend/app/prompts/executor.py)（与内置 react_agent 侧同源集中管理，消除"注释里约定两边保持一致"的双轨手抄；`_build_prompt_message` 为三段拼接的聚合视图，供测试锚定）。
+CLI 侧每轮构造单条 user 文本，由 `_compose_send_text` 按**稳定注入段在前、本轮指令在后**装配：
+
+```
+[跨轮历史回放]      仅新建 session 时(_load_history_replay)
+[仓库/上传上下文段]  仅首轮(_build_repo_context_section)
+[记忆注入段]        项目记忆 + 全局记忆(_build_memory_section)
+[纯指令]            _build_base_prompt → 同时落库展示(总在末尾)
+```
+
+只有最后一段落库（前端展示）；前三段属系统编排信息，只进发送内容。指令置后的理由：模型对末尾指令最敏感，而前面的注入段在同一 session 内逐字不变（配合注入段去重有利于提示词前缀缓存命中）。
+
+各段文案实现收敛于 [app/prompts/executor.py](../backend/app/prompts/executor.py)（与内置 react_agent 侧同源集中管理，消除"注释里约定两边保持一致"的双轨手抄）；`_build_prompt_message` 为四段拼接的聚合视图（供测试锚定），生产路径走 `_resolve_injection_plan` + `_compose_send_text`，两者共用同一装配函数。
 
 **第 1 轮**（底座复用 `build_first_round_question`——与 create_task 落库、内置 react_agent 首轮完全一致；上传任务会带"用户上传的文件已放入任务工作区"行；未预 clone 但有路径时附"仓库路径"兜底行）：
 ```
@@ -593,16 +612,32 @@ CLI 侧每轮构造单条 user 文本：**纯指令**（`_build_base_prompt`，�
 
 > “仓库路径”行两个条件缺一不可：纯上传任务的 `repo_path` 指向 `uploaded_files/`，称其“已 clone 的仓库”会误导（工作区文件路径已由 session cwd 提供）；预 clone/上传传输可能降级为空目录，此时声称“已就位”会让执行器跳过获取动作。内置侧同样不区分仓库/上传，统一用中性的“工作区路径”措辞（见 §3.3）。
 
-**每轮末尾追加**（与内置 react_agent system prompt 行为一致）：
-- 若有 `previous_plan`：`format_plan_reminder(previous_plan, variant="cli")`（中立措辞，兼容 CLI 原生 TodoList 等计划工具）
+**系统注入段（装配在本轮指令之前）**：
+- 若有 `previous_plan`：`format_plan_reminder(previous_plan, variant="cli")`（中立措辞，兼容 CLI 原生 TodoList 等计划工具）——属于本轮指令部分，随指令落在末尾
 - 若有 `memory_summary`：`[项目记忆摘要] ... 完整项目记忆可 read_file /home/user/.agent_memory/project_memory.md 查阅`（数据经 `memory_injection.load_project_memory_brief` 单源加载，summary 为空回退 memory_content 截断——与内置侧回退行为一致）
 - 若有 `global_memory`：跨项目通用经验段
 
+> 记忆/仓库上下文两段在同一 session 内**不逐轮重发**：`_resolve_injection_plan` 按段各自比对指纹（`_context_sections_hash`，对齐 Codex `reference_context_item` 的 diff 思路），未变则跳过，变化（如归纳出新约束）则重新注入并在发送成功后回写指纹。
+
 > **注意**：CLI agent 不像内置 react_agent 那样维护 `messages` 列表，每轮 prompt 都是独立的 user 文本。跨轮记忆主要依赖：
-> 1. **bridge + ACP session 复用**（首要）：同一任务的 bridge/CLI 进程随沙箱会话存活，后续轮次/resume 用缓存的 `acp_session_id` 直接发 prompt，**CLI 侧对话上下文随 session 在进程内延续**（见 §4.3 步骤 7/15）；沙箱重建或指纹变化时降级为全新链路，会话上下文丢失
-> 2. `previous_plan` 注入（plan 状态续接）
-> 3. 项目记忆 + 全局记忆（每轮重新拼接）
-> 4. CLI 自身的会话恢复机制（如 Codex 的 `codex exec resume <thread_id>`，由 codex_bridge 在进程内维护）
+> 1. **bridge + ACP session 复用**（首要）：同一任务的 bridge/CLI 进程随沙箱会话存活，后续轮次/resume 用缓存的 `acp_session_id` 直接发 prompt，**CLI 侧对话上下文随 session 在进程内延续**（见 §4.3 步骤 7/15）
+> 2. **新 session 的历史回放**（兼容降级）：沙箱重建或指纹变化导致会话上下文丢失时，把之前轮次执行记录渲染成文本回放给 CLI（数据源与内置侧 `_build_history_messages` 同源，经 `build_cli_history_replay_section` 输出带 `[系统注入|此前轮次执行记录]` 标记的整段，防被当成新指令）
+> 3. `previous_plan` 注入（plan 状态续接）
+> 4. 项目记忆 + 全局记忆（同 session 内内容未变则不重发，见上方注入段去重）
+> 5. CLI 自身的会话恢复机制（如 Codex 的 `codex exec resume <thread_id>`，由 codex_bridge 在进程内维护；Qoder/dsh 的 ACP 级会话恢复探查见下方归档）
+
+> **会话持久化恢复（session/load / session/resume）——探查结论归档（2026-10，未接入）**：三个 CLI 的磁盘持久化与恢复能力经实测（Qoder）与源码核对（dsh、codex）确认如下，可作为后续"后端重启后按 sessionId 恢复会话"的接入依据（替代该场景下的文本回放：CLI 自身 transcript 保真度更高且零 token 成本）：
+>
+> | | Qoder CLI 1.1.65 | deepseek-harness (dsh) | Codex（codex_bridge） |
+> |---|---|---|---|
+> | 标准 `session/load` | ✅ `loadSession: true`，实测仅凭 `sessionId+cwd+mcpServers` 即从磁盘恢复（transcript 非必需） | ❌ 未声明未实现 | ❌ |
+> | 扩展 `session/resume` | ✅ 实测可用 | ✅ `sessionCapabilities.resume`，从 SQLite 持久会话恢复，cwd 必须匹配，拒绝已激活/子代理会话 | ❌ `thread_id` 只存 bridge 进程内存，需改造 bridge（透出并持久化 sessionId→thread_id 映射）方可支持 |
+> | 磁盘持久化位置 | `~/.qoder/projects/<cwd>/<sessionId>.jsonl` + checkpoint 目录 | dsh-session-persistence（SQLite） | codex rollout/thread-store（`codex exec resume <thread_id>`） |
+>
+> - `sessionCapabilities: {list, resume, close}` 扩展族已被 `@agentclientprotocol/sdk` 1.4.0 收编，Qoder 与 dsh 声明一致；统一走 `session/resume` 即可覆盖 Qoder + dsh，Qoder 另支持标准 `session/load`
+> - 恢复的会话**按 cwd 定位项目**：cwd 必须与原会话一致；沙箱重建后磁盘状态随容器销毁，resume 不可用——文本回放仍是必要兜底，两者互补
+> - 接入要点：① `acp_session_id` 与注入段指纹（`injected_context_hash`）需持久化到 DB——恢复的会话上下文已包含此前注入的仓库/记忆段，指纹不同步恢复会造成重复注入；② resume 后 CLI 会异步回放历史 `session/update` 通知（实测可持续到下一个请求期间），须在 `_ACPCollector` 创建前调用并排空，防止历史被当成本轮输出重复入库/推前端；③ resume 失败一律降级 `session/new` + 文本回放
+> - 已知缺口（2026-10 代码审查记录在案，未修复）：全新链路首轮 prompt 以业务性异常失败时（仅连接类异常清缓存），缓存条目保留，下一轮复用该从未收到过消息的空 session 时 `need_replay=False` 不回放——历史回放机制在此窗口失效；上述 sessionId 持久化 + resume 接入可一并解决该缺口
 
 ### 4.5 wrapper 层差异
 

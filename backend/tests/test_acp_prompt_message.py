@@ -10,7 +10,9 @@ from app.agents.acp_base import (
     _build_memory_section,
     _build_prompt_message,
     _build_repo_context_section,
+    _compose_send_text,
 )
+from app.prompts.executor import SYSTEM_INJECT_MARKER
 
 
 def _mk_task(user_input="审计这个仓库的安全问题", params=None):
@@ -241,8 +243,12 @@ def test_memory_section_empty_when_no_memories():
     assert _build_memory_section("   ", "") == ""
 
 
-def test_prompt_message_equals_base_plus_repo_and_memory():
-    """_build_prompt_message == 纯指令 + 预 clone 上下文段 + 记忆段(发送完整,落库纯净)。"""
+def test_prompt_message_equals_sections_plus_base():
+    """发送装配 == 预 clone 上下文段 + 记忆段 + 纯指令(发送完整,落库纯净)。
+
+    本轮指令放在末尾(模型对末尾指令最敏感),前面的注入段在同一 session
+    内保持逐字不变,便于提示词前缀缓存命中。
+    """
     task = _mk_task()
     base = _build_base_prompt(
         task, 1, None, "[repo context]", "/home/user/repos/r", None,
@@ -253,5 +259,45 @@ def test_prompt_message_equals_base_plus_repo_and_memory():
         task, 1, None, "[repo context]", "/home/user/repos/r", None,
         memory_summary="PROJECT_MEM", global_memory="GLOBAL_MEM",
     )
-    assert msg == base + repo_section + section
+    assert msg == repo_section + section + "\n\n" + base
+
+
+def test_prompt_message_history_replay_goes_first():
+    """跨轮历史回放排最前(属"过去"的内容),本轮指令仍在末尾且与注入段有分隔。"""
+    from app.prompts.executor import build_cli_history_replay_section
+
+    task = _mk_task()
+    base = _build_base_prompt(
+        task, 2, "继续检查", None, "/home/user/repos/r", None,
+    )
+    section = _build_memory_section("PROJECT_MEM", "")
+    replay = build_cli_history_replay_section([
+        {"role": "user", "content": "首轮原话"},
+        {"role": "assistant", "content": "首轮结论"},
+    ])
+    msg = _build_prompt_message(
+        task, 2, "继续检查", None, "/home/user/repos/r", None,
+        memory_summary="PROJECT_MEM",
+        history_replay=replay,
+    )
+    assert msg.lstrip("\n").startswith(f"{SYSTEM_INJECT_MARKER}此前轮次执行记录]")
+    assert msg.index("首轮原话") < msg.index("PROJECT_MEM") < msg.index(base)
+    assert msg.endswith(base)
+    # 指令与前方注入段之间保留空行分隔(不能粘连成一词)
+    assert section.rstrip("\n") + "\n\n" + base in msg
+
+
+def test_compose_send_text_skips_empty_sections():
+    """空段不产生多余分隔;拼接顺序为历史回放 + 仓库上下文 + 记忆 + 指令。"""
+    assert _compose_send_text("BASE") == "BASE"
+    assert _compose_send_text("BASE", "", "", "") == "BASE"
+    assert _compose_send_text("", "", "", "REPLAY") == "REPLAY"
+    assert _compose_send_text("") == ""
+    # 稳定段在前,本轮指令在后;无前置换行的段之间补 \n\n
+    assert (
+        _compose_send_text("BASE", "REPO", "MEM", "REPLAY")
+        == "REPLAY\n\nREPO\n\nMEM\n\nBASE"
+    )
+    # 段自身已以换行开头时不重复加分隔
+    assert _compose_send_text("BASE", "\n\nREPO", "\n\nMEM") == "\n\nREPO\n\nMEM\n\nBASE"
 

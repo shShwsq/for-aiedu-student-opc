@@ -20,6 +20,11 @@ bridge 不在每轮结束时停止:进程随沙箱会话存活,供后续轮次/r
 (省去 ensure_cli_env/start_bridge/initialize/new_session 合计 ~25s);
 沙箱会话销毁(close_session)时经 stop_task_bridge 清缓存,容器销毁连带回收进程。
 
+上下文注入两个约定(详见 _load_history_replay / _context_sections_hash):
+- 走全新链路(新 session)的追问轮会把之前轮次执行记录回放给 CLI
+  —— 新 session 看不到上一轮的对话,否则只剩"基于之前的执行进度"无从续接
+- 复用同一 session 时,未变化的注入段(仓库上下文/记忆段)不重发,避免重复占 token
+
 各 wrapper 的差异通过回调/参数注入:
 - post_session_setup(client, session_id, task):session/new 之后、prompt 之前执行
   (deepseek 用此回调调 set_config_option 设置模型/思考强度)
@@ -30,6 +35,7 @@ bridge 不在每轮结束时停止:进程随沙箱会话存活,供后续轮次/r
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import queue
@@ -63,6 +69,7 @@ from app.perf import perf_log
 from app.prompts.executor import (
     FOLLOWUP_CORE_GUIDANCE,
     _has_creation_upload,
+    build_cli_history_replay_section,
     build_cli_memory_section,
     build_cli_repo_context_section,
     build_first_round_question,
@@ -1273,7 +1280,8 @@ def _try_reuse_bridge(
 
     可复用须同时满足:同一沙箱会话对象(容器未重建)、agent 类型一致、
     启动配置指纹一致、/health 通过。任一不满足则清缓存返回 None(走全新链路)。
-    返回:{"bridge_exec_id", "endpoint_url", "endpoint_headers", "acp_session_id"}
+    返回:{"bridge_exec_id", "endpoint_url", "endpoint_headers", "acp_session_id",
+    "injected_context_hash"}(末项为本 session 已注入的系统段指纹,供注入去重)
     """
     with _bridge_cache_lock:
         entry = _bridge_cache.get(task_id)
@@ -2141,22 +2149,27 @@ def _build_prompt_message(
     previous_plan: list[dict] | None,
     memory_summary: str = "",
     global_memory: str = "",
+    history_replay: str = "",
 ) -> str:
-    """构造发给 CLI 的完整 prompt 消息(纯指令 + 预 clone 上下文 + 记忆注入段)
+    """构造发给 CLI 的完整 prompt 消息(历史回放 + 预 clone 上下文 + 记忆注入段 + 纯指令)
 
-    落库展示用 _build_base_prompt(纯指令);预 clone 上下文段与记忆段
-    都只进发送内容,不落库不展示。
+    落库展示用 _build_base_prompt(纯指令);预 clone 上下文段、记忆段与
+    跨轮历史回放都只进发送内容,不落库不展示。
+
+    run_acp_agent 不直接调本函数(它需要在同一 session 内跳过未变化的注入段),
+    但两者均走 _compose_send_text,段落顺序因此一致。
     """
     variant = "upload" if _has_creation_upload(task.params) else "clone"
-    return (
+    return _compose_send_text(
         _build_base_prompt(
             task, round_idx, followup_query, repo_context, repo_path, previous_plan,
-        )
-        + _build_repo_context_section(
+        ),
+        _build_repo_context_section(
             repo_context if followup_query is None else None,
             variant,
-        )
-        + _build_memory_section(memory_summary, global_memory)
+        ),
+        _build_memory_section(memory_summary, global_memory),
+        history_replay,
     )
 
 
@@ -2232,9 +2245,139 @@ def _build_memory_section(memory_summary: str = "", global_memory: str = "") -> 
     """构造记忆注入段(拼在发送给 CLI 的 prompt 末尾,不落库不展示)
 
     文案实现收敛于 app/prompts/executor.py 的 build_cli_memory_section
-    (与内置 react_agent 侧的包装同源集中管理)。两部分都为空时返回空串。
+    (与内置 react_agent 侧的包装同源集中管理)。
+    两部分都为空时返回空串。
     """
     return build_cli_memory_section(memory_summary, global_memory)
+
+
+# ============================================================
+# 发送文本装配(稳定注入段在前,本轮指令置后)
+# ============================================================
+
+
+def _compose_send_text(
+    base_msg: str,
+    repo_ctx_section: str = "",
+    memory_section: str = "",
+    history_replay: str = "",
+) -> str:
+    """装配实际发给 CLI 的文本:稳定的系统注入段在前,本轮指令在后
+
+    段落顺序(与此前"指令在最前 + 上下文在尾"相反):
+    1. 跨轮历史回放(属"过去"的内容,也最稳定)
+    2. 预 clone / 上传上下文
+    3. 项目记忆 + 全局记忆
+    4. 本轮指令(用户原话 / 追问原文 / plan 状态提醒)
+
+    理由:本轮要求落在末尾(模型对末尾指令最敏感),而前几段在同一 session
+    内保持逐字不变,便于 CLI 侧与模型服务端的提示词前缀缓存命中。
+    空段直接跳过;段间分隔统一由本函数补(注入段自身已以 \n\n 开头时不重复加,
+    纯指令不带前导空行,靠这里补上分隔)。
+    """
+    parts = [
+        part for part in (history_replay, repo_ctx_section, memory_section, base_msg)
+        if part
+    ]
+    if not parts:
+        return ""
+    text = parts[0]
+    for part in parts[1:]:
+        text += part if part.startswith("\n") else "\n\n" + part
+    return text
+
+
+def _sha1_text(text: str) -> str:
+    """逐字指纹(空串也有稳定值,便于统一比较)"""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _context_sections_hash(
+    repo_ctx_section: str, memory_section: str,
+) -> dict[str, str]:
+    """两类注入段各自的指纹(内容逐字一致 → 指纹一致)
+
+    分桶而非合并哈希:两类内容各自变化(首轮后预 clone 段就不再拼,而记忆段
+    可能一直未变),合并指纹会让一段变化连带把另一段重发一遍。
+    """
+    return {
+        "repo": _sha1_text(repo_ctx_section),
+        "memory": _sha1_text(memory_section),
+    }
+
+
+def _remember_injected_context(task_id: str, ctx_hash: dict[str, str]) -> None:
+    """把本轮注入段指纹写回 session 缓存(缓存不在则静默跳过)"""
+    with _bridge_cache_lock:
+        entry = _bridge_cache.get(task_id)
+        if entry is not None:
+            entry["injected_context_hash"] = ctx_hash
+
+
+def _resolve_injection_plan(
+    reused: dict[str, Any] | None,
+    repo_ctx_section: str,
+    memory_section: str,
+) -> tuple[str, str, bool, dict[str, str]]:
+    """决定本轮的系统注入内容(注入策略集中在此,便于单测)
+
+    返回 (实际注入的仓库上下文段, 实际注入的记忆段, 是否需要历史回放, 注入段指纹):
+
+    - 复用同一 session(reused 非空)且某注入段逐字未变 → 该段置空:上一轮已
+      发过,内容已在 CLI 侧对话上下文里,重发只是重复占 token(对齐 Codex
+      reference_context_item 的 diff 思路);另一段变化不影响本判定
+    - 走全新链路(reused 为空,含沙箱重建/后端重启/启动参数或凭证变化)→
+      session 对之前轮次一无所知,需回放历史,且注入段全量重发
+    - 指纹永远按未裁剪的原内容计算:内容变化时指纹变化 → 下一轮重新注入
+    """
+    ctx_hash = _context_sections_hash(repo_ctx_section, memory_section)
+    if reused is None:
+        return repo_ctx_section, memory_section, True, ctx_hash
+
+    previous = reused.get("injected_context_hash") or {}
+    return (
+        "" if previous.get("repo") == ctx_hash["repo"] else repo_ctx_section,
+        "" if previous.get("memory") == ctx_hash["memory"] else memory_section,
+        False,
+        ctx_hash,
+    )
+
+
+def _load_history_replay(db: Session, task: Task, round_idx: int) -> str:
+    """构造"之前轮次执行记录"回放段(仅新建 ACP session 时需要)
+
+    背景:ACP session 复用时,之前轮次的对话上下文留在 CLI 进程内自然延续;
+    但沙箱重建 / 后端重启 / 启动参数或凭证变化都会走全新链路(session/new),
+    新 session 对之前轮次一无所知,追问轮只剩"基于之前的执行进度"就无从续接。
+
+    数据源与内置 react_agent 完全同源(_build_history_messages:同一张
+    Conversation 表 + 三级压缩 + token 预算),此处只多一步"结构化消息 →
+    单条文本"的渲染(CLI 的 session/prompt 只有 text 通道)。
+
+    不传 client:CLI 执行链不依赖后端 LLM(模型配额在 CLI 账号侧,后端可能
+    未配置 LLM key),因此不走 Level 2 的 LLM 压缩 —— 超预算时由兜底截断
+    保留最近轮次(最近轮次对续接最有价值)。
+
+    任何异常降级为"不注入":历史回放是增强项,不能拖垮正常执行轮。
+    """
+    if round_idx <= 1:
+        return ""
+    _t0 = time.perf_counter()
+    try:
+        # 函数级导入:CLI 侧不在模块加载期依赖内置 agent
+        from app.agents.react_agent import _build_history_messages
+
+        messages = _build_history_messages(db, task.id, round_idx)
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 构造跨轮历史回放失败(忽略,本轮不注入): {e}")
+        return ""
+    section = build_cli_history_replay_section(messages)
+    # [perf] 跨轮历史回放构造(走新 session 的追问轮才执行,含 DB 查询)
+    perf_log(
+        task.id, "acp_history_replay", time.perf_counter() - _t0,
+        round_idx=round_idx, replay_chars=len(section),
+    )
+    return section
 
 
 # ============================================================
@@ -2483,11 +2626,13 @@ def run_acp_agent(
                         "endpoint_headers": endpoint_headers,
                         "acp_session_id": acp_session_id,
                         "fingerprint": fingerprint,
+                        # 本 session 已注入过的系统段指纹(新 session 尚未注入)
+                        "injected_context_hash": {},
                     }
 
             # ---- 构造 prompt 消息 ----
             # 落库只存纯指令(前端展示不含预 clone 上下文与记忆注入段);
-            # 实际发送时再拼上这两段(系统编排信息,不展示给用户)
+            # 实际发送时再拼上系统注入段(不展示给用户,装配顺序见 _compose_send_text)
             base_msg = _build_base_prompt(
                 task, round_idx, followup_query, repo_context, repo_path, previous_plan,
             )
@@ -2511,17 +2656,32 @@ def run_acp_agent(
                     content=base_msg,
                 )
 
+            # ---- 系统注入段(只进发送内容,不落库)----
             # 上传任务走 upload 包裹变体(不称"已预先 clone",与正文一致)
             _repo_ctx_variant = (
                 "upload" if _has_creation_upload(task.params) else "clone"
             )
-            user_msg = (
-                base_msg
-                + _build_repo_context_section(
-                    repo_context if followup_query is None else None,
-                    _repo_ctx_variant,
+            raw_repo_ctx = _build_repo_context_section(
+                repo_context if followup_query is None else None,
+                _repo_ctx_variant,
+            )
+            raw_memory = _build_memory_section(memory_summary, global_memory)
+            repo_ctx_section, memory_section, need_replay, ctx_hash = _resolve_injection_plan(
+                reused, raw_repo_ctx, raw_memory,
+            )
+            if (raw_repo_ctx and not repo_ctx_section) or (
+                raw_memory and not memory_section
+            ):
+                logger.info(
+                    f"[task={task.id}] {agent_type} 同一 ACP session 内注入段未变化,"
+                    f"本轮不重复注入(仓库上下文/记忆段已在 CLI 上下文中):"
+                    f"skipped_repo={bool(raw_repo_ctx and not repo_ctx_section)}, "
+                    f"skipped_memory={bool(raw_memory and not memory_section)}"
                 )
-                + _build_memory_section(memory_summary, global_memory)
+            history_replay = _load_history_replay(db, task, round_idx) if need_replay else ""
+
+            user_msg = _compose_send_text(
+                base_msg, repo_ctx_section, memory_section, history_replay,
             )
 
             # ---- 流式发送 prompt ----
@@ -2543,6 +2703,8 @@ def run_acp_agent(
                         # 挂死兜底:按活动工具状态分级 idle 超时(见 PromptIdleTimeout)
                         idle_probe=lambda: collector.has_active_tools,
                     )
+                    # 记住本轮已注入的注入段指纹,供同 session 下一轮去重
+                    _remember_injected_context(task_id_str, ctx_hash)
 
             except Exception as e:
                 logger.exception(f"[task={task.id}] ACP prompt 失败 ({agent_type})")
