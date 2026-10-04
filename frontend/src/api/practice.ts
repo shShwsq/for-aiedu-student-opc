@@ -12,11 +12,13 @@ import type {
   ConfirmQuestionsRequest,
   ConfirmQuestionsResponse,
   DraftQuestion,
+  ExplainKnowledgePointsResponse,
   GenerateJobResponse,
   GenerateJobsResponse,
   GenerateJobStatus,
   GenerateModelInfo,
   GenerateRequest,
+  KnowledgeExplanation,
   KnowledgePointCard,
   LearningTopicCreateRequest,
   LearningTopicDef,
@@ -54,13 +56,15 @@ export function getGenerateJob(jobId: string): Promise<GenerateJobStatus> {
 }
 
 /**
- * 当前用户的出题 job 列表(运行中优先,限最近 10 条)
+ * 当前用户的 job 列表(运行中优先,限最近 10 条)
  *
- * 练习页侧栏轮询发现正在运行的出题 job(手动与自动来源都含);
+ * 练习页侧栏轮询发现正在运行的出题 job(默认 manual/auto);
+ * 知识点讲解 job 用 sources=['explain'] 单独取,不混进出题进度。
  * 实时进度与流式输出另走 SSE,见 api/practiceStream.ts。
  */
-export function listGenerateJobs(): Promise<GenerateJobsResponse> {
-  return client.get('/practice/generate/jobs').then((r) => r.data)
+export function listGenerateJobs(sources?: string[]): Promise<GenerateJobsResponse> {
+  const params = sources && sources.length ? { sources: sources.join(',') } : {}
+  return client.get('/practice/generate/jobs', { params }).then((r) => r.data)
 }
 
 /** 待确认候选题完整内容(可按来源任务过滤) */
@@ -102,9 +106,39 @@ export function getPracticeStats(): Promise<PracticeStats> {
   return client.get('/practice/stats').then((r) => r.data)
 }
 
-/** 知识点卡片列表(知识点看板视图):全量知识点 + SM-2 状态 + 题数 + 分栏状态 */
+/** 知识点卡片列表(知识点看板视图):全量知识点 + SM-2 状态 + 题数 + 分栏状态 + 讲解 */
 export function listKnowledgePoints(): Promise<KnowledgePointCard[]> {
   return client.get('/practice/knowledge-points').then((r) => r.data)
+}
+
+/**
+ * 按需生成/更新知识点讲解(异步)
+ *
+ * 立即返回 job_id,轮询 getGenerateJob 拿进度(讲解不接 SSE,1~3 次调用就够)。
+ * force=true 重写已有 auto 讲解;manual(用户自己写的)任何时候都不会被覆盖。
+ */
+export function explainKnowledgePoints(
+  knowledgeKeys: string[],
+  force = false,
+): Promise<ExplainKnowledgePointsResponse> {
+  return client
+    .post('/practice/knowledge-points/explain', {
+      knowledge_keys: knowledgeKeys,
+      force,
+    })
+    .then((r) => r.data)
+}
+
+/** 手工编辑知识点讲解(写后 source=manual,自动生成不再覆盖) */
+export function saveKnowledgeExplanation(
+  knowledgeKey: string,
+  markdown: string,
+): Promise<KnowledgeExplanation> {
+  return client
+    .put(`/practice/knowledge-points/${encodeURIComponent(knowledgeKey)}/explanation`, {
+      markdown,
+    })
+    .then((r) => r.data)
 }
 
 // ---- 学习主题(用户可管理词表:内置 4 个 + 自定义) ----

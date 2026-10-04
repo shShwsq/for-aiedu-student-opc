@@ -29,7 +29,9 @@ from app.deps import get_current_user
 from app.models.agent_policy import AgentPolicy
 from app.models.memory_settings import MemorySettings
 from app.models.practice import (
+    DEFAULT_GENERATE_CONCURRENCY,
     DEFAULT_THINKING_MODE,
+    MAX_GENERATE_CONCURRENCY,
     PracticeSettings,
 )
 from app.models.project import Project
@@ -107,12 +109,15 @@ def save_practice_settings(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UserPreferenceOut:
-    """保存/更新练习设置(自动生成开关 / 出题前恢复工作区 / 默认出题模型 / 思考模式)
+    """保存/更新练习设置(自动生成开关 / 出题前恢复工作区 / 默认出题模型 / 思考模式 /
+    知识点讲解开关与模型 / 出题并发度)
 
     存于 practice_settings 独立表(1:1),get_or_create:无行时自动创建。
     restore_workspace_for_practice / default_llm_config_id /
-    force_default_llm / thinking_mode_for_practice 可选:传 None 表示不修改;
-    default_llm_config_id 传空串表示清空。
+    force_default_llm / thinking_mode_for_practice /
+    generate_explanation_with_questions / explain_llm_config_id /
+    generate_concurrency 可选:传 None 表示不修改;
+    *_llm_config_id 传空串表示清空。
     (learning_topic 已移除:出题主题按发现内容自动匹配)
     """
     # 默认出题模型归属校验:必须是当前用户已保存的 LLM 配置
@@ -127,6 +132,19 @@ def save_practice_settings(
             raise HTTPException(
                 status_code=400,
                 detail="出题模型配置不存在或不属于当前用户",
+            )
+    # 讲解专用模型同样要归属校验(它是「轻任务另挂快模型」的入口)
+    if req.explain_llm_config_id:
+        cfg_row = (
+            db.query(UserLLMConfig)
+            .filter(UserLLMConfig.user_id == current_user.id)
+            .first()
+        )
+        ids = {c.get("id") for c in (cfg_row.llm_configs or [])} if cfg_row else set()
+        if req.explain_llm_config_id not in ids:
+            raise HTTPException(
+                status_code=400,
+                detail="讲解模型配置不存在或不属于当前用户",
             )
     row = (
         db.query(PracticeSettings)
@@ -149,15 +167,26 @@ def save_practice_settings(
         row.force_default_llm = req.force_default_llm
     if req.thinking_mode_for_practice is not None:
         row.thinking_mode_for_practice = req.thinking_mode_for_practice
+    if req.generate_explanation_with_questions is not None:
+        row.generate_explanation_with_questions = req.generate_explanation_with_questions
+    if req.explain_llm_config_id is not None:
+        row.explain_llm_config_id = req.explain_llm_config_id or None
+    if req.generate_concurrency is not None:
+        row.generate_concurrency = max(
+            1, min(int(req.generate_concurrency), MAX_GENERATE_CONCURRENCY)
+        )
     db.commit()
     db.refresh(row)
     logger.info(
         "用户 %s 更新练习设置: auto_generate_practice=%s "
-        "restore_workspace=%s default_llm_config_id=%s force_default_llm=%s thinking_mode=%s",
+        "restore_workspace=%s default_llm_config_id=%s force_default_llm=%s "
+        "thinking_mode=%s explain_with_questions=%s explain_llm_config_id=%s concurrency=%s",
         current_user.id, req.auto_generate_practice,
         req.restore_workspace_for_practice,
         row.default_llm_config_id, row.force_default_llm,
         row.thinking_mode_for_practice,
+        row.generate_explanation_with_questions,
+        row.explain_llm_config_id, row.generate_concurrency,
     )
     return _build_preference_out(db, current_user.id, settings_row=row)
 
@@ -520,6 +549,16 @@ def _build_preference_out(
         thinking_mode_for_practice=(
             settings_row.thinking_mode_for_practice
             if settings_row else DEFAULT_THINKING_MODE
+        ),
+        generate_explanation_with_questions=(
+            settings_row.generate_explanation_with_questions if settings_row else False
+        ),
+        explain_llm_config_id=(
+            settings_row.explain_llm_config_id if settings_row else None
+        ),
+        generate_concurrency=(
+            settings_row.generate_concurrency
+            if settings_row else DEFAULT_GENERATE_CONCURRENCY
         ),
         memory_settings=_memory_settings_out(memory_row),
         updated_at=updated_at,

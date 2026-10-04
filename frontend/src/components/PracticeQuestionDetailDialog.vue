@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 题目详情弹窗(完整题面 + 正确答案 + 解析 + 源码出处 + 作答统计)
+ * 题目详情弹窗(完整题面 + 正确答案 + 解析 + 源码出处 + 作答统计 + 知识点讲解)
  *
  * 列表行(题库管理 / 错题回顾 / 历史明细)只渲染一行摘要:题干超长会被
  * 截断,而选项、正确答案、解析压根不在列表 payload 里(整库下发全量内容
@@ -16,8 +16,9 @@
  */
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
-import { getQuestionDetail } from '@/api/practice'
+import { getQuestionDetail, saveKnowledgeExplanation } from '@/api/practice'
 import { extractErrorMessage } from '@/utils/error'
+import { renderMarkdown } from '@/utils/markdown'
 import {
   EMPTY_TEXT,
   formatDate,
@@ -73,6 +74,67 @@ const sourceRef = computed(() => {
   return d.source_lines ? `${d.source_file}:${d.source_lines}` : d.source_file
 })
 
+// ============================================================
+// 知识点讲解(错题复盘时就地看/就地改)
+// ============================================================
+/** 讲解编辑态(null=不在编辑) */
+const explainDraft = ref<string | null>(null)
+const explainSaving = ref(false)
+/** 讲解区提示文本(保存成功/失败都写在这里,不弹 toast) */
+const explainNote = ref('')
+const explainNoteError = ref(false)
+
+/** 讲解正文 HTML(marked + DOMPurify;Markdown 来源为模型或用户自己写的) */
+const explainHtml = computed(() =>
+  renderMarkdown(detail.value?.knowledge_explanation ?? ''),
+)
+
+/** 可编辑(有 knowledge_key 才能定位到知识点) */
+const explainKey = computed(() => detail.value?.knowledge_key || '')
+
+function startEditExplanation(): void {
+  explainNote.value = ''
+  explainNoteError.value = false
+  explainDraft.value = detail.value?.knowledge_explanation || ''
+}
+
+function cancelEditExplanation(): void {
+  explainDraft.value = null
+  explainNote.value = ''
+  explainNoteError.value = false
+}
+
+/**
+ * 保存手工编辑的讲解
+ *
+ * 写入后 source=manual,出题收尾批量与看板「更新讲解」都不会再覆盖它。
+ */
+async function saveExplanation(): Promise<void> {
+  const key = explainKey.value
+  if (!key || explainSaving.value) return
+  explainSaving.value = true
+  try {
+    const updated = await saveKnowledgeExplanation(key, explainDraft.value ?? '')
+    if (detail.value) {
+      detail.value = {
+        ...detail.value,
+        knowledge_explanation: updated.explanation,
+        knowledge_explanation_source: updated.explanation_source,
+      }
+    }
+    explainDraft.value = null
+    explainNote.value = updated.explanation
+      ? '已保存(自动生成不会再覆盖)'
+      : '已清空讲解,后续可重新生成'
+    explainNoteError.value = false
+  } catch (err) {
+    explainNote.value = extractErrorMessage(err)
+    explainNoteError.value = true
+  } finally {
+    explainSaving.value = false
+  }
+}
+
 /** 状态徽章样式(草稿=待确认偏警示,已入库=正常,已归档=降权) */
 const statusClass = computed(() => {
   switch (detail.value?.status) {
@@ -102,6 +164,10 @@ watch(
       loading.value = false
       errorMsg.value = ''
       detail.value = null
+      // 丢弃未提交的讲解草稿(避免换题时把上一题的正文带过去)
+      explainDraft.value = null
+      explainNote.value = ''
+      explainNoteError.value = false
       return
     }
     if (id) load(id)
@@ -210,6 +276,61 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeydown))
               <div class="qdialog-explanation">
                 <span class="section-label">解析</span>
                 <p>{{ detail.explanation || '该题暂无解析' }}</p>
+              </div>
+
+              <!-- 知识点讲解:该知识点多个考点的归纳(依据出题当时的材料与题目写成) -->
+              <div v-if="explainKey" class="qdialog-kp-explain">
+                <div class="kp-explain-head">
+                  <span class="section-label">知识点讲解</span>
+                  <span
+                    v-if="detail.knowledge_explanation_source"
+                    :class="[
+                      'explain-badge',
+                      detail.knowledge_explanation_source === 'manual'
+                        ? 'explain-badge-manual'
+                        : 'explain-badge-auto',
+                    ]"
+                    :title="detail.knowledge_explanation_source === 'manual'
+                      ? '你自己编辑过:自动生成不会覆盖'
+                      : '模型生成'"
+                  >{{ detail.knowledge_explanation_source === 'manual' ? '已编辑' : 'AI' }}</span>
+                  <button
+                    v-if="explainDraft === null"
+                    class="kp-explain-edit"
+                    :title="detail.knowledge_explanation
+                      ? '编辑这段讲解(保存后自动生成不再覆盖)'
+                      : '自己写一段讲解(保存到该知识点,所有同知识点题共享)'"
+                    @click="startEditExplanation"
+                  >{{ detail.knowledge_explanation ? '编辑' : '手写讲解' }}</button>
+                </div>
+
+                <template v-if="explainDraft !== null">
+                  <textarea
+                    v-model="explainDraft"
+                    class="kp-explain-editor"
+                    rows="8"
+                    placeholder="用 Markdown 写:是什么 / 为什么会踩 / 怎么判断与修复 / 易错点"
+                  />
+                  <div class="kp-explain-actions">
+                    <button class="btn-secondary" :disabled="explainSaving" @click="saveExplanation">
+                      {{ explainSaving ? '保存中…' : '保存' }}
+                    </button>
+                    <button class="btn-secondary" :disabled="explainSaving" @click="cancelEditExplanation">取消</button>
+                    <span class="kp-explain-hint">保存后标记为「已编辑」,自动生成不会再覆盖</span>
+                  </div>
+                </template>
+                <div
+                  v-else-if="detail.knowledge_explanation"
+                  class="markdown-body kp-explain-body"
+                  v-html="explainHtml"
+                />
+                <p v-else class="kp-explain-empty">
+                  该知识点还没有讲解 — 可在知识点看板上按出题材料生成,也可以直接手写一段
+                </p>
+                <p
+                  v-if="explainNote"
+                  :class="['kp-explain-note', explainNoteError ? 'note-error' : 'note-ok']"
+                >{{ explainNote }}</p>
               </div>
 
               <!-- 元信息:归类 / 统计 / 溯源 -->
@@ -546,6 +667,138 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeydown))
   color: var(--color-text-secondary);
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ---- 知识点讲解 ---- */
+.qdialog-kp-explain {
+  margin-bottom: var(--space-4);
+  padding-top: var(--space-2);
+  border-top: 1px dashed var(--color-border);
+}
+
+.kp-explain-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.kp-explain-head .section-label {
+  margin-bottom: 0;
+}
+
+.explain-badge {
+  padding: 0 var(--space-2);
+  font-size: var(--fs-xs);
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+}
+
+.explain-badge-auto {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.explain-badge-manual {
+  color: var(--color-success);
+  border-color: var(--color-success);
+}
+
+.kp-explain-edit {
+  margin-left: auto;
+  padding: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-primary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.kp-explain-edit:hover {
+  text-decoration: underline;
+}
+
+.kp-explain-body {
+  margin-top: var(--space-2);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--color-text);
+  word-break: break-word;
+}
+
+.kp-explain-body :deep(h3) {
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+}
+
+.kp-explain-body :deep(p),
+.kp-explain-body :deep(ul),
+.kp-explain-body :deep(ol) {
+  margin: 0 0 var(--space-2);
+}
+
+.kp-explain-body :deep(ul),
+.kp-explain-body :deep(ol) {
+  padding-left: var(--space-5);
+}
+
+.kp-explain-body :deep(code) {
+  padding: 0 var(--space-1);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.kp-explain-editor {
+  width: 100%;
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--color-text);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  resize: vertical;
+}
+
+.kp-explain-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.kp-explain-actions .btn-secondary {
+  height: 28px;
+  padding: 0 var(--space-3);
+  font-size: var(--fs-xs);
+}
+
+.kp-explain-hint {
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+}
+
+.kp-explain-empty {
+  margin: var(--space-2) 0 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+}
+
+.kp-explain-note {
+  margin: var(--space-2) 0 0;
+  font-size: var(--fs-xs);
+}
+
+.note-ok {
+  color: var(--color-success);
+}
+
+.note-error {
+  color: var(--color-danger);
 }
 
 /* ---- 元信息 ---- */

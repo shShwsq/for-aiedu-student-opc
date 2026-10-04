@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     # 429 限流退避重试次数(首次失败后最多再重试的次数,0=不重试)
     # 退避策略见 app/llm/client.py:指数退避+抖动,厂商返回 Retry-After 时优先采用
     LLM_RATE_LIMIT_MAX_RETRIES: int = 3
+    # ---- 出题并发上限(系统级天花板) ----
+    # 用户可在练习设置里选 1/2/4 并行逐条 finding 出题,实际并发取
+    # min(用户设置, 本项, 4)。厂商有「组内并发/RPM」上限时(部分厂商只允 1 并发),
+    # 选高了只会多撞 429,因此运维可把本项降到 1 强制全局串行。
+    PRACTICE_GENERATE_CONCURRENCY: int = 4
+    # 同一厂商(按 baseUrl+model 归组)全局并发天花板,跨出题 job 共享:
+    # 防两个 job 各自 4 并行把厂商配额扫光
+    PRACTICE_PROVIDER_MAX_CONCURRENCY: int = 4
 
     # ---- 数据统一根 ----
     # 4 个运行时数据目录(克隆/缓存/skill/上传)统一收纳在 data/ 根下,

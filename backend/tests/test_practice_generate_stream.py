@@ -95,7 +95,8 @@ def _clean_tables(test_engine):
 
 # fake 生成器:每条 Result 出 1 题,并发出 finding/token 流式事件
 def _fake_generate(db, task, user_id, max_findings=10, client=None,
-                   progress_callback=None, event_callback=None):
+                   progress_callback=None, event_callback=None,
+                   force_regenerate=False):
     findings = db.query(Result).filter(Result.task_id == task.id).all()[:max_findings]
     created = []
     for i, r in enumerate(findings):
@@ -299,6 +300,14 @@ def test_recent_text_keeps_tail():
 
 
 def test_token_events_trimmed_over_cap():
+    """超预算后从**左端**裁剪:留存事件仍是连续序号后缀
+
+    旧行为是在锁内找第一个 token 事件再用 list.remove() 删(O(n),
+    且中间挖空会让读端无法按后缀重放);现在统一从左侧丢最旧一条,
+    代价是极长 job 可能连头部结构事件也被丢弃 —— 晚接入客户端本来
+    就拿不到头部,由 snapshot(含 recent_text 尾部)兜底。
+    开启 token 合并后单 job 事件数在百量级,该分支几乎不再触发。
+    """
     user_id = uuid.uuid4()
     job_id = gen_jobs.create_job(user_id)
     try:
@@ -312,9 +321,15 @@ def test_token_events_trimmed_over_cap():
             len(e["data"]["delta"]) for e in job["events"] if e["type"] == "token"
         )
         assert token_chars <= 64 * 1024
-        # 结构事件不被裁剪
-        assert job["events"][0]["type"] == "progress"
-        assert any(e["type"] == "finding" for e in job["events"])
+        seqs = [e["seq"] for e in job["events"]]
+        # 连续后缀:相邻序号差恒为 1,且最新的输出仍在
+        assert all(b - a == 1 for a, b in zip(seqs, seqs[1:]))
+        # 共发过 3 类 72 条事件:set_total 的 progress + 1 条 finding + 70 条 token
+        assert seqs[-1] == 72
+        assert job["events"][-1]["type"] == "token"
+        # 读端仍可按 after_seq 增量重放(不会因为中间挖空而错位)
+        res = gen_jobs.read_events(job_id, user_id, after_seq=seqs[0], timeout=0)
+        assert [e["seq"] for e in res["events"]] == seqs[1:]
     finally:
         with gen_jobs._LOCK:
             gen_jobs._JOBS.pop(job_id, None)

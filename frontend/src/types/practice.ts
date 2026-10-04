@@ -7,6 +7,11 @@
 export interface GenerateRequest {
   task_id: string
   max_findings?: number
+  /**
+   * 重出开关:默认 false,本用户已就该 finding 出过题的后端会整条跳过(不再付 LLM 成本);
+   * 任务详情页「重新出题」显式传 true 才允许对同一发现重出
+   */
+  force_regenerate?: boolean
 }
 
 /** 生成的候选题(draft,预览阶段含答案与解析供校对) */
@@ -69,8 +74,8 @@ export interface GenerateJobSummary {
   done: number
   total: number
   error: string
-  /** 出题来源:manual(任务详情页手动) / auto(任务完成自动生成) */
-  source: 'manual' | 'auto'
+  /** 出题来源:manual(任务详情页手动) / auto(任务完成自动生成) / explain(知识点讲解) */
+  source: 'manual' | 'auto' | 'explain'
   task_id: string | null
   task_title: string
   current_finding: string
@@ -118,6 +123,26 @@ export interface GenerateRestoreData {
 export interface GenerateToolData {
   name: string
   summary: string
+}
+
+/**
+ * 收尾知识点讲解阶段(出题完成后顺带批量更新讲解)
+ *
+ * start=已开始 / done=已完成(written=实际写入数)。
+ * 侧栏用它补一行「知识点讲解已更新 N 条」。
+ */
+export interface GenerateExplainData {
+  phase: 'start' | 'done' | 'failed'
+  /** 待生成讲解的知识点数 */
+  total?: number
+  /** 分成几批调用(≤8 个知识点一批) */
+  batches?: number
+  /** 实际写入的知识点数(done 阶段) */
+  written?: number
+  /** 所用模型名 */
+  model?: string
+  /** 失败原因(failed 阶段) */
+  message?: string
 }
 
 /** 进度计数更新(每处理完一条 finding) */
@@ -221,6 +246,11 @@ export interface SubmitAnswerResponse {
   state: KnowledgeState | null
   answered_count: number
   total_count: number
+  /**
+   * 答错时后端下发的该知识点完整讲解(Markdown);
+   * 答对或尚未生成时为空串(不必每题都拖一段正文)
+   */
+  knowledge_explanation: string
 }
 
 // ---- 统计 / 题库 ----
@@ -297,6 +327,39 @@ export interface KnowledgePointCard {
   /** 题库中该知识点的 active 题数 */
   question_count: number
   board_status: BoardStatus
+  /** 知识点讲解正文(Markdown);空串=尚未生成 */
+  explanation: string
+  /** 讲解来源:auto=模型生成 / manual=手工编辑(不会被自动覆盖)/ 空=未生成 */
+  explanation_source: string
+  /** 生成所用模型名(手工编辑为空) */
+  explanation_model: string
+  /** 最近一次更新讲解的时间(展示「更新于」) */
+  explanation_updated_at: string | null
+  /** 是否有可供模型依据的题(无题时不亮「生成讲解」) */
+  can_generate_explanation: boolean
+}
+
+/** 按需生成知识点讲解请求(POST /practice/knowledge-points/explain) */
+export interface ExplainKnowledgePointsRequest {
+  knowledge_keys: string[]
+  /** true 时重写已有 auto 讲解;manual 讲解任何时候都不被自动覆盖 */
+  force?: boolean
+}
+
+/** 讲解 job 句柄(异步,轮询 getGenerateJob 拿进度) */
+export interface ExplainKnowledgePointsResponse {
+  job_id: string
+  /** 本次计划处理的知识点数 */
+  total: number
+}
+
+/** 知识点讲解字段(手工编辑后回写) */
+export interface KnowledgeExplanation {
+  knowledge_key: string
+  explanation: string
+  explanation_source: string
+  explanation_model: string
+  explanation_updated_at: string | null
 }
 
 export interface PracticeStats {
@@ -355,6 +418,10 @@ export interface QuestionDetail {
   learning_topic: string | null
   /** 来源任务(跳任务详情页查源码用;老题为 null) */
   source_task_id: string | null
+  /** 所属知识点的讲解正文(Markdown);空串=尚未生成 */
+  knowledge_explanation: string
+  /** 讲解来源:auto=模型生成 / manual=手工编辑 / 空=未生成 */
+  knowledge_explanation_source: string
   attempts: number
   correct_count: number
   accuracy: number | null

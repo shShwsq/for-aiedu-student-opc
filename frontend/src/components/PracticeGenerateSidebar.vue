@@ -14,6 +14,7 @@ import { subscribeGenerateStream } from '@/api/practiceStream'
 import type {
   GenerateDoneData,
   GenerateErrorData,
+  GenerateExplainData,
   GenerateFindingData,
   GenerateJobSummary,
   GenerateProgressData,
@@ -201,6 +202,7 @@ function subscribeToJob(job: GenerateJobSummary): void {
     onToken: handleToken,
     onTool: handleTool,
     onRestore: handleRestore,
+    onExplain: handleExplain,
     onProgress: handleProgress,
     onDone: handleDone,
     onError: handleError,
@@ -263,6 +265,23 @@ function handleTool(data: GenerateToolData): void {
 function handleRestore(data: GenerateRestoreData): void {
   if (snapshotTerminal.value) return
   restore.value = data
+}
+
+/**
+ * 收尾知识点讲解阶段(仅在用户开启「出题后自动更新讲解」时才有)
+ *
+ * 直接追写到输出区(与「[工具]」行同款),不新增模板与样式;
+ * 讲解写入的知识点数就是用户需要看到的唯一信息。
+ */
+function handleExplain(data: GenerateExplainData): void {
+  if (snapshotTerminal.value) return
+  if (data.phase === 'start') {
+    appendOutput(`\n[知识点讲解] 开始生成 ${data.total ?? 0} 条(分 ${data.batches ?? 1} 批)…\n`)
+  } else if (data.phase === 'done') {
+    appendOutput(`\n[知识点讲解] 已更新 ${data.written ?? 0} 条\n`)
+  } else {
+    appendOutput(`\n[知识点讲解] 生成失败(不影响已生成题目):${data.message || '未知原因'}\n`)
+  }
 }
 
 function handleProgress(data: GenerateProgressData): void {

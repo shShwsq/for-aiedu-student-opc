@@ -40,6 +40,7 @@ import {
 } from '@/api/practice'
 import { matchHashSectionId, useSectionNav } from '@/composables/useSectionNav'
 import { extractErrorMessage } from '@/utils/error'
+import { renderMarkdown } from '@/utils/markdown'
 import {
   formatDate,
   formatDifficulty,
@@ -329,6 +330,16 @@ async function handleStartPractice(
 const chosenIdx = ref<number | null>(null)
 const submitting = ref(false)
 const feedback = ref<SubmitAnswerResponse | null>(null)
+
+/**
+ * 答错时展开的知识点讲解 HTML
+ *
+ * 后端仅在错答下发 knowledge_explanation(答对时题目解析已够),
+ * 没生成讲解时为空串 → 模板不渲染折叠区。
+ */
+const feedbackExplainHtml = computed(() =>
+  renderMarkdown(feedback.value?.knowledge_explanation ?? ''),
+)
 
 const isLastQuestion = computed(
   () => currentIndex.value >= sessionQuestions.value.length - 1,
@@ -773,6 +784,16 @@ onBeforeUnmount(() => {
               </span>
             </div>
             <p v-if="feedback.explanation" class="feedback-explanation">{{ feedback.explanation }}</p>
+
+            <!-- 答错时附该知识点的完整讲解(后端仅在错答下发;没生成则不渲染折叠区) -->
+            <details v-if="feedback.knowledge_explanation" class="feedback-kp-explain">
+              <summary class="feedback-kp-explain-head">
+                <span class="kp-caret" aria-hidden="true" />
+                知识点讲解<span v-if="feedback.state"> · {{ feedback.state.knowledge_name }}</span>
+              </summary>
+              <!-- 讲解为模型产出,经 renderMarkdown(marked + DOMPurify) 后再注入 -->
+              <div class="markdown-body feedback-kp-explain-body" v-html="feedbackExplainHtml" />
+            </details>
             <div class="question-actions">
               <button class="btn-primary" @click="handleNext">
                 {{ isLastQuestion ? '查看本局统计' : '下一题' }}
@@ -1701,6 +1722,74 @@ onBeforeUnmount(() => {
   font-size: var(--fs-sm);
   line-height: var(--lh-relaxed);
   color: var(--color-text);
+}
+
+/* 答错时的知识点讲解折叠区 */
+.feedback-kp-explain {
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px dashed var(--color-border);
+}
+
+.feedback-kp-explain-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.feedback-kp-explain-head::-webkit-details-marker {
+  display: none;
+}
+
+/* 自绘小三角(展开时旋转),与看板卡片同款交互 */
+.kp-caret {
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--color-text-muted);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform var(--transition-fast);
+}
+
+.feedback-kp-explain[open] .kp-caret {
+  transform: rotate(90deg);
+}
+
+.feedback-kp-explain-body {
+  margin-top: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--color-text);
+  word-break: break-word;
+}
+
+.feedback-kp-explain-body :deep(h3) {
+  margin: var(--space-2) 0 var(--space-1);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+}
+
+.feedback-kp-explain-body :deep(p) {
+  margin: 0 0 var(--space-1);
+}
+
+.feedback-kp-explain-body :deep(ul),
+.feedback-kp-explain-body :deep(ol) {
+  margin: 0 0 var(--space-1);
+  padding-left: var(--space-4);
+}
+
+.feedback-kp-explain-body :deep(code) {
+  padding: 0 var(--space-1);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
 }
 
 /* ============ 本局统计 ============ */

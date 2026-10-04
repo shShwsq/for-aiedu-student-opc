@@ -6,14 +6,19 @@
  *   主题折叠区展开后是知识点卡片网格,组内保持后端排序
  *   (weak > due > mastered > learning > fresh)
  * - 每张卡片 = 一个知识点:SM-2 记忆状态 + 作答统计 + 题库题数 + 状态徽章
+ *   + 可折叠的「知识点讲解」(Markdown,依据出题当时的材料与题目写成)
  * - 区头「练这个主题」→ 跳 /practice?learningTopic=<key>,由练习页接管组卷;
  *   卡片「专项练习」→ 跳 /practice?topic=<key>(单知识点)
  * - 未知/已删除的主题 key 兜底「未分类」组排最后;停用主题照常成区
  *   (区头带「已停用」徽章,存量题不受影响,只是不再出新题)
  * - 布局对齐练习页/设置页:取消标题,第一行常驻操作头(去练习 + 知识点主题设置 +
- *   知识点数统计,在 .main 滚动区之外故不随内容滚动);左侧目录一个主题一项,
+ *   知识点数统计 + 批量更新讲解,在 .main 滚动区之外故不随内容滚动);左侧目录一个主题一项,
  *   点击即展开该区并平滑定位,scrollspy 高亮当前主题;知识点主题设置
  *   深链到 /settings/practice#learning-topics
+ *
+ * 讲解生成走异步 job(POST /practice/knowledge-points/explain → 轮询
+ * GET /practice/generate/{job_id}):单请求最多 20 个知识点,后端再按
+ * ≤8 个一次 LLM 调用分批;manual(用户自己写的)讲解不会被覆盖。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
@@ -21,8 +26,15 @@ import { useRouter } from 'vue-router'
 import AppHeader from '@/components/AppHeader.vue'
 import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
 import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
-import { listKnowledgePoints, listLearningTopics } from '@/api/practice'
+import {
+  explainKnowledgePoints,
+  getGenerateJob,
+  listKnowledgePoints,
+  listLearningTopics,
+} from '@/api/practice'
 import { extractErrorMessage } from '@/utils/error'
+import { formatDate } from '@/utils/practiceFormat'
+import { renderMarkdown } from '@/utils/markdown'
 import type {
   BoardStatus,
   KnowledgePointCard,
@@ -269,6 +281,109 @@ function startFocus(c: KnowledgePointCard): void {
 }
 
 // ============================================================
+// 知识点讲解(Markdown 展示 + 按需/批量生成)
+// ============================================================
+/** 单次请求的知识点数上限(与后端 ExplainKnowledgePointsRequest.max_length 一致) */
+const EXPLAIN_BATCH_SIZE = 20
+/** 轮询间隔(ms):讲解通常 1~3 次模型调用,轮询比接 SSE 更简单 */
+const EXPLAIN_POLL_MS = 1500
+
+/** 正在生成讲解的知识点 key(卡片级按钮置灰用;批量时为空串) */
+const busyKey = ref('')
+/** 讲解 job 进行中(含批量):屏蔽并发触发 */
+const explaining = ref(false)
+/** 讲解进度/失败提示文本(操作头右侧展示,不进滚动区) */
+const explainStatus = ref('')
+
+/**
+ * 讲解 HTML 缓存:key → 渲染后的 Markdown
+ *
+ * 卡片数可能较多,逐次重渲染 marked 会浪费;这里随 cards 变化重算一次,
+ * 模板只读成品 HTML。安全:renderMarkdown 已经过 DOMPurify 净化。
+ */
+const explanationHtml = computed<Map<string, string>>(
+  () =>
+    new Map(
+      cards.value.map((c) => [c.knowledge_key, renderMarkdown(c.explanation)]),
+    ),
+)
+
+function htmlOf(key: string): string {
+  return explanationHtml.value.get(key) ?? ''
+}
+
+/** 讲解来源徽章文本(manual 额外提示不会被自动覆盖) */
+function explainSourceLabel(source: string): string {
+  if (source === 'manual') return '已编辑'
+  if (source === 'auto') return 'AI'
+  return ''
+}
+
+/** 缺讲解但有题可依据的知识点(批量生成候选) */
+const missingExplanationKeys = computed<string[]>(() =>
+  cards.value
+    .filter((c) => c.can_generate_explanation && !c.explanation)
+    .map((c) => c.knowledge_key),
+)
+
+/**
+ * 轮询讲解 job 直到终态,返回实际写入的知识点数
+ * 超时不无限等:抛友好提示,后端 TTL 内跑完的话下次刷新仍能看到结果
+ */
+async function waitExplainJob(jobId: string, timeoutMs = 180000): Promise<number> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const job = await getGenerateJob(jobId)
+    if (job.status === 'done') return job.done
+    if (job.status === 'error') throw new Error(job.error || '讲解生成失败')
+    if (Date.now() > deadline) throw new Error('讲解生成超时,请稍后刷新看板')
+    explainStatus.value = `正在生成讲解 ${job.done}/${job.total || '…'}…`
+    await new Promise((r) => setTimeout(r, EXPLAIN_POLL_MS))
+  }
+}
+
+/**
+ * 跑一段讲解 job 并把看板刷回最新
+ *
+ * force=true 时重写已有 AI 讲解(用户手改的那部分后端仍会跳过)。
+ */
+async function runExplain(keys: string[], force: boolean, label: string): Promise<void> {
+  if (keys.length === 0) return
+  explaining.value = true
+  explainStatus.value = `正在${label}…`
+  let written = 0
+  try {
+    for (let i = 0; i < keys.length; i += EXPLAIN_BATCH_SIZE) {
+      const chunk = keys.slice(i, i + EXPLAIN_BATCH_SIZE)
+      const { job_id: jobId } = await explainKnowledgePoints(chunk, force)
+      written += await waitExplainJob(jobId)
+    }
+    explainStatus.value = `已更新 ${written} 条知识点讲解`
+  } catch (err) {
+    explainStatus.value = extractErrorMessage(err)
+  } finally {
+    explaining.value = false
+    busyKey.value = ''
+    await loadBoard()
+    setTimeout(() => {
+      if (!explaining.value) explainStatus.value = ''
+    }, 6000)
+  }
+}
+
+/** 单卡生成/更新讲解(force 取决于是否已有正文) */
+function explainOne(c: KnowledgePointCard): void {
+  if (explaining.value) return
+  busyKey.value = c.knowledge_key
+  void runExplain([c.knowledge_key], !!c.explanation, c.explanation ? '更新讲解' : '生成讲解')
+}
+
+/** 批量补全看板上缺讲解的知识点 */
+function explainMissing(): void {
+  void runExplain(missingExplanationKeys.value, false, `批量生成 ${missingExplanationKeys.value.length} 条讲解`)
+}
+
+// ============================================================
 // 展示辅助
 // ============================================================
 function statusLabel(status: BoardStatus): string {
@@ -344,8 +459,17 @@ onMounted(() => {
                 title="知识点主题设置"
                 :to="{ name: 'settings-practice', hash: '#learning-topics' }"
               >知识点主题设置</RouterLink>
+              <button
+                class="btn-ghost head-quiet-btn"
+                :disabled="explaining || missingExplanationKeys.length === 0"
+                :title="missingExplanationKeys.length === 0
+                  ? '全部知识点都已有讲解'
+                  : `为 ${missingExplanationKeys.length} 个尚无讲解的知识点生成讲解(依据出题时的材料与题目)`"
+                @click="explainMissing"
+              >{{ explaining ? '讲解生成中…' : `批量生成讲解(${missingExplanationKeys.length})` }}</button>
             </div>
             <div class="head-stats">
+              <span v-if="explainStatus" class="explain-status">{{ explainStatus }}</span>
               <span class="stat" title="按学习主题分组;点区头可练整个主题,点卡片可练单个知识点">
                 <span class="stat-num">{{ totalCount }}</span>
                 <span class="stat-name">知识点</span>
@@ -431,6 +555,36 @@ onMounted(() => {
                         @click="startFocus(c)"
                       >专项练习</button>
                     </div>
+
+                    <!-- 知识点讲解:有正文或(有题可依据时)才渲染折叠区 -->
+                    <details v-if="c.explanation || c.can_generate_explanation" class="kp-explain">
+                      <summary class="kp-explain-head">
+                        <svg class="chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="m9 18 6-6-6-6" />
+                        </svg>
+                        <span class="kp-explain-title">知识点讲解</span>
+                        <span
+                          v-if="explainSourceLabel(c.explanation_source)"
+                          :class="['explain-badge', c.explanation_source === 'manual' ? 'explain-badge-manual' : 'explain-badge-auto']"
+                          :title="c.explanation_source === 'manual'
+                            ? '你自己编辑过:自动生成不会覆盖'
+                            : `模型生成${c.explanation_model ? '(' + c.explanation_model + ')' : ''}`"
+                        >{{ explainSourceLabel(c.explanation_source) }}</span>
+                        <span v-if="c.explanation_updated_at" class="kp-explain-time">更新于 {{ formatDate(c.explanation_updated_at) }}</span>
+                      </summary>
+                      <div v-if="c.explanation" class="markdown-body kp-explain-body" v-html="htmlOf(c.knowledge_key)" />
+                      <p v-else class="kp-muted kp-explain-empty">还没有讲解 — 生成时会带上出题当时的材料与题目,不是空谈概念</p>
+                      <button
+                        class="btn-secondary btn-small kp-explain-btn"
+                        :disabled="explaining"
+                        :title="explaining
+                          ? '讲解生成中,请等待当前任务完成'
+                          : (c.explanation
+                            ? '重新生成这段讲解(手工编辑的讲解不会被自动覆盖)'
+                            : '依据出题材料与题目生成一段讲解')"
+                        @click.stop.prevent="explainOne(c)"
+                      >{{ busyKey === c.knowledge_key ? '生成中…' : (c.explanation ? '更新讲解' : '生成讲解') }}</button>
+                    </details>
                   </article>
                 </div>
               </details>
@@ -917,6 +1071,115 @@ onMounted(() => {
 .btn-secondary:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* ============ 知识点讲解(卡片内折叠区) ============ */
+.kp-explain {
+  margin-top: var(--space-1);
+  border-top: 1px dashed var(--color-border);
+  padding-top: var(--space-1);
+}
+
+/* summary 只占一行:标题 + 来源徽章 + 更新于 + 自绘三角 */
+.kp-explain-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.kp-explain-head::-webkit-details-marker {
+  display: none;
+}
+
+.kp-explain-title {
+  font-weight: var(--fw-medium);
+}
+
+/* 展开时三角旋转(与区头同款,但不受区头选择器影响) */
+.kp-explain[open] > .kp-explain-head .chevron {
+  transform: rotate(90deg);
+}
+
+.explain-badge {
+  padding: 0 var(--space-1);
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  background: var(--color-surface);
+}
+
+.explain-badge-auto {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.explain-badge-manual {
+  color: var(--color-success);
+  border-color: var(--color-success);
+}
+
+.kp-explain-time {
+  color: var(--color-text-muted);
+}
+
+.kp-explain-body {
+  margin: var(--space-2) 0 0;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--color-text);
+  word-break: break-word;
+}
+
+.kp-explain-body :deep(h3) {
+  margin: var(--space-2) 0 var(--space-1);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+}
+
+.kp-explain-body :deep(p) {
+  margin: 0 0 var(--space-1);
+}
+
+.kp-explain-body :deep(ul),
+.kp-explain-body :deep(ol) {
+  margin: 0 0 var(--space-1);
+  padding-left: var(--space-4);
+}
+
+.kp-explain-body :deep(code) {
+  padding: 0 var(--space-1);
+  font-size: var(--fs-xs);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.kp-explain-body :deep(pre) {
+  margin: 0 0 var(--space-1);
+  padding: var(--space-2);
+  overflow-x: auto;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.kp-explain-empty {
+  margin: var(--space-2) 0 0;
+}
+
+.kp-explain-btn {
+  margin-top: var(--space-2);
+}
+
+/* 操作头里的讲解进度/结果提示 */
+.explain-status {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
 }
 
 /* spinner */

@@ -9,6 +9,7 @@ app/models/practice.py LEARNING_TOPIC_* 一致的字符串字面量
 ("security" / "architecture" / "coding" / "contract",DB 存储的稳定枚举值)
 + 用户自定义主题的 "custom_*" 键,全部经参数传入(纯数据)。
 """
+import json
 from typing import Any
 
 # ============================================================
@@ -81,7 +82,23 @@ def build_custom_topic_head(topic: dict) -> str:
         description=str(topic.get("description") or "").strip() or "考察该主题的核心概念、常见陷阱与最佳实践",
     )
 
-# 工作区可用时注入的工具说明段(工具实际可用与否与 sandbox 存活状态一致)
+
+def resolve_topic_head(topic: str, custom_topics: list[dict] | None = None) -> str:
+    """取某学习主题的专业视角 head(内置用专有段,自定义用通用模板)
+
+    出题 system prompt 与知识点讲解 system prompt 共用本函数:
+    保证同一个主题的「出题口径」与「讲解口径」一致。
+    无匹配回落 security(防御)。
+    """
+    head = _TOPIC_PROMPT_HEADS.get(topic)
+    if head is None and custom_topics:
+        for d in custom_topics:
+            if d.get("key") == topic:
+                return build_custom_topic_head(d)
+    return head or _TOPIC_PROMPT_HEADS["security"]
+
+
+# 工作区可用时注入的工具说明段(工作区存活且未预读材料时用:强制先调工具)
 _TOOL_SECTION = """## 材料查阅工具(工作区已就绪,必须使用)
 出题前必须先调工具查阅真实材料(源码或文书原文),禁止跳过直接出题:
 - read_file(file_path, max_lines?, offset?):读工作区文件(带行号,分页)
@@ -96,6 +113,27 @@ _TOOL_SECTION = """## 材料查阅工具(工作区已就绪,必须使用)
 3. 改编题(origin=synthetic):先读原文件确认问题形态,再原创虚构材料,
    不给 source_file/source_lines
 确实在工作区中找不到相关文件时,才退回基于发现描述出题(此时不给 source_file)。"""
+
+# 材料已由服务端预读并附在发现后面时用(仍允许补读,但不再强制每题一次工具往返)
+_TOOL_SECTION_WITH_MATERIAL = """## 材料查阅工具(相关材料已预先读好附在下面)
+发现后面已给出按源码定位预先读出的真实材料片段(带行号),优先直接依据它出题;
+只有当片段不足以支撑考察点(需要看上下游/别的文件)时,才调用工具补读:
+- read_file(file_path, max_lines?, offset?) / search_code(...) / find_files(...)
+要求:
+1. 真实材料题(origin=repo):题干与 code_snippet 必须引用预读片段或补读的
+   真实内容,不得虚构,并给出 source_file(工作区内相对路径)与
+   source_lines(行区间如 "120-150" 或单行号 "42",取自片段行号)
+2. 改编题(origin=synthetic):可先按需补读确认问题形态,再原创虚构材料,
+   不给 source_file/source_lines
+3. 片段已足够时不要为了调工具而调工具(每次工具往返都会拖慢出题)
+片段为空或确实找不到相关材料时,才退回基于发现描述出题(此时不给 source_file)。"""
+
+# 服务端预读材料段(接在单条发现模板之后)
+_MATERIAL_SECTION_TEMPLATE = """
+
+【已为你读好的真实材料】(按本发现的源码定位预先读取,带行号;path=工作区相对路径)
+{materials}
+"""
 
 # 各主题共享的输出规则段(代码/文书材料双轨)
 _COMMON_RULES = """## 通用要求
@@ -145,23 +183,22 @@ _COMMON_RULES = """## 通用要求
 def build_system_prompt(
     topic: str, workspace_available: bool,
     custom_topics: list[dict] | None = None,
+    material_prefetched: bool = False,
 ) -> str:
     """按学习主题拼出题 system prompt;工作区可用时附工具说明段
 
     内置主题用专有视角 head;自定义主题(custom_topics 传入 {key,name,
     description} 列表)用通用模板 + 用户描述渲染;无匹配回落 security(防御)。
+
+    material_prefetched=True:相关源码片段已由服务端预读并附在发现后面,
+    工具段换成「按需补读」措辞(保留工具能力,但不再要求每题必须先调一次,
+    把每条发现的 LLM 往返从 2~4 次压到 1 次)。
     """
-    head = _TOPIC_PROMPT_HEADS.get(topic)
-    if head is None and custom_topics:
-        for d in custom_topics:
-            if d.get("key") == topic:
-                head = build_custom_topic_head(d)
-                break
-    if head is None:
-        head = _TOPIC_PROMPT_HEADS["security"]
-    sections = [head]
+    sections = [resolve_topic_head(topic, custom_topics)]
     if workspace_available:
-        sections.append(_TOOL_SECTION)
+        sections.append(
+            _TOOL_SECTION_WITH_MATERIAL if material_prefetched else _TOOL_SECTION
+        )
     sections.append(_COMMON_RULES)
     return "\n\n".join(sections)
 
@@ -309,3 +346,58 @@ _DEGEN_FEEDBACK = (
     "确保不看材料、不懂专业知识就无法确定答案;材料支撑不起专业考察点"
     "则直接返回空数组 []。"
 )
+
+
+# ============================================================
+# 知识点讲解:按出题上下文批量写讲解(口径与出题同一主题视角)
+# ============================================================
+
+# 讲解输出契约与质量要求(各主题共享,接在各主题视角 head 之后)
+_EXPLAIN_RULES = """## 知识点讲解要求
+你现在不是出题,而是给刚做错这些题的学习者写知识点讲解。
+每个知识点附了它的**出题上下文**(审计发现原文、实际读到的真实材料片段、
+围绕它生成的题目与解析),讲解必须从这些素材里归纳,不得凭空背概念:
+1. 四段结构,每段一个 ### 小标题:
+   ### 是什么 / ### 为什么会踩 / ### 怎么判断与修复 / ### 易错点
+2. 必须落到素材里的具体特征(函数名/调用方式/条款措辞/代码结构),
+   可以用行内代码或短列表;**不得虚构素材里没出现过的文件路径与行号**
+3. 同一知识点有多条素材时,归纳它们共同指向的那个易错模式,
+   不要逐题复述题目与答案
+4. 每个知识点 200~400 字(中文),总长不超 600 字;不要外层 ``` 围栏
+5. 素材确实撑不起专业讲解时,该知识点返回空字符串 markdown(宁缺毋滥)
+
+只输出 JSON 数组,不要任何其他文字。每个元素结构:
+{"knowledge_key": "原样返回", "markdown": "讲解正文(Markdown)"}"""
+
+
+def build_explain_system_prompt(topics: list[str], custom_defs: list[dict] | None = None) -> str:
+    """知识点讲解 system prompt
+
+    topics 为本批涉及的出题主题 key 列表(去重后按序);每个主题复用出题
+    同一份专业视角 head,保证「怎么出题」与「怎么讲解」口径一致。
+    custom_defs 为自定义主题词表({key,name,description}),用通用模板渲染。
+    """
+    heads: list[str] = []
+    seen: set[str] = set()
+    for topic in topics:
+        if topic in seen:
+            continue
+        seen.add(topic)
+        heads.append(resolve_topic_head(topic, custom_defs))
+    if not heads:
+        heads.append(resolve_topic_head("security"))
+    return "\n\n".join(heads) + "\n\n" + _EXPLAIN_RULES
+
+
+def build_explain_user_prompt(items: list[dict]) -> str:
+    """把逐知识点的出题上下文打包成 user prompt(一次批量出多个讲解)
+
+    items 为 explainer 汇好的素材:[{knowledge_key, knowledge_name,
+    learning_topic, sources: [...]}];一次调用覆盖多个知识点,
+    避免每个知识点一次往返(那会把收尾批量变成 N 次)。
+    """
+    return (
+        "以下是需要写讲解的知识点及其出题上下文(JSON 数组,一条 = 一个知识点):\n"
+        + json.dumps(items, ensure_ascii=False)
+        + "\n请逐个 knowledge_key 写讲解,按系统要求的格式输出。"
+    )

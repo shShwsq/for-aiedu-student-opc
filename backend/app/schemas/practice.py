@@ -25,6 +25,9 @@ class GenerateRequest(BaseModel):
     task_id: uuid.UUID
     # 参与生成的 finding 数上限(防 LLM 成本失控)
     max_findings: int = Field(default=10, ge=1, le=20)
+    # 重出开关:默认 False,本用户已就该 finding 出过题的整条跳过(不再付 LLM 成本);
+    # 任务详情页「重新出题」显式传 True 才允许对同一发现重出
+    force_regenerate: bool = False
 
 
 class GenerateJobResponse(BaseModel):
@@ -262,6 +265,9 @@ class SubmitAnswerResponse(BaseModel):
     # 本会话进度(answered / total)
     answered_count: int
     total_count: int
+    # 答错时附回该知识点的完整讲解(Markdown;答对或尚未生成时为空串)
+    # 只在错答下发:讲解正文平均 300 字,每题都带会把 payload 撑大
+    knowledge_explanation: str = ""
 
 
 # ============================================================
@@ -287,7 +293,8 @@ class KnowledgePointCardItem(BaseModel):
     """知识点卡片(知识点看板视图,GET /practice/knowledge-points)
 
     一张卡片 = 一个知识点:静态信息(key/name/languages) +
-    SM-2 记忆状态(无作答记录时为默认值) + 题库题数 + 看板分栏状态。
+    SM-2 记忆状态(无作答记录时为默认值) + 题库题数 + 看板分栏状态 +
+    知识点讲解(Markdown 正文与来源/更新时间)。
     """
 
     knowledge_key: str
@@ -311,6 +318,57 @@ class KnowledgePointCardItem(BaseModel):
     # 看板分栏(按优先级派生):weak=薄弱 / due=待复习 /
     # mastered=已巩固 / learning=学习中 / fresh=未开始
     board_status: Literal["weak", "due", "mastered", "learning", "fresh"] = "fresh"
+    # ---- 知识点讲解 ----
+    # 讲解正文(Markdown);空串 = 尚未生成(卡片展示「生成讲解」入口)
+    explanation: str = ""
+    # 来源:auto=模型生成 / manual=手工编辑(不会被自动覆盖)/ ""=未生成
+    explanation_source: str = ""
+    # 生成所用模型(手工编辑不记)
+    explanation_model: str = ""
+    # 最近一次更新讲解的时间(前端展示「更新于」)
+    explanation_updated_at: datetime | None = None
+    # 该知识点是否有可供模型出讲解的题素材(无题时前端不亮「生成讲解」)
+    can_generate_explanation: bool = False
+
+
+class ExplainKnowledgePointsRequest(BaseModel):
+    """按需生成/更新知识点讲解(POST /practice/knowledge-points/explain)
+
+    异步执行:立即返回 job_id,前端轮询 GET /practice/generate/{job_id}。
+    knowledge_keys 上限 20(一次点击覆盖看板上当前的缺讲解项就够用了,
+    再多应当走「出题收尾批量」路径顺便生成)。
+    """
+
+    knowledge_keys: list[str] = Field(default_factory=list, min_length=1, max_length=20)
+    # force=True 时重写已有 auto 讲解;manual 讲解任何时候都不被自动覆盖
+    force: bool = False
+
+
+class ExplainKnowledgePointsResponse(BaseModel):
+    """讲解 job 句柄与本次计划处理的知识点数"""
+
+    job_id: str
+    total: int
+
+
+class SaveKnowledgeExplanationRequest(BaseModel):
+    """手工编辑知识点讲解(PUT /practice/knowledge-points/{key}/explanation)
+
+    正文按 Markdown 存储与展示;上限沿用 MAX_EXPLANATION_CHARS。
+    写入后 explanation_source=manual,自动生成不再覆盖。
+    """
+
+    markdown: str = Field(default="", max_length=4000)
+
+
+class KnowledgeExplanationOut(BaseModel):
+    """知识点讲解字段回写视图(手工编辑后给前端拿最新来源与时间)"""
+
+    knowledge_key: str
+    explanation: str = ""
+    explanation_source: str = ""
+    explanation_model: str = ""
+    explanation_updated_at: datetime | None = None
 
 
 class StatsResponse(BaseModel):
@@ -365,6 +423,10 @@ class QuestionDetailResponse(QuestionContent):
     learning_topic: str | None = None
     # 来源任务(前端跳任务详情页查源码用;老题/手工导入为 None)
     source_task_id: uuid.UUID | None = None
+    # 所属知识点的讲解正文(Markdown;空串=尚未生成)——错题复盘时直接在弹窗里看
+    knowledge_explanation: str = ""
+    # 讲解来源(auto/manual/""),前端据此判断能否就地编辑与是否会被自动覆盖
+    knowledge_explanation_source: str = ""
     # 该题作答统计(无记录 attempts=0、accuracy=None)
     attempts: int = 0
     correct_count: int = 0

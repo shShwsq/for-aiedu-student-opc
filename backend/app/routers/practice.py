@@ -20,9 +20,12 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal, get_db
 from app.deps import get_current_user, get_current_user_sse
 from app.models.practice import (
+    EXPLANATION_SOURCE_MANUAL,
+    MAX_EXPLANATION_CHARS,
     Attempt,
     KnowledgePoint,
     PracticeSession,
+    PracticeSettings,
     Question,
     QuestionStatus,
     UserKnowledgeState,
@@ -36,17 +39,21 @@ from app.schemas.practice import (
     ConfirmQuestionsRequest,
     ConfirmQuestionsResponse,
     DraftQuestionResponse,
+    ExplainKnowledgePointsRequest,
+    ExplainKnowledgePointsResponse,
     GenerateJobResponse,
     GenerateJobsResponse,
     GenerateJobStatusResponse,
     GenerateJobSummary,
     GenerateModelResponse,
     GenerateRequest,
+    KnowledgeExplanationOut,
     KnowledgeStateResponse,
     KnowledgePointCardItem,
     PracticeSummaryResponse,
     QuestionDetailResponse,
     QuestionListItem,
+    SaveKnowledgeExplanationRequest,
     SessionAttemptItem,
     SessionDetailResponse,
     SessionListItem,
@@ -66,10 +73,16 @@ from app.services.practice.difficulty import (
     adjust_question_difficulty,
     estimate_ability,
 )
+from app.services.practice.explainer import (
+    build_digests_from_db,
+    explain_knowledge_points,
+)
 from app.services.practice.generator import (
     PracticeGenerateError,
     generate_questions_for_task,
+    resolve_explain_client_for_user,
     resolve_generate_model_info,
+    user_custom_topic_defs,
 )
 from app.services.practice.selector import (
     WEAKNESS_ERROR_RATE,
@@ -143,6 +156,9 @@ def generate_questions(
 
     立即返回 job_id,后台线程逐条 finding 调 LLM 出题,
     前端轮询 GET /practice/generate/{job_id} 拿进度与结果。
+
+    force_regenerate=False(默认)时,本用户已就该 finding 出过题的直接整条跳过,
+    不再付一次 LLM 成本(要重出同一发现请传 True)。
     """
     task = _get_task_owned(db, req.task_id, current_user.id)
     result_count = (
@@ -162,7 +178,7 @@ def generate_questions(
     gen_jobs.set_total(job_id, total=min(result_count, req.max_findings))
     thread = threading.Thread(
         target=_run_generate_job,
-        args=(job_id, task.id, current_user.id, req.max_findings),
+        args=(job_id, task.id, current_user.id, req.max_findings, req.force_regenerate),
         daemon=True,
         name=f"practice-generate-{job_id[:8]}",
     )
@@ -170,7 +186,10 @@ def generate_questions(
     return GenerateJobResponse(job_id=job_id)
 
 
-def _run_generate_job(job_id: str, task_id: UUID, user_id: UUID, max_findings: int) -> None:
+def _run_generate_job(
+    job_id: str, task_id: UUID, user_id: UUID, max_findings: int,
+    force_regenerate: bool = False,
+) -> None:
     """后台线程:独立 Session 执行生成,进度/结果写回 job,流式事件写事件日志"""
     db = SessionLocal()
     try:
@@ -182,11 +201,12 @@ def _run_generate_job(job_id: str, task_id: UUID, user_id: UUID, max_findings: i
             logger.warning("[practice] 手动出题 job=%s 任务不存在或无权访问 task=%s", job_id, task_id)
             return
         logger.info(
-            "[practice] 手动出题开始 job=%s task=%s user=%s max_findings=%d",
-            job_id, task_id, user_id, max_findings,
+            "[practice] 手动出题开始 job=%s task=%s user=%s max_findings=%d force_regenerate=%s",
+            job_id, task_id, user_id, max_findings, force_regenerate,
         )
         created, skipped = generate_questions_for_task(
             db, task, user_id, max_findings=max_findings,
+            force_regenerate=force_regenerate,
             progress_callback=lambda done, total: gen_jobs.update_job(
                 job_id, done=done, total=total
             ),
@@ -241,14 +261,23 @@ def _run_generate_job(job_id: str, task_id: UUID, user_id: UUID, max_findings: i
 @router.get("/generate/jobs", response_model=GenerateJobsResponse)
 def list_generate_jobs(
     current_user: User = Depends(get_current_user),
+    sources: str = Query(
+        default="manual,auto",
+        description="逗号分隔的 job 来源;默认只回出题 job(explain=知识点讲解 job 不混进侧栏)",
+    ),
 ) -> GenerateJobsResponse:
     """当前用户的出题 job 列表(运行中优先,限最近 10 条)
 
     练习页侧栏轮询发现正在运行的出题 job(手动与自动来源都含)。
+    看板用 `?sources=explain` 只看自己的讲解 job。
     注意:必须注册在 /generate/{job_id} 之前,否则 "jobs" 会被当成 job_id。
     """
+    wanted = tuple(s.strip() for s in (sources or "").split(",") if s.strip())
     return GenerateJobsResponse(
-        jobs=[GenerateJobSummary(**s) for s in gen_jobs.list_jobs(current_user.id)],
+        jobs=[
+            GenerateJobSummary(**s)
+            for s in gen_jobs.list_jobs(current_user.id, sources=wanted or None)
+        ],
     )
 
 
@@ -754,6 +783,8 @@ def submit_answer(
         ),
         answered_count=answered_count,
         total_count=session.question_count,
+        # 答错才下发知识点完整讲解(答对时题目解析已够,不必每题都拖正文)
+        knowledge_explanation="" if is_correct else ((kp.explanation if kp else "") or ""),
     )
 
 
@@ -1075,6 +1106,13 @@ def list_knowledge_points(
             due_at=due_at,
             question_count=q_counts.get(kp.id, 0) or 0,
             board_status=status,
+            # 知识点讲解(看板卡片内折叠展开直接渲染;空串时卡片展示「生成讲解」入口)
+            explanation=kp.explanation or "",
+            explanation_source=kp.explanation_source or "",
+            explanation_model=kp.explanation_model or "",
+            explanation_updated_at=kp.explanation_updated_at,
+            # 有入库题才有讲解素材可依据(无题时不亮生成按钮,避免模型凭空编)
+            can_generate_explanation=(q_counts.get(kp.id, 0) or 0) > 0,
         ))
 
     # 稳定排序:分栏优先,栏内薄弱按错误率降序、待复习按最急到期、
@@ -1091,6 +1129,129 @@ def list_knowledge_points(
 
     items.sort(key=_sort_key)
     return items
+
+
+@router.post("/knowledge-points/explain", response_model=ExplainKnowledgePointsResponse)
+def explain_knowledge_points_endpoint(
+    req: ExplainKnowledgePointsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ExplainKnowledgePointsResponse:
+    """按需生成/更新知识点讲解(异步 job,前端轮询 GET /practice/generate/{job_id})
+
+    讲解素材由 explainer 从 DB 重建:该知识点最近的题目(含 code_snippet
+    与源码定位)+ 题目关联的审计发现原文,不是让模型凭空背概念。
+    已有 auto 讲解只在 force=True 时重写;manual(用户自己写的)永不覆盖。
+    """
+    keys = [k.strip() for k in (req.knowledge_keys or []) if k.strip()]
+    if not keys:
+        raise HTTPException(status_code=400, detail="请至少指定一个知识点")
+    owned = {
+        kp.key
+        for kp in db.query(KnowledgePoint).filter(
+            KnowledgePoint.user_id == current_user.id,
+            KnowledgePoint.key.in_(keys),
+        ).all()
+    }
+    if not owned:
+        raise HTTPException(status_code=404, detail="知识点不存在或无权访问")
+
+    job_id = gen_jobs.create_job(
+        current_user.id, source="explain", task_title="知识点讲解",
+    )
+    gen_jobs.set_total(job_id, total=len(owned))
+    threading.Thread(
+        target=_run_explain_job,
+        args=(job_id, current_user.id, sorted(owned), req.force),
+        daemon=True,
+        name=f"practice-explain-{job_id[:8]}",
+    ).start()
+    return ExplainKnowledgePointsResponse(job_id=job_id, total=len(owned))
+
+
+def _run_explain_job(job_id: str, user_id: UUID, keys: list[str], force: bool) -> None:
+    """后台线程:独立 Session 批量生成讲解,进度/结果写回 job
+
+    job 的 done/total 语义复用出题 job 结构:total=待处理知识点数,
+    done=已写入讲解数;skipped_findings = 没产出讲解的知识点数。
+    """
+    db = SessionLocal()
+    try:
+        settings_row = db.query(PracticeSettings).filter(
+            PracticeSettings.user_id == user_id
+        ).first()
+        digests = build_digests_from_db(db, user_id, keys)
+        if not digests:
+            # 全部知识点都没题可依据 → 直接收口,不白跑一次 LLM
+            gen_jobs.update_job(
+                job_id, status="done", done=0,
+                skipped_findings=len(keys),
+            )
+            logger.info("[explain] job=%s 无可用题素材,未生成讲解", job_id)
+            return
+        written = explain_knowledge_points(
+            db, user_id, digests,
+            client=resolve_explain_client_for_user(db, user_id, settings_row),
+            force=force,
+            custom_defs=user_custom_topic_defs(db, user_id),
+            event_callback=lambda etype, data: gen_jobs.append_event(
+                job_id, etype, data
+            ),
+        )
+        gen_jobs.update_job(
+            job_id, status="done", done=written, created_count=written,
+            skipped_findings=max(0, len(keys) - written),
+        )
+        logger.info(
+            "[explain] job=%s 完成: 写入 %d/%d 个知识点讲解", job_id, written, len(keys),
+        )
+    except Exception as e:
+        logger.exception("[explain] job=%s 失败", job_id)
+        gen_jobs.update_job(job_id, status="error", error=str(e)[:500])
+    finally:
+        db.close()
+
+
+@router.put(
+    "/knowledge-points/{knowledge_key}/explanation",
+    response_model=KnowledgeExplanationOut,
+)
+def save_knowledge_explanation(
+    knowledge_key: str,
+    req: SaveKnowledgeExplanationRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> KnowledgeExplanationOut:
+    """手工编辑知识点讲解(写后 source=manual,自动生成不再覆盖)"""
+    kp = db.query(KnowledgePoint).filter(
+        KnowledgePoint.user_id == current_user.id,
+        KnowledgePoint.key == knowledge_key,
+    ).first()
+    if not kp:
+        raise HTTPException(status_code=404, detail="知识点不存在或无权访问")
+    markdown = (req.markdown or "").strip()
+    if len(markdown) > MAX_EXPLANATION_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"讲解正文不能超过 {MAX_EXPLANATION_CHARS} 字符",
+        )
+    kp.explanation = markdown or None
+    # 清空正文回到「尚未生成」态;有内容则标为手工编辑(自动生成会跳过)
+    kp.explanation_source = EXPLANATION_SOURCE_MANUAL if markdown else ""
+    kp.explanation_model = ""
+    kp.explanation_updated_at = _now() if markdown else None
+    db.commit()
+    logger.info(
+        "[explain] user=%s key=%s 手工编辑讲解(%d 字)",
+        current_user.id, knowledge_key, len(markdown),
+    )
+    return KnowledgeExplanationOut(
+        knowledge_key=kp.key,
+        explanation=kp.explanation or "",
+        explanation_source=kp.explanation_source or "",
+        explanation_model=kp.explanation_model or "",
+        explanation_updated_at=kp.explanation_updated_at,
+    )
 
 
 @router.get("/questions", response_model=list[QuestionListItem])
@@ -1222,6 +1383,9 @@ def get_question_detail(
         category=kp.category if kp else None,
         learning_topic=question.learning_topic,
         source_task_id=question.source_task_id,
+        # 所属知识点讲解(错题复盘时不必跳回看板)
+        knowledge_explanation=(kp.explanation if kp else "") or "",
+        knowledge_explanation_source=(kp.explanation_source if kp else "") or "",
         attempts=attempts,
         correct_count=correct,
         accuracy=(correct / attempts) if attempts else None,

@@ -1,24 +1,32 @@
 """题目生成:把审查任务的真实发现(Result)改编为客观练习题
 
 流程:
-1. 取任务 Results(上限 max_findings 条,防 LLM 成本失控)
+1. 取任务 Results(上限 max_findings 条,防 LLM 成本失控);
+   本用户已就该 finding 出过题的直接整条跳过(去重前置到 LLM 之前,
+   否则题目出完才发现 dedup_hash 撞上,钱已经花了)
 2. 逐条 finding 调 LLM 生成 1~3 题:
    - system prompt 按发现内容自动匹配的主题切换:
      主题词表来自用户设置(learning_topics 表,内置 4 个 + 自定义,
      仅启用主题参与;规则先行 + LLM 批量兜底),内置主题用专有
      出题视角,自定义主题用通用模板 + 用户描述
    - 提示词强制题目必须阅读真实材料(代码或文书原文)才能作答(禁止常识题);
-     工作区可用时挂只读迷你工具循环(read_file / search_code / find_files),
-     要求出题前先读材料并记录 source_file/source_lines;
+     工作区可用时先按 finding 的 file_path/line 定位**批量预读**材料
+     (同文件多 finding 共用一次读取),片段直拼进 prompt 并改用
+     「按需补读」提示词变体 → 多数 finding 0 工具轮次出题;
+     未命中预读的仍走只读迷你工具循环(read_file / search_code / find_files);
      沙箱已清理且用户开启「出题前恢复工作区」时先重新 clone 恢复
 3. json_repair 容错解析 + 字段校验,失败重试 1 次,仍失败丢弃该 finding;
-   两级质量关卡拦截不合格题(全部被拦时带质量反馈重试 1 次后丢弃):
+   散文包 JSON 的输出先抽平衡数组挽救(思考类模型常见形态),不白丢整条;
+   反馈重试在既有消息历史上追加反馈句,不重建工具循环(不重读文件);
+   429 撞限不占重试预算,等待后原地重试
+   两级质量关卡拦截不合格题(全部被拦时带质量反馈续写 1 次后丢弃):
    - 关卡 1(始终启用):退化题 — 叙述式判断题(某同学做了某判断是否
      正确)或判断题措辞泄露答案(题干含「仅凭」等)
    - 关卡 2(工作区可用时):无 code_snippet 的题,不看材料也能作答
 4. 致命错误快速失败:模型 401/403(额度耗尽/Key 失效)等不可重试错误
    立即中止剩余 finding,抛 PracticeGenerateError 由 job 层展示原因
-5. 知识点 get_or_create(优先 CWE 编号)+ 同用户 sha256 去重
+5. 知识点 get_or_create(优先 CWE 编号;job 内按 key 缓存,免每题一次 SELECT)
+   + 同用户 sha256 去重
 6. 落库为 draft(记录出题时实际匹配的主题与源码定位),前端预览确认后转 active
 
 出题模型解析:task.llm_config_id > 用户级默认出题模型
@@ -30,13 +38,19 @@ import hashlib
 import json
 import logging
 import re
+import threading
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 from json_repair import repair_json
 from sqlalchemy.orm import Session
 
 import openai
+from app.config import settings
 from app.llm.client import LLMClient
 from app.models.practice import (
     BUILTIN_TOPIC_DEFS,
@@ -57,6 +71,14 @@ from app.models.practice import (
 from app.models.task import Result, Task
 from app.models.user_llm_config import UserLLMConfig
 from app.services.practice.difficulty import clamp_difficulty
+from app.services.practice.explainer import (
+    add_digest,
+    explain_knowledge_points,
+    make_source_digest,
+)
+from app.services.practice.parse_utils import (
+    salvage_json_array as _salvage_json_array,
+)
 from app.tools import sandbox_tools
 
 logger = logging.getLogger(__name__)
@@ -69,6 +91,17 @@ PARSE_RETRY = 1
 MAX_TOOL_ROUNDS = 6
 # 单次工具结果回传 LLM 的截断阈值(防上下文爆炸)
 _MAX_TOOL_RESULT_CHARS = 3000
+# 限流(429)原地等待重试:不占质量/解析反馈的重试预算(撞限不是模型答得差)
+_RATE_LIMIT_INPLACE_WAITS = 2
+_RATE_LIMIT_WAIT_SECONDS = 5.0
+# 反馈续写可复用的消息历史文本量上限(超限则重建对话,避免把上下文顶爆)
+_MAX_CARRY_CHARS = 60000
+# token 事件合并阈值:够这个字符数或够这个时间才推一条 SSE 事件
+# (逐 chunk 推会让单 job 事件数涨到上千条:写端每条抢一次全局锁,
+# SSE 读端每次轮询又在全局锁内线性扫全表 → 出题线程与展示相互拖慢;
+# 200ms 粒度对侧栏打字机效果无影响)
+_TOKEN_BATCH_CHARS = 256
+_TOKEN_BATCH_SECONDS = 0.2
 
 
 class PracticeGenerateError(Exception):
@@ -102,11 +135,187 @@ from app.prompts.practice import (
     _DEGEN_FEEDBACK,
     _FINDING_TEMPLATE,
     _LEARNING_NOTE_TEMPLATE,
+    _MATERIAL_SECTION_TEMPLATE,
     _NO_CODE_FEEDBACK,
     _PRACTICE_TOOL_DEFINITIONS,
     build_system_prompt,
     build_topic_classify_prompt,
 )
+
+# ============================================================
+# 材料预读:按发现的源码定位一次性读好,压掉逐条发现的工具往返
+# ============================================================
+
+# 定位元信息可能的 key(场景与 agent 输出并不完全统一,按序容错匹配)
+_FILE_META_KEYS = ("file_path", "filepath", "source_file", "path", "file")
+_LINE_META_KEYS = ("line_range", "lines", "line", "start_line", "lineno", "location")
+# 行窗口两侧扩展行数(给 LLM 必要的上下文:导入段与函数签名)
+_PREFETCH_LINE_PAD = 40
+# 单次读取的最大行数(超大窗口截断,防一个文件吃掉整个上下文)
+_PREFETCH_MAX_LINES = 240
+# 单条 finding 最多附几个材料片段
+_PREFETCH_MAX_FILES_PER_FINDING = 3
+# 单个片段进提示词的字符上限
+_PREFETCH_MAX_CHARS_PER_FILE = 2400
+# 相邻区间合并阈值(两窗口间隙小于此值就一次读完,省一次往返)
+_PREFETCH_MERGE_GAP = 8
+# 行号提取:兼容 "42" / "L42" / "120-150" / "120:150" / "第 120 行"
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _meta_first_str(meta: dict, keys: tuple[str, ...]) -> str:
+    """按候选 key 取第一个非空字符串值(大小写不敏感)"""
+    lowered = {str(k).lower(): v for k, v in (meta or {}).items()}
+    for key in keys:
+        val = lowered.get(key)
+        if val is None:
+            continue
+        text = str(val).strip()
+        if text:
+            return text
+    return ""
+
+
+def _parse_line_window(raw: str) -> tuple[int, int] | None:
+    """从定位文本抽行区间;抽不到返回 None(表示整文件待 LLM 自己找)
+
+    兼容 "42" / "L42" / "120-150" / "120:150" / "第 120 行" / "42, 距 10 行" 等写法:
+    取文本里的数字串,1 个当单行,≥ 2 个取 [min, max](相等则单行)。
+    """
+    nums = [int(m) for m in _DIGITS_RE.findall(raw or "")]
+    if not nums:
+        return None
+    start, end = nums[0], (nums[-1] if len(nums) > 1 else nums[0])
+    if start <= 0:
+        start = end
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def _finding_material_targets(meta: dict) -> list[tuple[str, int | None, int | None]]:
+    """从发现元信息抽 (文件路径, 起始行, 结束行) 预读目标
+
+    只信 file_path 类字段;行定位缺失时给整文件开头(前 N 行),
+    仍然比让 LLM 自己盲探一次便宜。
+    """
+    path = _meta_first_str(meta, _FILE_META_KEYS)
+    if not path:
+        return []
+    window = _parse_line_window(_meta_first_str(meta, _LINE_META_KEYS))
+    start, end = window if window else (None, None)
+    return [(path, start, end)]
+
+
+def _merge_read_ranges(
+    windows: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """把同一文件的多条行窗口两侧加宽后合并重叠/紧邻区间,并按上限截断
+
+    返回排序后的 (offset, max_lines) 列表;None 行定位归一为文件开头。
+    """
+    padded: list[tuple[int, int]] = []
+    for start, end in windows:
+        s = max(1, (start or 1) - _PREFETCH_LINE_PAD)
+        e = (end or start or _PREFETCH_MAX_LINES) + _PREFETCH_LINE_PAD
+        padded.append((s, max(s, e)))
+    padded.sort()
+    merged: list[list[int]] = []
+    for s, e in padded:
+        if merged and s - merged[-1][1] <= _PREFETCH_MERGE_GAP:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    # 截断单区间跨度(靠前的窗口优先,它就是 finding 标注的位置)
+    return [
+        (s, min(e, s + _PREFETCH_MAX_LINES - 1))
+        for s, e in merged
+    ]
+
+
+def _prefetch_materials(
+    task_id: str, repo_path: str, findings: list[Result],
+) -> dict[str, list[dict]]:
+    """按发现的源码定位批量预读材料,返回 {finding_id: [片段]}
+
+    动机:同一文件的多个 finding 以前各自跑一遍 read_file 工具轮次
+    (每条 finding 多 1~3 次 LLM 往返);而 Result.metadata 已经带了
+    file_path / line 定位。这里按文件归并行窗口、去重读取一次,
+    片段直接拼进 user prompt → 多数 finding 可 0 工具轮次出题。
+
+    失败(文件不存在/二进制/沙箱异常)只记日志不抛出,该 finding
+    退回原来的强制工具阅读路径。单线程执行:不对沙箱会话做跨线程假设。
+    """
+    if not repo_path:
+        return {}
+    # path → [(finding_id, start, end)]
+    plan: dict[str, list[tuple[str, int | None, int | None]]] = {}
+    for f in findings:
+        for path, start, end in _finding_material_targets(f.metadata_ or {}):
+            plan.setdefault(path, []).append((str(f.id), start, end))
+    if not plan:
+        return {}
+
+    reads: dict[str, list[tuple[int, int, dict]]] = {}
+    for path, targets in plan.items():
+        ranges = _merge_read_ranges([(s, e) for _, s, e in targets])
+        got: list[tuple[int, int, dict]] = []
+        for offset, max_lines in ranges:
+            try:
+                res = sandbox_tools.read_file(
+                    repo_path, path,
+                    max_lines=max(1, min(max_lines - offset + 1, _PREFETCH_MAX_LINES)),
+                    offset=offset,
+                    task_id=task_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[practice] 预读材料失败 task=%s path=%s: %s", task_id, path, e,
+                )
+                continue
+            content = str((res or {}).get("content") or "").strip()
+            if not content or content.startswith("(二进制文件"):
+                continue
+            got.append(
+                (int((res or {}).get("start_line") or offset),
+                 int((res or {}).get("end_line") or offset), res),
+            )
+        reads[path] = got
+
+    out: dict[str, list[dict]] = {}
+    for path, targets in plan.items():
+        available = reads.get(path) or []
+        for fid, start, end in targets:
+            buckets = out.setdefault(fid, [])
+            for r_start, r_end, res in available:
+                if len(buckets) >= _PREFETCH_MAX_FILES_PER_FINDING:
+                    break
+                # 行定位已知且与本次读取区间不交叠 → 不属本 finding 的材料
+                if start is not None:
+                    want_lo = max(1, start - _PREFETCH_LINE_PAD)
+                    want_hi = (end or start) + _PREFETCH_LINE_PAD
+                    if not (r_start <= want_hi and want_lo <= r_end):
+                        continue
+                buckets.append({
+                    "path": path,
+                    "lines": f"{r_start}-{r_end}",
+                    "content": str(res.get("content") or "")[:_PREFETCH_MAX_CHARS_PER_FILE],
+                })
+    return {k: v for k, v in out.items() if v}
+
+
+def _render_material_section(snippets: list[dict]) -> str:
+    """预读片段渲染为提示词段(空列表返回空串,调用方据此选提示词变体)"""
+    if not snippets:
+        return ""
+    items = [
+        {"path": s["path"], "lines": s["lines"], "content": s["content"]}
+        for s in snippets
+    ]
+    return _MATERIAL_SECTION_TEMPLATE.format(
+        materials=json.dumps(items, ensure_ascii=False)
+    )
+
 
 # ============================================================
 # 主题自动匹配:规则先行 + LLM 批量兜底(主题词表来自用户设置)
@@ -304,17 +513,42 @@ def _stream_one_round(
     return "".join(content_parts), tool_calls
 
 
+def _new_llm_turn(system_prompt: str, finding_text: str) -> list[dict]:
+    """开一轮出题对话的消息底座(供 _call_llm 原地续写)"""
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": finding_text},
+    ]
+
+
+def _turn_chars(messages: list[dict]) -> int:
+    """消息历史文本量(粗估续写是否会把上下文顶爆)"""
+    total = 0
+    for m in messages or []:
+        total += len(str(m.get("content") or ""))
+        for tc in m.get("tool_calls") or []:
+            total += len(str((tc.get("function") or {}).get("arguments") or ""))
+    return total
+
+
 def _call_llm(
     client: LLMClient, system_prompt: str, finding_text: str,
     task_id: str, repo_path: str,
     on_event: Callable[[str, dict], None] | None = None,
+    messages: list[dict] | None = None,
 ) -> str:
-    """出题 LLM 调用:工作区可用 → 有界工具循环;否则单次直出"""
+    """出题 LLM 调用:工作区可用 → 有界工具循环;否则单次直出
+
+    messages(可选):**续写用的消息历史**(本函数会原地追加 assistant/tool 消息)。
+    质量/解析反馈重试时传上一轮的 messages 并追加反馈句:材料已在上下文里,
+    模型不必重读文件。以前重试是从原始 prompt 重建整个工具循环,
+    同一批文件重读一遍,单条 finding 成本近乎翻倍。
+    传了 messages 时 system_prompt/finding_text 不再参与重建(调用方已把
+    反馈作为 user 消息追加),保留这两个形参只为兼容旧签名与测试置假。
+    """
     tools = _PRACTICE_TOOL_DEFINITIONS if repo_path else None
-    messages: list[dict] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": finding_text},
-    ]
+    if messages is None:
+        messages = _new_llm_turn(system_prompt, finding_text)
     for _ in range(MAX_TOOL_ROUNDS):
         content, tool_calls = _stream_one_round(client, messages, tools, on_event)
         if not tool_calls:
@@ -389,6 +623,7 @@ def _load_git_tokens(db: Session, user_id) -> dict[str, str]:
 def _ensure_workspace(
     db: Session, task: Task, settings_row: PracticeSettings | None,
     event_callback: Callable[[str, dict], None] | None = None,
+    git_tokens: dict[str, str] | None = None,
 ) -> dict | None:
     """保障出题用的工作区,返回 workspace info(含 repo_path;不可用为 None)
 
@@ -399,6 +634,9 @@ def _ensure_workspace(
 
     event_callback 非空时推 restore 事件(start/progress/done/failed),
     供出题进度侧栏展示克隆进度;回调异常不影响恢复主流程。
+
+    git_tokens 可预先传入(主线程读库拿到):恢复可能跑在后台线程,
+    而 SQLAlchemy Session 非线程安全 —— 传了就在线程内再查库。
     """
 
     def _emit(phase: str, **extra) -> None:
@@ -424,7 +662,8 @@ def _ensure_workspace(
             repo_url,
             branch=params.get("branch"),
             task_id=task_id_str,
-            git_tokens=_load_git_tokens(db, task.user_id),
+            git_tokens=git_tokens if git_tokens is not None
+            else _load_git_tokens(db, task.user_id),
             progress_callback=lambda percent, message: _emit(
                 "progress", percent=percent, message=message,
             ),
@@ -483,6 +722,72 @@ def resolve_llm_client(db: Session, task: Task) -> LLMClient:
         except Exception as e:
             logger.warning("[practice] 加载出题模型配置失败,回退 env 默认: %s", e)
     return LLMClient()
+
+
+def resolve_explain_client(
+    db: Session, user_id, settings_row: PracticeSettings | None,
+    fallback: LLMClient,
+) -> LLMClient:
+    """讲解模型解析:practice_settings.explain_llm_config_id > 出题模型(fallback)
+
+    讲解是轻任务:用思考类模型出题要 ~160s/条,写一段讲解用不着那个代价,
+    所以允许单独挂个快/便宜的模型。配置缺失或失效静默回退出题模型。
+    """
+    cid = getattr(settings_row, "explain_llm_config_id", None)
+    if not cid or user_id is None:
+        return fallback
+    client = _client_from_config_id(db, user_id, cid)
+    if client is None:
+        logger.warning("[explain] 未找到讲解模型配置 id=%s,回退出题模型", cid)
+        return fallback
+    return client
+
+
+def resolve_explain_client_for_user(
+    db: Session, user_id, settings_row: PracticeSettings | None,
+) -> LLMClient:
+    """看板按需生成讲解时的模型:讲解专用 > 默认出题模型 > env 默认
+
+    这条路径没有 task(与任务无关,只围绕知识点),所以不走任务级配置。
+    """
+    cid = (
+        getattr(settings_row, "explain_llm_config_id", None)
+        or getattr(settings_row, "default_llm_config_id", None)
+    )
+    if cid and user_id is not None:
+        client = _client_from_config_id(db, user_id, cid)
+        if client is not None:
+            return client
+    return LLMClient()
+
+
+def _client_from_config_id(
+    db: Session, user_id, config_id: str,
+) -> LLMClient | None:
+    """按 UserLLMConfig 里的配置 id 构造客户端;找不到/构造失败返回 None"""
+    try:
+        cfg_row = db.query(UserLLMConfig).filter(
+            UserLLMConfig.user_id == user_id
+        ).first()
+        for c in ((cfg_row.llm_configs or []) if cfg_row else []):
+            if c.get("id") == config_id:
+                return LLMClient.from_config_dict(c)
+    except Exception as e:
+        logger.warning("[practice] 加载模型配置 id=%s 失败: %s", config_id, e)
+    return None
+
+
+def user_custom_topic_defs(db: Session, user_id) -> list[dict]:
+    """用户启用中的自定义学习主题({key,name,description})
+
+    出题与知识点讲解共用同一份词表,保证自定义主题的口径一致。
+    """
+    builtin = {b["key"] for b in BUILTIN_TOPIC_DEFS}
+    return [
+        {"key": t.key, "name": t.name, "description": t.description}
+        for t in ensure_user_topics(db, user_id)
+        if t.enabled and t.key not in builtin
+    ]
 
 
 def resolve_generate_model_info(db: Session, task: Task) -> dict[str, str]:
@@ -568,11 +873,26 @@ def _normalize_languages(raw: Any, source_file: str | None) -> list[str]:
     return langs[:_MAX_LANGUAGES]
 
 
+def _merge_kp_languages(kp: KnowledgePoint, languages: list[str] | None) -> None:
+    """知识点语言标签并集累积(保持原顺序追加新标签)"""
+    merged = list(kp.languages or [])
+    added = [l for l in (languages or []) if l not in merged]
+    if added:
+        kp.languages = merged + added
+
+
 def _get_or_create_knowledge_point(
     db: Session, user_id, key: str, name: str, languages: list[str] | None = None,
     learning_topic: str = DEFAULT_LEARNING_TOPIC,
+    cache: dict[str, "KnowledgePoint"] | None = None,
 ) -> KnowledgePoint:
     key = (key or "").strip() or "general"
+    if cache is not None and key in cache:
+        # 本轮已取过该知识点:只做语言标签并集,省掉一次 SELECT
+        # (一次 10 finding 的 job 会反复命中 CWE-89 这类高频知识点)
+        kp = cache[key]
+        _merge_kp_languages(kp, languages)
+        return kp
     kp = db.query(KnowledgePoint).filter(
         KnowledgePoint.user_id == user_id,
         KnowledgePoint.key == key,
@@ -580,10 +900,9 @@ def _get_or_create_knowledge_point(
     if kp:
         # 已有知识点:语言标签并集累积(保持原顺序追加新语言);
         # learning_topic first-wins(首个出题主题归属保持稳定)
-        merged = list(kp.languages or [])
-        added = [l for l in (languages or []) if l not in merged]
-        if added:
-            kp.languages = merged + added
+        _merge_kp_languages(kp, languages)
+        if cache is not None:
+            cache[key] = kp
         return kp
     kp = KnowledgePoint(
         user_id=user_id,
@@ -595,6 +914,8 @@ def _get_or_create_knowledge_point(
     )
     db.add(kp)
     db.flush()
+    if cache is not None:
+        cache[key] = kp
     return kp
 
 
@@ -678,6 +999,9 @@ def _parse_llm_questions(content: str, finding_meta: dict, finding_id=None) -> l
 
     解析/校验的每个丢弃分支都落日志(出题专用日志文件),
     便于排查“一道题也没生成”是模型输出问题还是校验过严。
+
+    输出为散文包裹的数组时(非 JSON 根)先走 _salvage_json_array 挽救,
+    挽不回才丢弃。
     """
     text = (content or "").strip()
     if not text:
@@ -690,7 +1014,24 @@ def _parse_llm_questions(content: str, finding_meta: dict, finding_id=None) -> l
             "[practice] finding=%s json_repair 解析失败: %s; 输出样例: %r",
             finding_id, e, text[:300],
         )
-        return []
+        result = None
+    if isinstance(result, str) or result is None:
+        # 散文 + JSON 数组(或非 JSON 文本):抽第一个平衡数组再试一次
+        salvaged = _salvage_json_array(text)
+        retry = None
+        if salvaged:
+            try:
+                retry = repair_json(salvaged, return_objects=True)
+            except Exception:
+                retry = None
+        if isinstance(retry, (list, dict)):
+            logger.info(
+                "[practice] finding=%s 输出非纯 JSON,已从散文中挽救出数组(长度 %d)",
+                finding_id, len(salvaged or ""),
+            )
+            result = retry
+        else:
+            result = []
     if isinstance(result, dict):
         result = [result]
     if not isinstance(result, list):
@@ -793,6 +1134,278 @@ def _select_findings(
     return (marked + rest)[:max_findings]
 
 
+class _TokenBatcher:
+    """把逐 chunk 的 token 增量合并成块再回调(只合并 token,其余事件透传)
+
+    顺序保证:非 token 事件(finding/tool)先 flush 累积文本再透传,
+    所以侧栏不会出现「下一条 finding 已开始但上一条的尾巴才到」。
+    调用方必须在一条 finding 结束后 close()(否则尾部文本会延后一个 finding 才现形)。
+    """
+
+    def __init__(
+        self, sink: Callable[[str, dict], None] | None,
+        *, max_chars: int = _TOKEN_BATCH_CHARS,
+        max_seconds: float = _TOKEN_BATCH_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._sink = sink
+        self._max_chars = max(1, max_chars)
+        self._max_seconds = max_seconds
+        self._clock = clock
+        self._buf: list[str] = []
+        self._chars = 0
+        self._since = clock()
+
+    def _flush(self) -> None:
+        if not self._buf or self._sink is None:
+            self._buf.clear()
+            self._chars = 0
+            return
+        try:
+            self._sink("token", {"delta": "".join(self._buf)})
+        except Exception:
+            pass  # 事件回调失败不影响出题主流程
+        self._buf.clear()
+        self._chars = 0
+        self._since = self._clock()
+
+    def emit(self, etype: str, data: dict) -> None:
+        if self._sink is None:
+            return
+        if etype != "token":
+            self._flush()
+            try:
+                self._sink(etype, data)
+            except Exception:
+                pass
+            return
+        delta = str(data.get("delta") or "")
+        # 先把够块的累积内容推出去(按已有内容判定阈值),再收新片段:
+        # 已存了 ≥0.2s 的文本不应等下一条才现形
+        if self._buf and (
+            self._chars >= self._max_chars
+            or self._clock() - self._since >= self._max_seconds
+        ):
+            self._flush()
+        self._buf.append(delta)
+        self._chars += len(delta)
+
+    def close(self) -> None:
+        """收口:把末尾不足阈值的文本一次推出"""
+        self._flush()
+
+
+def _build_finding_prompt(
+    finding: Result, meta: dict, material_text: str = "",
+) -> str:
+    """拼单条发现的 user prompt:发现正文 + 预读材料段 + 学习点提示"""
+    prompt = _FINDING_TEMPLATE.format(
+        title=finding.title,
+        content=(finding.content or "")[:4000],
+        metadata=meta,
+    )
+    # 预读到的真实材料接在发现后面(命中时提示词走「按需补读」变体)
+    if material_text:
+        prompt += material_text
+    # agent2 标记的学习点:注入考察方向,引导出题聚焦值得学的点
+    learning_note = meta.get("learning_note") if isinstance(meta, dict) else None
+    if _is_practice_worthy(finding) and learning_note:
+        prompt += _LEARNING_NOTE_TEMPLATE.format(note=str(learning_note)[:500])
+    return prompt
+
+
+def _generate_for_finding(
+    client: LLMClient, system_prompt: str, prompt: str, finding: Result,
+    meta: dict, task_id_str: str, repo_path: str,
+    event_callback: Callable[[str, dict], None] | None = None,
+) -> tuple[list[dict], str, str]:
+    """单条发现的出题:LLM 往返 + 解析 + 两道质量关卡 + 至多 1 次带反馈续写
+
+    返回 (合格题目 dict 列表, 最后一次 LLM 原文, 致命错误原因);
+    致命原因非空时调用方应中止剩余 finding(已生成题目照常保留)。
+
+    两处降本改动(都是针对日志里反复出现的浪费):
+    - 反馈重试**在既有消息历史上追加反馈句**,不重建工具循环:
+      材料已在上下文里,重建会把同一批文件重读一遍,单条成本近乎翻倍
+    - 429 不占反馈重试预算(限流不是模型答得差),等待后原地重试
+      耗尽次数才落到丢弃路径(以前一次撞限就白丢整条 finding)
+
+    只跑 LLM 与本地校验,不碰数据库(供后续并发化直接当工作单元用)。
+    """
+    messages = _new_llm_turn(system_prompt, prompt)
+    call_text = prompt  # 本轮新增的 user 文本(供日志与测试可观测)
+    content = ""
+    questions: list[dict] = []
+    fatal_reason = ""
+    rate_waits = 0
+    attempt = 0
+    # token 增量合并后再推(见 _TokenBatcher);tool/finding 事件原序透传
+    batcher = _TokenBatcher(event_callback)
+    while attempt <= PARSE_RETRY:
+        try:
+            content = _call_llm(
+                client, system_prompt, call_text, task_id_str, repo_path,
+                on_event=batcher.emit, messages=messages,
+            )
+        except openai.RateLimitError as e:
+            if rate_waits < _RATE_LIMIT_INPLACE_WAITS:
+                rate_waits += 1
+                wait = _RATE_LIMIT_WAIT_SECONDS * rate_waits
+                logger.info(
+                    "[practice] finding=%s 命中限流,%.0fs 后原地重试(%d/%d): %s",
+                    finding.id, wait, rate_waits, _RATE_LIMIT_INPLACE_WAITS, e,
+                )
+                time.sleep(wait)
+                continue
+            logger.warning(
+                "[practice] finding=%s 限流重试 %d 次仍失败,丢弃该条: %s",
+                finding.id, rate_waits, e,
+            )
+            content = ""
+        except Exception as e:
+            fatal = _fatal_llm_reason(e)
+            if fatal is not None:
+                # 额度/认证类错误:后续 finding 必然同样失败,立即中止
+                # 避免空转(原因经 PracticeGenerateError 推给前端展示)
+                logger.error("[practice] 出题模型致命错误,中止剩余 finding: %s", e)
+                fatal_reason = (
+                    f"出题模型 {getattr(client, 'model', '?')} {fatal}"
+                )
+                break
+            logger.warning(
+                "[practice] finding=%s LLM 调用失败(第 %d 次): %s",
+                finding.id, attempt + 1, e,
+            )
+            content = ""
+
+        questions = _parse_llm_questions(content, meta, finding_id=finding.id)
+        # 质量关卡 1(始终启用):退化题拦截(叙述式判断题/答案泄露措辞)
+        degen_dropped = 0
+        if questions:
+            sane = [q for q in questions if not _is_degenerate_question(q)]
+            degen_dropped = len(questions) - len(sane)
+            if degen_dropped:
+                logger.info(
+                    "[practice] finding=%s 质量关卡: %d/%d 题为退化题"
+                    "(叙述式判断/答案泄露)被丢弃",
+                    finding.id, degen_dropped, len(questions),
+                )
+            questions = sane
+        # 质量关卡 2:工作区可用时无 code_snippet 的题不合格(常识题拦截)
+        no_snippet_dropped = 0
+        if repo_path and questions:
+            qualified = [q for q in questions if q["code_snippet"]]
+            no_snippet_dropped = len(questions) - len(qualified)
+            if no_snippet_dropped:
+                logger.info(
+                    "[practice] finding=%s 质量关卡: %d/%d 题缺 code_snippet 被丢弃",
+                    finding.id, no_snippet_dropped, len(questions),
+                )
+            questions = qualified
+        if questions or fatal_reason:
+            break
+        # 全部被关卡拦截:带对应质量反馈重试一次(退化题反馈优先)
+        if attempt < PARSE_RETRY and (degen_dropped or no_snippet_dropped):
+            feedback = _DEGEN_FEEDBACK if degen_dropped else _NO_CODE_FEEDBACK
+            logger.info(
+                "[practice] finding=%s 全部题目被质量关卡拦截,带反馈续写(退化 %d/缺材料 %d)",
+                finding.id, degen_dropped, no_snippet_dropped,
+            )
+            if _turn_chars(messages) <= _MAX_CARRY_CHARS:
+                # 原地续写:只追加反馈句,上一轮回答与已读到的工具结果都在历史里
+                messages = messages + [
+                    {"role": "assistant", "content": content},
+                    {"role": "user", "content": feedback},
+                ]
+                call_text = prompt + feedback  # 本轮意图的完整描述(供可观测)
+            else:
+                # 历史太长:重建对话(退回旧行为,带反馈的完整 prompt)
+                messages = _new_llm_turn(system_prompt, prompt + feedback)
+                call_text = prompt + feedback
+            attempt += 1
+            continue
+        break
+    batcher.close()
+    return questions, content, fatal_reason
+
+
+# ============================================================
+# 可选并发:逐条 finding 并行跑 LLM,落库仍在主线程
+# ============================================================
+
+
+@dataclass
+class _FindingWork:
+    """一条 finding 的出题工作成果(LLM 部分,不含任何 DB 操作)"""
+
+    finding: Result
+    meta: dict
+    topic: str
+    snippets: list[dict]
+    questions: list[dict] = field(default_factory=list)
+    content: str = ""
+    fatal: str = ""
+
+
+# 厂商级并发闸门(按 provider+model 归组,跳 job 共享)
+_provider_gates: dict[str, tuple[int, threading.BoundedSemaphore]] = {}
+_provider_gates_lock = threading.Lock()
+
+
+@contextmanager
+def _provider_gate(client: LLMClient):
+    """限制同一厂商同时进行中的出题请求数
+
+    厂商侧「组内并发/RPM」是有配额的:两个出题 job 各自开 4 并行会互相扫配额,
+    闸门让全进程对该厂商的在途请求不超 PRACTICE_PROVIDER_MAX_CONCURRENCY。
+    并发度=1 时本质上只是个透传锁(不改变行为)。
+    """
+    key = (
+        f"{getattr(client, 'provider_id', '')}"
+        f"|{getattr(client, 'model', '')}"
+        f"|{getattr(client, 'base_url_override', '') or ''}"
+    )
+    limit = max(1, settings.PRACTICE_PROVIDER_MAX_CONCURRENCY)
+    with _provider_gates_lock:
+        entry = _provider_gates.get(key)
+        if entry is None or entry[0] != limit:
+            entry = (limit, threading.BoundedSemaphore(limit))
+            _provider_gates[key] = entry
+    sem = entry[1]
+    sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+def _workspace_restore_worth_bg(
+    task: Task, settings_row: PracticeSettings | None, probe: dict | None,
+) -> bool:
+    """是否可能需要走 clone(决定要不要开后台恢复线程)
+
+    仅作为“值不值得起线程”的提示判定,与 _ensure_workspace 内的实际闸门条件一致;
+    误判为 False 也只是回到原来的串行恢复路径,不会少恢复。
+    """
+    if (probe or {}).get("repo_path"):
+        return False  # 工作区存活,无需恢复
+    if settings_row is None or not settings_row.restore_workspace_for_practice:
+        return False
+    params = task.params or {}
+    return bool(params.get("repo_url"))
+
+
+def _effective_concurrency(settings_row: PracticeSettings | None, pending_count: int) -> int:
+    """本次 job 的实际并发度 = min(用户设置, 系统上限, 待处理条数)
+
+    用户设置默认 1(串行):部分厂商只允许 1 并发,并行只会换来 429 与退避等待。
+    运维可用 PRACTICE_GENERATE_CONCURRENCY=1 强制全局串行。
+    """
+    want = int(getattr(settings_row, "generate_concurrency", 1) or 1)
+    cap = max(1, min(want, settings.PRACTICE_GENERATE_CONCURRENCY))
+    return max(1, min(cap, max(1, pending_count)))
+
+
 def generate_questions_for_task(
     db: Session,
     task: Task,
@@ -801,6 +1414,7 @@ def generate_questions_for_task(
     client: LLMClient | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     event_callback: Callable[[str, dict], None] | None = None,
+    force_regenerate: bool = False,
 ) -> tuple[list[Question], int]:
     """为任务的 Results 生成 draft 题目
 
@@ -808,6 +1422,9 @@ def generate_questions_for_task(
     progress_callback(done, total):每处理完一条 finding 回调(异步生成进度展示用)。
     event_callback(type, data):流式事件回调(finding/token/tool,
     出题进度侧栏 SSE 展示用),异常不影响出题主流程。
+    force_regenerate:False 时,本用户已就该 finding 出过题的**整条跳过**
+      (去重原本发生在 LLM 之后:题目出完才发现 dedup_hash 撞上,钱已花);
+      任务详情页「重新出题」显式传 True 才允许重出。
     """
     if client is None:
         client = resolve_llm_client(db, task)
@@ -840,11 +1457,34 @@ def generate_questions_for_task(
     custom_defs = [d for d in topic_defs if d["key"] not in
                    {b["key"] for b in BUILTIN_TOPIC_DEFS}]
 
-    # 工作区:存活 → 挂工具循环;已清理 → 按设置尝试重新 clone
-    # (restore 事件经 event_callback 推出题进度侧栏展示克隆进度)
-    ws_info = _ensure_workspace(db, task, settings_row, event_callback=event_callback)
-    repo_path = (ws_info or {}).get("repo_path") or ""
+    # 工作区:存活 → 挂工具循环;已清理且开了恢复开关 → 后台线程重新 clone,
+    # 与主题分类(纯 LLM,不依赖工作区)并行进行 —— 大仓库克隆可能几分钟,
+    # 串在分类前面用户只能干看(旧行为:“开始出题”日志在 clone 之后才打)
     task_id_str = str(task.id)
+    probe = sandbox_tools.get_workspace_info(task_id_str)
+    restore_in_bg = _workspace_restore_worth_bg(task, settings_row, probe)
+    ws_box: dict[str, Any] = {}
+
+    def _run_workspace_restore() -> None:
+        try:
+            ws_box["info"] = _ensure_workspace(
+                db, task, settings_row,
+                event_callback=event_callback,
+                # Session 非线程安全:token 在主线程读好再带进线程
+                git_tokens=ws_box.get("git_tokens") or {},
+            )
+        except Exception as e:
+            logger.warning("[task=%s] 后台恢复工作区异常(降级为无工具出题): %s", task.id, e)
+            ws_box["info"] = probe
+
+    ws_thread: threading.Thread | None = None
+    if restore_in_bg:
+        ws_box["git_tokens"] = _load_git_tokens(db, task.user_id)
+        ws_thread = threading.Thread(
+            target=_run_workspace_restore, daemon=True,
+            name=f"practice-restore-{task_id_str[:8]}",
+        )
+        ws_thread.start()
 
     # 选题:agent2 标记的学习点(practice_worthy)优先,不足补未标记的;
     # 无标记时与按 created_at 取前 N 条等价(向后兼容)
@@ -865,14 +1505,40 @@ def generate_questions_for_task(
         findings = [f for f in findings if topic_map[f.id] in enabled_keys]
         topic_map = {f.id: topic_map[f.id] for f in findings}
         total_findings = len(findings)
-    # 预构建各主题的 system prompt(工作区可用性统一判定;
-    # 内置主题用专有视角,自定义主题用通用模板 + 用户描述)
-    system_prompts = {
-        t: build_system_prompt(
-            t, workspace_available=bool(repo_path), custom_topics=custom_defs,
+
+    # 预读材料需要工作区路径:此处才等后台 clone 结束(分类/选题已与其重叠完成)
+    if ws_thread is not None:
+        ws_thread.join()
+    ws_info = (
+        ws_box.get("info") if ws_thread is not None
+        else _ensure_workspace(db, task, settings_row, event_callback=event_callback)
+    )
+    repo_path = (ws_info or {}).get("repo_path") or ""
+
+    # 材料预读:按发现的源码定位一次性读好(同一文件的多条 finding 共用读取),
+    # 命中预读的 finding 改用「按需补读」提示词变体 → LLM 往返从 2~4 次压到 1 次
+    materials = _prefetch_materials(task_id_str, repo_path, findings)
+    if materials:
+        logger.info(
+            "[practice] task=%s 材料预读命中 %d/%d 条 finding",
+            task.id, len(materials), total_findings,
         )
-        for t in set(topic_map.values())
-    }
+
+    # 预构建各主题的 system prompt(工作区可用性统一判定;
+    # 内置主题用专有视角,自定义主题用通用模板 + 用户描述;
+    # 已附材料的走「按需补读」工具段,未附的仍要求先调工具)
+    prompt_cache: dict[tuple[str, bool], str] = {}
+
+    def _system_prompt_for(topic: str, has_material: bool) -> str:
+        ck = (topic, has_material)
+        if ck not in prompt_cache:
+            prompt_cache[ck] = build_system_prompt(
+                topic,
+                workspace_available=bool(repo_path),
+                custom_topics=custom_defs,
+                material_prefetched=has_material,
+            )
+        return prompt_cache[ck]
 
     # 出题起始快照:模型/主题分布/工作区/发现数(排查无题产出时的第一手上下文)
     logger.info(
@@ -887,113 +1553,93 @@ def generate_questions_for_task(
             Question.user_id == user_id
         ).all()
     }
+    # finding 级短路集合:该发现本用户已出过题则不再走 LLM(force_regenerate 时为空集)
+    already_generated: set[str] = set()
+    if not force_regenerate:
+        already_generated = {
+            str(rid) for (rid,) in db.query(Question.source_result_id).filter(
+                Question.user_id == user_id,
+                Question.source_result_id.isnot(None),
+            ).all()
+        }
+        _pre_skipped = sum(1 for f in findings if str(f.id) in already_generated)
+        if _pre_skipped:
+            logger.info(
+                "[practice] task=%s %d/%d 条 finding 本用户已出过题,本轮不再付 LLM 成本",
+                task.id, _pre_skipped, total_findings,
+            )
 
     created: list[Question] = []
     skipped = 0
     fatal_reason = ""  # 非空表示遇到不可重试致命错误,需中止原因冒泡
-    for idx, finding in enumerate(findings):
+    kp_cache: dict[str, KnowledgePoint] = {}
+    # 收尾知识点讲解:开关开启时边出题边汇上下文素材(关掉时零开销)
+    want_explain = bool(
+        settings_row is not None
+        and getattr(settings_row, "generate_explanation_with_questions", False)
+    )
+    explain_digests: dict[str, dict] = {}
+
+    # 先剔除本用户已出过题的 finding(整条跳过的不计入 LLM 工作量)
+    pending = [f for f in findings if str(f.id) not in already_generated]
+    pre_skipped = len(findings) - len(pending)
+    if pre_skipped:
+        skipped += pre_skipped
+        if progress_callback:
+            progress_callback(pre_skipped, total_findings)
+    concurrency = _effective_concurrency(settings_row, len(pending))
+    if concurrency > 1:
+        logger.info(
+            "[practice] task=%s 并发出题 %d 路(%d 条 finding;并发>1 时不推 token 流)",
+            task.id, concurrency, len(pending),
+        )
+
+    def _produce(finding: Result) -> _FindingWork:
+        """一条 finding 的出题工作:拼 prompt → LLM 往返 → 解析 → 质量关卡
+
+        只跑 LLM 与本地校验,不碰数据库 —— 可直接当线程池的 worker 单元用。
+        并发>1 时不推 token/tool 事件:侧栏打字机流是「一次只在一条 finding 上」
+        的假设,多路并行交错起来只会成一团乱码。
+        """
+        fid_str = str(finding.id)
         meta = finding.metadata_ or {}
         topic = topic_map[finding.id]
-        system_prompt = system_prompts[topic]
-        if event_callback:
-            try:
-                event_callback("finding", {
-                    "index": idx + 1,
-                    "total": total_findings,
-                    "title": finding.title,
-                })
-            except Exception:
-                pass
-        prompt = _FINDING_TEMPLATE.format(
-            title=finding.title,
-            content=(finding.content or "")[:4000],
-            metadata=meta,
+        snippets = materials.get(fid_str) or []
+        system_prompt = _system_prompt_for(topic, bool(snippets))
+        prompt = _build_finding_prompt(
+            finding, meta, _render_material_section(snippets),
         )
-        # agent2 标记的学习点:注入考察方向,引导出题聚焦值得学的点
-        learning_note = (
-            meta.get("learning_note") if isinstance(meta, dict) else None
+        with _provider_gate(client):
+            questions, content, fatal = _generate_for_finding(
+                client, system_prompt, prompt, finding, meta,
+                task_id_str, repo_path,
+                None if concurrency > 1 else event_callback,
+            )
+        return _FindingWork(
+            finding=finding, meta=meta, topic=topic, snippets=snippets,
+            questions=questions, content=content, fatal=fatal,
         )
-        if _is_practice_worthy(finding) and learning_note:
-            prompt += _LEARNING_NOTE_TEMPLATE.format(note=str(learning_note)[:500])
 
-        questions: list[dict] = []
-        user_prompt = prompt
-        content = ""
-        for attempt in range(PARSE_RETRY + 1):
-            try:
-                content = _call_llm(
-                    client, system_prompt, user_prompt, task_id_str, repo_path,
-                    on_event=event_callback,
-                )
-            except Exception as e:
-                fatal = _fatal_llm_reason(e)
-                if fatal is not None:
-                    # 额度/认证类错误:后续 finding 必然同样失败,立即中止
-                    # 避免空转(原因经 PracticeGenerateError 推给前端展示)
-                    logger.error(
-                        "[practice] 出题模型致命错误,中止剩余 finding: %s", e,
-                    )
-                    fatal_reason = (
-                        f"出题模型 {getattr(client, 'model', '?')} {fatal}"
-                    )
-                    break
-                logger.warning(
-                    "[practice] finding=%s LLM 调用失败(第 %d 次): %s",
-                    finding.id, attempt + 1, e,
-                )
-                content = ""
-            questions = _parse_llm_questions(content, meta, finding_id=finding.id)
-            # 质量关卡 1(始终启用):退化题拦截(叙述式判断题/答案泄露措辞)
-            degen_dropped = 0
-            if questions:
-                sane = [q for q in questions if not _is_degenerate_question(q)]
-                degen_dropped = len(questions) - len(sane)
-                if degen_dropped:
-                    logger.info(
-                        "[practice] finding=%s 质量关卡: %d/%d 题为退化题"
-                        "(叙述式判断/答案泄露)被丢弃",
-                        finding.id, degen_dropped, len(questions),
-                    )
-                questions = sane
-            # 质量关卡 2:工作区可用时无 code_snippet 的题不合格(常识题拦截)
-            no_snippet_dropped = 0
-            if repo_path and questions:
-                qualified = [q for q in questions if q["code_snippet"]]
-                no_snippet_dropped = len(questions) - len(qualified)
-                if no_snippet_dropped:
-                    logger.info(
-                        "[practice] finding=%s 质量关卡: %d/%d 题缺 code_snippet 被丢弃",
-                        finding.id, no_snippet_dropped, len(questions),
-                    )
-                questions = qualified
-            # 全部被关卡拦截:带对应质量反馈重试一次(退化问题优先反馈)
-            if not questions and attempt < PARSE_RETRY and (degen_dropped or no_snippet_dropped):
-                feedback = _DEGEN_FEEDBACK if degen_dropped else _NO_CODE_FEEDBACK
-                logger.info(
-                    "[practice] finding=%s 全部题目被质量关卡拦截,带反馈重试(退化 %d/缺材料 %d)",
-                    finding.id, degen_dropped, no_snippet_dropped,
-                )
-                user_prompt = prompt + feedback
-                continue
-            if questions:
-                break
-
-        if fatal_reason:
-            break
-
-        if not questions:
+    def _consume(work: _FindingWork) -> None:
+        """主线程落库(SQLAlchemy Session 非线程安全):去重 → 建知识点 → 追加 draft"""
+        nonlocal skipped, fatal_reason
+        finding = work.finding
+        if work.fatal:
+            fatal_reason = work.fatal
+            return
+        if not work.questions:
             skipped += 1
             logger.warning(
                 "[practice] finding=%s 未能产出任何题目(共 %d 次尝试);"
                 "最后一次 LLM 输出样例: %r",
-                finding.id, PARSE_RETRY + 1, (content or "")[:300],
+                finding.id, PARSE_RETRY + 1, (work.content or "")[:300],
             )
-            if progress_callback:
-                progress_callback(idx + 1, total_findings)
-            continue
+            return
 
         dup_skipped = 0
-        for q in questions:
+        kp_questions: dict[str, list[dict]] = {}   # 本条 finding 在各知识点下产出的题
+        kp_meta: dict[str, tuple[str, str]] = {}    # key → (展示名, 主题)
+        for q in work.questions:
             dedup_hash = compute_dedup_hash(q["stem"], q["code_snippet"])
             if dedup_hash in existing_hashes:
                 dup_skipped += 1
@@ -1003,8 +1649,13 @@ def generate_questions_for_task(
             kp = _get_or_create_knowledge_point(
                 db, user_id, q["knowledge_key"], q["knowledge_name"],
                 languages=q["languages"],
-                learning_topic=topic,
+                learning_topic=work.topic,
+                cache=kp_cache,
             )
+            if want_explain:
+                # 攒下「这道题当初基于什么材料/发现出出来的」,供收尾批量讲解
+                kp_questions.setdefault(kp.key, []).append(q)
+                kp_meta[kp.key] = (kp.name, work.topic)
             question = Question(
                 user_id=user_id,
                 source_task_id=task.id,
@@ -1019,7 +1670,7 @@ def generate_questions_for_task(
                 difficulty=q["difficulty"],
                 status=QuestionStatus.DRAFT,
                 dedup_hash=dedup_hash,
-                learning_topic=topic,  # 该题实际匹配的出题主题
+                learning_topic=work.topic,  # 该题实际匹配的出题主题
                 origin=q["origin"],
                 source_file=q["source_file"],
                 source_lines=q["source_lines"],
@@ -1033,15 +1684,95 @@ def generate_questions_for_task(
                 finding.id, dup_skipped,
             )
 
-        if progress_callback:
-            progress_callback(idx + 1, total_findings)
+        if want_explain:
+            for key, qs in kp_questions.items():
+                name, kp_topic = kp_meta[key]
+                add_digest(
+                    explain_digests, key, name, kp_topic,
+                    make_source_digest(
+                        finding.title, finding.content, work.meta, work.snippets, qs,
+                    ),
+                )
+
+    if concurrency <= 1:
+        # 串行路径(默认):逐条出题 + 逐条推 SSE 事件
+        for idx, finding in enumerate(pending):
+            if event_callback:
+                try:
+                    event_callback("finding", {
+                        "index": pre_skipped + idx + 1,
+                        "total": total_findings,
+                        "title": finding.title,
+                    })
+                except Exception:
+                    pass
+            _consume(_produce(finding))
+            if progress_callback:
+                progress_callback(
+                    min(pre_skipped + idx + 1, total_findings), total_findings,
+                )
+            if fatal_reason:
+                break
+    else:
+        # 并行只跑 LLM;落库在主线程逐条做,结果与串行一致
+        # (各 finding 的出题内容彼此独立,dedup/知识点写入始终单线程)
+        with ThreadPoolExecutor(
+            max_workers=concurrency,
+            thread_name_prefix=f"practice-gen-{task_id_str[:8]}",
+        ) as pool:
+            futures = [pool.submit(_produce, f) for f in pending]
+            finished = 0
+            for fut in as_completed(futures):
+                try:
+                    work = fut.result()
+                except Exception as e:
+                    # 单条 worker 意外异常不拖垮整个 job(LLM 层已自有重试,
+                    # 走到这里的多是本地 bug):计一条未出题,继续处理其余
+                    logger.exception("[practice] 并发出题 worker 异常,跳过该条: %s", e)
+                    skipped += 1
+                    finished += 1
+                    if progress_callback:
+                        progress_callback(
+                            min(pre_skipped + finished, total_findings), total_findings,
+                        )
+                    continue
+                _consume(work)
+                finished += 1
+                if progress_callback:
+                    progress_callback(
+                        min(pre_skipped + finished, total_findings), total_findings,
+                    )
+                if fatal_reason:
+                    # 额度/认证类错误:取消还没起跑的;在途的等它自然结束
+                    for other in futures:
+                        other.cancel()
+                    break
 
     db.commit()
     for q in created:
         db.refresh(q)
+
+    # 收尾批量更新知识点讲解:一次调用覆盖 ≤8 个知识点(不是每题一次),
+    # 失败只记日志 —— 讲解是增益,不能拖垮已生成的题目
+    explain_written = 0
+    if want_explain and explain_digests:
+        try:
+            explain_written = explain_knowledge_points(
+                db, user_id, explain_digests,
+                client=resolve_explain_client(db, user_id, settings_row, client),
+                custom_defs=custom_defs,
+                event_callback=event_callback,
+            )
+        except Exception as e:
+            logger.warning(
+                "[practice] task=%s 知识点讲解生成失败(题目不受影响): %s",
+                task.id, e,
+            )
+
     logger.info(
-        "[practice] 出题结束 task=%s: 生成 %d 题, %d/%d 条 finding 未出题%s",
-        task.id, len(created), skipped, total_findings,
+        "[practice] 出题结束 task=%s: 生成 %d 题, %d/%d 条 finding 未出题,"
+        " 知识点讲解更新 %d 条%s",
+        task.id, len(created), skipped, total_findings, explain_written,
         f"(致命错误中止: {fatal_reason})" if fatal_reason else "",
     )
     if fatal_reason:

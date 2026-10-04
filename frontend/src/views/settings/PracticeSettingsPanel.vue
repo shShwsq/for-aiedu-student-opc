@@ -34,7 +34,7 @@ import { matchHashSectionId, settingsScrollRootKey, useSectionNav } from '@/comp
 import { PRACTICE_SECTION_IDS } from '@/data/settingsNav'
 import { extractErrorMessage } from '@/utils/error'
 import type { LLMConfigItemOut } from '@/types/model_configs'
-import type { PracticeThinkingMode } from '@/types/memory'
+import type { PracticeThinkingMode, SavePracticeSettingsRequest } from '@/types/memory'
 import type { LearningTopicDef } from '@/types/practice'
 
 // ============================================================
@@ -59,6 +59,12 @@ const thinkingMode = ref<PracticeThinkingMode>('follow')
 const defaultModelId = ref('')
 /** 始终用默认出题模型(忽略任务自带模型配置) */
 const forceDefaultLlm = ref(false)
+/** 出题完成后是否顺带批量更新知识点讲解 */
+const explainWithQuestions = ref(false)
+/** 讲解专用模型配置 id(空串=沿用出题/默认模型) */
+const explainModelId = ref('')
+/** 出题并发度(1=串行;2/4=并行逐条 finding) */
+const generateConcurrency = ref(1)
 /** 用户已保存的 LLM 配置列表(默认出题模型下拉选项来源) */
 const llmConfigs = ref<LLMConfigItemOut[]>([])
 
@@ -86,6 +92,17 @@ const THINKING_OPTIONS: Array<{ value: PracticeThinkingMode; label: string; desc
   { value: 'follow', label: '跟随模型配置', desc: '使用出题模型配置自身的思考开关(默认)' },
   { value: 'on', label: '强制开启', desc: '出题更慢,题目质量可能更高' },
   { value: 'off', label: '强制关闭', desc: '出题更快;模型思考模式下工具调用异常导致出不出题时可尝试' },
+]
+
+/**
+ * 出题并发度选项(与后端 MAX_GENERATE_CONCURRENCY=4 一致)
+ *
+ * 厂商只允许 1 并发时,选高了会整片 429(现在 429 会先原地等重试,不再白丢 finding)。
+ */
+const CONCURRENCY_OPTIONS: Array<{ value: number; label: string; desc: string }> = [
+  { value: 1, label: '串行(默认)', desc: '逐条 finding 出题;厂商并发上限为 1 时选这个' },
+  { value: 2, label: '2 并行', desc: '总耗时约减半;需厂商允许至少 2 并发' },
+  { value: 4, label: '4 并行', desc: '总耗时约降至 1/4;厂商配额不够时会触发限流' },
 ]
 
 // ============================================================
@@ -215,6 +232,9 @@ async function load(): Promise<void> {
     thinkingMode.value = pref.thinking_mode_for_practice
     defaultModelId.value = pref.default_llm_config_id ?? ''
     forceDefaultLlm.value = pref.force_default_llm
+    explainWithQuestions.value = pref.generate_explanation_with_questions
+    explainModelId.value = pref.explain_llm_config_id ?? ''
+    generateConcurrency.value = pref.generate_concurrency
   } catch (err) {
     loadError.value = extractErrorMessage(err)
   } finally {
@@ -299,6 +319,63 @@ async function toggleForceDefault(): Promise<void> {
   } finally {
     saving.value = false
   }
+}
+
+/**
+ * 开关类设置统一提交口
+ *
+ * 后端每个字段都是 None=不改,所以只带本次要改的那一项(+ 必带的 auto_generate_practice)。
+ */
+async function patchPracticeSettings(
+  patch: Partial<SavePracticeSettingsRequest>,
+  successMsg: string,
+): Promise<void> {
+  if (busy.value) return
+  saving.value = true
+  try {
+    const latest = await savePracticeSettings({
+      auto_generate_practice: autoGenerate.value,
+      ...patch,
+    })
+    explainWithQuestions.value = latest.generate_explanation_with_questions
+    explainModelId.value = latest.explain_llm_config_id ?? ''
+    generateConcurrency.value = latest.generate_concurrency
+    showToast(successMsg, 'success')
+  } catch (err) {
+    showToast(extractErrorMessage(err), 'error')
+  } finally {
+    saving.value = false
+  }
+}
+
+async function toggleExplainWithQuestions(): Promise<void> {
+  const next = !explainWithQuestions.value
+  await patchPracticeSettings(
+    { generate_explanation_with_questions: next },
+    next
+      ? '已开启出题完成后批量更新知识点讲解(一次 job 只多几次轻调用)'
+      : '已关闭自动更新讲解,可在知识点看板上按需生成',
+  )
+}
+
+async function selectExplainModel(event: Event): Promise<void> {
+  const value = (event.target as HTMLSelectElement).value
+  if (value === explainModelId.value) return
+  await patchPracticeSettings(
+    { explain_llm_config_id: value },
+    value ? '讲解专用模型已更新' : '讲解模型已重置为沿出题模型',
+  )
+}
+
+async function selectConcurrency(raw: string): Promise<void> {
+  const next = Number(raw)
+  if (!Number.isFinite(next) || next === generateConcurrency.value) return
+  await patchPracticeSettings(
+    { generate_concurrency: next },
+    next === 1
+      ? '出题已改为串行(逐条 finding)'
+      : `出题并发度已设为 ${next}(受厂商并发上限约束,超限会触发限流)`,
+  )
 }
 
 async function selectModel(event: Event): Promise<void> {
@@ -529,6 +606,80 @@ onBeforeUnmount(() => {
             @click="toggleForceDefault"
           >
             <span class="switch-thumb" />
+          </button>
+        </div>
+      </div>
+
+      <!-- ===== 知识点讲解与出题并发 ===== -->
+      <div class="setting-block">
+        <span class="setting-title">知识点讲解</span>
+        <span class="setting-desc">
+          开启后,出题完成会顺带把本次涉及的知识点写成一段讲解(看板上可折叠展开阅读);
+          一次 job 只多几次轻任务调用(≤8 个知识点一批),不是每个知识点跑一次。
+          自己编辑过的讲解(标「已编辑」)永远不会被自动覆盖
+        </span>
+        <div class="force-default-row">
+          <div class="setting-info">
+            <span class="setting-title">出题后自动更新讲解</span>
+            <span class="setting-desc">默认关闭;关闭后仍可在知识点看板上逐点生成</span>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            :aria-checked="explainWithQuestions"
+            :class="['switch', { 'switch-on': explainWithQuestions }]"
+            :disabled="busy"
+            @click="toggleExplainWithQuestions"
+          >
+            <span class="switch-thumb" />
+          </button>
+        </div>
+        <span class="setting-title sub-title">讲解专用模型</span>
+        <span class="setting-desc">
+          讲解不需要出题那个代价(思考类模型出题要上百秒一条),可以单独挂个快模型
+        </span>
+        <select
+          class="model-select"
+          aria-label="讲解专用模型"
+          :value="explainModelId"
+          :disabled="busy"
+          @change="selectExplainModel"
+        >
+          <option value="">沿用出题模型</option>
+          <option v-for="cfg in llmConfigs" :key="cfg.id" :value="cfg.id">
+            {{ cfg.name }}({{ cfg.provider }} / {{ cfg.model }})
+          </option>
+        </select>
+        <span v-if="!llmConfigs.length" class="model-hint">
+          暂无已保存的模型配置,可先到「模型设置」中添加
+        </span>
+      </div>
+
+      <div class="setting-block">
+        <span class="setting-title">出题并发度</span>
+        <span class="setting-desc">
+          串行时出题耗时≈各条 finding 耗时之和(实测 kimi 约 30s/条、思考类模型 160s/条)。
+          提高并发能近似线性缩短总时长,但受厂商「组内并发/RPM」上限约束:
+          超限会触发 429,反而多等退避。建议与厂商配额一致(厂商只允许 1 并发时保持串行)
+        </span>
+        <div class="topic-list" role="radiogroup" aria-label="出题并发度">
+          <button
+            v-for="opt in CONCURRENCY_OPTIONS"
+            :key="opt.value"
+            type="button"
+            role="radio"
+            :aria-checked="generateConcurrency === opt.value"
+            :class="['topic-option', { 'topic-active': generateConcurrency === opt.value }]"
+            :disabled="busy"
+            @click="selectConcurrency(String(opt.value))"
+          >
+            <span class="topic-radio">
+              <span v-if="generateConcurrency === opt.value" class="topic-radio-dot" />
+            </span>
+            <span class="topic-text">
+              <span class="topic-label">{{ opt.label }}</span>
+              <span class="topic-desc">{{ opt.desc }}</span>
+            </span>
           </button>
         </div>
       </div>
@@ -989,6 +1140,11 @@ onBeforeUnmount(() => {
 .model-hint {
   font-size: var(--fs-xs);
   color: var(--color-text-muted);
+}
+
+/* 同一设置块内的二级标题(如「讲解专用模型」) */
+.setting-block .sub-title {
+  margin-top: var(--space-3);
 }
 
 .force-default-row {

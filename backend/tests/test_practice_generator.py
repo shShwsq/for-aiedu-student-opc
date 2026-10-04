@@ -2,6 +2,7 @@
 
 覆盖(不依赖数据库,直接喂 LLM 原始输出字符串):
 - 合法 JSON 数组解析 / 单对象包裹 / markdown 围栏容错(json_repair)
+- 散文包 JSON 的输出挽救(_salvage_json_array 括号/字符串/转义感知)
 - 字段校验:qtype 白名单、选项数、answer_idx 越界、全同选项
 - true_false 强制选项 ["正确","错误"]
 - CWE 元信息优先于 LLM 输出的 knowledge_key(含纯数字补前缀)
@@ -16,6 +17,11 @@
 - 致命错误快速失败(401/403 额度类错误立即中止并冒泡友好原因)
 - 迷你工具循环(_call_llm / _execute_practice_tool)
 - 出题前工作区保障(_ensure_workspace 重新 clone 恢复)
+- 材料批量预读(_parse_line_window / _merge_read_ranges / _prefetch_materials)
+  与「按需补读」提示词变体
+- 反馈续写复用消息历史(不重放工具循环 → 文件不重读)
+- finding 级去重短路(已出过题的发现不再付 LLM 成本,force_regenerate 可重出)
+- 知识点查询缓存(同一 key 多次命中只查一次)
 """
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -35,8 +41,12 @@ from app.services.practice.generator import (
     _ensure_workspace,
     _execute_practice_tool,
     _fatal_llm_reason,
+    _merge_read_ranges,
     _normalize_raw_question,
+    _parse_line_window,
     _parse_llm_questions,
+    _prefetch_materials,
+    _salvage_json_array,
     compute_dedup_hash,
 )
 
@@ -288,8 +298,12 @@ def test_origin_and_kp_languages_persisted_in_pipeline(monkeypatch):
 # ============================================================
 
 
-def _gen_db(finding_count=1, findings=None, topics=None):
-    """构造 mock db:按查询目标返回不同链(可指定 finding 列表/主题词表)"""
+def _gen_db(finding_count=1, findings=None, topics=None, generated_ids=None):
+    """构造 mock db:按查询目标返回不同链(可指定 finding 列表/主题词表)
+
+    generated_ids:已出过题的 finding id 列表(Question.source_result_id 列查询),
+    用于验证 finding 级去重短路。
+    """
     db = MagicMock()
     if findings is None:
         findings = [
@@ -313,6 +327,11 @@ def _gen_db(finding_count=1, findings=None, topics=None):
         elif model is LearningTopic:
             # ensure_user_topics 的词表查询(需含全部内置 key 才不触发播种)
             q.filter.return_value.all.return_value = topics if topics is not None else []
+        elif getattr(model, "name", "") == "source_result_id":
+            # Question.source_result_id 列查询:已出过题的 finding 短路集合
+            q.filter.return_value.all.return_value = [
+                (rid,) for rid in (generated_ids or [])
+            ]
         else:  # Question.dedup_hash 列查询:无已入库题目
             q.filter.return_value.all.return_value = []
         return q
@@ -350,7 +369,11 @@ def test_quality_gate_filters_snippetless_questions(monkeypatch):
 
 
 def test_quality_gate_feedback_retry_then_drop(monkeypatch):
-    """全部无 snippet → 追加质量反馈重试一次;仍不合格则整条 finding 跳过"""
+    """全部无 snippet → 带质量反馈续写一次;仍不合格则整条 finding 跳过
+
+    续写必须是**在既有消息历史上追加反馈句**,不是重建对话
+    (重建会把同一批文件重读一遍,单条 finding 成本近乎翻倍)。
+    """
     import json
 
     monkeypatch.setattr(
@@ -359,9 +382,14 @@ def test_quality_gate_feedback_retry_then_drop(monkeypatch):
     )
     no_snippet = json.dumps([_raw(code_snippet=None)], ensure_ascii=False)
     prompts_seen = []
+    carried: list[list[dict]] = []
 
-    def fake_call_llm(client, system_prompt, finding_text, task_id, repo_path, on_event=None):
+    def fake_call_llm(
+        client, system_prompt, finding_text, task_id, repo_path,
+        on_event=None, messages=None,
+    ):
         prompts_seen.append(finding_text)
+        carried.append(list(messages or []))
         return no_snippet
 
     monkeypatch.setattr(gen, "_call_llm", fake_call_llm)
@@ -374,6 +402,12 @@ def test_quality_gate_feedback_retry_then_drop(monkeypatch):
     assert len(prompts_seen) == 2
     assert "质量反馈" not in prompts_seen[0]
     assert "质量反馈" in prompts_seen[1]
+    # 第二次调用复用了第一轮的完整历史(system + 原发现 + 上一轮回答),
+    # 反馈作为最后一句 user 消息,而不是从头重建只发一个 prompt
+    assert len(carried[1]) == 4
+    assert [m["role"] for m in carried[1]] == ["system", "user", "assistant", "user"]
+    assert "质量反馈" in carried[1][-1]["content"]
+    assert "质量反馈" not in carried[1][1]["content"]
 
 
 def test_quality_gate_skipped_without_workspace(monkeypatch):
@@ -463,7 +497,10 @@ def test_quality_gate_degenerate_retry_feedback(monkeypatch):
     )], ensure_ascii=False)
     prompts_seen = []
 
-    def fake_call_llm(client, system_prompt, finding_text, task_id, repo_path, on_event=None):
+    def fake_call_llm(
+        client, system_prompt, finding_text, task_id, repo_path,
+        on_event=None, messages=None,
+    ):
         prompts_seen.append(finding_text)
         return bad
 
@@ -1423,7 +1460,10 @@ def test_learning_note_injected_into_finding_prompt(monkeypatch):
     )
     prompts = []
 
-    def fake_call_llm(client, system_prompt, finding_text, task_id, repo_path, on_event=None):
+    def fake_call_llm(
+        client, system_prompt, finding_text, task_id, repo_path,
+        on_event=None, messages=None,
+    ):
         prompts.append(finding_text)
         return json.dumps([_raw()], ensure_ascii=False)
 
@@ -1446,3 +1486,399 @@ def test_learning_note_injected_into_finding_prompt(monkeypatch):
     # 标记但缺 note / 未标记:均不注入
     assert "【学习价值提示】" not in prompts[1]
     assert "【学习价值提示】" not in prompts[2]
+
+
+# ============================================================
+# 材料批量预读(把每条 finding 的 LLM 往返从 2~4 次压到 1 次)
+# ============================================================
+
+
+def test_parse_line_window_formats():
+    """行定位文本兼容多种写法:"42" / "L42" / "120-150" / 倒序 / 无数字"""
+    assert _parse_line_window("42") == (42, 42)
+    assert _parse_line_window("L42") == (42, 42)
+    assert _parse_line_window("120-150") == (120, 150)
+    assert _parse_line_window("150-120") == (120, 150)
+    assert _parse_line_window("第 12 行, 共 5 处") == (5, 12)
+    assert _parse_line_window("") is None
+    assert _parse_line_window("无定位信息") is None
+
+
+def test_merge_read_ranges_merges_nearby_windows():
+    """同文件相近行窗口合并成一次读取(两侧各补 40 行上下文)"""
+    assert _merge_read_ranges([(100, 120), (130, 150)]) == [(60, 190)]
+
+
+def test_merge_read_ranges_keeps_far_apart_windows():
+    """相隔很远的窗口不合并(否则要读几千行),各自一次"""
+    assert _merge_read_ranges([(10, 20), (2000, 2010)]) == [(1, 60), (1960, 2050)]
+
+
+def test_merge_read_ranges_clamps_oversized_window():
+    """单区间跨度按上限截断,防止一个文件吃掉整个上下文"""
+    ranges = _merge_read_ranges([(1, 5000)])
+    assert ranges == [(1, 1 + 240 - 1)]
+
+
+def test_prefetch_materials_reads_same_file_once_for_multiple_findings(monkeypatch):
+    """同文件的两个 finding 共用一次读取;无定位的 finding 不预读"""
+    reads = []
+
+    def fake_read_file(repo_path, file_path, max_lines=200, offset=1, task_id=""):
+        reads.append((file_path, offset))
+        return {
+            "path": file_path, "content": f"{offset}  code",
+            "start_line": offset, "end_line": offset + max_lines - 1,
+            "total_lines": 500,
+        }
+
+    monkeypatch.setattr(gen.sandbox_tools, "read_file", fake_read_file)
+    findings = [
+        SimpleNamespace(id="f1", metadata_={"file_path": "src/a.py", "line": "42"}),
+        SimpleNamespace(id="f2", metadata_={"file_path": "src/a.py", "line": "50-60"}),
+        SimpleNamespace(id="f3", metadata_={"file_path": "src/b.py"}),
+        SimpleNamespace(id="f4", metadata_={"cwe": "CWE-89"}),
+    ]
+    got = _prefetch_materials("t1", "/repo", findings)
+    # a.py 窗口合并后一次 + b.py 一次 = 2 次读取(而不是 3 次)
+    assert len(reads) == 2
+    assert {"f1", "f2", "f3"} == set(got)
+    assert "f4" not in got  # 无 file_path → 交给 LLM 的工具循环盲找
+    assert got["f1"][0]["path"] == "src/a.py"
+    assert got["f1"][0]["content"].endswith("code")
+
+
+def test_prefetch_materials_caps_snippets_per_finding(monkeypatch):
+    """单条 finding 的片段数不超上限(prompt 膨胀防御)
+
+    现阶元信息只会给 1 个定位,故置上多个定位目标验证截断真的生效。
+    """
+    monkeypatch.setattr(
+        gen.sandbox_tools, "read_file",
+        lambda repo_path, file_path, max_lines=200, offset=1, task_id="": {
+            "content": "x", "start_line": 10, "end_line": 12, "total_lines": 20,
+        },
+    )
+    monkeypatch.setattr(
+        gen, "_finding_material_targets",
+        lambda meta: [(f"src/m{i}.py", 10, 10) for i in range(5)],
+    )
+    got = _prefetch_materials("t1", "/repo", [
+        SimpleNamespace(id="f1", metadata_={"file_path": "src/m0.py"}),
+    ])
+    assert len(got["f1"]) == gen._PREFETCH_MAX_FILES_PER_FINDING
+
+
+def test_prefetch_materials_swallows_read_error(monkeypatch):
+    """读取异常不外抛:该 finding 无片段,退回原工具循环路径"""
+    def boom(*a, **k):
+        raise RuntimeError("sandbox down")
+
+    monkeypatch.setattr(gen.sandbox_tools, "read_file", boom)
+    got = _prefetch_materials("t1", "/repo", [
+        SimpleNamespace(id="f1", metadata_={"file_path": "src/a.py", "line": "1"}),
+    ])
+    assert got == {}
+
+
+def test_prefetch_materials_without_workspace_returns_empty():
+    """工作区不可用(repo_path 空)时不做预读"""
+    got = _prefetch_materials("t1", "", [
+        SimpleNamespace(id="f1", metadata_={"file_path": "src/a.py", "line": "1"}),
+    ])
+    assert got == {}
+
+
+def test_pipeline_attaches_prefetched_material_and_softens_tool_section(monkeypatch):
+    """完整管线:命中预读的 finding 带真实材料出题,提示词改用「按需补读」措辞"""
+    import json
+
+    monkeypatch.setattr(
+        gen.sandbox_tools, "get_workspace_info",
+        lambda tid: {"repo_path": "/repo"},
+    )
+    monkeypatch.setattr(
+        gen.sandbox_tools, "read_file",
+        lambda repo_path, file_path, max_lines=200, offset=1, task_id="": {
+            "content": "42  cursor.execute(sql)",
+            "start_line": 42, "end_line": 42, "total_lines": 80,
+        },
+    )
+    seen = {}
+
+    def fake_call_llm(
+        client, system_prompt, finding_text, task_id, repo_path,
+        on_event=None, messages=None,
+    ):
+        seen["system"] = system_prompt
+        seen["user"] = finding_text
+        return json.dumps([_raw()], ensure_ascii=False)
+
+    monkeypatch.setattr(gen, "_call_llm", fake_call_llm)
+    findings = [SimpleNamespace(
+        id="r0", title="SQL 注入", content="拼接用户输入",
+        metadata_={"cwe": "CWE-89", "file_path": "src/a.py", "line": "42"},
+    )]
+    created, skipped = gen.generate_questions_for_task(
+        _gen_db(findings=findings), _gen_task(), "u1", client=MagicMock(),
+    )
+    assert created and skipped == 0
+    assert "【已为你读好的真实材料】" in seen["user"]
+    assert "cursor.execute(sql)" in seen["user"]
+    # 已附材料 → 工具段不再要求「必须使用」,避免白跑一次工具往返
+    assert "预先读好附在下面" in seen["system"]
+    assert "必须使用" not in seen["system"]
+
+
+def test_system_prompt_material_variant_keeps_tools():
+    """「按需补读」变体仍声明工具可用(片段不够时模型能自己补读)"""
+    strict = build_system_prompt("security", workspace_available=True)
+    soft = build_system_prompt(
+        "security", workspace_available=True, material_prefetched=True,
+    )
+    assert "read_file" in soft
+    assert "已就绪,必须使用" in strict
+    assert "已就绪,必须使用" not in soft
+    # 无工作区时 material_prefetched 不产生工具段(不谎报能力)
+    no_ws = build_system_prompt("security", workspace_available=False)
+    assert "材料查阅工具" not in no_ws
+
+
+# ============================================================
+# 散文包 JSON 的输出挽救(思考类模型常见形态,不白丢整条 finding)
+# ============================================================
+
+
+def test_salvage_json_array_balanced_and_string_aware():
+    assert _salvage_json_array('前缀 ["a]b", 1] 后缀 [2]') == '["a]b", 1]'
+    assert _salvage_json_array("[1, [2, 3], 4]") == "[1, [2, 3], 4]"
+    assert _salvage_json_array('["esc\\"quote"]') == '["esc\\"quote"]'
+    assert _salvage_json_array("没有数组") is None
+    assert _salvage_json_array("[未闭合") is None
+
+
+def test_parse_llm_questions_salvages_prose_wrapped_array():
+    """「【出题思路】… + JSON 数组」能出够题,不再被判为非数组丢弃"""
+    import json
+
+    body = json.dumps([_raw()], ensure_ascii=False)
+    content = (
+        "现在我已确认代码真实存在,将基于此出题。\n\n【出题思路】\n"
+        "1. 聚焦参数化查询\n\n现在开始出题:\n" + body + "\n以上。"
+    )
+    qs = _parse_llm_questions(content, {}, finding_id="f1")
+    assert len(qs) == 1
+    assert qs[0]["knowledge_key"] == "CWE-89"
+
+
+# ============================================================
+# 反馈续写不重放工具循环 + finding 级去重短路 + 知识点查询缓存
+# ============================================================
+
+
+def test_feedback_retry_reuses_history_without_re_reading_files(monkeypatch):
+    """第一轮调工具后题目不合格 → 反馈续写:文件不再重读,工具结果留在上下文里"""
+    import json
+
+    monkeypatch.setattr(
+        gen.sandbox_tools, "get_workspace_info",
+        lambda tid: {"repo_path": "/repo"},
+    )
+    reads = []
+
+    def fake_read_file(repo_path, file_path, max_lines=200, offset=1, task_id=""):
+        reads.append(file_path)
+        return {
+            "content": "x", "start_line": 1, "end_line": 10, "total_lines": 10,
+        }
+
+    monkeypatch.setattr(gen.sandbox_tools, "read_file", fake_read_file)
+    no_snippet = json.dumps([_raw(code_snippet=None)], ensure_ascii=False)
+    good = json.dumps([_raw(stem="带材料的题")], ensure_ascii=False)
+    client = _FakeClient([
+        [_chunk(tool_deltas=[
+            _delta(id="c1", name="read_file"),
+            _delta(args='{"file_path": "src/a.py"}'),
+        ])],
+        [_chunk(content=no_snippet)],
+        [_chunk(content=good)],
+    ])
+    created, skipped = gen.generate_questions_for_task(
+        _gen_db(findings=[SimpleNamespace(
+            id="r0", title="T", content="C", metadata_={"cwe": "CWE-89"},
+        )]),
+        _gen_task(), "u1", client=client,
+    )
+    assert len(created) == 1
+    # 关键断言:重试没有重建工具循环 → 同一文件只读一次
+    assert reads == ["src/a.py"]
+    # 第三轮请求的消息里带着上一轮的 assistant 回答与工具结果
+    final_messages = client.calls[-1]["messages"]
+    roles = [m["role"] for m in final_messages]
+    assert roles == ["system", "user", "assistant", "tool", "assistant", "user"]
+
+
+def test_pipeline_skips_findings_already_generated(monkeypatch):
+    """finding 级去重短路:已出过题的发现不再付 LLM 成本;force_regenerate 可重出"""
+    import json
+
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    calls = []
+
+    def fake_call_llm(*a, **k):
+        calls.append(1)
+        # 每次输出不同题干,避开同用户 dedup 拦截
+        return json.dumps([_raw(stem=f"题 {len(calls)}")], ensure_ascii=False)
+
+    monkeypatch.setattr(gen, "_call_llm", fake_call_llm)
+    created, skipped = gen.generate_questions_for_task(
+        _gen_db(finding_count=2, generated_ids=["r0"]),
+        _gen_task(), "u1", client=MagicMock(),
+    )
+    assert len(calls) == 1
+    assert skipped == 1
+    assert len(created) == 1
+
+    # 显式重出:短路失效,两条 finding 都走 LLM
+    calls.clear()
+    created2, skipped2 = gen.generate_questions_for_task(
+        _gen_db(finding_count=2, generated_ids=["r0"]),
+        _gen_task(), "u1", client=MagicMock(), force_regenerate=True,
+    )
+    assert len(calls) == 2 and skipped2 == 0 and len(created2) == 2
+
+
+def test_knowledge_point_lookup_cached_per_job(monkeypatch):
+    """同一知识点多题命中缓存:SELECT 次数 = 知识点数,不是题目数"""
+    import json
+
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    # 两条 finding 都产出 CWE-89 的题(不同题干,不会被 dedup 拦掉)
+    out_a = json.dumps([_raw(stem="A 题")], ensure_ascii=False)
+    out_b = json.dumps([_raw(stem="B 题")], ensure_ascii=False)
+    outs = [out_a, out_b]
+    idx = {"i": 0}
+
+    def fake_call_llm(*a, **k):
+        content = outs[idx["i"]]
+        idx["i"] += 1
+        return content
+
+    monkeypatch.setattr(gen, "_call_llm", fake_call_llm)
+    db = _gen_db(finding_count=2)
+    gen.generate_questions_for_task(db, _gen_task(), "u1", client=MagicMock())
+    kp_selects = [
+        c for c in db.query.call_args_list
+        if c.args and c.args[0] is gen.KnowledgePoint
+    ]
+    assert len(kp_selects) == 1
+
+
+def test_rate_limit_error_waits_and_retries_in_place(monkeypatch):
+    """429 不吃掉反馈重试预算:等待后原地重试,成功就正常出题"""
+    import json
+
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    slept = []
+    monkeypatch.setattr(gen.time, "sleep", lambda s: slept.append(s))
+
+    def fake_http_error():
+        return _http_response()
+
+    state = {"n": 0}
+
+    def flaky(*a, **k):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise openai.RateLimitError(
+                "Error code: 429 - rate limit",
+                response=fake_http_error(), body=None,
+            )
+        return json.dumps([_raw()], ensure_ascii=False)
+
+    monkeypatch.setattr(gen, "_call_llm", flaky)
+    created, skipped = gen.generate_questions_for_task(
+        _gen_db(), _gen_task(), "u1", client=MagicMock(),
+    )
+    assert created and skipped == 0
+    assert slept == [gen._RATE_LIMIT_WAIT_SECONDS]
+    assert state["n"] == 2
+
+
+# ============================================================
+# token 事件合并(把单 job 事件数从近万压到百量级)
+# ============================================================
+
+
+def test_token_batcher_merges_by_char_threshold():
+    events = []
+    b = gen._TokenBatcher(lambda t, d: events.append((t, d)), max_chars=10, max_seconds=999)
+    for _ in range(5):
+        b.emit("token", {"delta": "abcde"})  # 5×5=25 字符,阈值 10 → 至少 2 次 flush
+    b.close()
+    tokens = [d["delta"] for t, d in events if t == "token"]
+    assert "".join(tokens) == "abcde" * 5
+    assert len(tokens) < 5  # 确实合并了,不是逐 chunk 推
+    assert all(len(t) >= 10 for t in tokens[:-1])  # 只有收尾块可以不足阈值
+
+
+def test_token_batcher_flushes_before_structural_event():
+    """tool/finding 事件前必须先推出已累积文本,保证侧栏顺序正确"""
+    events = []
+    b = gen._TokenBatcher(lambda t, d: events.append((t, d)), max_chars=1000, max_seconds=999)
+    b.emit("token", {"delta": "part1"})
+    b.emit("tool", {"name": "read_file", "summary": "read_file: a.py"})
+    b.emit("token", {"delta": "part2"})
+    b.close()
+    assert [t for t, _ in events] == ["token", "tool", "token"]
+    assert events[0][1]["delta"] == "part1"
+    assert events[-1][1]["delta"] == "part2"
+
+
+def test_token_batcher_close_flushes_remainder():
+    events = []
+    b = gen._TokenBatcher(lambda t, d: events.append((t, d)), max_chars=1000, max_seconds=999)
+    b.emit("token", {"delta": "tail"})
+    assert events == []
+    b.close()
+    assert events == [("token", {"delta": "tail"})]
+
+
+def test_token_batcher_time_threshold_flushes():
+    """慢速输出(每 chunk 未到字符阈值)靠时间阈值兜住,不至于卡住不显示"""
+    clock = {"t": 0.0}
+    events = []
+    b = gen._TokenBatcher(
+        lambda t, d: events.append((t, d)),
+        max_chars=1000, max_seconds=0.2, clock=lambda: clock["t"],
+    )
+    b.emit("token", {"delta": "a"})
+    clock["t"] = 0.3
+    b.emit("token", {"delta": "b"})
+    assert [e[1]["delta"] for e in events] == ["a"]
+    b.close()
+    assert events[-1][1]["delta"] == "b"
+
+
+def test_token_batcher_none_sink_is_noop():
+    b = gen._TokenBatcher(None)
+    b.emit("token", {"delta": "x"})
+    b.emit("tool", {"name": "read_file"})
+    b.close()
+
+
+def test_pipeline_emits_batched_token_events(monkeypatch):
+    """完整管线:逐 chunk 的 LLM 输出合并成少量 token 事件,finding/tool 顺序不变"""
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    # 一轮流:20 个 50 字符碎块(共 1000 字符)
+    client = _FakeClient([[_chunk(content="x" * 50) for _ in range(20)]])
+    events = []
+    gen.generate_questions_for_task(
+        _gen_db(), _gen_task(), "u1", client=client,
+        event_callback=lambda t, d: events.append((t, d)),
+    )
+    tokens = [d["delta"] for t, d in events if t == "token"]
+    assert sum(len(t) for t in tokens) == 1000
+    assert len(tokens) <= 1000 / gen._TOKEN_BATCH_CHARS + 2
+    # finding 事件在 token 之前(合并不会打乱结构事件顺序)
+    assert events[0][0] == "finding"

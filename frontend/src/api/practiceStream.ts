@@ -16,6 +16,7 @@ import { getAccessToken } from './client'
 import type {
   GenerateDoneData,
   GenerateErrorData,
+  GenerateExplainData,
   GenerateFindingData,
   GenerateProgressData,
   GenerateRestoreData,
@@ -36,6 +37,8 @@ export interface GenerateStreamCallbacks {
   onTool?: (data: GenerateToolData) => void
   /** 出题前工作区恢复(沙箱已清理时重新 clone)的进度 */
   onRestore?: (data: GenerateRestoreData) => void
+  /** 收尾知识点讲解阶段(开关开启才有;用于补一行「讲解已更新 N 条」) */
+  onExplain?: (data: GenerateExplainData) => void
   /** 进度计数更新(每处理完一条 finding) */
   onProgress?: (data: GenerateProgressData) => void
   /** 生成完成(终止事件) */
@@ -90,6 +93,7 @@ export function subscribeGenerateStream(
   register('token', callbacks.onToken)
   register('tool', callbacks.onTool)
   register('restore', callbacks.onRestore)
+  register('explain', callbacks.onExplain)
   register('progress', callbacks.onProgress)
   register('done', callbacks.onDone, true)
   register('error', callbacks.onError, true)

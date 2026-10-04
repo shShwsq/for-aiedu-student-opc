@@ -176,6 +176,10 @@ class KnowledgePoint(Base):
     key 优先取 CWE 编号(如 "CWE-89"),来自 Result.metadata.cwe;
     无 CWE 时回退漏洞分类(如 "injection" / "auth" / "secrets")。
     per-user 唯一。
+
+    讲解字段(explanation*)承载知识点看板上的「知识点讲解」正文:
+    生成素材来自出题上下文(发现原文 + 预读到的真实材料 + 本次生成的题目),
+    不是让模型凭空写概念简介;生成与覆盖规则见 services/practice/explainer.py。
     """
 
     __tablename__ = "knowledge_points"
@@ -204,6 +208,23 @@ class KnowledgePoint(Base):
     learning_topic: Mapped[str] = mapped_column(
         String(64), nullable=False,
         default=DEFAULT_LEARNING_TOPIC, server_default=DEFAULT_LEARNING_TOPIC,
+    )
+
+    # ---- 知识点讲解(Markdown 正文,200~400 字)----
+    # 讲解正文(None/空串 = 尚未生成)
+    explanation: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    # 讲解来源:auto=模型生成 / manual=用户编辑 / ""=尚未生成
+    # manual 永不被自动生成覆盖(用户的自己的总结不会被刷掉)
+    explanation_source: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="", server_default="",
+    )
+    # 生成所用模型名(排查质量用;手工编辑不记)
+    explanation_model: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default="",
+    )
+    # 最近一次更新讲解的时间(前端展示「更新于」与陈旧判定)
+    explanation_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -391,6 +412,23 @@ THINKING_MODE_OFF = "off"
 THINKING_MODES = (THINKING_MODE_FOLLOW, THINKING_MODE_ON, THINKING_MODE_OFF)
 DEFAULT_THINKING_MODE = THINKING_MODE_FOLLOW
 
+# ============================================================
+# 知识点讲解来源(knowledge_points.explanation_source)
+# auto=出题收尾批量/按需生成写入;manual=用户在看板/弹窗手工编辑;
+# 空串=尚未生成。自动生成永远不覆盖 manual(用户的总结不被刷掉)。
+# ============================================================
+EXPLANATION_SOURCE_AUTO = "auto"
+EXPLANATION_SOURCE_MANUAL = "manual"
+# 讲解正文长度上限(手工编辑同一限制;防贴入超长文章撑爆卡片展示)
+MAX_EXPLANATION_CHARS = 4000
+
+# ============================================================
+# 出题并发度边界(practice_settings.generate_concurrency)
+# 默认 1=串行;上限防把厂商 RPM/并发打死(429 会让整条 finding 白跑)
+# ============================================================
+DEFAULT_GENERATE_CONCURRENCY = 1
+MAX_GENERATE_CONCURRENCY = 4
+
 
 class PracticeSettings(Base):
     """用户级练习设置 (per-user, 1:1)
@@ -450,6 +488,23 @@ class PracticeSettings(Base):
     thinking_mode_for_practice: Mapped[str] = mapped_column(
         String(16), nullable=False,
         server_default=DEFAULT_THINKING_MODE, default=DEFAULT_THINKING_MODE,
+    )
+    # 出题完成后是否顺带批量更新知识点讲解(默认关)
+    # 开启时一次 job 只多 1~2 次轻任务调用(按 ≤8 个知识点一批)
+    generate_explanation_with_questions: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
+    # 讲解专用模型(UserLLMConfig 中某条配置 id;None=沿用出题模型)
+    # 讲解是轻任务,可以用比出题快/便宜的模型(思考类模型出题要 160s/条)
+    explain_llm_config_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, default=None
+    )
+    # 出题并发度(1=串行,2/4=并行逐条 finding)
+    # 受厂商组内并发上限约束,超限会触发 429 → 建议与厂商配额一致
+    generate_concurrency: Mapped[int] = mapped_column(
+        Integer, nullable=False,
+        server_default=str(DEFAULT_GENERATE_CONCURRENCY),
+        default=DEFAULT_GENERATE_CONCURRENCY,
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -524,9 +579,13 @@ def migrate_practice_learning_columns() -> None:
 
     背景:项目用 Base.metadata.create_all(无 Alembic),已存在的表不会自动加新列。
     - practice_settings 加 learning_topic / restore_workspace_for_practice /
-      default_llm_config_id / thinking_mode_for_practice / force_default_llm
+      default_llm_config_id / thinking_mode_for_practice / force_default_llm /
+      generate_explanation_with_questions / explain_llm_config_id /
+      generate_concurrency
     - knowledge_points 加 languages / learning_topic(加列时一次性回填:
       取该 KP 题目中最常见的非空 learning_topic,无题保持默认 'security')
+      与讲解四列 explanation / explanation_source / explanation_model /
+      explanation_updated_at(存量知识点讲解为空,由看板「生成讲解」按需回填)
     - practice_questions 加 learning_topic(可空,老题不补)与
       source_file / source_lines(源码定位,可空)
     全新库(create_all 已建好新列)或已迁过 → 直接返回。
@@ -573,6 +632,24 @@ def migrate_practice_learning_columns() -> None:
                     "force_default_llm BOOLEAN NOT NULL DEFAULT false"
                 ))
                 log.info("practice_settings.force_default_llm 列迁移完成")
+            if "generate_explanation_with_questions" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE practice_settings ADD COLUMN "
+                    "generate_explanation_with_questions BOOLEAN NOT NULL DEFAULT false"
+                ))
+                log.info("practice_settings.generate_explanation_with_questions 列迁移完成")
+            if "explain_llm_config_id" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE practice_settings ADD COLUMN "
+                    "explain_llm_config_id VARCHAR(36)"
+                ))
+                log.info("practice_settings.explain_llm_config_id 列迁移完成")
+            if "generate_concurrency" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE practice_settings ADD COLUMN "
+                    "generate_concurrency INTEGER NOT NULL DEFAULT 1"
+                ))
+                log.info("practice_settings.generate_concurrency 列迁移完成")
         kp_topic_added = False
         if insp.has_table("knowledge_points"):
             cols = {c["name"] for c in insp.get_columns("knowledge_points")}
@@ -589,6 +666,19 @@ def migrate_practice_learning_columns() -> None:
                 ))
                 kp_topic_added = True
                 log.info("knowledge_points.learning_topic 列迁移完成")
+            # 知识点讲解四列(存量知识点默认为「尚未生成」,不回填正文)
+            for col_name, ddl in (
+                ("explanation", "ADD COLUMN explanation TEXT"),
+                ("explanation_source", "ADD COLUMN explanation_source VARCHAR(8) "
+                                      "NOT NULL DEFAULT ''"),
+                ("explanation_model", "ADD COLUMN explanation_model VARCHAR(64) "
+                                      "NOT NULL DEFAULT ''"),
+                ("explanation_updated_at", "ADD COLUMN explanation_updated_at "
+                                           "TIMESTAMP WITH TIME ZONE"),
+            ):
+                if col_name not in cols:
+                    conn.execute(text(f"ALTER TABLE knowledge_points {ddl}"))
+                    log.info(f"knowledge_points.{col_name} 列迁移完成")
         if insp.has_table("practice_questions"):
             cols = {c["name"] for c in insp.get_columns("practice_questions")}
             if "learning_topic" not in cols:
