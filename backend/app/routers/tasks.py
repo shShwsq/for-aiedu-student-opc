@@ -1268,7 +1268,10 @@ def export_task_report(
 def _build_markdown_report(
     task: Task, db: Session,
 ) -> str:
-    """生成 Markdown 报告:任务信息 + 重点与知识点(按 grouping 分组)"""
+    """生成 Markdown 报告:任务信息 + 重点与知识点(按 grouping 分组)+ 详细对话
+
+    不设独立「用户意图」节:报告按轮次呈现多轮对话,用户每轮发言都在其中。
+    """
     lines: list[str] = []
     lines.append("# 任务报告")
     lines.append("")
@@ -1284,10 +1287,6 @@ def _build_markdown_report(
     if task.error_message:
         lines.append(f"- 错误信息: {task.error_message}")
     lines.append("")
-    lines.append("## 用户意图")
-    lines.append("")
-    lines.append(task.user_input)
-    lines.append("")
 
     # 重点与知识点(场景降级后:grouping 从 task.params._grouping 读取,
     # meta_fields 从 results 的 metadata keys 动态推断)
@@ -1302,10 +1301,11 @@ def _build_markdown_report(
             for r in results:
                 _append_result_md(lines, r, meta_fields)
 
-    # 协作轨迹(结论类附录:跳过 thinking/tool_call/tool_result/history_compress)
+    # 详细对话(按轮组织的结论类对话,含 agent2 每轮审查结论/建议深挖;
+    # 跳过 thinking/tool_call/tool_result/history_compress 等过程类)
     trace = _collect_conversation_trace(task)
     if trace:
-        lines.append("## 协作轨迹")
+        lines.append("## 详细对话")
         lines.append("")
         _append_conversation_trace_md(lines, trace)
 
@@ -1412,6 +1412,8 @@ def _build_html_report(
         ".conv-tag.followup{background:#0891b2;}"
         ".conv-tag.submit{background:#16a34a;}"
         ".conv-tag.summary{background:#d97706;}"
+        ".conv-tag.review{background:#7c3aed;}"
+        ".conv-tag.suggestions{background:#0891b2;}"
         ".conv-tag.error{background:#dc2626;}"
         ".conv-role{font-size:12px;color:#6b7280;}"
         ".conv-content{margin-top:6px;white-space:pre-wrap;font-size:13px;}"
@@ -1433,9 +1435,6 @@ def _build_html_report(
         parts.append(f"<div>错误信息:{html.escape(task.error_message)}</div>")
     parts.append("</div>")
 
-    parts.append("<h2>用户意图</h2>")
-    parts.append(f'<div class="intent">{html.escape(task.user_input)}</div>')
-
     # 重点与知识点
     results = list(task.results)
     if results:
@@ -1447,10 +1446,10 @@ def _build_html_report(
             for r in results:
                 _append_result_html(parts, r, meta_fields)
 
-    # 协作轨迹(结论类附录)
+    # 详细对话(按轮组织的结论类对话,含 agent2 每轮审查结论/建议深挖)
     trace = _collect_conversation_trace(task)
     if trace:
-        parts.append("<h2>协作轨迹</h2>")
+        parts.append("<h2>详细对话</h2>")
         _append_conversation_trace_html(parts, trace)
 
     parts.append("</body></html>")
@@ -1514,7 +1513,7 @@ def _append_result_html(
 
 
 # ============================================================
-# 协作轨迹附录(报告导出用)
+# 详细对话(报告导出用:按轮组织的结论类对话)
 # ============================================================
 #
 # 与前端任务详情主对话流对齐:只摘「结论类」对话,跳过思考 / 工具调用 /
@@ -1525,26 +1524,27 @@ def _append_result_html(
 #    (thinking 含 reasoning_content 思考链,可能几 KB~几十 KB,塞进报告会让
 #    .md / PDF 体积爆炸,浏览器打印会卡死)
 #
-# 结论类消息保留协作决策链:用户提问 → agent2 评估/追问 → react_agent
-# 提交 → agent2 总结,读者无需展开每个工具调用细节即可重建协作脉络。
+# 结论类消息保留每轮脉络:用户发言 → agent1 提交结果 → agent2 审查/总结,
+# 读者无需展开每个工具调用细节即可按轮通读重建协作脉络。
 #
 # 补充特殊处理:
-# 2. react_agent 每轮总结无独立落库类型,约定为该轮最后一条
-#    role=react_agent type=thinking 的 content(与 orchestrator._load_react_summaries
-#    一致),报告侧按此约定合成「提交结果」条目
+# 2. agent1 每轮总结无独立落库类型,约定为该轮最后一条
+#    role=agent1 type=thinking 的 content(与 orchestrator 落库约定一致),
+#    报告侧按此约定合成「提交结果」条目
 # 3. 存量数据里追问轮 question 可能整段落库了拼进提示词的
-#    "[之前轮次的对话记忆]" 块(新数据已在 react_agent 落库侧拆分),
-#    报告侧裁剪兼容历史任务
-# 4. agent2 启用时,驱动第 r+1 轮的问题是第 r 轮 agent2 评估生成的
-#    追问(非 done 时评估 content 就是 followup_query),协作轨迹
-#    把这类评估归位到下一轮展示为提问/追问,避免与落库的样板 question 重复
+#    "[之前轮次的对话记忆]" 块(新数据已在落库侧拆分),报告侧裁剪兼容历史任务
+# 4. 存量旧任务(agent2 逐轮评估):第 r 轮评估的追问驱动第 r+1 轮,详细对话
+#    把这类评估归位到下一轮展示为追问,避免与落库的样板 question 重复
+#    (新流程已改后台审查,不再产生 evaluation)
 
 _CONVERSATION_TRACE_TYPES = {
-    "question",    # 用户提问(前端跳过主对话流,单独顶部渲染,报告保留)
-    "answer",      # 用户对追问的回答(前端主对话流展示)
-    "evaluation",  # agent2 评估
-    "followup",    # agent2 追问
-    "submit",      # react_agent 提交结果
+    "question",    # 用户某轮发言(首轮以 question 落库,后续轮为 message)
+    "answer",      # 用户对追问的回答(存量旧任务,新流程不再产出)
+    "evaluation",  # agent2 评估(存量旧任务逐轮评估,新流程已改为后台审查)
+    "followup",    # agent2 追问(存量旧任务,新流程不再产出)
+    "submit",      # agent1 提交结果(按轮从 thinking 合成)
+    "review",      # agent2 后台审查结论(reasoning 存完整 covered/missing/判断)
+    "suggestions", # agent2 建议深挖方向(JSON,报告渲染为列表)
     "summary",     # agent2 最终总结
     "message",     # 用户追加消息(前端主对话流右对齐展示)
     "error",       # 错误(关键失败原因,属于结论而非过程)
@@ -1563,7 +1563,7 @@ _FOLLOWUP_SECTION_LABELS = (
 )
 
 # agent2 评估中的非追问内容标记(_record_agent2 落库约定):
-# 这类评估是结论/动作记录而非驱动下一轮的问题,协作轨迹中保留在原轮
+# 这类评估是结论/动作记录而非驱动下一轮的问题,详细对话中保留在原轮
 # ("请求用户澄清"为旧版澄清提问机制的落库文案,保留以兼容存量数据)
 _UA_EVAL_NON_FOLLOWUP_MARKERS = ("评估完成,无需追问", "(未给出追问)", "请求用户澄清")
 
@@ -1588,6 +1588,8 @@ _CONVERSATION_TYPE_LABELS = {
     "evaluation": "评估",
     "followup": "追问",
     "submit": "提交结果",
+    "review": "审查结论",
+    "suggestions": "建议深挖方向",
     "summary": "总结",
     "message": "用户消息",
     "error": "错误",
@@ -1621,13 +1623,45 @@ def _strip_question_memory_block(content: str) -> str:
     return f"{head}\n\n{tail}" if head else tail
 
 
-def _collect_react_summaries(task: Task) -> list[dict[str, Any]]:
-    """按轮提取 react_agent 每轮最终总结,合成「提交结果」条目
+def _format_suggestions(raw: str) -> str:
+    """agent2 建议深挖卡落库为 JSON {"suggestions": [...]},渲染为可读列表
 
-    约定(与 orchestrator._load_react_summaries 一致):react_agent 每轮
-    最终总结落库为该轮最后一条 role=react_agent type=thinking 的 content,
-    无独立 submit 类型。报告白名单跳过 thinking,故在此按约定合成,
-    保证协作轨迹里能看到 react_agent 每轮的结果。
+    解析失败(老数据/异常形态)退回原文,避免丢信息。
+    """
+    try:
+        payload = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        payload = None
+    items = payload.get("suggestions") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return raw or "(无建议)"
+    lines = [f"- {str(s).strip()}" for s in items if str(s).strip()]
+    return "\n".join(lines) or "(无建议)"
+
+
+def _trace_content(c) -> str:
+    """结论类对话的展示正文(按 type 归一化)
+
+    - question:裁掉存量数据里的跨轮历史记忆块
+    - review / evaluation:reasoning 存完整正文(审查 covered/missing/判断),优先用它
+    - suggestions:JSON 渲染为列表
+    - 其他:content 原文
+    """
+    if c.type == "question":
+        return _strip_question_memory_block(c.content)
+    if c.type in ("review", "evaluation"):
+        return (c.reasoning or c.content or "").strip() or "(无内容)"
+    if c.type == "suggestions":
+        return _format_suggestions(c.content)
+    return c.content or "(无内容)"
+
+
+def _collect_react_summaries(task: Task) -> list[dict[str, Any]]:
+    """按轮提取 agent1 每轮最终总结,合成「提交结果」条目
+
+    约定:agent1 每轮最终总结落库为该轮最后一条 role=agent1 type=thinking
+    的 content,无独立 submit 类型。报告白名单跳过 thinking,故在此按约定合成,
+    保证详细对话里能看到 agent1 每轮的结果。
     """
     last_by_round: dict[int, Any] = {}
     for c in task.conversations:
@@ -1657,24 +1691,26 @@ def _collect_react_summaries(task: Task) -> list[dict[str, Any]]:
 
 
 def _collect_conversation_trace(task: Task) -> list[dict[str, Any]]:
-    """收集协作轨迹(仅结论类消息,按 round_idx + created_at 排序)
+    """收集详细对话(仅结论类消息,按 round_idx + created_at 排序)
 
     返回结构:[{round_idx, role, type, type_label, content, created_at}, ...]
     依赖 task.conversations relationship(同一 session 内触发 lazy load)。
 
+    报告按轮次呈现「多轮对话」:每轮 = 用户发言 + agent1 提交结果 + agent2
+    审查结论/总结,顺时间序通读即可重建协作脉络,无须区分「原始意图」与追问。
+
     过滤规则(与前端任务详情主对话流对齐):
     - 仅保留 _CONVERSATION_TRACE_TYPES 中的类型
       (thinking/tool_call/tool_result/history_compress 不在白名单,天然跳过)
-    - react_agent 每轮总结按约定合成「提交结果」条目并入
+    - agent1 每轮总结按约定合成「提交结果」条目并入
     - question 内容裁掉存量数据里的历史记忆块
+    - 追问轮去重:同轮已有干净的 user message(用户原话)时,该轮的编排
+      样板 question(react/acp 注入的"基于之前的执行进度…仓库路径…[本轮补充要求]"
+      包装体,与 message 内容重复且易误导)跳过,仅保留 message
 
-    agent2 启用时的提问归位:
-    - 驱动第 r+1 轮的问题是第 r 轮 agent2 评估的追问 → 归位到
-      r+1 轮展示为提问/追问(role=agent2);含存量数据里 round_idx=0
-      的初始评估(旧版在任务开始时有第 0 轮评估,其追问即第 1 轮有效意图)
-    - 落库的样板 question(原始意图/编排样板)相应跳过:第 1 轮原始意图
-      已在报告「用户意图」节展示,后续轮 question 主体就是已归位的追问
-    - 单 agent 模式(无 agent2 评估)保持原样展示落库 question
+    存量旧任务的 agent2 逐轮评估归位(新流程改为后台审查,不再产生 evaluation):
+    - 第 r 轮评估的追问驱动第 r+1 轮 → 归位到 r+1 轮展示为追问(role=agent2),
+      含 round_idx=0 的旧版初始评估;相应跳过该轮落库的样板 question 以免重复
     """
     convs = [
         c for c in task.conversations
@@ -1682,6 +1718,13 @@ def _collect_conversation_trace(task: Task) -> list[dict[str, Any]]:
     ]
     submits = _collect_react_summaries(task)
     submit_rounds = {it["round_idx"] for it in submits}
+
+    # 有干净 user message 的轮:该轮的编排样板 question 与之重复,跳过
+    # (首轮只有 question、无 message,它就是本轮的用户发言,正常保留)
+    message_rounds = {
+        c.round_idx for c in convs
+        if c.role == "user" and c.type == "message"
+    }
 
     # agent2 启用判定:存在 agent2 评估即为双 agent 协作
     # (单 agent 模式 agent2 完全关闭,不会有评估落库)
@@ -1710,12 +1753,16 @@ def _collect_conversation_trace(task: Task) -> list[dict[str, Any]]:
                 })
 
     for c in convs:
+        if (
+            c.role == "user" and c.type == "question"
+            and c.round_idx in message_rounds
+        ):
+            continue  # 追问轮:编排样板 question 与干净 message 重复,保留 message
         if ua_enabled and _is_ua_followup_evaluation(c) and c.round_idx + 1 in moved_question_rounds:
             continue  # 已归位到下一轮作为提问/追问
         if ua_enabled and c.role == "user" and c.type == "question":
-            # 第 1 轮 question 是用户原始意图(已在「用户意图」节展示);
-            # 后续轮 question 是编排样板 + 追问,追问已由评估归位覆盖。
-            # 若该轮没有归位的提问(异常/降级路径),则保留原 question 展示
+            # 存量旧任务:后续轮 question 主体是编排样板,真实追问已由上一轮评估
+            # 归位覆盖,故跳过;若该轮没有归位追问(异常/降级路径),保留原 question
             if c.round_idx == 1 and 1 in moved_question_rounds:
                 continue
             if c.round_idx >= 2 and c.round_idx in moved_question_rounds:
@@ -1725,10 +1772,7 @@ def _collect_conversation_trace(task: Task) -> list[dict[str, Any]]:
             "role": c.role,
             "type": c.type,
             "type_label": _CONVERSATION_TYPE_LABELS.get(c.type, c.type),
-            "content": (
-                _strip_question_memory_block(c.content)
-                if c.type == "question" else c.content
-            ),
+            "content": _trace_content(c),
             "created_at": c.created_at,
         })
     items.extend(submits)

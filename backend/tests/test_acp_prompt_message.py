@@ -145,6 +145,30 @@ def test_base_prompt_repo_path_fallback_kept():
     assert "仓库路径: /home/user/repos/r" in base
 
 
+def test_followup_repo_task_keeps_repo_path(monkeypatch):
+    """真实仓库 + 工作区有文件:追问轮保留"仓库路径(已 clone)"行。"""
+    import app.agents.acp_base as ab
+    monkeypatch.setattr(ab.sandbox_tools, "workspace_has_files", lambda *a, **k: True)
+    task = _mk_task(params={"repo_url": "https://github.com/a/b"})
+    msg = _build_base_prompt(
+        task, 2, "教学逻辑怎么样?", None, "/home/user/repos/r", None,
+    )
+    assert "仓库路径(已 clone,无需再 clone): /home/user/repos/r" in msg
+    assert "[本轮补充要求]\n教学逻辑怎么样?" in msg
+
+
+def test_followup_upload_task_omits_repo_path(monkeypatch):
+    """纯上传任务(无 repo_url):追问轮不拼接误导性的"仓库路径"行。"""
+    import app.agents.acp_base as ab
+    monkeypatch.setattr(ab.sandbox_tools, "workspace_has_files", lambda *a, **k: True)
+    task = _mk_task(params={"upload_id": "u1"})
+    msg = _build_base_prompt(
+        task, 2, "教学逻辑怎么样?", None, "/ws/uploaded_files", None,
+    )
+    assert "仓库路径" not in msg
+    assert "[本轮补充要求]\n教学逻辑怎么样?" in msg
+
+
 def test_repo_context_section_roundtrip():
     """_build_repo_context_section:有内容时包裹提示语,空时返回空串。"""
     assert _build_repo_context_section(None) == ""

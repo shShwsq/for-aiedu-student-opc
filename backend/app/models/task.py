@@ -172,13 +172,13 @@ class Conversation(Base):
     # 角色:user / agent2 / react_agent
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     # 消息类型:
-    #   question(用户提问)
-    #   evaluation(agent2 评估)
-    #   followup(agent2 追问)
-    #   thinking(react_agent / agent2 思考)
-    #   tool_call / tool_result
-    #   submit(react_agent 提交结果)
+    #   question(用户提问) / message(用户追加消息)
+    #   review(agent2 后台审查结论,详情存 reasoning)
+    #   suggestions(agent2 建议深挖方向,content 为 JSON)
     #   summary(agent2 最终总结)
+    #   thinking(agent1 / agent2 思考)
+    #   tool_call / tool_result
+    #   evaluation / followup / answer(存量旧任务逐轮评估,新流程不再产出)
     #   error
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)

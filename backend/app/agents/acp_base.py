@@ -2191,9 +2191,14 @@ def _build_base_prompt(
             "基于之前的执行进度,请处理以下新消息"
             f"({FOLLOWUP_CORE_GUIDANCE})"
         )
-        # 只有工作区确实有文件才声称"已 clone":预 clone 可能失败降级为
-        # 空目录,此时若断言已 clone 会误导 CLI 跳过 clone
-        if repo_path and sandbox_tools.workspace_has_files(str(task.id)):
+        # 仅真实 git 仓库才提示"仓库路径(已 clone)":纯上传任务的 repo_path 指向
+        # uploaded_files/,该措辞会误导(工作区文件路径已由 session cwd 提供);
+        # 且只有工作区确实有文件才声称"已 clone"(预 clone 可能降级为空目录)
+        if (
+            (task.params or {}).get("repo_url")
+            and repo_path
+            and sandbox_tools.workspace_has_files(str(task.id))
+        ):
             msg += f"\n仓库路径(已 clone,无需再 clone): {repo_path}"
         msg += f"\n\n[本轮补充要求]\n{followup_query}"
 
