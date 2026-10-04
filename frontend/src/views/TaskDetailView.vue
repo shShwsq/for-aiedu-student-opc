@@ -2863,8 +2863,12 @@ function toggleResult(id: string): void {
     <aside v-if="task && !detailCollapsed" class="detail-sidebar">
       <div class="detail-sidebar-header">
         <span class="detail-sidebar-title">任务详情</span>
-        <!-- 状态徽标 + 下载/打印:自任务概览区块顶部迁入,排在折叠按钮左侧 -->
-        <span :class="['badge', statusConfig[task.status].class]">
+        <!-- 状态徽标 + 下载/打印:自任务概览区块顶部迁入,排在折叠按钮左侧
+             完成时间不再单列,改为悬浮徽标时以 title 展示 -->
+        <span
+          :class="['badge', statusConfig[task.status].class]"
+          :title="task.completed_at ? '完成时间 ' + formatTime(task.completed_at) : undefined"
+        >
           {{ statusConfig[task.status].label }}
         </span>
         <div
@@ -2905,23 +2909,16 @@ function toggleResult(id: string): void {
         />
       </div>
       <div class="detail-sidebar-body">
-        <!-- 任务详情(扁平化,无卡片外框):状态徽标与下载/打印按钮已移至标题行,用户意图卡片已移除 -->
-        <section class="overview-section">
-          <dl class="overview-meta">
-            <div>
-              <dt>场景</dt>
-              <dd>{{ task.scenario }}</dd>
-            </div>
-            <div>
-              <dt>创建时间</dt>
-              <dd>{{ formatTime(task.created_at) }}</dd>
-            </div>
-            <div v-if="task.completed_at">
-              <dt>完成时间</dt>
-              <dd>{{ formatTime(task.completed_at) }}</dd>
-            </div>
-          </dl>
-          <div v-if="task.current_stage" class="overview-stage">
+        <!-- 任务详情概览(精简后仅保留运行期实时阶段与错误提示):
+             场景/创建时间/完成时间已移除——场景降级为模板无展示价值,
+             创建时间主区标题行已有,完成时间改悬浮"已完成"徽章查看。
+             当前阶段是运行/暂停态唯一的实时进度文案,故仅活跃期保留;
+             任务进入终态(完成/失败)后收起,避免"任务完成,…"这类冗余收尾行。 -->
+        <section
+          v-if="(isRunning && task.current_stage) || task.error_message"
+          class="overview-section"
+        >
+          <div v-if="isRunning && task.current_stage" class="overview-stage">
             <span class="label">当前阶段</span>
             <p>{{ task.current_stage }}</p>
           </div>
@@ -3421,24 +3418,6 @@ function toggleResult(id: string): void {
 .btn-export:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-}
-
-.overview-meta {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: var(--space-2);
-  margin-bottom: var(--space-3);
-}
-
-.overview-meta dt {
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-  margin-bottom: var(--space-1);
-}
-
-.overview-meta dd {
-  font-size: var(--fs-sm);
-  color: var(--color-text);
 }
 
 .overview-stage {
