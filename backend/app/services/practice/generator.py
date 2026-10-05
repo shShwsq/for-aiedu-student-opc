@@ -1219,16 +1219,17 @@ def _generate_for_finding(
     meta: dict, task_id_str: str, repo_path: str,
     event_callback: Callable[[str, dict], None] | None = None,
 ) -> tuple[list[dict], str, str]:
-    """单条发现的出题:LLM 往返 + 解析 + 两道质量关卡 + 至多 1 次带反馈续写
+    """单条发现的出题:LLM 往返 + 解析 + 两道质量关卡 + 至多 1 次重试
 
     返回 (合格题目 dict 列表, 最后一次 LLM 原文, 致命错误原因);
     致命原因非空时调用方应中止剩余 finding(已生成题目照常保留)。
 
-    两处降本改动(都是针对日志里反复出现的浪费):
-    - 反馈重试**在既有消息历史上追加反馈句**,不重建工具循环:
-      材料已在上下文里,重建会把同一批文件重读一遍,单条成本近乎翻倍
-    - 429 不占反馈重试预算(限流不是模型答得差),等待后原地重试
-      耗尽次数才落到丢弃路径(以前一次撞限就白丢整条 finding)
+    两类重试(共 1 次预算,由 PARSE_RETRY 控制):
+    - 质量关卡全拦 → 带对应反馈句在既有消息历史上续写,不重建工具循环
+      (材料已在上下文里,重建会把同一批文件重读一遍,单条成本近乎翻倍)
+    - LLM 异常/输出不可解析 → 不带反馈原地重试(等价于旧版 for 循环的
+      自然重试;思考类模型 160s 超时并不罕见,首败即丢整条 finding 太浪费)
+    - 429 不占上述预算(限流不是模型答得差),单独原地等待重试
 
     只跑 LLM 与本地校验,不碰数据库(供后续并发化直接当工作单元用)。
     """
@@ -1322,6 +1323,15 @@ def _generate_for_finding(
                 # 历史太长:重建对话(退回旧行为,带反馈的完整 prompt)
                 messages = _new_llm_turn(system_prompt, prompt + feedback)
                 call_text = prompt + feedback
+            attempt += 1
+            continue
+        # LLM 异常/输出不可解析(未触发任何关卡):原地重试一次(不带反馈),
+        # 与模块 docstring「失败重试 1 次」口径一致(旧版 for 循环的自然重试行为)
+        if attempt < PARSE_RETRY:
+            logger.info(
+                "[practice] finding=%s 无有效输出(LLM 失败或解析空),原地重试(第 %d/%d 次)",
+                finding.id, attempt + 2, PARSE_RETRY + 1,
+            )
             attempt += 1
             continue
         break

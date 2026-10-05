@@ -19,6 +19,7 @@ import logging
 from datetime import datetime, timezone
 
 from json_repair import repair_json
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.llm.client import LLMClient
@@ -36,7 +37,9 @@ from app.services.practice.parse_utils import salvage_json_array
 logger = logging.getLogger(__name__)
 
 # 单批知识点数(超出分批,防单次输出被 max_tokens 截断且便于定位失败批次)
-MAX_KP_PER_BATCH = 8
+# 6 个 × 400 字中文 ≈ 2400 字符 + Markdown/JSON 转义 ≈ 2000-3000 tokens,
+# 4096 上限留一倍余量;再往上加批次大小截断风险陡增(cl100k 类 tokenizer 更明显)
+MAX_KP_PER_BATCH = 6
 # 每个知识点最多带几条发现上下文(同知识点反复出题时取最新的几条)
 MAX_SOURCES_PER_KP = 3
 # 每条上下文最多带几道题
@@ -48,8 +51,9 @@ _FINDING_CONTENT_CHARS = 1200
 _MATERIAL_CHARS = 900
 _QUESTION_EXPLANATION_CHARS = 300
 
-# 讲解输出上限:4 段小标题 + 正文,2048 token 足够 8 个知识点(超出分批)
-_MAX_OUTPUT_TOKENS = 2048
+# 讲解输出上限:4 段小标题 + 正文,按 MAX_KP_PER_BATCH=6 个知识点、每个 200~400 字
+# 估算,主流中文 tokenizer(0.6-1.0 token/字)约 1500-3000 token,4096 留一倍余量
+_MAX_OUTPUT_TOKENS = 4096
 
 
 def _clip(text: object, limit: int) -> str:
@@ -244,11 +248,23 @@ def _parse_explanations(content: str) -> dict[str, str]:
 
 
 def _collect_llm_text(client: LLMClient, messages: list[dict]) -> str:
-    """一次性收集讲解输出(讲解不需要工具,也不推送打字机事件)"""
+    """一次性收集讲解输出(讲解不需要工具,也不推送打字机事件)
+
+    遇到 finish_reason='length'(max_tokens 截断)记 warning:JSON 数组被切
+    到一半时 json_repair 通常只能救回头部 KP,尾部会静默缺失,给排障留条线索。
+    """
     parts: list[str] = []
+    finish_reason = None
     for chunk in client.chat_stream(messages, max_tokens=_MAX_OUTPUT_TOKENS):
         if chunk.content_delta:
             parts.append(chunk.content_delta)
+        if getattr(chunk, "finish_reason", None):
+            finish_reason = chunk.finish_reason
+    if finish_reason == "length":
+        logger.warning(
+            "[explain] 讲解输出被 max_tokens=%d 截断,尾部知识点可能缺失",
+            _MAX_OUTPUT_TOKENS,
+        )
     return "".join(parts)
 
 
@@ -344,9 +360,31 @@ def _explain_one_batch(
         if not markdown:
             continue
         kp = kp_by_key[key]
+        # 快速筛掉批次开始前就已标 manual 的(避免白跑 UPDATE);
+        # 但 LLM 调用期间用户并发 PUT 的 manual 状态读不到(session 身份映射陈旧),
+        # 真正的守卫交给下面的条件 UPDATE:让 DB 层原子判定 source != 'manual'
         if not _should_write(kp, force=True):
-            continue  # 并发下用户刚手工编辑过
-        kp.explanation = markdown[:MAX_EXPLANATION_CHARS]
+            continue
+        new_explanation = markdown[:MAX_EXPLANATION_CHARS]
+        result = db.execute(
+            update(KnowledgePoint)
+            .where(
+                KnowledgePoint.id == kp.id,
+                KnowledgePoint.explanation_source != EXPLANATION_SOURCE_MANUAL,
+            )
+            .values(
+                explanation=new_explanation,
+                explanation_source=EXPLANATION_SOURCE_AUTO,
+                explanation_model=model_name[:64],
+                explanation_updated_at=now,
+            )
+        )
+        if not getattr(result, "rowcount", 0):
+            # 并发下用户刚手工编辑过 → SQL WHERE 挡下,不覆盖 manual
+            continue
+        # 条件 UPDATE 绕过了 ORM 脏标记,手动同步身份映射,
+        # 避免调用方后续读同一个 kp 拿到陈旧值
+        kp.explanation = new_explanation
         kp.explanation_source = EXPLANATION_SOURCE_AUTO
         kp.explanation_model = model_name[:64]
         kp.explanation_updated_at = now

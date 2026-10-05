@@ -583,6 +583,53 @@ def test_fatal_llm_error_aborts_without_retry(monkeypatch):
     assert "免费额度" in msg
 
 
+def test_non_fatal_llm_error_retries_once(monkeypatch):
+    """回归:超时/5xx 等非致命异常仍应重试 1 次(与模块 docstring「失败重试 1 次」一致)
+
+    并发化重构把 while 循环的 exit 改成了「无关卡拦截就直接 break」,一度
+    导致非致命路径只剩 1 次调用;这里守住重试次数与最终丢弃行为。
+    """
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise RuntimeError("timeout")
+
+    monkeypatch.setattr(gen, "_call_llm", boom)
+    created, skipped = gen.generate_questions_for_task(
+        _gen_db(), _gen_task(), "u1", client=MagicMock(),
+    )
+    assert not created
+    assert skipped == 1
+    # PARSE_RETRY=1 → 共 2 次尝试
+    assert len(calls) == gen.PARSE_RETRY + 1
+
+
+def test_unparseable_llm_output_retries_once(monkeypatch):
+    """回归:LLM 返回不可解析内容(非空但无 JSON)应重试 1 次
+
+    与 test_non_fatal_llm_error_retries_once 成对:一条守异常路径,
+    一条守「有内容但解析空」路径,两条都别退化回单次即丢。
+    """
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    prompts_seen = []
+
+    def always_garbage(*a, **k):
+        prompts_seen.append(a[2] if len(a) > 2 else "")
+        return "模型瞎说的话,根本不是 JSON"
+
+    monkeypatch.setattr(gen, "_call_llm", always_garbage)
+    created, skipped = gen.generate_questions_for_task(
+        _gen_db(), _gen_task(), "u1", client=MagicMock(),
+    )
+    assert not created
+    assert skipped == 1
+    assert len(prompts_seen) == gen.PARSE_RETRY + 1
+    # 原地重试不带反馈:两次的 user prompt 内容应一致(未追加质量反馈句)
+    assert prompts_seen[0] == prompts_seen[1]
+
+
 # ============================================================
 # 去重哈希
 # ============================================================

@@ -225,8 +225,8 @@ def test_explain_writes_only_targets_and_clips_markdown():
     assert db.commit.call_count == 1
 
 
-def test_explain_batches_at_most_eight_kp_per_call():
-    """11 个知识点分 2 批(≤8/批),而不是 11 次往返;两批都写入"""
+def test_explain_batches_at_most_six_kp_per_call():
+    """11 个知识点分 2 批(≤MAX_KP_PER_BATCH/批),而不是 11 次往返;两批都写入"""
     keys = [f"CWE-{i}" for i in range(11)]
     kps = [_kp(key=k) for k in keys]
     digests = {k: _digest_entry(k) for k in keys}
@@ -248,7 +248,8 @@ def test_explain_batches_at_most_eight_kp_per_call():
     client.chat_stream = fake_stream
     written = explain_knowledge_points(db, "u1", digests, client=client)
     assert written == 11
-    assert [len(b) for b in batches_seen] == [8, 3]
+    assert [len(b) for b in batches_seen] == [ex.MAX_KP_PER_BATCH,
+                                              11 - ex.MAX_KP_PER_BATCH]
     assert all(kp.explanation_source == EXPLANATION_SOURCE_AUTO for kp in kps)
 
 
@@ -268,6 +269,34 @@ def test_explain_skips_manual_and_missing_kp():
     assert manual.explanation == "我的总结"
     # 一次 LLM 调用都不该发(没有可写目标就早退)
     assert client.calls == []
+
+
+def test_explain_conditional_update_protects_concurrent_manual_edit():
+    """回归:批次 LLM 期间用户并发 PUT manual → SQL WHERE 挡下,不覆盖
+
+    会话身份映射里 kp 是批次开始前查的旧值(source=''),内存里
+    `_should_write(kp, force=True)` 复查读不到并发提交的 manual → 会误判
+    可写。修复改成条件 UPDATE,让 DB 原子判定 explanation_source != 'manual';
+    mock db.execute 返回 rowcount=0 模拟被 WHERE 挡下,断言不写入。
+    """
+    kp = _kp(explanation=None, source="")  # 批次开始时读到的旧状态
+    kp.id = "k1"
+    db = _mock_db_with_kps([kp])
+    exec_result = MagicMock()
+    exec_result.rowcount = 0  # 并发 PUT 已在 DB 端把 source 改成 manual
+    db.execute.return_value = exec_result
+
+    client = _FakeLLMClient([json.dumps(
+        [{"knowledge_key": "CWE-89", "markdown": "### 是什么\n自动生成内容"}],
+        ensure_ascii=False,
+    )])
+    written = explain_knowledge_points(db, "u1", _digest(), client=client)
+
+    assert written == 0
+    # 身份映射里的 kp 不能被同步为 auto(用户的 manual 讲解要保住)
+    assert kp.explanation is None
+    assert kp.explanation_source == ""
+    assert db.execute.call_count == 1
 
 
 def test_explain_batch_failure_does_not_break_caller():

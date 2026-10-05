@@ -273,7 +273,11 @@ def _resp():
 
 
 def test_worker_exception_does_not_kill_job(monkeypatch):
-    """单条 worker 意外异常:计一条未出题,其余照常入库"""
+    """单条 worker 反复异常:该条计数为未出题,其余照常入库
+
+    「反复」是关键词:非致命错误路径现在会重试 1 次(与模块 docstring
+    「失败重试 1 次」一致),所以让 r0 每次调用都抛,才能真正走丢弃路径。
+    """
     monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
     monkeypatch.setattr(settings, "PRACTICE_GENERATE_CONCURRENCY", 4, raising=True)
     findings = _findings(3)
@@ -283,7 +287,7 @@ def test_worker_exception_does_not_kill_job(monkeypatch):
     def flaky(client, system_prompt, finding_text, task_id, repo_path,
               on_event=None, messages=None):
         seen["n"] += 1
-        if seen["n"] == 1:
+        if "发现0" in finding_text:
             raise RuntimeError("本地 bug")
         return VALID_OUT.replace("题干", f"题干{seen['n']}")
 

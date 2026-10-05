@@ -39,6 +39,8 @@ const fromExisting = ref(false)
 /** 异步出题进度(已处理/总 finding 数) */
 const genDone = ref(0)
 const genTotal = ref(0)
+/** 本次出题是否要求「忽略去重」(仅错误态下用户主动重出时为 true) */
+const forceRequested = ref(false)
 /** 勾选保留的题 id */
 const selected = reactive<Set<string>>(new Set())
 /** 确认结果(done 阶段展示) */
@@ -56,6 +58,7 @@ function resetState(): void {
   fromExisting.value = false
   genDone.value = 0
   genTotal.value = 0
+  forceRequested.value = false
 }
 
 function enterPreview(questions: DraftQuestion[]): void {
@@ -84,16 +87,24 @@ async function loadDraftsOrGenerate(): Promise<void> {
   }
 }
 
-/** 发起异步出题并轮询进度 */
-async function generate(): Promise<void> {
+/** 发起异步出题并轮询进度
+ *
+ * force=true 时传 force_regenerate,后端跳过「本用户已出过题的 finding
+ * 整条短路」的默认策略(错误态下用户主动点「重新出题」按钮触发)。
+ */
+async function generate(force = false): Promise<void> {
   phase.value = 'generating'
   errorMsg.value = ''
   fromExisting.value = false
+  forceRequested.value = force
   genDone.value = 0
   genTotal.value = 0
   const token = ++pollToken
   try {
-    const { job_id: jobId } = await generateQuestions({ task_id: props.taskId })
+    const { job_id: jobId } = await generateQuestions({
+      task_id: props.taskId,
+      force_regenerate: force || undefined,
+    })
     // 轮询直到 done/error;对话框关闭(token 失效)则中止
     for (;;) {
       if (token !== pollToken) return
@@ -215,7 +226,17 @@ function formatDifficulty(d: number): string {
               <p class="error-text">生成失败:{{ errorMsg }}</p>
               <div class="phase-actions">
                 <button class="btn-secondary" @click="handleClose">关闭</button>
-                <button class="btn-primary" @click="generate">重试</button>
+                <button class="btn-primary" @click="generate(false)">重试</button>
+                <!--
+                  「已出过题的 finding 整条跳过」是后端默认短路(省 LLM 成本),
+                  用户确认入库后再点生成会全被跳过走到这里;给出绕过短路的入口。
+                -->
+                <button
+                  v-if="!forceRequested && skippedFindings > 0"
+                  class="btn-secondary"
+                  title="忽略去重短路,重新对已出过题的发现调用 LLM(会产生额外费用)"
+                  @click="generate(true)"
+                >重新出题(忽略去重)</button>
               </div>
             </div>
 

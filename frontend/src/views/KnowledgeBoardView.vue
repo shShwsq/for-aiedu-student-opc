@@ -18,7 +18,8 @@
  *
  * 讲解生成走异步 job(POST /practice/knowledge-points/explain → 轮询
  * GET /practice/generate/{job_id}):单请求最多 20 个知识点,后端再按
- * ≤8 个一次 LLM 调用分批;manual(用户自己写的)讲解不会被覆盖。
+ * ≤MAX_KP_PER_BATCH(explainer.py)一次 LLM 调用分批;manual(用户自己写的)
+ * 讲解不会被覆盖。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
