@@ -180,6 +180,14 @@ GitHub 和 Gitee 二者均支持,按需配置。留空的平台对应路由会�
 | `GITEE_OAUTH_CLIENT_ID` | Gitee 第三方应用 Client ID(在 https://gitee.com/oauth/applications 创建,权限勾 `user_info` + `projects`) |
 | `GITEE_OAUTH_CLIENT_SECRET` | Gitee 第三方应用 Client Secret |
 | `GITEE_OAUTH_REDIRECT_URI` | Gitee 回调地址,默认 `http://localhost:5173/auth/gitee/callback` |
+| `GIT_OAUTH_MAX_RETRIES` | 平台接口传输层失败(连不上 / 超时 / 5xx)的额外重试次数,`0`=不重试。仅对「重复发送安全」的请求重试:单次有效的授权码换 token 不重发 |
+
+> **错误码约定**(见 [backend/app/git_errors.py](backend/app/git_errors.py))
+> - `400`:平台明确拒绝——授权码失效 / 已被用过(刷新回调页、浏览器后退重放 `?code=` 最常见)、scope 不足
+> - `401`:`/git/{provider}/repos`、`/refresh` —— 平台判定 token 已失效,需重新绑定
+> - `409`:`{provider}/bind` 该 Git 账号已被其他用户绑定;登录时同邮箱账号已绑另一个平台账号
+> - `502` / `504`:连不上 GitHub/Gitee、TLS 握手被重置、读超时、平台 5xx —— 与你的授权码和 `.env` 配置无关,稍后重试即可
+> 两类都会在后端记 `warning` 日志(含根因与 user_id),排查时看控制台/日志而不是只看访问日志的状态码。
 
 > **OAuth 应用配置要点**
 > - GitHub:Authorization callback URL 填后端 `GITHUB_OAUTH_REDIRECT_URI` 的值

@@ -99,7 +99,14 @@ onMounted(async () => {
         </svg>
       </div>
       <p class="error-text">{{ errorMsg }}</p>
-      <RouterLink to="/login" class="back-link">返回登录</RouterLink>
+      <!-- 已登录说明走的是绑定流程,回设置页重新授权(回登录页会被守卫弹回首页,
+           反而看不到绑定入口);未登录才是登录失败 -->
+      <RouterLink
+        :to="authStore.isAuthenticated ? '/settings/account' : '/login'"
+        class="back-link"
+      >
+        {{ authStore.isAuthenticated ? '返回重新绑定' : '返回登录' }}
+      </RouterLink>
     </div>
   </div>
 </template>

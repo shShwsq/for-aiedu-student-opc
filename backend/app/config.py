@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     GITEE_OAUTH_CLIENT_SECRET: str = ""
     GITEE_OAUTH_REDIRECT_URI: str = "http://localhost:5173/auth/gitee/callback"
 
+    # 调用 Git 平台接口(GitHub/Gitee OAuth 与 API)传输层失败后的额外重试次数。
+    # 本机实测到 github.com 偶发 TLS 握手被重置、RTT 2-5s,一次抖动就失败会把
+    # 可恢复的网络问题报成用户可见错误。仅幂等请求(GET/撤销 token)重试全部传输层
+    # 失败,单次有效的授权码换 token 只在"请求尚未发出"的连接失败上重试
+    # (详见 app/git_provider.py request_json)。0=不重试。
+    GIT_OAUTH_MAX_RETRIES: int = 2
+
     # LLM(阶段 1:开发期单 provider 配置)
     LLM_PROVIDER: str = "dashscope"
     LLM_API_KEY: str = ""

@@ -31,6 +31,7 @@ from app.email_service import (
     send_verification_email,
     verify_token,
 )
+from app.git_errors import http_exc_for_git_error
 from app.git_provider import GitProviderError, get_provider
 from app.models.email_token import EmailTokenType
 from app.models.user import User
@@ -400,12 +401,19 @@ def git_oauth(
     """
     try:
         p = get_provider(provider)
-        gh_user = p.oauth_login(req.code)
     except GitProviderError as e:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        ) from e
+
+    try:
+        gh_user = p.oauth_login(req.code)
+    except GitProviderError as e:
+        # 区分链路故障与真正的 OAuth 错误:前者 502/504 提示稍后重试,
+        # 一律报 400 会把用户引去改 .env(见 app/git_errors.py)
+        raise http_exc_for_git_error(
+            e, action="Git 平台 OAuth 登录", provider_display=p.display_name
+        ) from e
 
     # 1. (provider, provider_user_id) 已绑定 → 登录该用户
     binding = (
@@ -422,6 +430,19 @@ def git_oauth(
         # 2. email 已注册,关联该平台(建仅登录 binding,access_token="")
         user = db.query(User).filter(User.email == gh_user.email).first()
         if user:
+            # 该账号在这个平台已有绑定行(平台侧换过账号 / 同一邮箱挂到多个
+            # 平台账号):再插一行会撞 uq_user_provider(user_id, provider)
+            # 唯一约束 → 裸 IntegrityError 会变成没有 detail 的 500。
+            # 这里不静默改写既有 provider_user_id(身份关联不能悄悄换人),
+            # 明确 409 让用户知道该怎么解绑。
+            if any(b.provider == provider for b in user.git_bindings):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"该邮箱已注册,且已绑定另一个 {p.display_name} 账号;"
+                        "请先用原账号登录并解绑,或改用其他邮箱"
+                    ),
+                )
             db.add(
                 UserGitBinding(
                     user_id=user.id,

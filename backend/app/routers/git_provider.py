@@ -10,6 +10,11 @@
 - GET    /git/{provider}/repos       列出当前用户该平台仓库(含私有)
 - PATCH  /git/{provider}/sync-email  将账号邮箱同步为平台邮箱(仅支持可验证邮箱的平台)
 - POST   /git/{provider}/refresh     用 refresh_token 刷新 access_token(仅 Gitee 支持)
+
+错误码约定(实现见 app/git_errors.py):
+- 平台明确拒绝(授权码失效 / scope 不足 / 凭证错)→ 400,token 类接口用 401
+- 链路或平台故障(连不上 / 超时 / 5xx / 响应损坏)→ 502/504,detail 提示稍后重试
+两类都会在服务端记一条 warning(带根因与 user_id),避免只剩一行状态码无从排查。
 """
 import logging
 import time
@@ -21,7 +26,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import get_current_user
-from app.git_provider import GitProviderError, get_provider
+from app.git_errors import http_exc_for_git_error
+from app.git_provider import GitProviderError, GitProviderUnavailable, get_provider
 from app.models.user import User
 from app.models.user_git_binding import UserGitBinding
 from app.security import decrypt_secret, encrypt_secret
@@ -140,7 +146,9 @@ def _ensure_valid_token(db: Session, binding: UserGitBinding, p) -> str:
     - 不支持刷新(GitHub)或无 expires_at(老数据)→ 直接返回当前 token
     - 未临近过期(> REFRESH_LEAD_SECONDS)→ 直接返回当前 token
     - 临近过期/已过期且有 refresh_token → 刷新并更新 binding(access/refresh/expires_at)
-    - 刷新失败 → 抛 GitProviderError(让上层走 "token 失效" 提示)
+    - 刷新失败 → 抛 GitProviderError(平台判定 refresh_token 失效 → 上层 401
+      提示重新绑定)或 GitProviderUnavailable(链路故障 → 上层 502/504,
+      不该让用户以为凭证失效)
 
     db.commit() 由本函数负责(刷新成功时);刷新失败时不提交,保持原 token 不变。
     """
@@ -200,8 +208,12 @@ def bind_provider(
         token_set = p.exchange_code_for_token(req.code)
         info = p.get_user_info(token_set.access_token)
     except GitProviderError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        # 网络/平台故障给 502/504,真正的 OAuth 参数错才 400
+        raise http_exc_for_git_error(
+            e,
+            action=f"绑定 {p.display_name}",
+            provider_display=p.display_name,
+            user_id=current_user.id,
         ) from e
 
     # provider_user_id 冲突检查:若已被其他用户占用,拒绝绑定
@@ -429,10 +441,21 @@ def sync_email(
     try:
         token = _ensure_valid_token(db, binding, p)
         info = p.get_user_info(token)
-    except (GitProviderError, ValueError) as e:
+    except GitProviderError as e:
+        raise http_exc_for_git_error(
+            e,
+            action=f"同步 {p.display_name} 邮箱(取用户信息)",
+            provider_display=p.display_name,
+            user_id=current_user.id,
+        ) from e
+    except ValueError as e:
+        # decrypt_secret 失败:服务端密钥与库里密文不匹配,属服务端配置问题
+        logger.error(
+            "user %s 的 %s token 解密失败: %s", current_user.id, p.display_name, e
+        )
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"获取 {p.display_name} 用户信息失败: {e}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="token 解密失败,请联系管理员",
         ) from e
 
     provider_email = info.email
@@ -442,9 +465,11 @@ def sync_email(
             if emails:
                 provider_email = emails[0]
         except GitProviderError as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"获取 {p.display_name} 邮箱失败: {e}",
+            raise http_exc_for_git_error(
+                e,
+                action=f"同步 {p.display_name} 邮箱(取邮箱列表)",
+                provider_display=p.display_name,
+                user_id=current_user.id,
             ) from e
 
     if not provider_email:
@@ -529,8 +554,20 @@ def list_repos(
     try:
         token = _ensure_valid_token(db, binding, p)
         raw = p.list_repos(token)
+    except GitProviderUnavailable as e:
+        # 链路/平台故障:token 其实没坏,提示"重新绑定"会误导用户
+        raise http_exc_for_git_error(
+            e,
+            action=f"列出 {p.display_name} 仓库",
+            provider_display=p.display_name,
+            user_id=current_user.id,
+        ) from e
     except GitProviderError as e:
-        # token 可能已失效,提示用户重新绑定
+        # 平台明确拒绝(4xx):token 可能已失效,提示用户重新绑定
+        logger.warning(
+            "user %s 的 %s 仓库列表被平台拒绝(→ 401): %s",
+            current_user.id, p.display_name, e,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"{p.display_name} token 失效,请重新绑定: {e}",
@@ -580,14 +617,33 @@ def refresh_provider_token(
 
     try:
         new_set = p.refresh_access_token(decrypt_secret(binding.refresh_token))
+    except GitProviderUnavailable as e:
+        # 链路/平台故障时 refresh_token 并未被平台判定无效,
+        # 提示"请重新绑定"会误导(而且重绑要重新走授权页)
+        raise http_exc_for_git_error(
+            e,
+            action=f"刷新 {p.display_name} token",
+            provider_display=p.display_name,
+            user_id=current_user.id,
+        ) from e
     except GitProviderError as e:
         logger.warning(
-            "user %s 手动刷新 %s token 失败: %s",
+            "user %s 手动刷新 %s token 失败(→ 401): %s",
             current_user.id, p.display_name, e,
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"刷新失败,请重新绑定: {e}",
+        ) from e
+    except ValueError as e:
+        # decrypt_secret 失败:服务端密钥与库里密文不匹配
+        logger.error(
+            "user %s 的 %s refresh_token 解密失败: %s",
+            current_user.id, p.display_name, e,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="token 解密失败,请联系管理员",
         ) from e
 
     binding.access_token = encrypt_secret(new_set.access_token)
