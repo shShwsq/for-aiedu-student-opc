@@ -19,7 +19,7 @@ from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
@@ -72,6 +72,12 @@ class UserGitBinding(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+    # 反向关系:与 User.git_bindings 成对(/auth/oauth/{provider} 登录用
+    # binding.user 取回本地用户)。缺这一侧时访问 binding.user 直接抛
+    # AttributeError → 接口 500,已有绑定行的用户永远登录不了。
+    # 删除用户仍由 FK ondelete=CASCADE 在数据库层级联(passive_deletes 在父侧声明)。
+    user: Mapped["User"] = relationship("User", back_populates="git_bindings")
 
 
 def migrate_legacy_github_bindings() -> None:

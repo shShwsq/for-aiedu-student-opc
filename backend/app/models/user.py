@@ -44,9 +44,11 @@ class User(Base):
     )
 
     # Git 平台绑定(GitHub / Gitee),一对多(每用户每 provider 一行)
+    # 反向侧见 UserGitBinding.user(必须成对,否则 binding.user 取不到用户)
     # 级联删除由 FK ondelete=CASCADE 在数据库层完成;passive_deletes=True 让 ORM 不额外发 DELETE
     git_bindings: Mapped[list["UserGitBinding"]] = relationship(
         "UserGitBinding",
+        back_populates="user",
         cascade="all, delete-orphan",
         passive_deletes=True,
         lazy="selectin",
