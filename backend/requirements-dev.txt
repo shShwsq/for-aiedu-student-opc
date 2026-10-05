@@ -1,0 +1,8 @@
+# 测试专用依赖 —— 不进生产镜像(生产只 pip install requirements.txt,见 deploy/Dockerfile.backend)
+# 安装:.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+# 并行跑全量:.venv\Scripts\python.exe -m pytest -n 4   (pytest.ini 已默认 --dist loadscope)
+pytest>=9.1.1
+pytest-asyncio>=1.4.0
+# 多进程分发加速:重型用例的耗时主要是远端 PostgreSQL 往返与真实 git 子进程的 IO 等待,
+# 并行收益明显(全量 1265 项 ~3 分钟 → ~1.6 分钟)
+pytest-xdist>=3.8.0
