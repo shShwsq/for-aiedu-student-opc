@@ -1,6 +1,6 @@
-"""用户级 agent 智能体策略 (per-user, 1:1)
+"""用户级智能体策略 (per-user, 1:1)
 
-agent2(质检智能体)智能体策略的用户级默认(启停、协作轮次、验证权限等),
+agent2(检查助手)策略的用户级默认(启停、验证权限、引用复核等),
 任务级可通过 task.params["_agent_policy"] 覆盖。
 字段语义见 agent_policy.DEFAULT_AGENT_POLICY。
 

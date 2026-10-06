@@ -1,6 +1,6 @@
-"""agent 智能体策略:默认值定义 + 用户级/任务级合并解析
+"""智能体策略:默认值定义 + 用户级/任务级合并解析
 
-agent2(质检智能体)的智能体策略入口:
+agent2(检查助手)策略入口:
 - DEFAULT_AGENT_POLICY:全字段默认值(与 AgentPolicy 表列对齐)
 - resolve_agent_policy:合并 用户级默认(agent_policies 表)+ 任务级覆盖
   (task.params["_agent_policy"]),返回最终生效的策略

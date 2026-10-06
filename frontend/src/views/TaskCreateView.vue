@@ -1261,96 +1261,96 @@ onUnmounted(() => {
                         当前为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估与验证。
                       </p>
 
-                    <!-- agent2 依赖字段:关闭时整组隐藏(v-show 保留值,提交 payload 不变) -->
-                    <Transition name="collapse">
-                      <div v-show="policyAgent2Enabled" class="policy-dependent">
-                    <label class="policy-toggle-row">
-                      <input v-model="policyAllowVerify" class="switch" type="checkbox" />
-                      <span>允许检查助手自行验证 <span class="policy-experimental">(实验性)</span></span>
-                    </label>
+                      <!-- agent2 依赖字段:关闭时整组隐藏(v-show 保留值,提交 payload 不变) -->
+                      <Transition name="collapse">
+                        <div v-show="policyAgent2Enabled" class="policy-dependent">
+                          <label class="policy-toggle-row">
+                            <input v-model="policyAllowVerify" class="switch" type="checkbox" />
+                            <span>允许检查助手自行验证 <span class="policy-experimental">(实验性)</span></span>
+                          </label>
 
-                    <!-- 测试环境设置:仅当开启「允许自行验证」时展开 -->
-                    <Transition name="collapse">
-                      <div v-show="policyAllowVerify" class="verifier-config">
-                        <label class="policy-field">
-                          <span class="policy-label">测试环境 URL</span>
-                          <input
-                            v-model.trim="testEnvUrl"
-                            type="url"
-                            class="policy-input"
-                            placeholder="http://localhost:3000(已部署的应用地址)"
-                          />
-                          <span class="policy-hint">检查助手将在此环境动态验证安全发现</span>
-                        </label>
+                          <!-- 测试环境设置:仅当开启「允许自行验证」时展开 -->
+                          <Transition name="collapse">
+                            <div v-show="policyAllowVerify" class="verifier-config">
+                              <label class="policy-field">
+                                <span class="policy-label">测试环境 URL</span>
+                                <input
+                                  v-model.trim="testEnvUrl"
+                                  type="url"
+                                  class="policy-input"
+                                  placeholder="http://localhost:3000(已部署的应用地址)"
+                                />
+                                <span class="policy-hint">检查助手将在此环境动态验证安全发现</span>
+                              </label>
 
-                        <label class="policy-field">
-                          <span class="policy-label">授权模式</span>
-                          <BaseSelect
-                            v-model="verifierAuthMode"
-                            :options="verifierAuthModeOptions"
-                            class="policy-select"
-                            aria-label="授权模式"
-                          />
-                          <span class="policy-hint">控制验证动作执行前是否需要用户确认</span>
-                        </label>
+                            <label class="policy-field">
+                              <span class="policy-label">授权模式</span>
+                              <BaseSelect
+                                v-model="verifierAuthMode"
+                                :options="verifierAuthModeOptions"
+                                class="policy-select"
+                                aria-label="授权模式"
+                              />
+                              <span class="policy-hint">控制验证动作执行前是否需要用户确认</span>
+                            </label>
 
-                        <!-- 登录凭证列表(可选):LLM 按 auth_profile=label 选择身份,
-                             工具自动注入对应请求头。用于越权测试(同一端点不同身份访问)。
-                             LLM 只看到 label,看不到 header_value(安全)。 -->
-                        <div class="auth-tokens-section">
-                          <div class="auth-tokens-header">
-                            <span class="policy-label">登录凭证 <span class="policy-optional">(可选)</span></span>
-                            <button type="button" class="auth-token-add-btn" @click="addAuthToken">
-                              + 添加身份
-                            </button>
-                          </div>
-                          <span class="policy-hint">
-                            配置不同身份的认证头,LLM 验证越权时会按需选择(如:管理员 vs 普通用户访问同一端点)
-                          </span>
+                            <!-- 登录凭证列表(可选):LLM 按 auth_profile=label 选择身份,
+                                 工具自动注入对应请求头。用于越权测试(同一端点不同身份访问)。
+                                 LLM 只看到 label,看不到 header_value(安全)。 -->
+                            <div class="auth-tokens-section">
+                              <div class="auth-tokens-header">
+                                <span class="policy-label">登录凭证 <span class="policy-optional">(可选)</span></span>
+                                <button type="button" class="auth-token-add-btn" @click="addAuthToken">
+                                  + 添加身份
+                                </button>
+                              </div>
+                              <span class="policy-hint">
+                                配置不同身份的认证头,LLM 验证越权时会按需选择(如:管理员 vs 普通用户访问同一端点)
+                              </span>
 
-                          <div
-                            v-for="(token, idx) in verifierAuthTokens"
-                            :key="idx"
-                            class="auth-token-row"
-                          >
-                            <input
-                              v-model.trim="token.label"
-                              type="text"
-                              class="auth-token-input auth-token-label"
-                              placeholder="身份名(如 管理员)"
-                            />
-                            <input
-                              v-model.trim="token.header_name"
-                              type="text"
-                              class="auth-token-input auth-token-header-name"
-                              placeholder="Header 名"
-                              list="auth-header-suggestions"
-                            />
-                            <input
-                              v-model.trim="token.header_value"
-                              type="text"
-                              class="auth-token-input auth-token-header-value"
-                              placeholder="Header 值(如 Bearer xxx)"
-                            />
-                            <button
-                              type="button"
-                              class="auth-token-remove-btn"
-                              aria-label="删除"
-                              @click="removeAuthToken(idx)"
-                            >×</button>
-                          </div>
+                              <div
+                                v-for="(token, idx) in verifierAuthTokens"
+                                :key="idx"
+                                class="auth-token-row"
+                              >
+                                <input
+                                  v-model.trim="token.label"
+                                  type="text"
+                                  class="auth-token-input auth-token-label"
+                                  placeholder="身份名(如 管理员)"
+                                />
+                                <input
+                                  v-model.trim="token.header_name"
+                                  type="text"
+                                  class="auth-token-input auth-token-header-name"
+                                  placeholder="Header 名"
+                                  list="auth-header-suggestions"
+                                />
+                                <input
+                                  v-model.trim="token.header_value"
+                                  type="text"
+                                  class="auth-token-input auth-token-header-value"
+                                  placeholder="Header 值(如 Bearer xxx)"
+                                />
+                                <button
+                                  type="button"
+                                  class="auth-token-remove-btn"
+                                  aria-label="删除"
+                                  @click="removeAuthToken(idx)"
+                                >×</button>
+                              </div>
 
-                          <datalist id="auth-header-suggestions">
-                            <option value="Authorization" />
-                            <option value="Cookie" />
-                            <option value="X-API-Key" />
-                            <option value="X-Auth-Token" />
-                          </datalist>
+                              <datalist id="auth-header-suggestions">
+                                <option value="Authorization" />
+                                <option value="Cookie" />
+                                <option value="X-API-Key" />
+                                <option value="X-Auth-Token" />
+                              </datalist>
+                              </div>
+                            </div>
+                          </Transition>
                         </div>
-                      </div>
-                    </Transition>
-                      </div>
-                    </Transition>
+                      </Transition>
                     </div>
                     <!-- /分组:检查助手 -->
 
@@ -1358,17 +1358,17 @@ onUnmounted(() => {
                     <div class="adv-group">
                       <div class="adv-group-title">执行</div>
 
-                    <!-- AI助手确认策略(builtin 与 CLI 执行器均生效) -->
-                    <label class="policy-field">
-                      <span class="policy-label">AI助手确认策略</span>
-                      <BaseSelect
-                        v-model="policyExecutorCommandConfirm"
-                        :options="executorConfirmOptions"
-                        class="policy-select"
-                        aria-label="AI助手确认策略"
-                      />
-                      <span class="policy-hint">控制 AI助手(内置 / CLI)执行危险命令时是否弹窗确认。CLI 中 Codex 受非交互模式限制,仅支持自动批准。</span>
-                    </label>
+                      <!-- AI助手确认策略(builtin 与 CLI 执行器均生效) -->
+                      <label class="policy-field">
+                        <span class="policy-label">AI助手确认策略</span>
+                        <BaseSelect
+                          v-model="policyExecutorCommandConfirm"
+                          :options="executorConfirmOptions"
+                          class="policy-select"
+                          aria-label="AI助手确认策略"
+                        />
+                        <span class="policy-hint">控制 AI助手(内置 / CLI)执行危险命令时是否弹窗确认。CLI 中 Codex 受非交互模式限制,仅支持自动批准。</span>
+                      </label>
                     </div>
                     <!-- /分组:执行 -->
                   </div>
@@ -1771,7 +1771,7 @@ onUnmounted(() => {
   background: #7c3aed;
 }
 
-/* 第 3 行 agent1 控件容器:横向排列执行器 + CLI 配置 / 技能 */
+/* 第 2 行 agent1 控件容器:横向排列执行器 + CLI 配置 / 技能 */
 .react-controls {
   display: flex;
   align-items: center;

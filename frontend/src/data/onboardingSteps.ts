@@ -140,6 +140,15 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     content: '场景提供预设 prompt 模板,选择后可自动填入输入框;也可自由输入覆盖模板。',
   },
   {
+    id: 'create-react-executor',
+    target: 'create-react-executor',
+    route: 'task-create',
+    placement: 'right',
+    title: '执行器(AI助手)',
+    content:
+      '选择执行器:内置 AI助手可在此选模型(留空则用「高级设置」里的评估模型);若已配置外部 CLI(Qoder / DeepSeek / Codex),可在此切换,模型由 CLI 账号或环境变量管理。',
+  },
+  {
     id: 'create-user-model',
     target: 'create-user-model',
     route: 'task-create',
@@ -147,15 +156,6 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     title: '高级设置',
     content:
       '点开可配置检查助手(启停 / 评估模型 / 允许自行验证)与执行命令确认模式。检查助手默认在后台质检 AI助手 的产出;关闭后进入单 agent 模式,AI助手 跑 1 轮直接产出结果。',
-  },
-  {
-    id: 'create-react-executor',
-    target: 'create-react-executor',
-    route: 'task-create',
-    placement: 'right',
-    title: '执行器(AI助手)',
-    content:
-      '选择执行器:内置 AI助手直接用上面的模型;若已配置外部 CLI(Qoder / DeepSeek / Codex),可在此切换,模型由 CLI 账号或环境变量管理。',
   },
   {
     id: 'create-input',

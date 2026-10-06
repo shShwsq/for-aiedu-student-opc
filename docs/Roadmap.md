@@ -334,7 +334,7 @@ uvicorn app.main:app --reload
 - **任务运行中弹窗**:QuestionDialog(澄清提问)/ ChecklistReviewDialog(checklist 确认)/ VerifyActionDialog(verifier 授权)/ CommandConfirmDialog(local 模式危险命令 + sandbox 模式内置 react_agent `per_command` + CLI `per_command` 命令确认)
 - **技能管理页**:SkillManagementView,用户上传 / 编辑自定义 skill(SKILL.md),隔离存储
 - **记忆管理页**:MemoryManagementView,管理用户偏好 / 全局记忆 / 项目记忆三类长期记忆
-- **智能体策略页**:CollaborationPolicyView,配置评估频率 + 验证权限 + verifier 测试环境 + 登录 token + AI助手命令确认模式
+- **智能体策略页**:AgentPolicyPanel,配置评估频率 + 验证权限 + verifier 测试环境 + 登录 token + AI助手命令确认模式
 
 ---
 
