@@ -467,7 +467,7 @@ def test_record_conversation_publishes_superset_payload(monkeypatch):
 
 
 def test_record_conversation_publish_event_off(monkeypatch):
-    """publish_event=False:只落库不推(thinking 场景,流式卡片已展示)。"""
+    """publish_event=False:只落库不推事件(thinking 不再用此模式,见 test_thinking_persistence)。"""
     from app.agents.runtime import conversation as rt_conv
 
     class _FakeConv:

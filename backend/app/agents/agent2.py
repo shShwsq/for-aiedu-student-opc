@@ -171,6 +171,38 @@ def build_tool_window_section(
 # ============================================================
 
 
+def _record_agent2_thinking(
+    db: Session | None,
+    task: Task | None,
+    task_id: UUID | str,
+    round_idx: int,
+    reasoning_chunk: str,
+) -> None:
+    """落库一次流式调用的真实思考链(逐次写,不攒到审查结束)
+
+    为什么逐次落库:一次审查动辄数分钟、多次 LLM 调用(只读核查/动态验证/
+    引用复核各带一段思考)。攒到最后一次性写有两个恶果——
+    1. 中途刷新页面/离开详情页再回来的用户,侧栏既没有流式卡片(组件卸载)
+       也没有历史记录,整段审查过程看起来"消失"了;
+    2. parse_failed / 降级 / 被新一轮接管等提前 return 路径根本走不到写库
+       那一行,思考链直接丢失。
+
+    推 conversation 事件(不推则实时流式卡片永远退不掉,或反过来要等整页
+    快照才补上这段思考),前端按 reasoning 文本对账退役实时卡片。
+    落库失败不影响审查(review 结论才是主产物)。
+    """
+    if db is None or task is None or not reasoning_chunk.strip():
+        return
+    try:
+        record_conversation(
+            db, task,
+            round_idx=round_idx, role="agent2", type="thinking",
+            content="", reasoning=reasoning_chunk,
+        )
+    except Exception as e:
+        logger.warning(f"[task={task_id}] 落库 agent2 思考链失败(忽略): {e}")
+
+
 def run_agent2(
     user_intent: str,
     agent1_summaries: list[dict[str, Any]],
@@ -344,7 +376,6 @@ def run_agent2(
     read_tool_count = 0
     verify_count = 0
     reference_count = 0
-    reasoning_parts: list[str] = []  # 各次流式调用的真实思考链(含工具循环)
     degraded_error: Exception | None = None
     while True:
         try:
@@ -366,7 +397,9 @@ def run_agent2(
                 )
                 break
         if reasoning_chunk:
-            reasoning_parts.append(reasoning_chunk)
+            # 思考链逐次落库(见 _record_agent2_thinking:刷新/中途离开页面可见,
+            # 且降级/解析失败提前 return 时已写下的部分不丢)
+            _record_agent2_thinking(db, task, task_id, round_idx, reasoning_chunk)
 
         # 兜底:结构化 tool_calls 为空但 content 里有 Hermes 风格文本
         # 工具调用块(GLM/Qwen 思考模式把工具调用写在正文,而非走结构化
@@ -598,23 +631,9 @@ def run_agent2(
             "parse_failed": True,
         }
 
-    # 落库真实思考链(供前端刷新后还原思考卡片,与 agent1 thinking 同机制)。
-    # 不推 SSE:流式期间已通过 thinking_delta 在流式卡片展示,推送会重复。
-    # 结构化评估记录仍由 orchestrator._record_agent2 落库(跨轮记忆依赖)。
-    reasoning_full = "\n\n".join(p for p in reasoning_parts if p.strip())
-    if db is not None and task is not None and reasoning_full:
-        try:
-            db.add(Conversation(
-                task_id=task.id,
-                round_idx=round_idx,
-                role="agent2",
-                type="thinking",
-                content="",
-                reasoning=reasoning_full,
-            ))
-            db.commit()
-        except Exception as e:
-            logger.warning(f"[task={task_id}] 落库 agent2 思考链失败(忽略): {e}")
+    # 真实思考链已在上方循环里逐次落库(_record_agent2_thinking),
+    # 此处不再攒一份"整轮一条"——那样降级/解析失败会整段丢失。
+    # 结构化评估记录仍由 orchestrator._record_agent2_review 落库(跨轮记忆依赖)。
 
     # 规整输出(suggestions/results/grouping 缺失时补默认值,
     # suggestions 非法类型时丢弃),保证调用方拿到结构一致的 dict

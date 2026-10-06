@@ -404,7 +404,7 @@ def run_react_agent(
 
         # 流式调用 LLM,累积 reasoning / content / tool_calls
         # 同时通过 event_bus 实时推送 thinking_delta 给前端
-        reasoning_full, content_full, tool_calls_full, finish_reason, _conv_id = _stream_llm_response(
+        reasoning_full, content_full, tool_calls_full, finish_reason, conv_id = _stream_llm_response(
             client, task, db, round_idx, iteration, messages, tools
         )
 
@@ -427,15 +427,16 @@ def run_react_agent(
         messages.append(assistant_msg)
 
         # 落库思考(content + reasoning),供刷新页面后查看
-        # 不推送 SSE!流式卡片已经完整展示了 content + reasoning,
-        # 再推 conversation 事件会重复。迟到订阅者通过 GET /tasks/{id} 快照拿完整对话。
+        # 同时推 conversation 事件:流式卡片按 conv_id 退役为只读历史卡片,
+        # 中途离开详情页再回来的订阅者(没收到这次的 thinking_delta 增量)
+        # 也只有在这条事件到达时才能看到这段思考,否则要等下一次整页快照。
         if content_full or reasoning_full:
             _add_conversation(
                 db, task, round_idx=round_idx,
                 role="agent1", type="thinking",
                 content=content_full,
                 reasoning=reasoning_full,
-                publish_event=False,
+                stream_conv_id=conv_id,
             )
             # 提取计划清单(复杂任务时 react_agent 会在 content 里输出 <plan>...</plan>)
             # 合并 LLM 显式更新到 current_plan(信任 LLM 的 done 标注),
@@ -682,14 +683,15 @@ def _stream_llm_response(
     测试与扩展点仍可按模块属性替换。实际收 chunk / 推 thinking_delta /
     工具调用跨 chunk 累积 / perf 打点均由 runtime.stream_llm 统一实现。
 
-    返回 (reasoning_full, content_full, tool_calls_full, conv_id, finish_reason)
+    返回 (reasoning_full, content_full, tool_calls_full, finish_reason, conv_id)
         - reasoning_full: 完整思考链(落库供回看)
         - content_full: 完整回答内容
         - tool_calls_full: 完整工具调用列表
             [{"id": str, "name": str, "arguments_str": str, "index": int}]
-        - conv_id: 这次 LLM 调用的标识(供调试/日志,前端不再用于去重)
         - finish_reason: 流结束原因('stop' / 'tool_calls' / 'length' 等),
             供调用方判断"模型是否主动结束"。None 表示异常中断。
+        - conv_id: 这次 LLM 调用的流式卡片标识,落库 thinking 时作为
+            stream_conv_id 一起推给前端,供实时卡片与历史记录对账退役
     """
     result = stream_llm(
         client, messages,
@@ -700,8 +702,8 @@ def _stream_llm_response(
         result.reasoning,
         result.content,
         result.tool_calls,
-        result.conv_id,
         result.finish_reason,
+        result.conv_id,
     )
 
 

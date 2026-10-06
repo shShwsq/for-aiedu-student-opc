@@ -265,6 +265,13 @@ export interface ConversationEventData {
   tool_call_id?: string | null
   /** 仅 user 追问消息有:附带上传文件展示信息 */
   attachments?: AttachmentInfo[] | null
+  /**
+   * 仅 type=thinking 有:落库前那次流式 thinking_delta 的 conv_id。
+   * 前端据此把对应的实时流式卡片退役成只读历史卡片(避免同一思考双份);
+   * 无此字段时按 reasoning/content 文本对账(见 utils/thinkingReconcile)。
+   * 老任务/老后端为 undefined,文本对账仍可用。
+   */
+  stream_conv_id?: string | null
   created_at: string | null
 }
 

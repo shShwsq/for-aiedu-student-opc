@@ -98,7 +98,7 @@
 - **重点与知识点产出(审查完成时 results)**:从全程提炼 **3-8 条精选知识点**,不是全量发现清单;每条 metadata 含 `learning_note`(必有,学习价值说明)、`practice_worthy: true`(默认)、可选 severity/file_path/line/verified/ref_* 系列。grouping 默认 null(平铺),仅安全审计类按严重度分组对用户有帮助时才声明
 - **题目与知识点生成**:任务完成后由 orchestrator 调用 practice 服务(实现位于 `app/services/practice/`)生成练习题与知识点,选题优先覆盖 practice_worthy 标记的知识点
 - **审查维度自定**：无预定义覆盖度清单，agent2 每次评估时根据用户意图自行确定应覆盖的审查维度（3-8 个为宜），跨轮保持维度 id 稳定
-- **流式输出**：`_stream_agent2_llm`（runtime.stream_llm 薄包装）收 token，实时推送 `thinking_delta` 事件给前端（Agent2Panel 侧栏渲染）；content 为最终评估 JSON 不进流式卡片，只展示思考链
+- **流式输出**：`_stream_agent2_llm`（runtime.stream_llm 薄包装）收 token，实时推送 `thinking_delta` 事件给前端（Agent2Panel 侧栏渲染）；content 为最终评估 JSON 不进流式卡片，只展示思考链。思考链**逐次流式调用即落库并推 `conversation` 事件**（`_record_agent2_thinking`）——审查动辄数分钟多次调用，攒到末尾一条会因 parse_failed/降级提前 return 整段丢失，中途刷新页面也会看不见已生成的部分
 - **跨轮记忆**：第 2 轮起注入自己之前各轮的审查记录(type=review;兼容旧版 type=evaluation),避免 covered/missing 反复摇摆
 
 ### 2.2 输入参数（`run_agent2`）
@@ -196,6 +196,7 @@ def run_agent2(
 - `type=review`：审查结论卡（content 精简显示,reasoning 含已覆盖/未覆盖/判断,供刷新页面回看 + 跨轮记忆加载）
 - `type=suggestions`：建议深挖方向(JSON,前端渲染成卡片+深挖按钮)
 - `type=summary`：最终总结卡(侧栏 summaries 分组)
+- `type=thinking`（`_record_agent2_thinking`,与上面三条职责不同）：真实思考链,**每次流式调用一条**(content 为空,reasoning 为该次 reasoning_content),落库即推 `conversation` 事件供侧栏 Agent2Panel 还原;动态验证的 `role=agent2, type=thinking`(content 带 `[验证结果]` 前缀)同机制。主对话流不展示 agent2 的 thinking(`isAgent2Followup` 只放行真追问 evaluation)
 
 ### 2.8 引用复核（`check_reference`）
 
@@ -333,8 +334,8 @@ def run_react_agent(
 每个迭代：
 1. **暂停检查点**：`wait_if_paused(task.id)`（粗粒度，工具调用前还有细粒度检查点）
 2. **用户补充消息注入**：`drain_user_messages(task.id)` 取用户在运行中/暂停中追加的消息：先按 `message_id` 查回已落库的 Conversation 逐条补推 `conversation` 事件（待处理条目转入对话流，推送失败仅记日志）；若本批消息带附件，先把新 `upload_ids` **全量累积**写入 `params.followup_upload_ids`（先落库再传输，保证与沙箱回收重放/工作区回退浏览同一布局）并 `add_uploads_to_workspace` 传进 `followup_uploads/`，拼接 `FOLLOWUP_ATTACHMENT_NOTE` 目录提示；最后经 `format_injected_user_messages` 合并为一条 user 消息注入 `messages`（附件传输失败 catch+log，不中断本轮，文字消息照常注入）
-3. **流式调 LLM**：`_stream_llm_response` 返回 `reasoning_full / content_full / tool_calls_full / finish_reason`
-4. **落库 thinking**：`type=thinking, publish_event=False`（流式卡片已展示，避免重复推 SSE）
+3. **流式调 LLM**：`_stream_llm_response` 返回 `reasoning_full / content_full / tool_calls_full / finish_reason / conv_id`（顺序即解包顺序，`finish_reason` 排在 `conv_id` 前）
+4. **落库 thinking**：`type=thinking` + `stream_conv_id=conv_id`，**并推 `conversation` 事件**：`thinking_delta` 是高频瞬时事件、事件总线不缓存，中途离开详情页再回来的订阅者只能靠这条落库事件补上那段思考；前端按 `stream_conv_id`（无则按文本）把对应的实时流式卡片退役成只读历史卡片，不会双份
 5. **提取 plan**：`_extract_plan(content_full)`（[runtime/plan.py](../backend/app/agents/runtime/plan.py) `extract_plan`，与 CLI 侧共用）从 `<plan>...</plan>` 块解析，`_merge_plan` 合并到 `current_plan`
 6. **tool_calls 兜底**：结构化 `tool_calls_full` 为空时，从 content 文本解析 `<tool_call>` 块
 7. **结束判断**：`not tool_calls_full` 时先看遗留消息守卫 `has_pending_messages(task.id)`——本迭代 drain 之后、最终答案生成期间到达的消息 → **不结束，`continue` 下一迭代顶部 drain 后同轮处理**；无遗留则结束（`finish_reason=length` 只记 warning 降级，同样用 `content_full` 作 summary 退出，不会重试补完）
@@ -469,7 +470,7 @@ ExecutorAgent (ABC)
 | `plan` | `plan` | 否 |
 | `error` | `thinking_delta(phase=error)` | 否 |
 
-**迭代切段**：ACP 一次 prompt 内部可能含多次 ReAct 迭代（thought → message → tool_call → tool_result → ...）。按 `tool_call` 切段：每遇到 `tool_call` 就结束当前迭代（推 `phase=end` + 落库一条 thinking），开启新迭代（新 `conv_id`），让前端以独立流式卡片展示。
+**迭代切段**：ACP 一次 prompt 内部可能含多次 ReAct 迭代（thought → message → tool_call → tool_result → ...）。按 `tool_call` 切段：每遇到 `tool_call` 就结束当前迭代（推 `phase=end` + 落库一条 thinking 并推 `conversation` 事件，事件带本迭代的 `stream_conv_id`），开启新迭代（新 `conv_id`），让前端以独立流式卡片展示。
 
 **工具调用解析**：
 - Qoder：`rawInput` 在 `tool_call` 事件一次性给出
@@ -748,7 +749,7 @@ list of `{label, header_name, header_value}`：
 | 思考增量 | `thinking_delta(role=agent2, verify=true, phase=reasoning/content)` | （累积到 reasoning_buf） |
 | 工具调用 | `conversation(role=agent2, type=tool_call, verify=true)` | 是（人类可读描述如「验证请求: GET /api/users [http_request]」） |
 | 工具结果 | `conversation(role=agent2, type=tool_result, verify=true)` | 是（超 5000 字符截断；runtime 统一落库，tool_call_id 与 tool_call 配对） |
-| 思考完成 | （隐含 phase=end） | `role=agent2, type=thinking, content="[验证结果] ..."` |
+| 思考完成 | （隐含 phase=end） | `role=agent2, type=thinking, content="[验证结果] ..."`，落库即推 `conversation` 事件（无 `stream_conv_id`，前端按 reasoning/content 文本对账退役实时卡片） |
 
 ### 5.6 输出
 

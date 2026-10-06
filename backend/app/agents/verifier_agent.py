@@ -338,8 +338,10 @@ def _record_verifier_thinking(
 ) -> None:
     """落库 verifier_agent 的思考/总结(runtime.record_conversation 统一实现)
 
-    对用户透明(role=agent2, type=thinking);不推 SSE——流式卡片已展示
-    验证过程,推送会重复(与 react_agent 的 thinking 同策略)。
+    对用户透明(role=agent2, type=thinking)。推 conversation 事件:验证过程
+    动辄数分钟,中途离开详情页再回来的订阅者收不到 thinking_delta 增量
+    (总线不缓存),只能靠这条落库事件看到已完成的这段验证思考;前端按
+    reasoning/content 文本对账退役对应的实时卡片,不会重复展示。
     """
     record_conversation(
         db, task, round_idx=round_idx,
@@ -349,7 +351,6 @@ def _record_verifier_thinking(
             if not content.startswith("[验证") else content
         ),
         reasoning=reasoning or None,
-        publish_event=False,
     )
 
 

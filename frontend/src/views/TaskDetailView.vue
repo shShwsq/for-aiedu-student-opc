@@ -13,8 +13,9 @@
  * 流式思考显示(thinking_delta):
  * - 一次 LLM 调用对应一个 conv_id,前端按 conv_id 累积 reasoning + content
  * - 流式期间以"流式思考卡片"显示打字机效果
- * - 思考链同时以 type=thinking 落库(agent1 / agent2),
- *   刷新页面后从 GET /tasks/{id} 还原为只读流式卡片
+ * - 思考链同时以 type=thinking 落库,落库即推 conversation 事件
+ *   (带 stream_conv_id),前端据此把实时卡片退役成只读历史卡片;
+ *   刷新/中途离开页面再回来时由 GET /tasks/{id} 快照还原同一批卡片
  */
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -55,6 +56,7 @@ import { extractErrorMessage } from '@/utils/error'
 import { parseDiffFileSegments } from '@/utils/diffFiles'
 import { renderMarkdown } from '@/utils/markdown'
 import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
+import { findRetiredCardConvId } from '@/utils/thinkingReconcile'
 import type {
   AttachmentInfo,
   CloneProgressEventData,
@@ -620,9 +622,22 @@ function connectSSE(taskId: string): void {
           (m) => m.id !== data.id,
         )
       }
+      // 去重:刷新/中途离开详情页再回来时,快照已含全部落库记录,
+      // 而事件总线的历史补播会把同一条 conversation 事件再推一遍
+      // (重复 id 直接忽略,否则对话流里出现两条一模一样的消息)
+      if (task.value.conversations.some((c) => c.id === data.id)) return
+      // 思考落库:退役与之对应的实时流式卡片(否则同一段思考会以
+      // "实时卡片 + 只读历史卡片"两份出现在对话流里)。
+      // 内置 react_agent 与 CLI 执行器带 stream_conv_id 精确匹配;
+      // agent2 审查/动态验证拿不到该 id,按 reasoning/content 文本对账。
+      if (data.type === 'thinking') {
+        const retired = findRetiredCardConvId(streamingItems.values(), data)
+        if (retired) streamingItems.delete(retired)
+      }
       // 追加到对话列表
-      // 注意:agent1 的 type=thinking 不走 SSE 推送(已在流式卡片展示),
-      // 这里收到的都是其他类型(工具调用/结果/提交/用户指令/agent2 评估等)
+      // 注意:type=thinking 的落库记录也会走这里 —— 它是"中途离开页面再回来"
+      // 时那段思考的唯一实时来源(thinking_delta 增量是瞬时的,总线不缓存,
+      // 断线期间的增量永远收不到),不推就得等下一次整页快照才显示。
       const conv: Conversation = {
         id: data.id,
         round_idx: data.round_idx,
@@ -846,7 +861,8 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
   } else if (phase === 'end') {
     // 流式结束:标记完成,reasoning 自动折叠(只显示标题和字数提示)
     // 不移除卡片:它是本次会话内唯一的实时展示载体;
-    // 刷新页面后由落库的 type=thinking 记录还原为只读卡片
+    // 落库后收到同一段的 conversation 事件时退役(见 onConversation),
+    // 中途离开页面再回来则由快照还原为只读卡片
     cur.status = 'done'
     cur.finished_at = new Date().toISOString()
     cur.reasoning_expanded = false
@@ -1524,8 +1540,10 @@ const roundGroups = computed<RoundGroup[]>(() => {
   const groups = new Map<number, DisplayItem[]>()
 
   // 加入正式对话:
-  // - type=thinking 且有 reasoning → 转成流式卡片样式展示(只读,状态 done,reasoning 折叠)
-  //   这样刷新页面后历史的思考过程仍以流式卡片的形式展示,和实时流式视觉一致
+  // - type=thinking 且有 reasoning/content → 转成流式卡片样式展示(只读,状态 done,reasoning 折叠)
+  //   这样刷新页面后历史的思考过程仍以流式卡片的形式展示,和实时流式视觉一致;
+  //   只有 content 没有思考链也算(非思考型模型/CLI 只出正文的迭代,
+  //   实时阶段本来就是卡片形态,落库后不该降级成普通消息气泡)
   // - role=user type=question(用户指令) → 跳过,单独提取到顶部 userDirective 显示
   // - 其他类型 → 正常对话项
   //
@@ -1548,14 +1566,14 @@ const roundGroups = computed<RoundGroup[]>(() => {
     // insertSeq 定位错位。
     if (c.role === 'agent2' && !isAgent2Followup(c)) return
 
-    if (c.type === 'thinking' && c.reasoning) {
+    if (c.type === 'thinking' && (c.reasoning?.trim() || c.content?.trim())) {
       // 还原为流式卡片(只读模式)
       const historyConvId = `history:${c.id}`
       const streamingItem: StreamingItem = {
         conv_id: historyConvId,
         round_idx: c.round_idx,
         role: c.role as 'agent1' | 'agent2',
-        reasoning: c.reasoning,
+        reasoning: c.reasoning ?? '',
         content: c.content,
         status: 'done',
         started_at: c.created_at,

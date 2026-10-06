@@ -1567,11 +1567,17 @@ class _ACPCollector:
         self._iter_started = True
 
     def _flush_iteration(self) -> None:
-        """结束当前迭代:推送 phase=end + 落库 thinking(若有内容)"""
+        """结束当前迭代:推送 phase=end + 落库 thinking(若有内容)并推 conversation
+
+        落库事件带 stream_conv_id(即本迭代的流式卡片 id):前端据此把实时
+        流式卡片退役成只读历史卡片;中途离开详情页再回来的订阅者收不到
+        thinking_delta 增量(总线不缓存),只能靠这条 conversation 事件补上。
+        """
         if not self._iter_started:
             return
+        stream_conv_id = self.current_conv_id
         publish(self.task.id, "thinking_delta", {
-            "conv_id": self.current_conv_id,
+            "conv_id": stream_conv_id,
             "round_idx": self.round_idx,
             "role": "agent1",
             "phase": "end",
@@ -1585,7 +1591,7 @@ class _ACPCollector:
                 role="agent1", type="thinking",
                 content=self.content_buf,
                 reasoning=self.reasoning_buf,
-                publish_event=False,
+                stream_conv_id=stream_conv_id,
             )
         self._iter_started = False
 
