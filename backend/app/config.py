@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     # (详见 app/git_provider.py request_json)。0=不重试。
     GIT_OAUTH_MAX_RETRIES: int = 2
 
+    # 调用 Git 平台接口时走的代理,如 http://127.0.0.1:7890(Clash/v2rayN 的 HTTP 混合端口)。
+    # 只作用于 GitHub/Gitee 的 OAuth 与 API 调用:挂全局 HTTPS_PROXY 会连带影响 LLM /
+    # 沙箱 / ACP 的 httpx 客户端,而需要翻出去的往往只有 github.com 这一个域
+    # (Gitee 是国内直连,走代理反而变慢)。
+    # 留空则沿用系统 HTTP_PROXY/HTTPS_PROXY 环境变量(httpx trust_env 默认开启)。
+    GIT_OAUTH_PROXY: str = ""
+
     # LLM(阶段 1:开发期单 provider 配置)
     LLM_PROVIDER: str = "dashscope"
     LLM_API_KEY: str = ""

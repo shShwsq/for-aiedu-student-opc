@@ -287,6 +287,67 @@ def test_github_network_failure_is_unavailable(patched):
 
 
 # ============================================================
+# 4xx detail:平台正文里的原因必须带出来(Gitee 把多种成因收敛成同一个 401)
+# ============================================================
+
+
+def test_4xx_json_body_reason_is_appended(patched):
+    """实测:Gitee 的 401 只报状态码等于没报,原因在正文 error_description 里"""
+    patched["install"]([_resp(401, {
+        "error": "invalid_request",
+        "error_description": "授权方式无效，或者登录回调地址无效、过期或已被撤销",
+    })])
+    with pytest.raises(GitProviderError) as ei:
+        _call("POST", idempotent=False)
+    msg = str(ei.value)
+    assert "401" in msg
+    assert "回调地址无效" in msg
+
+
+def test_4xx_html_body_is_stripped_and_truncated(patched):
+    """网关/代理的错误页:剥掉标签后截断进 detail,不把整页 HTML 塞给前端"""
+    patched["install"]([_resp(400, text="<html><body>" + "redirect_uri mismatch " * 50 + "</body></html>")])
+    with pytest.raises(GitProviderError) as ei:
+        _call("POST", idempotent=False)
+    msg = str(ei.value)
+    assert "redirect_uri mismatch" in msg
+    assert "<html>" not in msg
+    assert len(msg) < 500
+
+
+def test_4xx_detail_drops_mdn_boilerplate(patched):
+    """raise_for_status 尾部的 MDN 链接对排查无益,还会让 detail 变成多行"""
+    patched["install"]([_resp(401, text="unauthorized")])
+    with pytest.raises(GitProviderError) as ei:
+        _call("POST", idempotent=False)
+    assert "developer.mozilla.org" not in str(ei.value)
+    assert "\n" not in str(ei.value)
+
+
+def test_4xx_detail_redacts_credentials_echoed_by_platform(patched):
+    """detail 会透出到前端:平台回显请求参数时不能把 client_secret 一起带出去"""
+    patched["install"]([_resp(401, {
+        "error_description": "client_secret=supersecretvalue 校验不通过",
+    })])
+    with pytest.raises(GitProviderError) as ei:
+        _call("POST", idempotent=False)
+    msg = str(ei.value)
+    assert "supersecretvalue" not in msg
+    assert "client_secret=***" in msg
+
+
+def test_4xx_empty_body_keeps_status_only(patched):
+    """平台 4xx 无正文:不编造原因,只给 raise_for_status 的口径"""
+    patched["install"]([httpx.Response(
+        404, request=httpx.Request("POST", "https://example.test/x")
+    )])
+    with pytest.raises(GitProviderError) as ei:
+        _call("POST", idempotent=False)
+    assert "平台返回" not in str(ei.value)
+    assert "404" in str(ei.value)
+
+
+# ============================================================
 # 路由层映射:GitProviderError → 状态码
 # ============================================================
 

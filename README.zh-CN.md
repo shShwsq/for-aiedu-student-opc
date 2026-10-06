@@ -181,13 +181,15 @@ GitHub 和 Gitee 二者均支持,按需配置。留空的平台对应路由会�
 | `GITEE_OAUTH_CLIENT_SECRET` | Gitee 第三方应用 Client Secret |
 | `GITEE_OAUTH_REDIRECT_URI` | Gitee 回调地址,默认 `http://localhost:5173/auth/gitee/callback` |
 | `GIT_OAUTH_MAX_RETRIES` | 平台接口传输层失败(连不上 / 超时 / 5xx)的额外重试次数,`0`=不重试。仅对「重复发送安全」的请求重试:单次有效的授权码换 token 不重发 |
+| `GIT_OAUTH_PROXY` | Git 平台接口专用代理(仅 GitHub/Gitee 的 OAuth 与 API),如 `http://127.0.0.1:7890`。到 github.com 的 TLS 握手被链路卡住时填它;不要挂全局 `HTTPS_PROXY`(会连带改变 LLM / 沙箱 / ACP 的出站路径),留空则沿用系统代理环境变量 |
 
 > **错误码约定**(见 [backend/app/git_errors.py](backend/app/git_errors.py))
-> - `400`:平台明确拒绝——授权码失效 / 已被用过(刷新回调页、浏览器后退重放 `?code=` 最常见)、scope 不足
+> - `400`:平台明确拒绝——授权码失效 / 已被用过(刷新回调页、浏览器后退重放 `?code=` 最常见)、回调地址与授权时不一致、凭证或 scope 不对。Gitee 把这几种收敛成同一个 401,因此 detail 会附上平台正文里的原因(凭证已脱敏),无需再手工 curl 复现
 > - `401`:`/git/{provider}/repos`、`/refresh` —— 平台判定 token 已失效,需重新绑定
 > - `409`:`{provider}/bind` 该 Git 账号已被其他用户绑定;登录时同邮箱账号已绑另一个平台账号
 > - `502` / `504`:连不上 GitHub/Gitee、TLS 握手被重置、读超时、平台 5xx —— 与你的授权码和 `.env` 配置无关,稍后重试即可
 > 两类都会在后端记 `warning` 日志(含根因与 user_id),排查时看控制台/日志而不是只看访问日志的状态码。
+> 日志已做凭证脱敏:Gitee 把 `access_token` 放在 URL query 上,httpx 的 INFO 日志会带出完整 URL,统一在 handler 层过滤成 `***`(见 [backend/app/log_redaction.py](backend/app/log_redaction.py))。
 
 > **OAuth 应用配置要点**
 > - GitHub:Authorization callback URL 填后端 `GITHUB_OAUTH_REDIRECT_URI` 的值

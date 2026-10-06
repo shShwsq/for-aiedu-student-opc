@@ -181,13 +181,15 @@ Both GitHub and Gitee are supported; configure as needed. Platforms left empty w
 | `GITEE_OAUTH_CLIENT_SECRET` | Gitee third-party app Client Secret |
 | `GITEE_OAUTH_REDIRECT_URI` | Gitee callback URL, defaults to `http://localhost:5173/auth/gitee/callback` |
 | `GIT_OAUTH_MAX_RETRIES` | Extra retries when the transport layer fails against the platform (unreachable / timeout / 5xx); `0` disables retries. Only requests that are safe to repeat are retried — a single-use authorization code is never re-sent |
+| `GIT_OAUTH_PROXY` | Proxy for Git platform calls only (GitHub/Gitee OAuth + API), e.g. `http://127.0.0.1:7890`. Set it when the TLS handshake to github.com stalls; do **not** set a global `HTTPS_PROXY` — that would also reroute LLM / sandbox / ACP traffic. Empty falls back to the system proxy env vars |
 
 > **Error code contract** (implementation: [backend/app/git_errors.py](backend/app/git_errors.py))
-> - `400`: the platform clearly rejected the request — authorization code expired or already used (refreshing the callback page / navigating back onto a `?code=` URL is the usual cause), insufficient scope
+> - `400`: the platform clearly rejected the request — authorization code expired or already used (refreshing the callback page / navigating back onto a `?code=` URL is the usual cause), callback URL differing from the one used at authorize time, wrong credentials or insufficient scope. Gitee collapses all of these into one 401, so the detail now appends the platform's own reason text (credentials redacted) instead of requiring a manual curl repro
 > - `401`: `/git/{provider}/repos` and `/refresh` — the platform considers the token dead, re-bind required
 > - `409`: `/git/{provider}/bind` — that Git account is already bound to another user; on login, the matching e-mail account is already bound to a different platform account
 > - `502` / `504`: cannot reach GitHub/Gitee, TLS handshake reset, read timeout, platform 5xx — unrelated to your authorization code or `.env`, just retry later
 > Both classes log a backend `warning` with the root cause and `user_id`, so troubleshooting reads the console/log instead of guessing from an access-log status code.
+> Logs are credential-redacted: Gitee passes `access_token` in the URL query and httpx logs the full URL at INFO, so values are filtered to `***` at the handler level (see [backend/app/log_redaction.py](backend/app/log_redaction.py)).
 
 > **OAuth app configuration notes**
 > - GitHub: set the Authorization callback URL to the value of `GITHUB_OAUTH_REDIRECT_URI`

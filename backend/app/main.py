@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.database import Base, engine
+from app.log_redaction import install_log_redaction
 from app.routers import agent_configs, auth, health, skills, tasks
 from app.routers import git_provider as git_provider_router
 from app.routers import model_configs as model_configs_router
@@ -25,6 +26,11 @@ logging.basicConfig(
     level=_log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+# 凭证脱敏:Gitee 把 access_token 放在 URL query 上,httpx 会把完整 URL 打进
+# INFO 日志(生产默认级别),长期有效的 token 因此落到日志文件/采集链路里。
+# 统一在 handler 上过滤,详见 app/log_redaction.py
+install_log_redaction()
 
 # 出题链路专用滚动日志:logs/practice_generate.log(与 perf.log 同目录约定)
 # 排查“一道题也没生成”需要持久化记录:模型解析/工作区状态/每条 finding 的
@@ -44,6 +50,7 @@ try:
     # 挂到出题相关 logger:services.practice(generator/auto_generate/jobs)
     # 与 routers.practice(job 线程);文件 handler 随 INFO 级别全量落盘
     _practice_handler.setLevel(logging.INFO)
+    install_log_redaction(_practice_handler)
     for _name in ("app.services.practice", "app.routers.practice"):
         logging.getLogger(_name).addHandler(_practice_handler)
 except Exception:  # 日志落盘失败不影响应用启动

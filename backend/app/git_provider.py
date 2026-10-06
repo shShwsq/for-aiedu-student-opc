@@ -34,6 +34,7 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.log_redaction import redact_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,17 @@ _RETRY_BUDGET_SECONDS = 24.0
 
 
 def _open_client(timeout: float) -> httpx.Client:
-    """单独成函数便于测试替换(不在 httpx 模块层面打补丁)"""
+    """单独成函数便于测试替换(不在 httpx 模块层面打补丁)
+
+    GIT_OAUTH_PROXY 只给 Git 平台调用加代理:实测 github.com 的 TLS 握手会
+    被链路卡住(10s 无 ServerHello),而同一进程里 Gitee 200ms 就走完 —— 这是
+    域级链路问题,挂全局 HTTPS_PROXY 会连带改变 LLM / 沙箱 / ACP 的出站路径,
+    风险远大于收益。显式配了代理时关掉 trust_env,避免系统 HTTP_PROXY 与
+    NO_PROXY 把这份配置悄悄顶掉。
+    """
+    proxy = (settings.GIT_OAUTH_PROXY or "").strip()
+    if proxy:
+        return httpx.Client(timeout=timeout, proxy=proxy, trust_env=False)
     return httpx.Client(timeout=timeout)
 
 
@@ -126,6 +137,72 @@ def _parse_json(response: httpx.Response, label: str) -> Any:
             f"{label}: 平台响应不是合法 JSON({str(response.text)[:120]})",
             timeout=False,
         ) from e
+
+
+# 4xx 正文里透出给用户的最大长度:平台错误页可能是整段 HTML,截断后再进 detail
+_MAX_REASON_CHARS = 200
+
+# 平台错误体里表示「原因」的字段(Gitee/GitHub 命名不统一,按信息量从高到低取第一个非空)
+_REASON_KEYS = ("error_description", "message", "error", "description")
+
+
+def _truncate(text: str) -> str:
+    """折叠空白 + 截断,避免把整段 HTML 错误页塞进一行日志/前端 detail"""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= _MAX_REASON_CHARS:
+        return collapsed
+    return collapsed[:_MAX_REASON_CHARS] + "…"
+
+
+def _extract_error_reason(response: httpx.Response) -> str:
+    """从 4xx 响应体里抽出平台给出的原因,拿不到则返回空串
+
+    Gitee 的 /oauth/token 把「回调地址不匹配」「授权码已被用过」「Client Secret
+    不对」收敛成同一个 401,区分信息只在正文里(error_description / message 字段)。
+    丢掉正文就等于把三种成因完全不同的故障报成同一句话 —— 实测这次 401 只能靠
+    curl 手工复现才知道原因。
+    """
+    body = (response.text or "").strip()
+    if not body:
+        return ""
+    try:
+        data = response.json()
+    except ValueError:
+        # 网关/代理返回的错误页:剥掉标签的截断正文仍比只报状态码有用
+        return _truncate(re.sub(r"<[^>]+>", " ", body))
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            # 少数端点把原因嵌在 error 对象里
+            nested = err.get("message") or err.get("code")
+            if nested:
+                return _truncate(str(nested))
+        for key in _REASON_KEYS:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return _truncate(value)
+        # 结构不认识:退化为截断后的原文,至少比「什么都没有」更接近根因
+    return _truncate(body)
+
+
+def _describe_4xx(response: httpx.Response) -> str:
+    """4xx 的可读描述:沿用 raise_for_status 的口径,再补上平台正文里的原因
+
+    正文与 URL 都过一遍 redact_secrets:平台可能把请求参数原样回显,而 Gitee 的
+    revoke URL 把 access_token 放在**路径**上,原样透出到前端 detail 不安全
+    (见 app/log_redaction.py)。
+
+    raise_for_status 的原文尾部是 "\nFor more information check:
+    https://developer.mozilla.org/...",对排查无用还会把多行文本塞进前端 detail,
+    这里只留第一行。
+    """
+    try:
+        response.raise_for_status()
+        base = f"HTTP {response.status_code}"  # 理论上到不了(4xx 必抛)
+    except httpx.HTTPStatusError as e:
+        base = str(e).split("\nFor more information check", 1)[0].strip()
+    reason = _extract_error_reason(response)
+    return redact_secrets(f"{base}(平台返回:{reason})" if reason else base)
 
 
 def request_json(
@@ -226,11 +303,10 @@ def request_json(
                 f"{label}: {failure}", timeout=False
             ) from failure
         if 400 <= code < 500 and code not in ok_statuses:
-            # 平台明确拒绝:授权码/凭证/scope 问题,消息沿用 raise_for_status 口径
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                raise GitProviderError(f"{label}: {e}") from e
+            # 平台明确拒绝:授权码/凭证/scope 问题,重试不会改变结果。
+            # 正文里的原因要带出来 —— Gitee 把「回调地址不匹配 / 授权码已用过 /
+            # 凭证不对」全收敛成同一个 401,只报状态码等于没报(见 _describe_4xx)
+            raise GitProviderError(f"{label}: {_describe_4xx(response)}")
         if response.content and expect_json:
             return code, _parse_json(response, label)
         return code, None
@@ -606,9 +682,14 @@ class GiteeProvider(GitProvider):
             raise GitProviderError(
                 "Gitee OAuth 未配置:请在 .env 设置 GITEE_OAUTH_CLIENT_ID 和 GITEE_OAUTH_CLIENT_SECRET"
             )
+        # 应用凭证必须一起带上:Gitee 的 /oauth/token 在 grant_type=refresh_token 时
+        # 同样校验 client_id/client_secret,只传 refresh_token 会被回 401
+        # (与换 token 同一个端点,报错文案笼统,看不出是缺参数)
         payload = {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
+            "client_id": settings.GITEE_OAUTH_CLIENT_ID,
+            "client_secret": settings.GITEE_OAUTH_CLIENT_SECRET,
         }
         headers = {"Accept": "application/json"}
         # idempotent=False:刷新会旋转 refresh_token,响应丢失后重发用的还是旧
