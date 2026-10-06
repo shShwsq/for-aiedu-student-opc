@@ -771,6 +771,19 @@ def _build_credential_envs(credentials: dict[str, str], agent_type: str) -> dict
     return envs
 
 
+def _credential_injection_missing(
+    credential_envs: dict[str, str], pre_bridge_hook
+) -> bool:
+    """是否缺少任何凭证注入手段(据此在启动前拦截)。
+
+    环境变量映射为空 且 无文件注入型 pre_bridge_hook 时,才算真正的配置缺失。
+    典型:codex chatgpt 模式无 api_key → credential_envs={},但凭证经 pre_bridge_hook
+    以 auth.json 文件注入沙箱,应放行(否则会在 bridge 启动前误报"凭证映射为空")。
+    qoder/deepseek 无 pre_bridge_hook,仍要求 credential_envs 非空,行为不变。
+    """
+    return not credential_envs and pre_bridge_hook is None
+
+
 # ============================================================
 # 沙箱环境准备:bridge 脚本 + CLI 可用性检查
 # ============================================================
@@ -2601,8 +2614,8 @@ def run_acp_agent(
 
     post_bridge_hook: bridge 运行后的收尾回调
         (session, credentials, agent_type, db, user_id) -> None。
-        本轮 prompt 成功结束后、提取 summary 之前调用(尽力而为,异常吞掉)。
-        codex chatgpt 模式用此读回轮换后的 auth.json 并回写用户配置。
+        置于外层 finally,成功/异常路径都会调用(尽力而为,自身 try/except 兜底),
+        以便 codex chatgpt 模式即便本轮失败也能回捞已轮换的 auth.json 并回写用户配置。
 
     返回:(results, summary, final_plan)
         results: 始终为空 list(结构化结果由 agent2 在 done 时提取)
@@ -2646,7 +2659,8 @@ def run_acp_agent(
         credential_envs = credential_env_builder(credentials, task)
     else:
         credential_envs = _build_credential_envs(credentials, agent_type)
-    if not credential_envs:
+    # chatgpt 模式无环境变量但经 pre_bridge_hook 注入 auth.json,故放行(判断集中在助手函数)
+    if _credential_injection_missing(credential_envs, pre_bridge_hook):
         raise RuntimeError("凭证映射为空,无法注入环境变量(请检查 registry 配置)")
 
     # ---- 获取/创建沙箱会话 ----
@@ -3011,13 +3025,15 @@ def run_acp_agent(
         if not _cached:
             _stop_acp_bridge(session, bridge_exec_id, agent_type)
 
-    # ---- wrapper 层钩子:bridge 运行后的收尾 ----
-    # codex chatgpt 模式用此读回轮换后的 auth.json 并回写用户配置(尽力而为)
-    if post_bridge_hook:
-        try:
-            post_bridge_hook(session, credentials, agent_type, db, task.user_id)
-        except Exception as e:
-            logger.warning(f"[task={task.id}] {agent_type} post_bridge_hook 失败(忽略): {e}")
+        # ---- wrapper 层钩子:bridge 运行后的收尾(置于 finally,异常路径也尽量回捞) ----
+        # codex chatgpt 模式:即便本轮 prompt 失败/bridge 挂掉,codex 可能已轮换 auth.json
+        # 中的 token,不回捞会让旧 refresh_token 逐步失效(正是此 hook 要解决的问题)。
+        # 无变化不写库;自身 try/except 兜底,不会掩盖上方正在传播的异常。
+        if post_bridge_hook:
+            try:
+                post_bridge_hook(session, credentials, agent_type, db, task.user_id)
+            except Exception as e:
+                logger.warning(f"[task={task.id}] {agent_type} post_bridge_hook 失败(忽略): {e}")
 
     # ---- 提取 summary 和 plan ----
     summary = collector.content_full or ""
@@ -3126,7 +3142,8 @@ def test_credential_streaming(
         credential_envs = credential_env_builder(credentials, None)
     else:
         credential_envs = _build_credential_envs(credentials, agent_type)
-    if not credential_envs:
+    # 与 run_acp_agent 一致:无环境变量但有 pre_bridge_hook(文件注入)时放行
+    if _credential_injection_missing(credential_envs, pre_bridge_hook):
         yield done(False, "凭证映射为空(请检查 registry 配置)")
         return
 

@@ -17,6 +17,10 @@ from app.agents.codex_cli_agent import (
     _codex_post_bridge_hook,
     _codex_pre_bridge_hook,
 )
+from app.agents.acp_base import (
+    _build_credential_envs,
+    _credential_injection_missing,
+)
 from app.agents.registry import get_credential_fields
 from app.routers.agent_configs import _merge_credentials
 from app.schemas.agent_configs import CredentialValue
@@ -269,3 +273,36 @@ def test_post_hook_skips_when_no_tokens_in_env_auth():
 
     _codex_post_bridge_hook(session, {"auth_mode": "chatgpt"}, "codex_cli", db, "user-1")
     assert db.committed is False
+
+
+# ============================================================
+# 凭证注入通道判定(回归:chatgpt 模式无 env 但有文件注入 hook → 放行)
+#
+# 旧代码用 `if not credential_envs: raise` 会在 bridge 启动前把 chatgpt 模式误判为
+# "凭证映射为空"而彻底跑不起来。修复后按「既无 env 又无 pre_bridge_hook」才拦截。
+# ============================================================
+
+
+def test_build_envs_empty_for_chatgpt_creds():
+    creds = {"auth_mode": "chatgpt", "auth_json": _VALID_AUTH, "model": "gpt-5"}
+    # 前提确认:chatgpt 模式下 credential_envs 确实为空(api_key 已被清除)
+    assert _build_credential_envs(creds, "codex_cli") == {}
+
+
+def test_injection_not_missing_when_pre_bridge_hook_present():
+    # 回归核心:env 为空但存在 pre_bridge_hook(auth.json 文件注入)→ 不应判为缺注入
+    assert (
+        _credential_injection_missing({}, _codex_pre_bridge_hook) is False
+    )
+
+
+def test_injection_missing_when_no_env_and_no_hook():
+    # 无 env 且无 hook(qoder/deepseek 配错)→ 判为缺注入,应拦截
+    assert _credential_injection_missing({}, None) is True
+
+
+def test_api_key_mode_has_env_injection():
+    creds = {"auth_mode": "api_key", "api_key": "sk-1"}
+    envs = _build_credential_envs(creds, "codex_cli")
+    assert envs == {"CODEX_API_KEY": "sk-1"}
+    assert _credential_injection_missing(envs, _codex_pre_bridge_hook) is False
