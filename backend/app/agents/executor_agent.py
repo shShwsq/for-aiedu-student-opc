@@ -1,6 +1,6 @@
-"""执行智能体抽象层(Executor Provider)
+"""AI助手抽象层(Executor Provider)
 
-将"执行智能体"抽象为统一接口,支持多种实现:
+将"AI助手"抽象为统一接口,支持多种实现:
 - BuiltinReactAgent:内置 react_agent(基于 react_agent.py)
 - ExternalCLIAgent:外部 CLI agent,通过 ACP 协议通信(沙箱内运行),
   按 registry 动态派发(如 qoder_cli,未来可扩展 aider / goose 等)
@@ -52,7 +52,7 @@ REGISTERED_EXECUTORS: tuple[str, ...] = (EXECUTOR_BUILTIN,)
 
 
 class ExecutorAgent(ABC):
-    """执行智能体抽象基类
+    """AI助手抽象基类
 
     子类必须实现 run(),签名与原 react_agent.run_react_agent 对齐,
     便于 orchestrator 无差别调用。

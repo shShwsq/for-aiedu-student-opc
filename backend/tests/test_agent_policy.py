@@ -44,7 +44,7 @@ def _make_task_with_overrides(user_id=None, params=None, scenario="general"):
 def _mock_db_with_policy(policy_row=None):
     """构造 mock db:db.query(AgentPolicy).filter(...).first() 返回 policy_row。
 
-    policy_row=None 表示用户未保存过协作策略(查无记录)。
+    policy_row=None 表示用户未保存过智能体策略(查无记录)。
     """
     db = MagicMock()
     db.query.return_value.filter.return_value.first.return_value = policy_row

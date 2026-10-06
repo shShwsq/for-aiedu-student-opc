@@ -1,6 +1,6 @@
-"""用户级 agent 协作策略 (per-user, 1:1)
+"""用户级 agent 智能体策略 (per-user, 1:1)
 
-agent2(质检智能体)协作策略的用户级默认(启停、协作轮次、验证权限等),
+agent2(质检智能体)智能体策略的用户级默认(启停、协作轮次、验证权限等),
 任务级可通过 task.params["_agent_policy"] 覆盖。
 字段语义见 agent_policy.DEFAULT_AGENT_POLICY。
 
@@ -52,7 +52,7 @@ class AgentPolicy(Base):
     verifier_auth_mode_default: Mapped[str] = mapped_column(
         Text, nullable=False, server_default="per_action", default="per_action"
     )
-    # 执行智能体命令确认默认模式("always_approve" / "per_command")
+    # AI助手确认策略默认模式("always_approve" / "per_command")
     executor_command_confirm_default: Mapped[str] = mapped_column(
         Text,
         nullable=False,
@@ -230,7 +230,7 @@ def migrate_agent_policy_rename_columns() -> None:
     背景:项目用 Base.metadata.create_all(无 Alembic),已存在的表不会改列名。
     老库 agent_policies 建表时启用开关列名为 user_agent_enabled(旧命名),
     后来模型统一改为 agent2_enabled(与 DEFAULT_AGENT_POLICY / API 契约对齐),
-    ORM SELECT 找不到列 → GET/PUT /memory/preferences 500,协作策略页加载失败。
+    ORM SELECT 找不到列 → GET/PUT /memory/preferences 500,智能体策略页加载失败。
 
     - user_agent_enabled 存在且 agent2_enabled 不存在 → RENAME(保留数据)
     - 全新库(已是新列名)或已迁过 → 直接返回

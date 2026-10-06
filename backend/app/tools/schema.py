@@ -35,7 +35,7 @@ _CURRENT_TASK_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
 _CURRENT_GIT_TOKENS: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
     "current_git_tokens"
 )
-# 当前任务的执行智能体命令确认模式(从 task.params._executor_command_confirm 读取)
+# 当前任务的 AI助手命令确认模式(从 task.params._executor_command_confirm 读取)
 # "always_approve"(默认):危险命令直接执行不弹窗
 # "per_command":危险命令执行前推前端 CommandConfirmDialog 弹窗确认
 # 仅 run_command 工具读取此值;用于 sandbox 与 local 模式下统一控制危险命令确认行为
@@ -59,7 +59,7 @@ def set_current_task(
     user_id: 任务所属用户 id。用于 skill 工具按用户过滤:
         内置 skill 全局共享,用户上传的 skill 仅 owner 可见。
         None 表示匿名任务(只看内置 skill)。
-    executor_command_confirm: 执行智能体命令确认模式。
+    executor_command_confirm: AI助手命令确认模式。
         "always_approve":危险命令直接执行不弹窗(默认)
         "per_command":危险命令推前端 CommandConfirmDialog 弹窗确认
         仅对内置 react_agent 的 run_command 工具生效;CLI 执行器走 ACP request_permission 机制独立处理。

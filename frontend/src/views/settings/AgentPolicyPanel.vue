@@ -1,11 +1,12 @@
 <script setup lang="ts">
 /**
- * 协作策略设置面板(嵌套在 SettingsLayout 内)
+ * 智能体策略设置面板(嵌套在 SettingsLayout 内)
  *
- * 作为 agent2(检查助手)协作策略的用户级默认配置:
+ * 作为 agent2(检查助手)行为与执行命令策略的用户级默认配置:
  * - agent2 启停
  * - 验证权限:agent2 是否能自行调用工具验证(实验性)
  * - 验证授权模式:验证动作的默认授权模式(直接执行 / 逐动作授权)
+ * - AI助手确认策略
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
@@ -38,7 +39,7 @@ const policyAllowVerify = ref(DEFAULT_POLICY.allow_verify)
 const policyAllowReference = ref(DEFAULT_POLICY.allow_reference_check)
 /** 验证授权默认模式(任务级可覆盖) */
 const policyVerifierAuthMode = ref<'direct' | 'per_action'>(DEFAULT_POLICY.verifier_auth_mode_default)
-/** 执行智能体命令确认默认模式(任务级 _executor_command_confirm 可覆盖) */
+/** AI助手确认策略默认模式(任务级 _executor_command_confirm 可覆盖) */
 const policyExecutorCommandConfirm = ref<'always_approve' | 'per_command'>(DEFAULT_POLICY.executor_command_confirm_default)
 
 /** 验证授权模式选项(对齐 BaseSelect {value,label} 结构) */
@@ -47,7 +48,7 @@ const verifierAuthModeOptions = computed(() => [
   { value: 'direct' as 'direct' | 'per_action', label: '直接执行(不弹窗)' },
 ])
 
-/** 执行智能体命令确认模式选项 */
+/** AI助手确认策略选项 */
 const executorConfirmOptions = computed(() => [
   { value: 'always_approve' as 'always_approve' | 'per_command', label: '自动批准(不弹窗,注入 YOLO 模式)' },
   { value: 'per_command' as 'always_approve' | 'per_command', label: '逐命令确认(危险命令弹窗批准)' },
@@ -159,7 +160,7 @@ async function handleSave(): Promise<boolean> {
       verifierAuthMode: policyVerifierAuthMode.value,
       executorCommandConfirm: policyExecutorCommandConfirm.value,
     }
-    showToast('协作策略已保存', 'success')
+    showToast('智能体策略已保存', 'success')
     return true
   } catch (err) {
     showToast(extractErrorMessage(err), 'error')
@@ -194,7 +195,7 @@ const FIELD_HELP: Record<string, string> = {
   verifier_auth_mode:
     '仅在开启「自行验证」时生效。逐动作授权:每个验证动作(HTTP 请求 / PoC 脚本)执行前弹窗让用户确认;直接执行:验证动作自动执行不弹窗。此为用户级默认,任务创建或运行时可单独覆盖。',
   executor_command_confirm:
-    '控制执行智能体(内置执行器 / Qoder / DeepSeek / Codex)执行危险命令时是否弹窗确认。自动批准:所有命令直接执行不弹窗(速度快,适合可信任务);逐命令确认:每个危险命令执行前弹窗让用户批准(更安全,防容器破坏/资源耗尽)。此为用户级默认,任务创建时可单独覆盖。注意:Codex CLI 受非交互模式限制,仅支持自动批准,选择「逐命令确认」时会降级并警告。',
+    '控制 AI助手(内置执行器 / Qoder / DeepSeek / Codex)执行危险命令时是否弹窗确认。自动批准:所有命令直接执行不弹窗(速度快,适合可信任务);逐命令确认:每个危险命令执行前弹窗让用户批准(更安全,防容器破坏/资源耗尽)。此为用户级默认,任务创建时可单独覆盖。注意:Codex CLI 受非交互模式限制,仅支持自动批准,选择「逐命令确认」时会降级并警告。',
 }
 
 /** 当前展开帮助气泡的字段 key(null=无展开) */
@@ -232,9 +233,9 @@ onUnmounted(() => {
     <!-- 页头 -->
     <div class="page-header">
       <div>
-        <h1>协作策略</h1>
+        <h1>智能体策略</h1>
         <p class="page-subtitle">
-          检查助手协作策略的用户级默认。任务创建时可单独覆盖。
+          检查助手与执行策略的用户级默认。任务创建时可单独覆盖。
         </p>
       </div>
       <div class="header-meta">
@@ -344,10 +345,10 @@ onUnmounted(() => {
         </div>
       </Transition>
 
-      <!-- 执行智能体命令确认模式(独立于 agent2,始终可用) -->
+      <!-- AI助手确认策略(独立于 agent2,始终可用) -->
       <label class="policy-field policy-field-command-confirm">
         <div class="field-head">
-          <span class="policy-label">执行智能体命令确认模式</span>
+          <span class="policy-label">AI助手确认策略</span>
           <div
             :ref="(el) => { if (el) fieldHelpRefs.set('executor_command_confirm', el as HTMLElement); else fieldHelpRefs.delete('executor_command_confirm') }"
             class="field-help-wrap"
@@ -365,7 +366,7 @@ onUnmounted(() => {
           :options="executorConfirmOptions"
           :disabled="saving"
           class="policy-select"
-          aria-label="执行智能体命令确认模式"
+          aria-label="AI助手确认策略"
         />
       </label>
 

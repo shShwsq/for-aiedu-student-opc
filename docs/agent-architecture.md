@@ -1,8 +1,8 @@
 # 双智能体架构与上下文传递逻辑
 
-本文档整理 `backend/app/agents/` 目录下 agent2（质检智能体,前端显示「检查助手」）、agent1（执行智能体,前端显示「AI助手」,内置实现为 `react_agent`）、外部 CLI agent（Qoder / DeepSeek Harness / Codex）的代码逻辑、协作流程与上下文传递机制，并覆盖协作策略（`agent_policy.py`）、交付物上传链路（uploads → orchestrator）与工作区变更捕获（`workspace_diff.py`）。
+本文档整理 `backend/app/agents/` 目录下 agent2（质检智能体,前端显示「检查助手」）、agent1（前端显示「AI助手」,内置实现为 `react_agent`）、外部 CLI agent（Qoder / DeepSeek Harness / Codex）的代码逻辑、协作流程与上下文传递机制，并覆盖智能体策略（`agent_policy.py`）、交付物上传链路（uploads → orchestrator）与工作区变更捕获（`workspace_diff.py`）。
 
-> 命名约定:agent1 = 执行智能体(「AI助手」,内置实现 react_agent.py,或外部 CLI 执行器);agent2 = 质检智能体(「检查助手」)。Conversation 落库与 SSE 事件的 `role` 取值即为 `agent1` / `agent2`。下文代码细节中 `react_agent` 指内置实现模块。
+> 命名约定:agent1 = AI助手(内置实现 react_agent.py,或外部 CLI 执行器);agent2 = 质检智能体(「检查助手」)。Conversation 落库与 SSE 事件的 `role` 取值即为 `agent1` / `agent2`。下文代码细节中 `react_agent` 指内置实现模块。
 
 > 阅读前置：`docs/spec.md`（产品定义）、`backend/app/agents/orchestrator.py`（协作编排）。
 
@@ -68,7 +68,7 @@
 - **纯对话轮跳过审查**:本轮 agent1 无任何工具调用(`_round_has_tool_calls` 查 Conversation 无 `role=agent1, type=tool_call` 记录;builtin 与 CLI 执行器均按此落库)→ 判定为纯对话轮,`_finish_conversation_round` 直接收尾(推 `agent1_done`,done/finish 经 `_end_event_scope` 统一判定),跳过审查/结果替换/练习题/记忆归纳,保留既有结果与审查状态
 - **审查失败/降级**:保留 agent1 summary 临时结果,`review_status=failed`,落警告对话,仍推 `review_done(review_status=failed)` → `done`;任务状态不回滚(审查失败 ≠ 任务失败)
 - **无"协作总轮次"设置**:初始运行单轮,多轮协作由用户驱动(resume)。原 `AgentPolicy.max_rounds` 已移除(启动迁移 `migrate_agent_policy_drop_max_rounds_column` 幂等 DROP 老库列)
-- **单 agent 退化**:协作策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无后台审查,`review_status` 保持 `NULL`
+- **单 agent 退化**:智能体策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无后台审查,`review_status` 保持 `NULL`
 - **resume(用户驱动多轮)**:用户追加消息 / 点击建议「深挖」触发。**追问直达 agent1,不等老审查**:端点同步置 `RUNNING` 落库(消除 SSE 快照竞态 + 并发第二条消息按运行中语义入队,防双跑)后启动 resume;老审查(若仍在跑)与新轮 agent1 **并行**——各自落库自己轮次的知识点,`done`/`finish` 仅由最后活跃流推送(事件活跃期 scope 机制,`_begin_event_scope`/`_end_event_scope`,世代号单调递增,下游链仅最新流执行);总线:老审查在跑(打开)→ 不重置(SSE 不断线),上一轮已收尾 → 重置后启动。用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述,agent1 跨轮历史由 `_build_history_messages` 以结构化 messages 注入,用户追问原文作为独立 user 消息;plan 状态从 `task.params["_plan"]` 跨轮续接),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。每次 resume = agent1 一轮 + (分析轮)后台审查
 - **并行世代门控**(消除并行抖动):老审查被新流取代(用户追问/遗留续轮已启动新一轮)时——① verify/PoC 动态验证降级跳过(`run_agent2(superseded_check=...)`,与新轮共享沙箱不再执行 verifier,防端口/进程争抢);② 任务级字段(`review_status`/`current_stage`)与 `review_done` 事件归最新流所有,老审查跳过写入(防侧栏 badge 被收尾值短暂覆盖);知识点落库与审查结论卡不受影响(按轮追加,历史完整)
 - **并行已知限制**(接受的设计取舍):① 老审查的**只读核查**仍与新轮 agent1 共享同一任务沙箱——新轮改文件时老审查读到的可能是"移动靶"(执行类 PoC 已由世代门控降级跳过);② `task.params["_grouping"]` 每轮覆盖,历史轮知识点的分组声明以最新轮为准
@@ -224,7 +224,7 @@ agent1 结论引用外部依据(URL / CVE / 安全公告 / 官方文档)时,agen
 
 ---
 
-## 3. 内置 react_agent(agent1 执行智能体)详解
+## 3. 内置 react_agent(agent1 = AI助手)详解
 
 **文件**：[backend/app/agents/react_agent.py](../backend/app/agents/react_agent.py)
 
@@ -689,7 +689,7 @@ CLI 侧每轮构造单条 user 文本，由 `_compose_send_text` 按**稳定注�
 | `deepseek_cli_agent` | [deepseek_cli_agent.py](../backend/app/agents/deepseek_cli_agent.py) | `_deepseek_credential_env_builder`：静态映射 `DEEPSEEK_API_KEY`（+ 可选 `DEEPSEEK_BASE_URL`）+ 按命令确认模式注入 `DSH_PERMISSION_MODE`（`always_approve` → `danger-full-access` 跳过审批；`per_command` 保持 dsh 默认 `workspace-write`，危险命令发 `request_permission`）；`_deepseek_post_session_setup`：session/new 后调 `set_config_option` 设 `model` / `reasoning_effort` |
 | `codex_cli_agent` | [codex_cli_agent.py](../backend/app/agents/codex_cli_agent.py) | `_codex_pre_bridge_hook`：写 `~/.codex/config.toml`（模型/provider/approval_policy=never/sandbox_mode=danger-full-access）；使用 `codex_bridge.py`（非默认 `acp_bridge`）；**`per_command` 模式不被 `codex exec --json` 支持（非交互模式），自动降级为 `always_approve` 并警告** |
 
-> **命令确认模式**（`task.params._executor_command_confirm`）：控制执行智能体（内置 react_agent + CLI）执行危险命令时是否弹窗确认。`always_approve`（默认）：内置 react_agent 在 sandbox 下直接执行（沙箱已隔离），CLI 注入 YOLO/never 配置跳过审批；`per_command`：CLI 走 ACP `request_permission` 请求 → bridge SSE 推 `permission_request` 事件 → 前端 `CommandConfirmDialog` 弹窗 → `POST /tasks/{id}/permission_response` 回写结果；内置 react_agent 走 `_PendingCommandConfirm` 机制 → SSE 推 `command_confirm` 事件 → `POST /tasks/{id}/command_confirm` 回写。local 模式下 dangerous 命令始终推确认（无视此字段）。详见 spec.md §3.5.2。
+> **命令确认模式**（`task.params._executor_command_confirm`）：控制 AI助手（内置 react_agent + CLI）执行危险命令时是否弹窗确认。`always_approve`（默认）：内置 react_agent 在 sandbox 下直接执行（沙箱已隔离），CLI 注入 YOLO/never 配置跳过审批；`per_command`：CLI 走 ACP `request_permission` 请求 → bridge SSE 推 `permission_request` 事件 → 前端 `CommandConfirmDialog` 弹窗 → `POST /tasks/{id}/permission_response` 回写结果；内置 react_agent 走 `_PendingCommandConfirm` 机制 → SSE 推 `command_confirm` 事件 → `POST /tasks/{id}/command_confirm` 回写。local 模式下 dangerous 命令始终推确认（无视此字段）。详见 spec.md §3.5.2。
 
 ### 4.6 bridge 脚本
 
@@ -728,7 +728,7 @@ agent2 在评估覆盖度后,若用户开启了「允许自行验证」(`allow_v
 | `per_action`（默认） | 每个 `http_request` / `run_python_code` 调用前推送 `verify_action` SSE 事件 → 前端弹窗 `VerifyActionDialog` 让用户确认 → 阻塞等待（`user_interaction.request_verify_authorization`） | 生产 / 测试环境隔离不彻底，需人工把关 |
 | `direct` | 不弹窗，直接执行 | 测试环境完全隔离，可信 |
 
-用户可在「协作策略」页设默认模式（`verifier_auth_mode_default`），任务创建时可覆盖。
+用户可在「智能体策略」页设默认模式（`verifier_auth_mode_default`），任务创建时可覆盖。
 
 ### 5.4 登录 token（`task.params._verifier.auth_tokens`）
 
@@ -802,7 +802,7 @@ list of `{label, header_name, header_value}`：
 - 前端 `CommandConfirmDialog.vue`：显示完整命令 + 拦截原因（红色高亮）+ 「拒绝 / 同意」按钮
 - 用户拒绝时返回 `{"status_code": 0, "body": "[用户拒绝执行此命令]"}`，agent 收到反馈跳过
 
-> **注意**：此为 local 模式（无沙箱）专用，拦截的是 `sandbox_tools` 的 `run_command` / `write_file` 等宿主机直接执行的工具。local 模式下 dangerous 命令始终推确认（无视 `executor_command_confirm`，即使 `always_approve` 也不能跳过）。CLI 执行智能体（qoder/deepseek/codex）的危险命令确认走 ACP `request_permission` 机制（SSE 事件 `permission_request`、API `POST /tasks/{id}/permission_response`），见 §4.5 与 spec.md §3.5.2。**sandbox 模式下内置 react_agent 的 dangerous 命令在 `per_command` 模式时也走此 `_PendingCommandConfirm` 机制**（复用 `command_confirm` SSE 事件 + `POST /tasks/{id}/command_confirm` API），通过 `react_agent.py` → `set_current_task(executor_command_confirm=...)` → `_CURRENT_EXECUTOR_COMMAND_CONFIRM` ContextVar → `execute_tool` 自动注入 `command_confirm_mode` 到 `run_command`。三条路径共用前端 `CommandConfirmDialog.vue` 组件。
+> **注意**：此为 local 模式（无沙箱）专用，拦截的是 `sandbox_tools` 的 `run_command` / `write_file` 等宿主机直接执行的工具。local 模式下 dangerous 命令始终推确认（无视 `executor_command_confirm`，即使 `always_approve` 也不能跳过）。CLI AI助手（qoder/deepseek/codex）的危险命令确认走 ACP `request_permission` 机制（SSE 事件 `permission_request`、API `POST /tasks/{id}/permission_response`），见 §4.5 与 spec.md §3.5.2。**sandbox 模式下内置 react_agent 的 dangerous 命令在 `per_command` 模式时也走此 `_PendingCommandConfirm` 机制**（复用 `command_confirm` SSE 事件 + `POST /tasks/{id}/command_confirm` API），通过 `react_agent.py` → `set_current_task(executor_command_confirm=...)` → `_CURRENT_EXECUTOR_COMMAND_CONFIRM` ContextVar → `execute_tool` 自动注入 `command_confirm_mode` 到 `run_command`。三条路径共用前端 `CommandConfirmDialog.vue` 组件。
 
 ### 6.4 平台原生隔离（`SANDBOX_LOCAL_NATIVE_ISOLATION=true`，可选）
 
@@ -983,9 +983,9 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | [user_messages.py](../backend/app/user_messages.py) | 用户补充消息队列（运行中/暂停中追加） |
 | [pause_controller.py](../backend/app/pause_controller.py) | 暂停/恢复控制器 |
 | [event_bus.py](../backend/app/event_bus.py) | 事件总线(publish / SSE 订阅) |
-| [agent_policy.py](../backend/app/agent_policy.py) | 协作策略(默认值定义 + 用户级/任务级合并解析) |
+| [agent_policy.py](../backend/app/agent_policy.py) | 智能体策略(默认值定义 + 用户级/任务级合并解析) |
 | [services/workspace_diff.py](../backend/app/services/workspace_diff.py) | 任务完成时工作区 diff/patch 捕获 + 仓库树快照(存 task_artifacts) |
 | [models/task_artifact.py](../backend/app/models/task_artifact.py) | 任务工作区产物模型(kind=git_diff / repo_tree) |
 | [tools/quality_tools.py](../backend/app/tools/quality_tools.py) | 代码质量工具(run_lint / run_coverage,local/sandbox 双模式) |
 | [tools/dependency_tools.py](../backend/app/tools/dependency_tools.py) | 依赖清单解析工具(list_dependencies,串联 query_cve) |
-| [models/agent_policy.py](../backend/app/models/agent_policy.py) | 用户级协作策略表(agent2 启停 / 协作轮次 / 验证权限) |
+| [models/agent_policy.py](../backend/app/models/agent_policy.py) | 用户级智能体策略表(agent2 启停 / 验证权限 / 引用复核) |

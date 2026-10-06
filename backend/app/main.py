@@ -77,7 +77,7 @@ async def lifespan(app: FastAPI):
     migrate_legacy_data_dirs()
 
     from app.models import email_token, task, user  # noqa: F401
-    from app.models import agent_policy  # noqa: F401  # 用户级协作策略独立表
+    from app.models import agent_policy  # noqa: F401  # 用户级智能体策略独立表
     from app.models import task_artifact  # noqa: F401
     from app.models import user_agent_config  # noqa: F401
     from app.models import user_git_binding  # noqa: F401
@@ -136,7 +136,7 @@ async def lifespan(app: FastAPI):
     # migrate_agent_policy_table(其 INSERT 引用该列)
     migrate_agent_policy_add_reference_check_column()
     migrate_agent_policy_table()
-    # 重命名 agent_policies 旧列 user_agent_enabled → agent2_enabled(修复协作策略页 500)
+    # 重命名 agent_policies 旧列 user_agent_enabled → agent2_enabled(修复智能体策略页 500)
     migrate_agent_policy_rename_columns()
     # 检查点/打断功能移除:删 agent_policies 5 个旧列 + 清理 conversations 历史过程记录
     from app.models.agent_policy import (

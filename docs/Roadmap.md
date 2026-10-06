@@ -27,10 +27,10 @@
 
 #### 执行器与外部 CLI 集成
 
-- **执行器抽象层(ExecutorAgent)**:把"执行智能体"抽象为统一接口,支持 builtin(内置 react_agent)和外部 CLI agent(通过 ACP 协议通信)两种 provider。新增 agent 类型只需在 registry 注册,无需改核心代码。
+- **执行器抽象层(ExecutorAgent)**:把"AI助手"抽象为统一接口,支持 builtin(内置 react_agent)和外部 CLI agent(通过 ACP 协议通信)两种 provider。新增 agent 类型只需在 registry 注册,无需改核心代码。
 - **ACP Bridge**:HTTP ↔ stdio 桥接服务,运行在沙箱内,让外部 CLI agent(如 Qoder CLI / DeepSeek Harness CLI / Codex CLI)通过 ACP 协议接入。
-- **Qoder CLI Agent**:通过 ACP 协议调用 Qoder CLI 作为执行智能体(agent1),模型由 CLI 账号配额管理,不走后端 LLM 配置。
-- **DeepSeek CLI Agent**:通过 ACP 协议调用 DeepSeek 开源的 DeepSeek Harness CLI(简称 dsh,`dsh --profile acp`)作为执行智能体(agent1),模型经 `session/set_config_option` 在 session/new 后设置(model / reasoning_effort),权限模式经 `DSH_PERMISSION_MODE` 环境变量注入(默认 workspace-write,always_approve 时 danger-full-access),凭证 `DEEPSEEK_API_KEY`(+ 可选 `DEEPSEEK_BASE_URL`,支持自部署端点)。
+- **Qoder CLI Agent**:通过 ACP 协议调用 Qoder CLI 作为 AI助手(agent1),模型由 CLI 账号配额管理,不走后端 LLM 配置。
+- **DeepSeek CLI Agent**:通过 ACP 协议调用 DeepSeek 开源的 DeepSeek Harness CLI(简称 dsh,`dsh --profile acp`)作为 AI助手(agent1),模型经 `session/set_config_option` 在 session/new 后设置(model / reasoning_effort),权限模式经 `DSH_PERMISSION_MODE` 环境变量注入(默认 workspace-write,always_approve 时 danger-full-access),凭证 `DEEPSEEK_API_KEY`(+ 可选 `DEEPSEEK_BASE_URL`,支持自部署端点)。
 - **Codex CLI Agent**:通过 ACP 协议调用 OpenAI Codex CLI。Codex 不原生支持 ACP,通过专用的 `codex_bridge.py` 翻译 `codex exec --json` 的 JSONL 事件流为 ACP 通知。凭证经 `CODEX_API_KEY` 环境变量注入,`~/.codex/config.toml` 写入 `approval_policy=never` + `sandbox_mode=danger-full-access` 支持非交互模式。**注意**:`codex exec --json` 是非交互模式,不支持 `per_command` 命令确认(会自动降级为 `always_approve` 并警告)。
 - **codex_bridge.py**:Codex 专用桥接脚本,处理 Codex 特有的事件流语义(ErrorItem 通知翻译为 thought_chunk 而非 error、stderr 累积到错误消息等),所有 POST `/rpc` 响应以 SSE 流式返回。
 
@@ -43,8 +43,8 @@
 - **循环检测**:滑动窗口检测重复工具调用(连续相同 + 交替循环),打破死循环。
 - **Plan 状态管理**:react_agent 在思考中输出 `<plan>` 清单,代码维护状态,跨轮续接避免重复规划。
 - **verifier_agent(实验性)**:独立的验证智能体,agent2 在评估覆盖度后可调用它在已部署测试环境动态验证 agent1 的发现(如确认 SQL 注入是否真实可利用)。独立 ReAct 循环 + 独立工具集(`http_request` 在沙箱内 urllib 执行 + `run_python_code`),支持 `per_action`(每个动作弹窗确认)/ `direct`(直接执行)两种授权模式。支持登录 token 注入(auth_profile,label 选择身份,LLM 永不见 token 明文)。
-- **协作策略设置页**:用户可配置评估频率(每轮 / 每两轮 / 仅最后)、验证权限(是否允许 agent2 自行验证 + 授权模式默认值 + verifier 测试环境 URL + 多个登录 token)、执行智能体命令确认模式(自动批准 / 逐命令确认,对内置 react_agent 与 CLI 执行器均生效)。
-- **执行智能体命令确认**(executor_command_confirm):控制执行智能体(内置 react_agent + CLI:qoder/deepseek/codex)执行危险命令时是否弹窗确认,防容器破坏与资源耗尽。两条独立机制:**内置 react_agent** 走 `sandbox_tools.run_command` 的 `_PendingCommandConfirm` 机制(与 local 模式危险命令确认同源,SSE 事件 `command_confirm`),通过 `react_agent.py` → `set_current_task` → `_CURRENT_EXECUTOR_COMMAND_CONFIRM` ContextVar → `execute_tool` 自动注入;**CLI 执行智能体** 走 ACP `request_permission` 机制(bridge SSE 推 `permission_request` 事件 → 前端 `CommandConfirmDialog` 弹窗 → `POST /tasks/{id}/permission_response` 回写)。`always_approve`(默认):内置 react_agent 在 sandbox 下直接执行,CLI 注入 YOLO/never 配置跳过审批;`per_command`:两条路径都推确认。local 模式下 dangerous 命令始终推确认(无视此字段)。Codex 受非交互模式限制仅支持 `always_approve`,`per_command` 时自动降级并警告。用户级默认在协作策略页设置,任务级可在新建任务页覆盖(builtin 与 CLI 执行器均显示)。
+- **协作策略设置页**:用户可配置评估频率(每轮 / 每两轮 / 仅最后)、验证权限(是否允许 agent2 自行验证 + 授权模式默认值 + verifier 测试环境 URL + 多个登录 token)、AI助手命令确认模式(自动批准 / 逐命令确认,对内置 react_agent 与 CLI 执行器均生效)。
+- **AI助手命令确认**(executor_command_confirm):控制AI助手(内置 react_agent + CLI:qoder/deepseek/codex)执行危险命令时是否弹窗确认,防容器破坏与资源耗尽。两条独立机制:**内置 react_agent** 走 `sandbox_tools.run_command` 的 `_PendingCommandConfirm` 机制(与 local 模式危险命令确认同源,SSE 事件 `command_confirm`),通过 `react_agent.py` → `set_current_task` → `_CURRENT_EXECUTOR_COMMAND_CONFIRM` ContextVar → `execute_tool` 自动注入;**CLI AI助手** 走 ACP `request_permission` 机制(bridge SSE 推 `permission_request` 事件 → 前端 `CommandConfirmDialog` 弹窗 → `POST /tasks/{id}/permission_response` 回写)。`always_approve`(默认):内置 react_agent 在 sandbox 下直接执行,CLI 注入 YOLO/never 配置跳过审批;`per_command`:两条路径都推确认。local 模式下 dangerous 命令始终推确认(无视此字段)。Codex 受非交互模式限制仅支持 `always_approve`,`per_command` 时自动降级并警告。用户级默认在协作策略页设置,任务级可在新建任务页覆盖(builtin 与 CLI 执行器均显示)。
 
 #### 记忆与技能系统
 
@@ -61,9 +61,9 @@
 - **异步 job + SSE**:出题后台线程执行,`/practice/generate/{job_id}/stream` 推送进度;出题日志落盘 `logs/practice_generate.log`。
 - **前端**:PracticeView(练习首页 / 会话答题 / 统计趋势 / 题库管理)、出题进度侧栏、生成确认弹窗、练习设置弹窗;`PRACTICE_ENABLED` 功能开关前后端联动。
 
-#### 工作区变更与协作策略
+#### 工作区变更与智能体策略
 
-- **协作策略独立表(agent_policies)**:用户级默认从 `user_preferences` JSONB 迁移为独立 1:1 表(agent2 启停 / 协作轮次 / 验证权限),任务级经 `task.params._agent_policy` 覆盖。(其中的“协作轮次 max_rounds”列已随 agent2 后台审查重构移除:初始运行 agent1 单轮即完成,多轮由用户 resume 驱动。)
+- **智能体策略独立表(agent_policies)**:用户级默认从 `user_preferences` JSONB 迁移为独立 1:1 表(agent2 启停 / 协作轮次 / 验证权限),任务级经 `task.params._agent_policy` 覆盖。(其中的“协作轮次 max_rounds”列已随 agent2 后台审查重构移除:初始运行 agent1 单轮即完成,多轮由用户 resume 驱动。)
 - **工作区变更捕获(workspace_diff)**:任务完成时捕获已跟踪 + 未跟踪文件合成 git patch,存 `task_artifacts`(kind=git_diff,上限 100 万字符);仓库树快照(kind=repo_tree)兜底;前端任务详情页展示变更区(按行着色、可折叠)。
 - (检查点评估与软中断功能曾在本阶段实现,后因价值/成本比不高整体移除:agent2 保留 round 边界完整评估,`AgentPolicy` 表的检查点/打断列一并清理。)
 
@@ -334,7 +334,7 @@ uvicorn app.main:app --reload
 - **任务运行中弹窗**:QuestionDialog(澄清提问)/ ChecklistReviewDialog(checklist 确认)/ VerifyActionDialog(verifier 授权)/ CommandConfirmDialog(local 模式危险命令 + sandbox 模式内置 react_agent `per_command` + CLI `per_command` 命令确认)
 - **技能管理页**:SkillManagementView,用户上传 / 编辑自定义 skill(SKILL.md),隔离存储
 - **记忆管理页**:MemoryManagementView,管理用户偏好 / 全局记忆 / 项目记忆三类长期记忆
-- **协作策略页**:CollaborationPolicyView,配置评估频率 + 验证权限 + verifier 测试环境 + 登录 token + 执行智能体命令确认模式
+- **智能体策略页**:CollaborationPolicyView,配置评估频率 + 验证权限 + verifier 测试环境 + 登录 token + AI助手命令确认模式
 
 ---
 

@@ -10,7 +10,7 @@
  * 左侧文件列表,右侧编辑器(编辑/预览切换)。
  * 预览用 marked 渲染 + DOMPurify 净化(项目记忆可能由 agent 归纳自不可信仓库内容,防存储型 XSS)。
  *
- * 入口:主导航「记忆管理」项(与模型设置/CLI 设置/协作策略并列)。
+ * 入口:主导航「记忆管理」项(与模型设置/CLI 设置/智能体策略并列)。
  * Agent 策略配置已迁移至 /agent-policy(AgentPolicyView),本页仅管理记忆文本。
  */
 import { computed, onMounted, reactive, ref } from 'vue'

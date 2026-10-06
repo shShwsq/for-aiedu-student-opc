@@ -1,4 +1,4 @@
-"""react_agent:基于 ReAct 模式的执行智能体
+"""react_agent:基于 ReAct 模式的 AI助手
 
 阶段 4 重构:
 - system prompt 从场景取,不再硬编码

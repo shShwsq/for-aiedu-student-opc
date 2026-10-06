@@ -220,7 +220,7 @@ def build_global_memory_section(
 
 
 def resolve_agent_memory_file_path(mode: str, local_dir, filename: str) -> str:
-    """计算执行智能体可真正打开的记忆文件绝对路径(按运行模式)。
+    """计算 AI助手可真正打开的记忆文件绝对路径(按运行模式)。
 
     - sandbox 模式:/home/user/.agent_memory/<filename> —— 容器内真实路径,
       外部 CLI 在其中运行,可直接读取,与后端虚拟路径恰好一致

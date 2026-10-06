@@ -1,13 +1,13 @@
-"""agent 协作策略:默认值定义 + 用户级/任务级合并解析
+"""agent 智能体策略:默认值定义 + 用户级/任务级合并解析
 
-agent2(质检智能体)的协作策略入口:
+agent2(质检智能体)的智能体策略入口:
 - DEFAULT_AGENT_POLICY:全字段默认值(与 AgentPolicy 表列对齐)
 - resolve_agent_policy:合并 用户级默认(agent_policies 表)+ 任务级覆盖
   (task.params["_agent_policy"]),返回最终生效的策略
 
 策略项覆盖:agent2 开关、验证权限(allow_verify /
 verifier_auth_mode_default)、引用复核(allow_reference_check)、
-执行智能体命令确认默认模式等。
+AI助手确认策略默认模式等。
 
 历史:曾有 max_rounds(协作总轮次)设置,agent2 审查移到后台执行后
 初始运行只有 1 轮 agent1、多轮由用户驱动(resume),该设置已移除。
@@ -33,7 +33,7 @@ DEFAULT_AGENT_POLICY: dict[str, Any] = {
     "agent2_enabled": True,  # 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证)
     "allow_verify": False,  # agent2 是否能调用 verifier_agent(需任务配了 test_env_url)
     "verifier_auth_mode_default": "per_action",  # 验证授权默认模式(任务级可覆盖)
-    "executor_command_confirm_default": "always_approve",  # 执行智能体命令确认默认模式(任务级 _executor_command_confirm 可覆盖)
+    "executor_command_confirm_default": "always_approve",  # AI助手确认策略默认模式(任务级 _executor_command_confirm 可覆盖)
     # agent2 是否能调用 check_reference 复核 agent1 引用的网址
     # (后端安全抓取,SSRF 防护;独立于 repo_path / test_env_url,任何任务可用)
     "allow_reference_check": True,
@@ -74,7 +74,7 @@ def resolve_agent_policy(task: Task, db: Session) -> dict[str, Any]:
     if resolve_scenario_id(task.scenario or "") in verify_default_scenarios():
         defaults["allow_verify"] = True
 
-    # 加载用户级默认(若用户已登录且保存过协作策略)
+    # 加载用户级默认(若用户已登录且保存过智能体策略)
     if task.user_id is not None:
         try:
             from app.models.agent_policy import AgentPolicy

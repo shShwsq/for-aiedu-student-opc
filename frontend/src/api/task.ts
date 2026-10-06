@@ -270,7 +270,7 @@ export function updateTaskVerifierConfig(
 }
 
 /**
- * 更新任务运行时配置(模型 + 协作策略)
+ * 更新任务运行时配置(agent1 / agent2 评估模型)
  *
  * running/paused 时修改在下一轮执行(completed 后追加消息 / failed 重试)生效。
  */

@@ -3,7 +3,7 @@
 ## 1. 概述
 
 ### 1.1 产品定位
-双智能体协作的代码分析平台,核心是 **agent1(执行智能体,前端「AI助手」)执行 + agent2(质检智能体,前端「检查助手」)后台审查(核查优先、建议深挖兜底)** 的协作模式,在单 ReAct 架构之上叠加结果审视能力。
+双智能体协作的代码分析平台,核心是 **agent1(前端「AI助手」)执行 + agent2(质检智能体,前端「检查助手」)后台审查(核查优先、建议深挖兜底)** 的协作模式,在单 ReAct 架构之上叠加结果审视能力。
 
 **场景降级后的定位变更**:系统不再绑定单一安全审计场景。agent2 按任务意图自行确定审查维度,prompt 通用化,工具全部开放,结果结构通用化。当前提供三个预设场景模板(快捷提示词 + 推荐 skill):通用 / 代码审核 / 文书审核。
 
@@ -28,7 +28,7 @@
 └─────────────┘
 ```
 
-**执行器抽象层(ExecutorAgent)**:把"执行智能体"(agent1)抽象为统一接口,支持多种实现:
+**执行器抽象层(ExecutorAgent)**:把"AI助手"(agent1)抽象为统一接口,支持多种实现:
 - `builtin`:系统内置 react_agent(基于 react_agent.py,agent1 的内置实现),使用后端配置的 LLM
 - `qoder_cli`:沙箱内运行 Qoder CLI,通过 ACP 协议通信(`qodercli --acp --yolo`),模型由 CLI 账号配额管理
 - `deepseek_cli`:沙箱内运行 DeepSeek Harness CLI(简称 dsh,开源),通过 ACP 协议通信(`dsh --profile acp`),模型经 `session/set_config_option` 设置(model / reasoning_effort),凭证 `DEEPSEEK_API_KEY`(+ 可选 `DEEPSEEK_BASE_URL`)
@@ -72,7 +72,7 @@
 
 ## 3. 核心流程:双智能体协作
 
-### 3.1 agent1(执行智能体)阶段:首轮执行
+### 3.1 agent1(AI助手)阶段:首轮执行
 任务启动后 agent1 直接按用户意图执行(任务开始时不再有 agent2 初始评估/澄清提问/覆盖度清单确认)。
 - 执行器可以是内置 react_agent(ReAct 模式)或外部 CLI agent(Qoder / DeepSeek / Codex via ACP)
 - 内置 react_agent 拥有工具:clone_repo / list_files / find_files / read_file / search_code / run_semgrep / query_cve / write_file / run_python_code / list_skills / skill
@@ -122,7 +122,7 @@ agent2 是**幕后质检者**(agent1 是台前回答者):其核查过程与知�
 - 示例:"已发现 SQL 注入 2 处(位置见上文)。请继续检查认证与授权模块,重点关注:1) 权限校验是否在每个受保护路由上;2) JWT 验证是否校验签名与过期;3) 是否存在 IDOR(通过用户可控 ID 访问他人资源)。"
 
 ### 3.5.1 验证智能体(实验性,verifier_agent)
-**实验性功能**:在协作策略中开启「允许 agent2(检查助手)自行验证」后,agent2 可调用独立的 `verifier_agent` 在已部署测试环境动态验证 agent1 的发现(如确认 SQL 注入是否真实可利用、IDOR 是否可访问他人资源)。
+**实验性功能**:在智能体策略中开启「允许 agent2(检查助手)自行验证」后,agent2 可调用独立的 `verifier_agent` 在已部署测试环境动态验证 agent1 的发现(如确认 SQL 注入是否真实可利用、IDOR 是否可访问他人资源)。
 
 - **对用户透明**:前端不暴露 `verifier_agent` 字样,SSE 事件 `role=agent2` + `verify=true`,UI 显示「正在验证」而非「正在评估」
 - **独立 ReAct 循环**:自己的 messages + 迭代(最大 10 次),复用 agent1 的沙箱会话(`run_python_code` 在同一沙箱,可 `read_file` 仓库代码辅助构造 PoC)
@@ -132,20 +132,20 @@ agent2 是**幕后质检者**(agent1 是台前回答者):其核查过程与知�
   - `run_python_code`:在沙箱执行 Python(可复用 agent1 沙箱已 clone 的仓库)
 - **授权模式**(`task.params._verifier.auth_mode`):
   - `per_action`:每个 `http_request` / `run_python_code` 调用前推送 `verify_action` SSE 事件 → 前端弹窗 `VerifyActionDialog` 让用户确认 → 阻塞等待(`user_interaction.request_verify_authorization`)
-  - `direct`:不弹窗,直接执行(用户可在「协作策略」设默认,任务创建时可覆盖)
+  - `direct`:不弹窗,直接执行(用户可在「智能体策略」设默认,任务创建时可覆盖)
 - **登录 token**(`task.params._verifier.auth_tokens`):list of `{label, header_name, header_value}`,LLM 调 `http_request` 时传 `auth_profile=label` 选择身份,工具自动注入 `header_name: header_value` 到请求头。LLM 永不见 token 明文(安全)。前端 TaskCreateView 允许添加多个 token,TaskDetailView 只读展示(`maskTokenValue`:首 8 + 尾 4 字符)
 - **输出**:验证完成后输出自然语言总结——每个验证目标的结论(已确认可利用 / 无法确认 / 确认为误报)+ 关键证据(状态码、响应片段)+ 严重级别建议。系统提示强调「不要对生产环境造成破坏性影响」「优先用最小化 PoC(如 `' OR 1=1--` 比 `DROP TABLE` 更合适)」
 
-### 3.5.2 执行智能体命令确认(executor_command_confirm)
+### 3.5.2 AI助手命令确认(executor_command_confirm)
 
-控制执行智能体(内置 react_agent / CLI:qoder_cli / deepseek_cli / codex_cli)执行危险命令时是否弹窗确认,防容器破坏与资源耗尽。
+控制 AI助手(内置 react_agent / CLI:qoder_cli / deepseek_cli / codex_cli)执行危险命令时是否弹窗确认,防容器破坏与资源耗尽。
 
 **两条独立机制**(共用前端 `CommandConfirmDialog.vue` 组件):
 - **内置 react_agent**:走 `sandbox_tools.run_command` 的 `_PendingCommandConfirm` 机制(与 local 模式危险命令确认同源),SSE 事件 `command_confirm`
-- **CLI 执行智能体**:走 ACP 协议的 `request_permission` JSON-RPC 机制,SSE 事件 `permission_request`
+- **CLI AI助手**:走 ACP 协议的 `request_permission` JSON-RPC 机制,SSE 事件 `permission_request`
 
 - **配置字段**:
-  - 用户级默认:`agent_policy.executor_command_confirm_default`("always_approve" / "per_command"),在「协作策略」页设置
+  - 用户级默认:`agent_policy.executor_command_confirm_default`("always_approve" / "per_command"),在「智能体策略」页设置
   - 任务级覆盖:`task.params._executor_command_confirm`,在「新建任务」页设置(builtin 与 CLI 执行器均显示)
   - 优先级:`task.params._executor_command_confirm` > `executor_command_confirm_default` > "always_approve"
   - 后端 `agent_policy.resolve_agent_policy` 把 `executor_command_confirm_default` 映射到 `task.params._executor_command_confirm`(若任务级未显式设置)
@@ -157,11 +157,11 @@ agent2 是**幕后质检者**(agent1 是台前回答者):其核查过程与知�
   - **sandbox 模式**:仅 `per_command` + dangerous 时推前端确认;`always_approve` 时直接执行(沙箱已隔离,破坏范围限于容器内)
   - 复用 local 模式的 `_PendingCommandConfirm` + `command_confirm` SSE 事件 + `GET /tasks/{id}/pending_command_confirm` + `POST /tasks/{id}/command_confirm` API
 
-- **CLI 执行智能体行为**(always_approve 模式,默认):
+- **CLI AI助手行为**(always_approve 模式,默认):
   - Qoder:启动参数带 `--yolo`,跳过所有审批
   - DeepSeek CLI(dsh):注入 `DSH_PERMISSION_MODE=danger-full-access` 环境变量,审批策略 never
   - Codex:config.toml 设 `approval_policy=never` + `sandbox_mode=danger-full-access`(非交互模式必需)
-- **CLI 执行智能体行为**(per_command 模式):
+- **CLI AI助手行为**(per_command 模式):
   - CLI 检测到危险命令时通过 ACP 发送 `request_permission` 请求
   - `acp_bridge.py` 解析请求 → SSE 推 `permission_request` 事件到后端 → 前端 `CommandConfirmDialog` 弹窗
   - 用户确认后 `POST /tasks/{id}/permission_response` → bridge 写回 ACP 响应 → CLI 继续/中止
@@ -170,7 +170,7 @@ agent2 是**幕后质检者**(agent1 是台前回答者):其核查过程与知�
 
 ### 3.5.3 引用复核(check_reference)
 
-协作策略开启「复核 AI助手引用的网址」(`agent_policy.allow_reference_check`,默认开,全场景可用)后,agent2 可抽查复核 agent1 结论引用的外部依据链接(CVE / 安全公告 / 官方文档):核对存在性、来源可靠性分级、页面标题与正文摘录。单轮评估上限 3 次(`MAX_REFERENCE_CALLS=3`)。
+智能体策略开启「复核 AI助手引用的网址」(`agent_policy.allow_reference_check`,默认开,全场景可用)后,agent2 可抽查复核 agent1 结论引用的外部依据链接(CVE / 安全公告 / 官方文档):核对存在性、来源可靠性分级、页面标题与正文摘录。单轮评估上限 3 次(`MAX_REFERENCE_CALLS=3`)。
 
 **安全边界**:
 - **SSRF 硬防护**(后端进程抓取,非沙箱):仅 http/https;重定向逐跳(≤3 跳)校验主机**全部** IP,拒绝私网/回环/链路本地(含云元数据)/保留段/CGNAT/IPv4-mapped IPv6,数字形式主机名同样拦截;**DNS rebinding 防护**——校验通过后直连 IP(Host/SNI/证书校验仍用原域名),消除 TOCTOU;响应体限量 50k 字符,超时 15s
@@ -284,7 +284,7 @@ Result(任务结果项,通用)
 - Conversation 新增 `round_idx`(协作轮次)、`reasoning`(思考链)、`message`(用户补充消息)、`history_compress`(LLM 压缩缓存)等类型
 
 **后续新增表**(详见 §9.15-9.18):
-- `AgentPolicy`(agent_policies):用户级协作策略独立表(1:1,agent2 启停 / 验证权限 / 引用复核开关),从 `user_preferences` JSONB 迁移而来,任务级经 `task.params._agent_policy` 覆盖(曾有的 `max_rounds` 协作总轮次列已随后台审查重构移除)
+- `AgentPolicy`(agent_policies):用户级智能体策略独立表(1:1,agent2 启停 / 验证权限 / 引用复核开关),从 `user_preferences` JSONB 迁移而来,任务级经 `task.params._agent_policy` 覆盖(曾有的 `max_rounds` 协作总轮次列已随后台审查重构移除)
 - `TaskArtifact`(task_artifacts):任务工作区产物,1:N 挂在 Task 上(`kind=git_diff` 存工作区变更 patch,`kind=repo_tree` 存仓库树快照)
 - 练习模块表族(knowledge_points / questions / user_knowledge_states / practice_sessions / attempts / practice_settings / learning_topics):知识点、题库、SM-2 记忆状态、会话、答题流水、用户练习设置与学习主题词表;`KnowledgePoint.learning_topic` 存所属主题 key(出题时首次写入 first-wins,存量由启动迁移回填众数);`learning_topics` 为用户级主题词表(内置 4 行懒播种 is_builtin=true 仅可停用 + 自定义行可增删改,enabled 兼出题开关)
 
@@ -343,7 +343,7 @@ Result(任务结果项,通用)
    - API 新增 `GET /tasks/{id}/pending_command_confirm` + `POST /tasks/{id}/command_confirm`
    - 前端 `CommandConfirmDialog.vue` 组件:显示完整命令 + 拦截原因(红色高亮)+ 「拒绝 / 同意」按钮
    - 用户拒绝时返回 `{"status_code": 0, "body": "[用户拒绝执行此命令]"}`,agent 收到反馈跳过
-   - **注意**:此为 local 模式(无沙箱)专用,拦截的是 `sandbox_tools` 的 `run_command` / `write_file` 等宿主机直接执行的工具。local 模式下 dangerous 命令始终推确认(无视 executor_command_confirm_mode)。CLI 执行智能体(qoder/deepseek/codex)的危险命令确认走 ACP `request_permission` 机制,见 §3.5.2(SSE 事件 `permission_request`、API `POST /tasks/{id}/permission_response`)。sandbox 模式下内置 react_agent 的 dangerous 命令在 `per_command` 模式时也走此机制(复用 `command_confirm` 事件)
+   - **注意**:此为 local 模式(无沙箱)专用,拦截的是 `sandbox_tools` 的 `run_command` / `write_file` 等宿主机直接执行的工具。local 模式下 dangerous 命令始终推确认(无视 executor_command_confirm_mode)。CLI AI助手(qoder/deepseek/codex)的危险命令确认走 ACP `request_permission` 机制,见 §3.5.2(SSE 事件 `permission_request`、API `POST /tasks/{id}/permission_response`)。sandbox 模式下内置 react_agent 的 dangerous 命令在 `per_command` 模式时也走此机制(复用 `command_confirm` 事件)
 
 4. **平台原生隔离**(`SANDBOX_LOCAL_NATIVE_ISOLATION=true`,可选):
    - macOS:`sandbox-exec`(系统目录只读 + 工作区读写 + 禁 `sudo` / `su`)
@@ -582,7 +582,7 @@ Result(任务结果项,通用)
 
 ### 9.1 执行器抽象层(ExecutorAgent)
 
-将「执行智能体」抽象为统一接口(`ExecutorAgent` 抽象基类),支持多种实现:
+将「AI助手」抽象为统一接口(`ExecutorAgent` 抽象基类),支持多种实现:
 - **BuiltinReactAgent**:内置 react_agent,委托 `react_agent.run_react_agent`,使用后端配置的 LLM
 - **ExternalCLIAgent**:外部 CLI agent 的通用包装,通过 registry 声明的 `executor_module` / `executor_func` 延迟加载
 - **工厂模式**:`get_executor(task)` 根据 `task.executor` 字段返回对应实例,未知值回退 builtin
@@ -649,7 +649,7 @@ react_agent 维护跨轮 plan 状态:
 | `plan` | 计划清单状态更新(跨轮续接) |
 | `verify_action` | 验证动作授权请求(verifier_agent 的 `per_action` 模式,前端 VerifyActionDialog) |
 | `command_confirm` | 危险命令确认(local 模式,前端 CommandConfirmDialog) |
-| `permission_request` | CLI 执行智能体命令确认(CLI `per_command` 模式,前端 CommandConfirmDialog;ACP `request_permission` 事件转译) |
+| `permission_request` | CLI AI助手命令确认(CLI `per_command` 模式,前端 CommandConfirmDialog;ACP `request_permission` 事件转译) |
 | `done` | 任务完成 |
 | `error` | 任务失败/异常 |
 
@@ -666,7 +666,7 @@ react_agent 维护跨轮 plan 状态:
 | `/settings/account` | settings/AccountSettingsPanel | 账号设置(改密码 / 邮箱验证 / Git 平台绑定 GitHub+Gitee / 删除账号) |
 | `/settings/models` | settings/ModelSettingsPanel | LLM 模型配置(多厂商列表式管理) |
 | `/settings/cli` | settings/CliSettingsPanel | 外部 CLI 凭据配置(按 registry 动态列出 agent 类型;二级目录 `childMode='switch'`,与面板内 tab 栏双向同步) |
-| `/settings/policy` | settings/AgentPolicyPanel | 协作策略(检查助手启用 / 验证授权模式 / 引用复核开关 / CLI 命令确认模式;原“协作轮次”设置已随后台审查移除) |
+| `/settings/policy` | settings/AgentPolicyPanel | 智能体策略(检查助手启用 / 验证授权模式 / 引用复核开关 / CLI 命令确认模式;原“协作轮次”设置已随后台审查移除) |
 | `/settings/practice` | settings/PracticeSettingsPanel | 练习设置(出题偏好 / 学习主题管理 / 数据管理;二级目录 `childMode='anchor'`,同页锚点 + scrollspy;练习功能开关关闭时隐藏入口) |
 | `/practice` | PracticeView | 自适应练习(出题生成 / 练习会话 / 题库管理 / 错题回顾 / 练习记录;左侧目录锚点 + 常驻操作头布局) |
 | `/practice/history` | 重定向 `/practice#history` | 旧练习记录路径,保书签兼容(历史会话 + 每周正确率趋势已内嵌为练习首页「历史记录」段) |

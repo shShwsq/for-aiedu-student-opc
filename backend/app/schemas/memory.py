@@ -198,7 +198,7 @@ class SaveAgentPolicyRequest(BaseModel):
     - allow_reference_check: agent2 是否能复核 agent1 引用的网址
       (后端安全抓取 + SSRF 防护;结果仅供参考信号)
     - verifier_auth_mode_default: 验证授权默认模式("direct"直接执行 / "per_action"逐动作授权)
-    - executor_command_confirm_default: 执行智能体命令确认默认模式
+    - executor_command_confirm_default: AI助手确认策略默认模式
         "always_approve" 自动批准所有命令 / "per_command" 每个危险命令弹窗确认
 
     历史:曾有 max_rounds(协作总轮次)字段,agent2 审查移到后台执行后已移除。

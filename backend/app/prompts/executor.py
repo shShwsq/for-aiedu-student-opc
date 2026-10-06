@@ -1,6 +1,6 @@
 """执行链(内置 react_agent + CLI/acp_base)的提示词与上下文段落。
 
-集中管理所有送进执行智能体 LLM 的文本资产:
+集中管理所有送进 AI助手 LLM 的文本资产:
 - system prompt 常量、追问指引、plan 提醒、循环/迭代兜底提示
 - repo context / 上传文件 / 记忆段等上下文段落的纯文本包装函数
 
@@ -56,7 +56,7 @@ def build_first_round_question(user_input: str, params: dict | None) -> str:
 # 通用 system prompt(场景降级后,不再从场景读取)
 # ============================================================
 
-REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(执行智能体),负责执行实际的分析任务(如代码审计、审查、质量分析等)。
+REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(AI助手),负责执行实际的分析任务(如代码审计、审查、质量分析等)。
 
 ## 你的职责
 根据任务指令对目标仓库执行分析,发现并记录问题,最后用自然语言总结你的发现。

@@ -531,7 +531,7 @@ def update_task_runtime_config(
 
     - 模型 id 需存在于任务归属用户的 LLM 配置列表,否则 400
     - react_llm_config_id 仅 executor=builtin 时可改(CLI 执行器模型自管)
-    - 协作策略(max_rounds)已随后台审查重构移除,此处只更新模型配置
+    - 智能体策略项(max_rounds)已随后台审查重构移除,此处只更新模型配置
     """
     task = db.get(Task, task_id)
     if not task:

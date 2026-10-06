@@ -227,7 +227,7 @@ const allSkills = ref<SkillSummary[]>([])
 const skillsError = ref('')
 
 // ============================================================
-// 右侧设置抽屉(协作策略 / 技能两个分区;测试环境设置并入协作策略的「允许自行验证」开关下)
+// 右侧设置抽屉(高级设置 / 技能两个分区;检查助手启停与测试环境设置并入「高级设置」)
 // ============================================================
 
 /** 抽屉分区标识 */
@@ -422,10 +422,10 @@ const error = ref('')
 const policyAgent2Enabled = ref(true)
 /** agent2 是否能自己验证(实验性) */
 const policyAllowVerify = ref(false)
-/** 执行智能体命令确认模式(任务级 _executor_command_confirm 覆盖;builtin 与 CLI 执行器均生效) */
+/** AI助手确认策略(任务级 _executor_command_confirm 覆盖;builtin 与 CLI 执行器均生效) */
 const policyExecutorCommandConfirm = ref<'always_approve' | 'per_command'>('always_approve')
 
-/** 执行智能体命令确认模式选项(对齐 BaseSelect {value,label} 结构) */
+/** AI助手确认策略选项(对齐 BaseSelect {value,label} 结构) */
 const executorConfirmOptions = [
   { value: 'always_approve' as 'always_approve' | 'per_command', label: '自动批准' },
   { value: 'per_command' as 'always_approve' | 'per_command', label: '逐命令确认' },
@@ -446,7 +446,7 @@ const DEFAULT_POLICY = {
 
 /**
  * 用户级默认策略(比较基准,用于判断是否需要提交任务级覆盖)。
- * - 初始为系统默认值;onMounted 加载用户偏好(协作策略设置页保存的)后替换为实际值。
+ * - 初始为系统默认值;onMounted 加载用户偏好(智能体策略设置页保存的)后替换为实际值。
  * - 加载失败/未配置时保持系统默认,与后端 resolve_agent_policy 的合并结果一致。
  */
 const userPolicyDefaults = ref({
@@ -475,15 +475,7 @@ watch(
   },
 )
 
-// 单 agent 模式下策略抽屉入口被内联选择器替代;若关闭 agent2 时 policy 分区正展开,
-// 收起抽屉避免残留近乎空白的面板
-watch(policyAgent2Enabled, (enabled) => {
-  if (!enabled && drawerOpen.value && drawerSection.value === 'policy') {
-    closeDrawer()
-  }
-})
-
-// ---- 测试环境 / 动态验证配置(协作策略抽屉内,开启「允许自行验证」后展示) ----
+// ---- 测试环境 / 动态验证配置(高级设置抽屉内,开启「允许自行验证」后展示) ----
 // agent2 可在已部署的测试环境动态验证 agent1 发现的安全问题。
 // 对用户透明:不出现 verifier_agent 字样,只显示"正在验证"。
 // 是否启用由 policyAllowVerify(允许检查助手自行验证)统一控制。
@@ -771,7 +763,7 @@ async function handleSubmit(): Promise<void> {
       params._agent_policy = agentPolicy
     }
 
-    // 执行智能体命令确认模式(任务级 _executor_command_confirm 覆盖)
+    // AI助手确认策略(任务级 _executor_command_confirm 覆盖)
     // 与 agent_policy 分离存储:后端 agent_policy.resolve_agent_policy 会把
     // executor_command_confirm_default 映射到 task.params._executor_command_confirm(若未显式设置);
     // 此处仅在用户改了用户级默认时显式提交,优先级最高。
@@ -884,7 +876,7 @@ onMounted(async () => {
       getAgentConfigs().catch(() => null), // 静默失败,无 agent 配置不影响提交
       getPreferences().catch(() => null), // 静默失败:未配置/未登录时用系统默认策略
     ])
-    // 用户级默认策略(协作策略设置页保存的):填充为协作策略表单初始值,
+    // 用户级默认策略(智能体策略设置页保存的):填充为高级设置表单初始值,
     // 并同步为提交时的比较基准(未配置时表单保持系统默认,行为不变)
     if (prefs?.agent_policy) {
       const p = prefs.agent_policy
@@ -986,38 +978,7 @@ onUnmounted(() => {
               </div>
             </div>
   
-            <!-- 第 2 行:agent2(启用开关 + 评估模型;关闭时模型选择器置灰) -->
-            <div class="config-row" data-onboarding="create-user-model">
-              <div class="config-label-group">
-                <span class="agent-avatar avatar-agent2" aria-hidden="true">
-                  <BrandLogo :size="22" variant="agent2" />
-                </span>
-                <span class="config-label">检查助手</span>
-              </div>
-              <!-- 启用开关(自协作策略抽屉移至此处):关闭=单 agent 模式,右侧模型选择器置灰 -->
-              <label
-                class="ua-enable-toggle"
-                :title="policyAgent2Enabled ? '检查助手参与协作(质检 / 验证)' : '单 agent 模式:AI助手 跑 1 轮直接产出结果'"
-              >
-                <input v-model="policyAgent2Enabled" class="switch" type="checkbox" />
-                <span>{{ policyAgent2Enabled ? '已启用' : '已停用' }}</span>
-              </label>
-              <div class="model-select">
-                <BaseSelect
-                  v-model="selectedLlmConfigId"
-                  :options="llmConfigOptions"
-                  :disabled="loadingModels || !policyAgent2Enabled"
-                  :aria-label="modelSelectLabel"
-                />
-                <RouterLink
-                  v-if="llmConfigs.length === 0 && !loadingModels"
-                  to="/settings/models"
-                  class="model-empty-link"
-                >配置 →</RouterLink>
-              </div>
-            </div>
-  
-            <!-- 第 3 行:agent1 设置(执行器 + CLI 模型配置 / 技能) -->
+            <!-- 第 2 行:agent1(AI助手)设置(执行器 + CLI 模型配置 / 技能;检查助手已并入「高级设置」抽屉) -->
             <div class="config-row">
               <div class="config-label-group">
                 <span class="agent-avatar avatar-agent1" aria-hidden="true">
@@ -1164,20 +1125,6 @@ onUnmounted(() => {
                   </svg>
                 </button>
 
-                <!-- 单 agent 模式:命令确认模式内联设置(与 agent1 同行;不显示文字标签,悬停提示用途) -->
-                <div
-                  v-if="!policyAgent2Enabled"
-                  class="command-confirm-inline"
-                  title="设置命令确认模式"
-                >
-                  <BaseSelect
-                    v-model="policyExecutorCommandConfirm"
-                    :options="executorConfirmOptions"
-                    size="sm"
-                    class="command-confirm-select"
-                    aria-label="命令确认模式"
-                  />
-                </div>
                 <template v-if="!useAgentExecutor && allSkills.length > 0">
                   <Teleport defer to="#settings-drawer-body">
                     <div v-show="drawerOpen && drawerSection === 'skills'" class="drawer-section-body">
@@ -1220,13 +1167,14 @@ onUnmounted(() => {
               </div>
             </div>
   
-            <!-- 协作策略抽屉入口(仅 agent2 启用时展示;单 agent 模式下命令确认模式已内联到 agent1 行) -->
-            <div v-if="policyAgent2Enabled" class="config-row config-row-scenario">
+            <!-- 高级设置抽屉入口(合并原「检查助手」行 + 协作策略:agent2 启停/评估模型/验证/命令确认;始终展示) -->
+            <div class="config-row config-row-scenario">
               <button
                 type="button"
                 class="drawer-toggle"
                 :aria-expanded="drawerOpen && drawerSection === 'policy'"
-                :title="drawerTitle('policy', '协作策略')"
+                :title="drawerTitle('policy', '高级设置')"
+                data-onboarding="create-user-model"
                 @click="openDrawer('policy')"
               >
                 <svg
@@ -1252,9 +1200,9 @@ onUnmounted(() => {
                   <line x1="8" y1="10" x2="8" y2="14" />
                   <line x1="16" y1="18" x2="16" y2="22" />
                 </svg>
-                <span>协作策略</span>
+                <span>高级设置</span>
                 <span class="advanced-summary">
-                  {{ policyAllowVerify ? '可自行验证' : '默认' }}
+                  {{ !policyAgent2Enabled ? '单智能体' : (policyAllowVerify ? '可自行验证' : '默认') }}
                 </span>
                 <svg
                   class="advanced-chevron"
@@ -1275,10 +1223,43 @@ onUnmounted(() => {
   
                 <Teleport defer to="#settings-drawer-body">
                   <div v-show="drawerOpen && drawerSection === 'policy'" class="drawer-section-body">
-                    <!-- 单 agent 模式提示:agent2 关闭时(开关在 topbar 第 2 行),说明下方依赖字段为何隐藏 -->
-                    <p v-if="!policyAgent2Enabled" class="policy-single-hint">
-                      当前为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估与验证。
-                    </p>
+                    <!-- 分组:检查助手(原 topbar 第 2 行整体移入) -->
+                    <div class="adv-group">
+                      <div class="adv-group-title">
+                        <span class="agent-avatar avatar-agent2" aria-hidden="true">
+                          <BrandLogo :size="20" variant="agent2" />
+                        </span>
+                        <span>检查助手</span>
+                      </div>
+
+                      <label
+                        class="policy-toggle-row policy-toggle-primary"
+                        :title="policyAgent2Enabled ? '检查助手后台质检 / 验证' : '单 agent 模式:AI助手 跑 1 轮直接产出结果'"
+                      >
+                        <input v-model="policyAgent2Enabled" class="switch" type="checkbox" />
+                        <span>{{ policyAgent2Enabled ? '已启用' : '已停用' }}</span>
+                      </label>
+
+                      <label class="policy-field">
+                        <span class="policy-label">{{ modelSelectLabel }}</span>
+                        <BaseSelect
+                          v-model="selectedLlmConfigId"
+                          :options="llmConfigOptions"
+                          :disabled="loadingModels || !policyAgent2Enabled"
+                          class="policy-select"
+                          :aria-label="modelSelectLabel"
+                        />
+                        <RouterLink
+                          v-if="llmConfigs.length === 0 && !loadingModels"
+                          to="/settings/models"
+                          class="model-empty-link"
+                        >配置 →</RouterLink>
+                      </label>
+
+                      <!-- 单 agent 模式提示:agent2 关闭时说明下方依赖字段为何隐藏 -->
+                      <p v-if="!policyAgent2Enabled" class="policy-single-hint">
+                        当前为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估与验证。
+                      </p>
 
                     <!-- agent2 依赖字段:关闭时整组隐藏(v-show 保留值,提交 payload 不变) -->
                     <Transition name="collapse">
@@ -1370,18 +1351,26 @@ onUnmounted(() => {
                     </Transition>
                       </div>
                     </Transition>
+                    </div>
+                    <!-- /分组:检查助手 -->
 
-                    <!-- 执行智能体命令确认模式(builtin 与 CLI 执行器均生效) -->
+                    <!-- 分组:执行(独立于 agent2) -->
+                    <div class="adv-group">
+                      <div class="adv-group-title">执行</div>
+
+                    <!-- AI助手确认策略(builtin 与 CLI 执行器均生效) -->
                     <label class="policy-field">
-                      <span class="policy-label">执行智能体命令确认模式</span>
+                      <span class="policy-label">AI助手确认策略</span>
                       <BaseSelect
                         v-model="policyExecutorCommandConfirm"
                         :options="executorConfirmOptions"
                         class="policy-select"
-                        aria-label="执行智能体命令确认模式"
+                        aria-label="AI助手确认策略"
                       />
-                      <span class="policy-hint">控制执行智能体(内置 / CLI)执行危险命令时是否弹窗确认。CLI 中 Codex 受非交互模式限制,仅支持自动批准。</span>
+                      <span class="policy-hint">控制 AI助手(内置 / CLI)执行危险命令时是否弹窗确认。CLI 中 Codex 受非交互模式限制,仅支持自动批准。</span>
                     </label>
+                    </div>
+                    <!-- /分组:执行 -->
                   </div>
                 </Teleport>
             </div>
@@ -1711,7 +1700,7 @@ onUnmounted(() => {
   flex-direction: column;
 }
 
-/* 内容列:在滚动容器内水平 + 垂直居中(与技能管理 / CLI 设置 / 协作策略一致);
+/* 内容列:在滚动容器内水平 + 垂直居中(与技能管理 / CLI 设置 / 智能体策略一致);
    内容超高时 margin auto 退化为 0,自动改为顶部对齐可滚动,不会被裁剪。
    width: 100% + max-width 保持原块级流的宽度行为(flex 下 auto 边距会取消拉伸) */
 .main-col {
@@ -2521,7 +2510,7 @@ onUnmounted(() => {
   flex: 1;
 }
 
-/* ---- 设置抽屉入口按钮(协作策略 / 技能) ---- */
+/* ---- 设置抽屉入口按钮(高级设置 / 技能) ---- */
 .drawer-toggle {
   display: inline-flex;
   align-items: center;
@@ -2550,7 +2539,7 @@ onUnmounted(() => {
   box-shadow: 0 0 0 3px var(--color-primary-light);
 }
 
-/* 分区专属图标(协作策略=滑块 / 技能=星光),强化「点击可设置」的入口感 */
+/* 分区专属图标(高级设置=滑块 / 技能=星光),强化「点击可设置」的入口感 */
 .toggle-icon {
   flex-shrink: 0;
   color: var(--color-text-muted);
@@ -2637,26 +2626,35 @@ onUnmounted(() => {
   gap: var(--space-3);
 }
 
-/* agent2 启用开关(topbar 第 2 行,位于模型下拉框左侧) */
-.ua-enable-toggle {
+/* 高级设置抽屉内分组(检查助手 / 执行) */
+.adv-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.adv-group + .adv-group {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+}
+
+.adv-group-title {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
   color: var(--color-text-secondary);
-  cursor: pointer;
-  user-select: none;
 }
 
-/* 单 agent 模式:命令确认模式内联设置(替代「协作策略」抽屉入口;无文字标签,悬停提示用途) */
-.command-confirm-inline {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-}
-
-.command-confirm-select {
-  min-width: 120px;
+/* 检查助手启停(高级设置抽屉主开关) */
+.policy-toggle-primary {
+  padding: var(--space-2) var(--space-3);
+  margin: 0;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-weight: var(--fw-medium);
 }
 
 /* 设置面板内技能列表改单列,卡片更舒展 */

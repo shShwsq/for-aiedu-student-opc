@@ -2235,7 +2235,7 @@ async function handleSuggestionDig(text: string): Promise<void> {
   }
 }
 
-/** 运行时设置(模型/协作策略)保存成功:回填后端最新快照 */
+/** 运行时设置(agent1 / agent2 模型)保存成功:回填后端最新快照 */
 function handleRuntimeConfigSaved(updated: TaskDetail): void {
   task.value = updated
 }
@@ -2778,7 +2778,7 @@ function toggleResult(id: string): void {
       </template>
       </div>
 
-      <!-- 运行时设置面板(输入框上方箭头展开:react/agent2 模型 + 协作策略;
+      <!-- 运行时设置面板(输入框上方箭头展开:react/agent2 模型;
            运行中/暂停中修改在下一轮执行生效,组件内 toast 提示) -->
       <TaskRuntimeSettings
         v-if="task && (task.status === 'running' || task.status === 'paused' || task.status === 'completed' || task.status === 'failed')"

@@ -93,7 +93,7 @@ export interface SaveAgentPolicyRequest {
   allow_reference_check: boolean
   /** 验证授权默认模式:"direct" 直接执行 / "per_action" 逐动作授权(任务级可覆盖) */
   verifier_auth_mode_default: 'direct' | 'per_action'
-  /** 执行智能体命令确认默认模式(任务级 _executor_command_confirm 可覆盖):
+  /** AI助手确认策略默认模式(任务级 _executor_command_confirm 可覆盖):
    *  - "always_approve":自动批准所有命令(注入 YOLO/never 策略,不弹窗)
    *  - "per_command":每个危险命令弹窗确认(CLI 走 ACP request_permission 通道) */
   executor_command_confirm_default: 'always_approve' | 'per_command'

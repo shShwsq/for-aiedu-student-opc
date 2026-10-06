@@ -1,4 +1,4 @@
-"""deepseek_cli_agent:基于 DeepSeek Harness CLI(dsh)+ ACP 协议的执行智能体(薄封装)
+"""deepseek_cli_agent:基于 DeepSeek Harness CLI(dsh)+ ACP 协议的 AI助手(薄封装)
 
 在沙箱内启动 DeepSeek Harness CLI(开源 https://github.com/deepseek-ai/deepseek-harness)
 的 ACP 服务(dsh --profile acp),通过 HTTP 桥接(acp_bridge.py)与后端通信。

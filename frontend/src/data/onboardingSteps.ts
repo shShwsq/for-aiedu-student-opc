@@ -106,9 +106,9 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     placement: 'bottom',
     title: '主导航',
     content:
-      '顶栏可切换:模型设置(配置 LLM)、CLI 设置(外部 CLI 凭据)、协作策略(评估频率 / 验证权限 / CLI 命令确认)、技能管理(上传自定义技能)、记忆管理(用户偏好 / 全局 / 项目记忆)。',
+      '顶栏可切换:模型设置(配置 LLM)、CLI 设置(外部 CLI 凭据)、智能体策略(检查助手启停 / 验证权限 / CLI 命令确认)、技能管理(上传自定义技能)、记忆管理(用户偏好 / 全局 / 项目记忆)。',
     contentWhenPractice:
-      '顶栏可切换:模型设置(配置 LLM)、CLI 设置(外部 CLI 凭据)、协作策略(评估频率 / 验证权限 / CLI 命令确认)、技能管理(上传自定义技能)、自适应练习(按掌握度出题复习)、记忆管理(用户偏好 / 全局 / 项目记忆)。',
+      '顶栏可切换:模型设置(配置 LLM)、CLI 设置(外部 CLI 凭据)、智能体策略(检查助手启停 / 验证权限 / CLI 命令确认)、技能管理(上传自定义技能)、自适应练习(按掌握度出题复习)、记忆管理(用户偏好 / 全局 / 项目记忆)。',
   },
   {
     id: 'home-practice',
@@ -144,9 +144,9 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     target: 'create-user-model',
     route: 'task-create',
     placement: 'right',
-    title: '检查助手评估模型',
+    title: '高级设置',
     content:
-      '选择用于结果评估的模型。若列表为空,先到「模型设置」配置一个 LLM 凭据。下方执行器还可单独选另一个模型(空时回退到此模型)。',
+      '点开可配置检查助手(启停 / 评估模型 / 允许自行验证)与执行命令确认模式。检查助手默认在后台质检 AI助手 的产出;关闭后进入单 agent 模式,AI助手 跑 1 轮直接产出结果。',
   },
   {
     id: 'create-react-executor',

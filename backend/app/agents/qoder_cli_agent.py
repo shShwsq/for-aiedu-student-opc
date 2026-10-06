@@ -1,4 +1,4 @@
-"""qoder_cli_agent:基于 Qoder CLI + ACP 协议的执行智能体(薄封装)
+"""qoder_cli_agent:基于 Qoder CLI + ACP 协议的 AI助手(薄封装)
 
 在沙箱内启动 Qoder CLI 的 ACP(Agent Client Protocol)服务,通过 HTTP 桥接
 (acp_bridge.py)与后端通信。模型配置由 Qoder 账号配额管理,后端不直接管理

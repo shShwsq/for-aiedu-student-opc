@@ -47,7 +47,7 @@ export const PRACTICE_SECTION_IDS = ['generation', 'learning-topics', 'data'] as
 /**
  * 设置页目录(顺序即渲染顺序)
  *
- * 账户/模型/协作策略是单表单或单列表,不拆二级;协作策略还有 dirty 离页确认,
+ * 账户/模型/智能体策略是单表单或单列表,不拆二级;智能体策略还有 dirty 离页确认,
  * 同路由 hash 切换不会触发弹窗,是保持一层结构的额外理由。
  */
 export const SETTINGS_NAV: SettingsNavItem[] = [
@@ -59,7 +59,7 @@ export const SETTINGS_NAV: SettingsNavItem[] = [
     children: 'agent-types',
     childMode: 'switch',
   },
-  { path: '/settings/policy', label: '协作策略' },
+  { path: '/settings/policy', label: '智能体策略' },
   { path: '/settings/memory', label: '记忆设置' },
   {
     path: '/settings/practice',
