@@ -34,6 +34,13 @@ export interface CredentialField {
   options?: Array<{ value: string; label: string }>
   /** select 类型的默认值(未配置时使用) */
   default?: string
+  /**
+   * 条件显隐:仅当当前凭证满足此约束时,前端才展示该字段并参与校验/提交。
+   * 形如 { auth_mode: 'chatgpt' } 表示仅当 auth_mode=chatgpt 时可见;缺省则始终可见。
+   */
+  visible_when?: Record<string, string> | null
+  /** secret 类型专用:是否用多行 textarea 输入(如粘贴 auth.json 这类较长凭据) */
+  multiline?: boolean
 }
 
 /** agent 类型元数据(GET /agents/types) */

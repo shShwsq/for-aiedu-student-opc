@@ -330,13 +330,27 @@ def _encrypt_credentials(creds: dict) -> str:
     return encrypt_secret(plaintext)
 
 
+def _is_field_visible(fdef: dict, effective: dict) -> bool:
+    """判断字段在给定生效凭证下是否可见(基于 visible_when)
+
+    visible_when 形如 {"auth_mode": "chatgpt"}:仅当 effective["auth_mode"]=="chatgpt" 时可见。
+    无 visible_when 则始终可见。生效值取不到(字段缺失)按不满足处理。
+    """
+    cond = fdef.get("visible_when")
+    if not cond:
+        return True
+    return all(effective.get(k) == v for k, v in cond.items())
+
+
 def _merge_credentials(
     agent_type: str,
     old_creds: dict,
     new_values: list,
 ) -> dict:
-    """合并凭证(策略同 model_configs._merge_llm_configs)
+    """合并凭证(策略同 model_configs._merge_llm_configs,并支持条件显隐字段)
 
+    - 先算生效 auth_mode(本次提交优先,缺省回退旧值),用于判定字段可见性
+    - 不可见字段:不写入结果(切模式即清除另一模式的残留密钥,如 chatgpt 模式丢弃 api_key)
     - secret 字段:空串 → 保留旧值;非空 → 更新;首次 required 空串 → 报错
     - text 字段:直接用新值(可为空)
     """
@@ -346,10 +360,22 @@ def _merge_credentials(
     # 构建 new_values 的 lookup
     new_map = {v.key: v.value for v in new_values}
 
+    # 生效凭证(用于 visible_when 判定):auth_mode 属非 secret,本次提交优先,否则旧值
+    effective: dict = dict(old_creds)
+    am_def = field_map.get("auth_mode")
+    if am_def is not None:
+        submitted_am = new_map.get("auth_mode", "")
+        effective["auth_mode"] = submitted_am or old_creds.get("auth_mode", "") or am_def.get("default", "")
+
     result: dict = {}
     for fdef in field_defs:
         key = fdef["key"]
         ftype = fdef.get("type", "secret")
+
+        # 不可见字段直接跳过:既不写入新值,也不保留旧值(切模式即清除另一模式密钥)
+        if not _is_field_visible(fdef, effective):
+            continue
+
         new_val = new_map.get(key, "")
 
         if ftype == "secret":

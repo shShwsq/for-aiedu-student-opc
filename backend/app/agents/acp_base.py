@@ -2575,6 +2575,7 @@ def run_acp_agent(
     post_session_setup: Callable[[ACPClient, str, Task], None] | None = None,
     credential_env_builder: Callable[[dict[str, str], Task | None], dict[str, str]] | None = None,
     pre_bridge_hook: Callable[[Any, dict[str, str], str, Task | None], None] | None = None,
+    post_bridge_hook: Callable[[Any, dict[str, str], str, Session, Any], None] | None = None,
 ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
     """跑一轮 ACP CLI 执行器(通用流程)
 
@@ -2597,6 +2598,11 @@ def run_acp_agent(
         在 _ensure_cli_env 之后、_start_acp_bridge 之前执行,
         用于向沙箱写入 CLI 需要的配置文件。
         task 为 None 时(测试连接场景)默认 always_approve。
+
+    post_bridge_hook: bridge 运行后的收尾回调
+        (session, credentials, agent_type, db, user_id) -> None。
+        本轮 prompt 成功结束后、提取 summary 之前调用(尽力而为,异常吞掉)。
+        codex chatgpt 模式用此读回轮换后的 auth.json 并回写用户配置。
 
     返回:(results, summary, final_plan)
         results: 始终为空 list(结构化结果由 agent2 在 done 时提取)
@@ -3005,6 +3011,14 @@ def run_acp_agent(
         if not _cached:
             _stop_acp_bridge(session, bridge_exec_id, agent_type)
 
+    # ---- wrapper 层钩子:bridge 运行后的收尾 ----
+    # codex chatgpt 模式用此读回轮换后的 auth.json 并回写用户配置(尽力而为)
+    if post_bridge_hook:
+        try:
+            post_bridge_hook(session, credentials, agent_type, db, task.user_id)
+        except Exception as e:
+            logger.warning(f"[task={task.id}] {agent_type} post_bridge_hook 失败(忽略): {e}")
+
     # ---- 提取 summary 和 plan ----
     summary = collector.content_full or ""
     if not summary:
@@ -3068,6 +3082,7 @@ def test_credential_streaming(
     test_acp_args: list[str] | None = None,
     credential_env_builder: Callable[[dict[str, str], Task | None], dict[str, str]] | None = None,
     pre_bridge_hook: Callable[[Any, dict[str, str], str, Task | None], None] | None = None,
+    post_bridge_hook: Callable[[Any, dict[str, str], str, Session, Any], None] | None = None,
 ) -> Generator[dict, None, None]:
     """流式版测试凭证:yield SSE 事件 dict(供路由层格式化为 SSE)
 
@@ -3089,6 +3104,8 @@ def test_credential_streaming(
         task=None(测试场景),wrapper 应默认 always_approve。
     pre_bridge_hook: bridge 启动前的沙箱准备回调(codex 用此写 ~/.codex/config.toml);
         task=None(测试场景),wrapper 应默认 always_approve。
+    post_bridge_hook: bridge 运行后的收尾回调(session, credentials, agent_type, db, user_id);
+        在沙箱关闭前调用(尽力而为),codex chatgpt 模式用此回写轮换后的 auth.json。
 
     done/error 为终止事件,生成器在此后结束。
     """
@@ -3417,6 +3434,12 @@ def test_credential_streaming(
         logger.exception(f"[{agent_type}_test] 流式测试过程异常")
         yield {"type": "error", "data": {"ok": False, "message": f"测试异常: {e}"}}
     finally:
+        # 沙箱关闭前:先执行 post hook(codex chatgpt 回写轮换后的 auth.json,尽力而为)
+        if post_bridge_hook:
+            try:
+                post_bridge_hook(session, credentials, agent_type, db, user_id)
+            except Exception as e:
+                logger.warning(f"[{agent_type}_test] post_bridge_hook 失败(忽略): {e}")
         if bridge_exec_id:
             _stop_acp_bridge(session, bridge_exec_id, agent_type)
         try:

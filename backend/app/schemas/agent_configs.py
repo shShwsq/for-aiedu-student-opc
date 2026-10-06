@@ -31,6 +31,12 @@ class CredentialField(BaseModel):
     options: list[dict[str, str]] | None = None
     # select 类型专用:默认值(未配置时使用)
     default: str | None = None
+    # 条件显隐:仅当当前凭证满足此约束时前端才展示该字段并参与校验/提交。
+    # 形如 {"auth_mode": "chatgpt"} 表示仅当 auth_mode=chatgpt 时可见。
+    # None 表示始终可见。
+    visible_when: dict[str, str] | None = None
+    # secret 类型专用:是否用多行 textarea 输入(如粘贴 auth.json 这类较长凭据)
+    multiline: bool = False
 
 
 class AgentTypeMeta(BaseModel):
@@ -56,7 +62,8 @@ class CredentialValue(BaseModel):
     """
 
     key: str
-    value: str = Field(default="", max_length=4096)
+    # 上限放宽到 32768:ChatGPT 模式的 auth_json 是整段含 JWT 的 JSON,远超普通密钥长度
+    value: str = Field(default="", max_length=32768)
 
 
 class SaveAgentConfigRequest(BaseModel):

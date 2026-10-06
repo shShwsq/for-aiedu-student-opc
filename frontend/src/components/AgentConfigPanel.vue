@@ -145,16 +145,49 @@ function fieldError(field: CredentialField): string {
   return ''
 }
 
-/** 是否所有必填字段都满足提交条件 */
+/**
+ * 字段在当前草稿下是否可见(基于 visible_when)
+ *
+ * 形如 visible_when={auth_mode:'chatgpt'}:仅当 draft.values.auth_mode==='chatgpt' 时可见。
+ * 不可见字段不渲染、不参与校验、不提交。
+ */
+function isFieldVisible(field: CredentialField): boolean {
+  const cond = field.visible_when
+  if (!cond) return true
+  return Object.entries(cond).every(
+    ([depKey, depVal]) => (draft.values[depKey] ?? '') === depVal,
+  )
+}
+
+/** 当前可见的字段列表(供模板渲染与提交/校验) */
+const visibleFields = computed(
+  () => (props.meta?.credential_fields ?? []).filter(isFieldVisible),
+)
+
+// 认证方式等切换导致字段可见性变化时,清空已隐藏字段的草稿值,
+// 避免切回另一模式时把残留输入误提交(如 chatgpt→api_key 前清掉 auth_json)。
+watch(
+  () =>
+    (props.meta?.credential_fields ?? [])
+      .map((f) => (isFieldVisible(f) ? '1' : '0'))
+      .join(''),
+  () => {
+    for (const f of props.meta?.credential_fields ?? []) {
+      if (!isFieldVisible(f)) draft.values[f.key] = ''
+    }
+  },
+)
+
+/** 是否所有(可见)必填字段都满足提交条件 */
 const canSubmit = computed(() => {
   if (props.saving) return false
-  const fields = props.meta?.credential_fields ?? []
-  return fields.every((f) => !fieldError(f))
+  return visibleFields.value.every((f) => !fieldError(f))
 })
 
 function handleSubmit(): void {
   if (!canSubmit.value || !props.meta) return
-  const credentials: CredentialValue[] = props.meta.credential_fields.map((f) => ({
+  // 仅提交可见字段:隐藏字段不写入,后端会清除另一模式残留密钥
+  const credentials: CredentialValue[] = visibleFields.value.map((f) => ({
     key: f.key,
     value: draft.values[f.key] ?? '',
   }))
@@ -334,7 +367,7 @@ onUnmounted(() => {
         <!-- 动态凭据字段(grid 并排,secret 占整行) -->
         <div class="fields-grid">
           <div
-            v-for="field in meta.credential_fields"
+            v-for="field in visibleFields"
             :key="field.key"
             :class="['field', { 'field-full': field.type === 'secret' }]"
           >
@@ -376,32 +409,46 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <!-- secret 类型:password 输入 + 眼睛切换显隐 -->
+            <!-- secret 类型:password 输入 + 眼睛切换显隐;multiline 则用 textarea -->
             <div v-if="field.type === 'secret'" class="input-wrapper">
-              <input
+              <textarea
+                v-if="field.multiline"
                 :id="`agent-field-${field.key}`"
                 v-model="draft.values[field.key]"
-                :type="draft.show[field.key] ? 'text' : 'password'"
+                class="field-textarea"
+                rows="6"
+                spellcheck="false"
                 autocomplete="off"
                 :placeholder="fieldPlaceholder(field)"
                 :class="{ invalid: fieldError(field) }"
                 :disabled="saving"
               />
-              <button
-                type="button"
-                class="toggle-pwd"
-                :aria-label="draft.show[field.key] ? '隐藏' : '显示'"
-                @click="draft.show[field.key] = !draft.show[field.key]"
-              >
-                <svg v-if="!draft.show[field.key]" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                  <circle cx="12" cy="12" r="3" />
-                </svg>
-                <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
-                  <line x1="1" y1="1" x2="23" y2="23" />
-                </svg>
-              </button>
+              <template v-else>
+                <input
+                  :id="`agent-field-${field.key}`"
+                  v-model="draft.values[field.key]"
+                  :type="draft.show[field.key] ? 'text' : 'password'"
+                  autocomplete="off"
+                  :placeholder="fieldPlaceholder(field)"
+                  :class="{ invalid: fieldError(field) }"
+                  :disabled="saving"
+                />
+                <button
+                  type="button"
+                  class="toggle-pwd"
+                  :aria-label="draft.show[field.key] ? '隐藏' : '显示'"
+                  @click="draft.show[field.key] = !draft.show[field.key]"
+                >
+                  <svg v-if="!draft.show[field.key]" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                  <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+                    <line x1="1" y1="1" x2="23" y2="23" />
+                  </svg>
+                </button>
+              </template>
             </div>
 
             <!-- text 类型:普通明文输入 -->
@@ -703,6 +750,42 @@ onUnmounted(() => {
 
 .field input.invalid,
 .field select.invalid {
+  border-color: var(--color-danger);
+}
+
+/* secret + multiline 的 textarea:对齐 input 观感,高度自适应、纵向可拖拽 */
+.field textarea.field-textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-sm);
+  font-family: var(--font-mono);
+  line-height: 1.5;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm, 6px);
+  resize: vertical;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.field textarea.field-textarea::placeholder {
+  color: var(--color-text-muted);
+  font-family: var(--font-base);
+}
+
+.field textarea.field-textarea:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px var(--color-primary-light);
+}
+
+.field textarea.field-textarea:disabled {
+  background: var(--color-surface-alt);
+  cursor: not-allowed;
+}
+
+.field textarea.field-textarea.invalid {
   border-color: var(--color-danger);
 }
 

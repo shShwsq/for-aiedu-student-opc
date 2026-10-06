@@ -140,13 +140,50 @@ AGENT_REGISTRY: dict[str, dict[str, Any]] = {
         ),
         "credential_fields": [
             {
+                "key": "auth_mode",
+                "label": "认证方式",
+                "type": "select",
+                "required": True,
+                "default": "api_key",
+                "options": [
+                    {"value": "api_key", "label": "OpenAI API Key"},
+                    {"value": "chatgpt", "label": "ChatGPT 账户(粘贴 auth.json)"},
+                ],
+                "description": (
+                    "选择 Codex 的认证方式:\n"
+                    "• OpenAI API Key:用 API Key 计费,可配自定义端点;\n"
+                    "• ChatGPT 账户:用 ChatGPT 订阅额度(Plus/Pro/Team/Business/Enterprise/Edu),"
+                    "在本机 codex login 后粘贴 ~/.codex/auth.json。"
+                ),
+            },
+            {
                 "key": "api_key",
                 "label": "API Key",
                 "type": "secret",
                 "required": True,
                 "placeholder": "sk-...",
                 "help_url": "https://platform.openai.com/api-keys",
+                "visible_when": {"auth_mode": "api_key"},
                 "description": "OpenAI API Key 或自定义端点的 API Key",
+            },
+            {
+                "key": "auth_json",
+                "label": "ChatGPT auth.json",
+                "type": "secret",
+                "required": True,
+                "multiline": True,
+                "placeholder": "粘贴 ~/.codex/auth.json 的完整内容",
+                "help_url": "https://platform.openai.com/codex",
+                "help_text": (
+                    "在本机执行 `codex login` 完成 ChatGPT 登录后,打开 ~/.codex/auth.json,"
+                    "把整段 JSON 粘贴到此。SecondLook 加密存储,每次运行写入沙箱 CODEX_HOME,"
+                    "并在运行后回写轮换后的新 token。"
+                ),
+                "visible_when": {"auth_mode": "chatgpt"},
+                "description": (
+                    "ChatGPT 账户 OAuth 凭证(auth.json)。\n"
+                    "需含 tokens(id_token/access_token/refresh_token);Codex 会用 refresh_token 自动续期。"
+                ),
             },
             {
                 "key": "base_url",
@@ -154,6 +191,7 @@ AGENT_REGISTRY: dict[str, dict[str, Any]] = {
                 "type": "text",
                 "required": False,
                 "placeholder": "https://api.openai.com/v1(留空用默认)",
+                "visible_when": {"auth_mode": "api_key"},
                 "description": (
                     "自定义 API 端点(OpenAI 兼容)。\n"
                     "留空 = OpenAI 官方;填入 = 第三方中转/Ollama/vLLM 等。\n"
@@ -174,6 +212,7 @@ AGENT_REGISTRY: dict[str, dict[str, Any]] = {
                 "type": "select",
                 "required": False,
                 "default": "responses",
+                "visible_when": {"auth_mode": "api_key"},
                 "options": [
                     {"value": "responses", "label": "Responses API(Codex 唯一支持)"},
                 ],
