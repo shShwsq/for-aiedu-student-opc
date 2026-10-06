@@ -371,6 +371,24 @@ class KnowledgeExplanationOut(BaseModel):
     explanation_updated_at: datetime | None = None
 
 
+class SetKnowledgeTopicRequest(BaseModel):
+    """手工修正知识点所属学习主题(PUT /practice/knowledge-points/{key}/topic)
+
+    topic_key 必须是当前用户名下的主题(内置 security/architecture/coding/
+    contract 或自定义 custom_*,含已停用主题);保存时级联更新该知识点下
+    全部题目的 learning_topic,保持两处字段一致。
+    """
+
+    topic_key: str = Field(min_length=1, max_length=64)
+
+
+class KnowledgeTopicOut(BaseModel):
+    """知识点主题回写视图(改后给前端拿最新主题 key)"""
+
+    knowledge_key: str
+    learning_topic: str
+
+
 class StatsResponse(BaseModel):
     """练习首页统计(GET /practice/stats)"""
 

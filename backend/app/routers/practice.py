@@ -24,11 +24,13 @@ from app.models.practice import (
     MAX_EXPLANATION_CHARS,
     Attempt,
     KnowledgePoint,
+    LearningTopic,
     PracticeSession,
     PracticeSettings,
     Question,
     QuestionStatus,
     UserKnowledgeState,
+    ensure_user_topics,
 )
 from app.models.task import Result, Task
 from app.models.user import User
@@ -50,10 +52,12 @@ from app.schemas.practice import (
     KnowledgeExplanationOut,
     KnowledgeStateResponse,
     KnowledgePointCardItem,
+    KnowledgeTopicOut,
     PracticeSummaryResponse,
     QuestionDetailResponse,
     QuestionListItem,
     SaveKnowledgeExplanationRequest,
+    SetKnowledgeTopicRequest,
     SessionAttemptItem,
     SessionDetailResponse,
     SessionListItem,
@@ -1251,6 +1255,53 @@ def save_knowledge_explanation(
         explanation_source=kp.explanation_source or "",
         explanation_model=kp.explanation_model or "",
         explanation_updated_at=kp.explanation_updated_at,
+    )
+
+
+@router.put(
+    "/knowledge-points/{knowledge_key}/topic",
+    response_model=KnowledgeTopicOut,
+)
+def set_knowledge_topic(
+    knowledge_key: str,
+    req: SetKnowledgeTopicRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> KnowledgeTopicOut:
+    """手工修正知识点所属学习主题(看板改主题用)
+
+    看板分组与「练这个主题」组卷都以 KnowledgePoint.learning_topic 为准,
+    因此主题改在知识点级;保存时级联更新该知识点下全部题目的 learning_topic,
+    避免两处字段发散(含老题 NULL 一并归一)。
+    目标主题须属于当前用户(ensure_user_topics 播种内置后按 key 命中),
+    已停用主题也可选(存量不受影响,仅不再出新题)。
+    """
+    kp = db.query(KnowledgePoint).filter(
+        KnowledgePoint.user_id == current_user.id,
+        KnowledgePoint.key == knowledge_key,
+    ).first()
+    if not kp:
+        raise HTTPException(status_code=404, detail="知识点不存在或无权访问")
+    # 只认当前用户名下的主题(内置 + 自定义),杜绝越权挂他人 key
+    ensure_user_topics(db, current_user.id)
+    topic = db.query(LearningTopic).filter(
+        LearningTopic.user_id == current_user.id,
+        LearningTopic.key == req.topic_key,
+    ).first()
+    if not topic:
+        raise HTTPException(status_code=400, detail="学习主题不存在")
+    kp.learning_topic = req.topic_key
+    db.query(Question).filter(
+        Question.knowledge_point_id == kp.id,
+    ).update({"learning_topic": req.topic_key})
+    db.commit()
+    logger.info(
+        "[topic] user=%s key=%s 手工改主题 → %s",
+        current_user.id, knowledge_key, req.topic_key,
+    )
+    return KnowledgeTopicOut(
+        knowledge_key=kp.key,
+        learning_topic=kp.learning_topic,
     )
 
 

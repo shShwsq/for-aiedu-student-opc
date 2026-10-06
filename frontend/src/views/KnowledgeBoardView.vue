@@ -7,6 +7,9 @@
  *   (weak > due > mastered > learning > fresh)
  * - 每张卡片 = 一个知识点:SM-2 记忆状态 + 作答统计 + 题库题数 + 状态徽章
  *   + 可折叠的「知识点讲解」(Markdown,依据出题当时的材料与题目写成)
+ *   + 卡片底部「改主题」下拉:手工修正自动匹配出错的主题
+ *     (PUT /practice/knowledge-points/{key}/topic,知识点级改动会级联其下题目,
+ *      保存后整板刷新让卡片流入新分区)
  * - 区头「练这个主题」→ 跳 /practice?learningTopic=<key>,由练习页接管组卷;
  *   卡片「专项练习」→ 跳 /practice?topic=<key>(单知识点)
  * - 未知/已删除的主题 key 兜底「未分类」组排最后;停用主题照常成区
@@ -32,6 +35,7 @@ import {
   getGenerateJob,
   listKnowledgePoints,
   listLearningTopics,
+  setKnowledgeTopic,
 } from '@/api/practice'
 import { extractErrorMessage } from '@/utils/error'
 import { formatDate } from '@/utils/practiceFormat'
@@ -282,6 +286,47 @@ function startFocus(c: KnowledgePointCard): void {
 }
 
 // ============================================================
+// 手工修正知识点所属主题(看板改主题)
+// ============================================================
+/** 正在改主题的知识点 key(该卡下拉置灰用) */
+const topicBusyKey = ref('')
+/** 改主题结果提示(操作头右侧展示,与讲解进度共用一行文本) */
+const topicStatus = ref('')
+
+/** 当前卡片的主题是否为已定义主题(否则为兜底「未分类」,需额外占位 option) */
+function isKnownTopic(key: string): boolean {
+  return topics.value.some((t) => t.key === key)
+}
+
+/**
+ * 改知识点主题:成功后整板刷新让卡片流入新分区
+ *
+ * 与当前主题相同则忽略(下拉初次渲染不会误触发);后端会级联更新该
+ * 知识点下全部题目,故练习页/「练这个主题」会按新主题命中。
+ */
+async function changeTopic(c: KnowledgePointCard, event: Event): Promise<void> {
+  const el = event.target as HTMLSelectElement
+  const newKey = el.value
+  if (!newKey || newKey === c.learning_topic) return
+  topicBusyKey.value = c.knowledge_key
+  topicStatus.value = ''
+  try {
+    await setKnowledgeTopic(c.knowledge_key, newKey)
+    topicStatus.value = `已将「${c.knowledge_name}」移到新主题`
+    await loadBoard()
+  } catch (err) {
+    topicStatus.value = extractErrorMessage(err)
+    // :value 绑定值未变时 Vue 不会重写 el.value,失败后需手动把下拉刷回真实主题
+    el.value = c.learning_topic
+  } finally {
+    topicBusyKey.value = ''
+    setTimeout(() => {
+      if (!topicBusyKey.value) topicStatus.value = ''
+    }, 6000)
+  }
+}
+
+// ============================================================
 // 知识点讲解(Markdown 展示 + 按需/批量生成)
 // ============================================================
 /** 单次请求的知识点数上限(与后端 ExplainKnowledgePointsRequest.max_length 一致) */
@@ -471,6 +516,7 @@ onMounted(() => {
             </div>
             <div class="head-stats">
               <span v-if="explainStatus" class="explain-status">{{ explainStatus }}</span>
+              <span v-if="topicStatus" class="explain-status">{{ topicStatus }}</span>
               <span class="stat" title="按学习主题分组;点区头可练整个主题,点卡片可练单个知识点">
                 <span class="stat-num">{{ totalCount }}</span>
                 <span class="stat-name">知识点</span>
@@ -555,6 +601,22 @@ onMounted(() => {
                         :title="c.question_count === 0 ? '该知识点暂无入库题目' : `只练习「${c.knowledge_name}」的题目`"
                         @click="startFocus(c)"
                       >专项练习</button>
+                      <select
+                        class="kp-topic-select"
+                        :value="c.learning_topic"
+                        :disabled="topicBusyKey === c.knowledge_key"
+                        title="修改所属主题(会连带更新该知识点下题目的主题)"
+                        @change="changeTopic(c, $event)"
+                      >
+                        <option
+                          v-if="!isKnownTopic(c.learning_topic)"
+                          :value="c.learning_topic"
+                          disabled
+                        >未分类</option>
+                        <option v-for="t in topics" :key="t.key" :value="t.key">
+                          {{ t.name }}{{ t.enabled ? '' : '(已停用)' }}
+                        </option>
+                      </select>
                     </div>
 
                     <!-- 知识点讲解:有正文或(有题可依据时)才渲染折叠区 -->
@@ -1042,6 +1104,7 @@ onMounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: var(--space-2);
   margin-top: var(--space-1);
 }
@@ -1049,6 +1112,24 @@ onMounted(() => {
 .kp-count {
   font-size: var(--fs-xs);
   color: var(--color-text-muted);
+}
+
+/* 改主题下拉:紧凑,不撑破卡片;与「专项练习」并排靠右 */
+.kp-topic-select {
+  margin-left: var(--space-1);
+  max-width: 96px;
+  padding: 2px 4px;
+  font-size: var(--fs-xs);
+  color: var(--color-text);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 6px);
+  cursor: pointer;
+}
+
+.kp-topic-select:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .btn-secondary {

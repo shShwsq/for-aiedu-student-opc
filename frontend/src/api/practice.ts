@@ -20,6 +20,7 @@ import type {
   GenerateRequest,
   KnowledgeExplanation,
   KnowledgePointCard,
+  KnowledgeTopicOut,
   LearningTopicCreateRequest,
   LearningTopicDef,
   LearningTopicUpdateRequest,
@@ -137,6 +138,23 @@ export function saveKnowledgeExplanation(
   return client
     .put(`/practice/knowledge-points/${encodeURIComponent(knowledgeKey)}/explanation`, {
       markdown,
+    })
+    .then((r) => r.data)
+}
+
+/**
+ * 手工修正知识点所属学习主题(看板改主题用)
+ *
+ * 主题改在知识点级:后端会级联更新该知识点下全部题目的 learning_topic,
+ * 目标 topic_key 须属于当前用户(含已停用主题),否则 400。
+ */
+export function setKnowledgeTopic(
+  knowledgeKey: string,
+  topicKey: string,
+): Promise<KnowledgeTopicOut> {
+  return client
+    .put(`/practice/knowledge-points/${encodeURIComponent(knowledgeKey)}/topic`, {
+      topic_key: topicKey,
     })
     .then((r) => r.data)
 }

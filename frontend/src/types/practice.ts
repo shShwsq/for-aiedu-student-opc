@@ -362,6 +362,12 @@ export interface KnowledgeExplanation {
   explanation_updated_at: string | null
 }
 
+/** 知识点主题回写字段(手工改主题后回写) */
+export interface KnowledgeTopicOut {
+  knowledge_key: string
+  learning_topic: string
+}
+
 export interface PracticeStats {
   ability: number
   due_count: number

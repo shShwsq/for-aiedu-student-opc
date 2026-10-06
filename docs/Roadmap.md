@@ -57,6 +57,7 @@
 - **SM-2 遗忘曲线(sm2.py)**:答对 quality=4 / 答错 quality=1,EF 与间隔序列(1 → 6 → 前值×EF)标准实现,`due_at` 驱动到期复习。
 - **综合选题(selector.py)**:到期复习优先 > 薄弱点强化 > 难度匹配 > 新知识引入的加权打分,含同知识点 ≤60%、复习题占比 ≥50%、冷启动取难度 ≤2 新题等约束。
 - **四主题出题(自动匹配)**:网络安全 / 架构设计 / 通用代码能力 / 合同文书四套提示词;主题不再是用户级设置,而是出题时逐 finding 自动匹配(规则先行 + LLM 一次批量兜底,失败降级 security);沙箱未销毁时注入材料(源码或文书原文) + 迷你工具循环(read_file/search_code/find_files)增强质量;沙箱过期可重新拉取工作区(默认关)。
+- **知识点主题手动修正(知识点看板)**:看板每张卡片底部「改主题」下拉可修正自动匹配出错的主题(`PUT /practice/knowledge-points/{key}/topic`);改在知识点级并级联更新其下题目的 `learning_topic`(看板分组与「练这个主题」组卷均按知识点主题命中),目标主题须属于当前用户(含已停用),改后整板刷新让卡片流入新分区。
 - **出题模型三级解析**:task 级 > 用户级默认(`practice_settings.default_llm_config_id`)> env 默认;思考模式三态覆盖(follow/on/off)。
 - **异步 job + SSE**:出题后台线程执行,`/practice/generate/{job_id}/stream` 推送进度;出题日志落盘 `logs/practice_generate.log`。
 - **前端**:PracticeView(练习首页 / 会话答题 / 统计趋势 / 题库管理)、出题进度侧栏、生成确认弹窗、练习设置弹窗;`PRACTICE_ENABLED` 功能开关前后端联动。
