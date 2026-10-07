@@ -4,6 +4,7 @@
 - _looks_credentialed:HTTPS+token 命中,匿名 HTTPS / SSH / 路径里带 @ 的 URL 不误伤
 - _scrub_url_userinfo:config / FETCH_HEAD / reflog 三种真实写法
 - _scrub_clone_credentials local:改写三个文件 + set-url 用匿名 URL + argv 不含 token
+- _scrub_clone_credentials local 行尾:清洗后保留 LF(Windows 默认换行翻译会污染整文件)
 - _scrub_clone_credentials sandbox:命令串里绝不出现 token 字面值(否则换个泄漏面)
 - 清理异常不推翻克隆结果(只记 error)
 """
@@ -141,6 +142,24 @@ def test_scrub_local_rewrites_all_record_files(tmp_path):
     # reflog 的说明文字与 FETCH_HEAD 的行结构不受影响(只剥 userinfo)
     assert "clone: from" in (tmp_path / ".git" / "logs" / "HEAD").read_text(encoding="utf-8")
     assert (tmp_path / ".git" / "FETCH_HEAD").read_text(encoding="utf-8").startswith(f"{SHA}\t")
+
+
+def test_scrub_local_preserves_lf_endings(tmp_path):
+    """Windows 上 write_text 默认 newline=None 会把 \n 译成 \r\n,git 的
+    config/FETCH_HEAD/reflog 是 LF 文件,翻行尾等于整文件变更污染下游 diff"""
+    _make_git_dir(tmp_path)
+    session = FakeSession()
+    ctx = {"session": session, "mode": "local", "repo_path": str(tmp_path)}
+
+    sandbox_tools._scrub_clone_credentials(
+        ctx, str(tmp_path), CRED_URL, ANON_URL, task_id="t1"
+    )
+
+    for rel in ("config", "FETCH_HEAD"):
+        raw = (tmp_path / ".git" / rel).read_bytes()
+        assert b"\r\n" not in raw, f".git/{rel} 被换行翻译污染成 CRLF"
+    reflog_raw = (tmp_path / ".git" / "logs" / "HEAD").read_bytes()
+    assert b"\r\n" not in reflog_raw, "reflog 被换行翻译污染成 CRLF"
 
 
 def test_scrub_local_skips_anonymous_clone(tmp_path):

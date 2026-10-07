@@ -500,6 +500,15 @@ def read_workspace_uploads_file(
     task = _check_task_access(task_id, db, current_user)
     sandbox_tools.cleanup_expired_sessions_bg()
 
+    # 与工作区预览/上传下载同口径拒凭证类路径:zip 条目名只拒绝对路径与 `..`,
+    # `.git/config`/`id_rsa`/`*.pem` 能合法落进上传目录,不拦就出现"上传下载 403,
+    # 预览却回原文"的语义倒挂——匿名任务(user_id=None)对任何人可读,漏面更大
+    if is_denied_download_path(path or ""):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="该文件不支持预览(凭证 / 密钥类路径)",
+        )
+
     resolved = resolve_path(_task_upload_slots(task), path)
     if resolved is None:
         raise HTTPException(status_code=404, detail=f"文件不存在: {path}")

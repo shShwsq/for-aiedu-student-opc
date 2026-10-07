@@ -3,6 +3,8 @@
 覆盖:
 - normalize_repo_url/cache_key:token URL 与匿名 URL 同键、.git 后缀归一
 - ensure_bare_cache 首次:建立 bare + 安全断言(config 无 token、remote 为匿名)
+- bare FETCH_HEAD 清洗:_strip_url_userinfo 口径 / _scrub_bare_fetch_head 幂等与
+  保留 LF / _fetch_bare 成功后必调钩子
 - fetch TTL:窗口内不 fetch,超窗 fetch
 - 分支缺失:强制 fetch 后仍缺返回 None;新分支真实 fetch 后命中;tag 可命中
 - 损坏重建:_is_healthy_bare 失败 → 删缓存重建
@@ -124,6 +126,85 @@ def test_ensure_builds_bare_and_strips_token(tmp_path, cache_dir, monkeypatch):
     # meta 存在且记录匿名 URL
     meta = json.loads((bare.parent / rc._META_NAME).read_text(encoding="utf-8"))
     assert meta["url"] == rc.normalize_repo_url("https://github.com/foo/bar")
+
+
+# ============================================================
+# bare FETCH_HEAD 清洗(git fetch 会把 fetch URL 记进文件头)
+# ============================================================
+
+
+def test_strip_url_userinfo_variants():
+    """与 sandbox_tools 同口径:只剥 http(s) URL 的 userinfo,不误伤 SSH/路径含 @"""
+    cred = "abc\tbranch 'main' of https://x-access-token:ghpSECRET@git.example.com/o/r\n"
+    anon = rc._strip_url_userinfo(cred)
+    assert "ghpSECRET" not in anon
+    assert "https://git.example.com/o/r" in anon
+    # 大小写不敏感(HTTPS://)也剥掉
+    assert "tok" not in rc._strip_url_userinfo("HTTPS://u:tok@host/p\n")
+    # SSH 形态 git@host:path 不该被动
+    ssh = "git@github.com:foo/bar.git\n"
+    assert rc._strip_url_userinfo(ssh) == ssh
+
+
+def test_scrub_bare_fetch_head_strips_token(tmp_path):
+    """fetch 后写盘:含 userinfo 的行被清洗,原 LF 行尾与 SHA 结构保留"""
+    bare = tmp_path / "repo.git"
+    bare.mkdir()
+    token_url = "https://x-access-token:ghpSECRET@github.com/foo/bar.git"
+    fetch_head = bare / "FETCH_HEAD"
+    fetch_head.write_text(
+        f"{'1' * 40}\tbranch 'main' of {token_url}\n"
+        f"{'2' * 40}\t\ttag 'v1' of {token_url}\n",
+        encoding="utf-8", newline="",
+    )
+
+    rc._scrub_bare_fetch_head(bare, task_id="t1")
+
+    raw = fetch_head.read_bytes()
+    assert b"ghpSECRET" not in raw
+    assert b"https://github.com/foo/bar.git" in raw
+    # LF 保住,Windows 上默认换行翻译会污染整文件
+    assert b"\r\n" not in raw
+    # 前缀 SHA 与 tab 结构不变
+    assert raw.startswith(b"11111111")
+    assert raw.count(b"branch 'main' of") == 1
+    assert raw.count(b"tag 'v1' of") == 1
+
+
+def test_scrub_bare_fetch_head_noop_when_clean(tmp_path):
+    """已匿形的 FETCH_HEAD 不动(幂等,避免每次 fetch 都触发 mtime 变化)"""
+    bare = tmp_path / "repo.git"
+    bare.mkdir()
+    original = "abc123\tbranch 'main' of https://github.com/foo/bar.git\n"
+    fetch_head = bare / "FETCH_HEAD"
+    fetch_head.write_text(original, encoding="utf-8", newline="")
+    before_stat = fetch_head.stat()
+
+    rc._scrub_bare_fetch_head(bare, task_id="t1")
+
+    assert fetch_head.read_text(encoding="utf-8") == original
+    # 未清洗就不重写字节
+    assert fetch_head.stat().st_mtime_ns == before_stat.st_mtime_ns
+
+
+def test_scrub_bare_fetch_head_missing_ok(tmp_path):
+    """FETCH_HEAD 不存在(clone --bare 不会写它):不抛,静默返回"""
+    bare = tmp_path / "repo.git"
+    bare.mkdir()
+    rc._scrub_bare_fetch_head(bare, task_id="t1")  # 不抛即为通过
+
+
+def test_fetch_bare_invokes_scrub(tmp_path, cache_dir, monkeypatch):
+    """_fetch_bare 成功后必须调清洗钩子(集成侧的锁定,不真跑 git)"""
+    origin = _make_origin(tmp_path / "origin")
+    bare = rc.ensure_bare_cache(_url(origin), task_id="t1")
+    assert bare is not None
+
+    calls: list[str] = []
+    monkeypatch.setattr(rc, "_scrub_bare_fetch_head",
+                         lambda d, tid: calls.append(str(d)))
+    assert rc._fetch_bare(bare, _url(origin), git_tokens={}, task_id="t2") is True
+    assert calls == [str(bare)]
 
 
 # ============================================================

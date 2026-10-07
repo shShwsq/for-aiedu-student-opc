@@ -3276,7 +3276,10 @@ def _scrub_clone_credentials(
                 text = f.read_text(encoding="utf-8", errors="replace")
                 cleaned = _scrub_url_userinfo(text)
                 if cleaned != text:
-                    f.write_text(cleaned, encoding="utf-8")
+                    # newline="" 关翻译:Windows 上默认会把 \n 换成 \r\n,而 git
+                    # 的 config/FETCH_HEAD/reflog 是 LF 文件,翻一次行尾就等于整文件
+                    # 变更,下游工作区 diff 会误报"每行都改过"
+                    f.write_text(cleaned, encoding="utf-8", newline="")
                 # 回读复查:写失败/只读属性(Windows 的 git pack 文件)都在这暴露
                 if _looks_credentialed(f.read_text(encoding="utf-8", errors="replace")):
                     residual.append(str(f))

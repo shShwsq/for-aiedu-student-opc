@@ -48,6 +48,50 @@ _EVICT_MIN_AGE = 3600.0
 # 短 git 子命令超时(fetch 大仓库仍用 REPO_CLONE_TIMEOUT)
 _GIT_SHORT_TIMEOUT = 30
 
+# 剥 http(s) URL 的 userinfo(与 sandbox_tools._URL_USERINFO_RE 同口径):
+# 用于 fetch 之后清洗 bare/FETCH_HEAD —— git 会把 "… of <带 token URL>" 写进去,
+# 而 bare 目录在 REPO_CACHE_SANDBOX_ENABLED=True 时只读挂载进容器,agent cat 即得
+_URL_USERINFO_RE = re.compile(r"(\bhttps?://)[^/\s@]+@", re.IGNORECASE)
+
+
+def _strip_url_userinfo(text: str) -> str:
+    """抹掉文本里所有 http(s) URL 的 userinfo(仅 bare 缓存清洗用)"""
+    return _URL_USERINFO_RE.sub(r"\1", text)
+
+
+def _scrub_bare_fetch_head(bare_dir: Path, task_id: str) -> None:
+    """fetch 后清 bare 仓库根的 FETCH_HEAD 里的 token userinfo
+
+    `git fetch <url>` 会写 FETCH_HEAD "… of <url>",带 token 的 fetch_url 因此落盘。
+    初次 `_build_bare_cache` 用 `git clone --bare` 不写 FETCH_HEAD,只有增量 fetch
+    才有这个残留。清洗失败仅 warning,不阻塞(缓存可用性优先,单条 fetch 泄漏面已知)。
+    """
+    fetch_head = bare_dir / "FETCH_HEAD"
+    if not fetch_head.is_file():
+        return
+    try:
+        text = fetch_head.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        logger.warning(f"[repo_cache] task={task_id} 读 FETCH_HEAD 失败(跳过清洗): {e}")
+        return
+    cleaned = _strip_url_userinfo(text)
+    if cleaned == text:
+        return
+    try:
+        # newline="" 保 LF:Windows 默认翻译会把整个 FETCH_HEAD 改成 CRLF,
+        # 破坏 git 侧的字节口径也污染下游 diff
+        fetch_head.write_text(cleaned, encoding="utf-8", newline="")
+    except OSError as e:
+        logger.warning(f"[repo_cache] task={task_id} 写 FETCH_HEAD 失败(凭证残留): {e}")
+        return
+    # 复查:写不进去或只读属性(Windows pack)暴露在这
+    try:
+        residual = fetch_head.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if _URL_USERINFO_RE.search(residual):
+        logger.error(f"[repo_cache] task={task_id} FETCH_HEAD 清洗后仍含凭证 userinfo")
+
 
 def _run_git(argv: list[str], timeout: int | None = None) -> str:
     """宿主机执行 git(argv 列表,不经 shell),非零退出抛 RuntimeError"""
@@ -273,8 +317,12 @@ def _fetch_bare(
 ) -> bool:
     """增量 fetch(--prune 清理已删远端分支)。显式 URL + refspec:
     - remote.origin.url 已重写为匿名,私有仓库必须用带 token 的一次性 URL fetch
-      (URL 作参数不写入 config,token 不落盘)
+      (URL 作参数不写入 config;但 git 会把 fetch URL 记进 FETCH_HEAD,详见下)
     - 显式 refspec 才会更新 refs/heads(fetch URL 时不自动用 remote 配置)
+
+    成功后立即清洗 bare/FETCH_HEAD 的 userinfo —— 不洗的话在
+    REPO_CACHE_SANDBOX_ENABLED=True 部署下,agent 在容器里 `cat <mount>/FETCH_HEAD`
+    就能拿到 token。清洗失败也不回退 fetch 结果(缓存可用性优先)。
 
     失败仅 warning 返回 False,调用方继续用旧缓存(缓存永不阻塞任务)。
     """
@@ -290,6 +338,7 @@ def _fetch_bare(
             ],
             timeout=settings.REPO_CLONE_TIMEOUT,
         )
+        _scrub_bare_fetch_head(bare_dir, task_id)
         meta_path = bare_dir.parent / _META_NAME
         meta = _read_meta(meta_path)
         meta["last_fetch_at"] = time.time()

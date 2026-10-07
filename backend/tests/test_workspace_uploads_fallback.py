@@ -5,7 +5,8 @@
 - get_workspace.has_uploads:纯 params 推导,零存储访问
 - 回退树形状:单上传平铺 / 多上传 {i}-{name}(含前缀目录链,防前端孤儿丢枝)
   / followup 布局 / GC 占位 unavailable / 条目截断
-- 回退读文件:内容分页 / 二进制占位与 binary 标记 / 超限 400 / 路径反解失败 404 / 穿越 404
+- 回退读文件:内容分页 / 二进制占位与 binary 标记 / 超限 400 / 路径反解失败 404 / 穿越 404 /
+  凭证类路径 403(与工作区预览/上传下载同口径拒 .git/**、id_rsa、*.pem,不误伤前缀名)
 - 树缓存:TTL 内命中陈旧缓存,refresh 强制重建
 - 存储后端异常(非 UploadError)→ 500
 """
@@ -417,3 +418,37 @@ def test_read_file_traversal_404():
     with pytest.raises(HTTPException) as ei:
         _read(task, "../meta.json")
     assert ei.value.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [".git/config", "sub/.git/config", ".GIT/config", "id_rsa", "keys/server.pem"],
+)
+def test_read_file_denied_paths_403(bad_path):
+    """凭证/密钥类路径与上传下载端点同口径拒绝:zip 条目校验只拒绝对路径与 `..`,
+    `.git/**`/id_rsa/*.pem 能合法解压进上传目录;不拦就会出现"下载 403,预览回原文"
+    的语义倒挂,匿名任务下漏面更大"""
+    m1 = save_upload(
+        _make_zip({"README.md": "ok", ".git/config": "leaky", "keys/server.pem": "PEM"}),
+        "repo.zip", "u1",
+    )
+    # 顶层路径命中拒绝清单:直接 403,不进 resolve_path
+    task = _task(params={"upload_ids": [m1["upload_id"]]})
+    with pytest.raises(HTTPException) as ei:
+        _read(task, bad_path)
+    assert ei.value.status_code == 403
+    assert "凭证" in ei.value.detail
+
+
+def test_read_file_denied_allows_normal_paths():
+    """deny 清单不误伤同名前缀:gitignore/git-config 之类应正常放行"""
+    m1 = save_upload(
+        _make_zip({"gitignore.txt": "x", "my.git-hooks/pre-commit": "y", "git/config.md": "z"}),
+        "docs.zip", "u1",
+    )
+    task = _task(params={"upload_ids": [m1["upload_id"]]})
+    # 三个都不该被拦(段级匹配只吃整段 `.git`,不吃前缀或后缀)
+    assert _read(task, "gitignore.txt")["content"] == "x"
+    assert _read(task, "my.git-hooks/pre-commit")["content"] == "y"
+    assert _read(task, "git/config.md")["content"] == "z"
+
