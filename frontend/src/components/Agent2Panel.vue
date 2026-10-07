@@ -8,7 +8,7 @@
  *
  * 后台审查流程(agent1 结束即任务完成):
  * - reviewStatus=running:头部"检查中"badge,审查流式实时可见
- * - reviewStatus=done:头部"检查完成"badge;建议深挖卡(suggestions)可点"深挖"
+ * - reviewStatus=done:头部"检查完成"badge;建议追问卡(suggestions)可点"追问"
  * - reviewStatus=failed:头部"检查失败"badge(保留 AI助手执行结果)
  *
  * 数据来源:
@@ -55,7 +55,7 @@ const props = defineProps<{
   reviewStatus?: ReviewStatus | null
 }>()
 
-/** 用户点击"深挖"建议:交给父组件走现有发消息流程(resume) */
+/** 用户点击"追问"建议:交给父组件走现有发消息流程(resume) */
 const emit = defineEmits<{
   (e: 'send-suggestion', text: string): void
 }>()
@@ -95,7 +95,7 @@ const rounds = computed<RoundGroup[]>(() => {
     else if (c.type === 'review') g.reviews.push(c)
     else if (c.type === 'summary') g.summaries.push(c)
     else if (c.type === 'suggestions') {
-      // suggestions 不进轮组:由下方独立区块渲染(深挖卡片)
+      // suggestions 不进轮组:由下方独立区块渲染(追问卡片)
       continue
     } else if (c.type) g.others.push(c) // 未知 type 容错(老数据形态)
   }
@@ -106,7 +106,7 @@ const rounds = computed<RoundGroup[]>(() => {
   return [...byRound.values()].sort((a, b) => a.round_idx - b.round_idx)
 })
 
-/** 建议深挖方向(取最新一条 type=suggestions 的 JSON,旧版整块覆盖) */
+/** 建议追问方向(取最新一条 type=suggestions 的 JSON,旧版整块覆盖) */
 const suggestions = computed<string[]>(() => {
   let latest: Conversation | null = null
   for (const c of props.conversations) {
@@ -124,10 +124,10 @@ const suggestions = computed<string[]>(() => {
   }
 })
 
-/** 深挖按钮防重复(点击后由父组件发消息,审查重新开始) */
+/** 追问按钮防重复(点击后由父组件发消息,审查重新开始) */
 const diggingSuggestion = ref<string | null>(null)
 
-/** 点击"深挖":把建议文本作为用户消息发出(emit 给父组件走 resume 链路) */
+/** 点击"追问":把建议文本作为用户消息发出(emit 给父组件走 resume 链路) */
 function handleDig(text: string): void {
   if (diggingSuggestion.value) return
   diggingSuggestion.value = text
@@ -142,7 +142,7 @@ const reviewBadge = computed<{ text: string; cls: string } | null>(() => {
   return null
 })
 
-// 新一轮审查开始(resume 深挖/追加消息)→ 解除深挖按钮的防重复锁
+// 新一轮审查开始(resume 追问/追加消息)→ 解除追问按钮的防重复锁
 watch(
   () => props.reviewStatus,
   () => { diggingSuggestion.value = null },
@@ -303,9 +303,9 @@ function charCount(text: string | null | undefined): number {
       </div>
     </div>
 
-    <!-- 建议深挖方向(审查完成后;点击"深挖"作为用户消息发出去走 resume) -->
+    <!-- 建议追问方向(审查完成后;点击"追问"作为用户消息发出去走 resume) -->
     <div v-if="suggestions.length > 0" class="panel-suggestions">
-      <p class="panel-suggestions-title">建议深挖方向</p>
+      <p class="panel-suggestions-title">建议追问方向</p>
       <div
         v-for="(s, i) in suggestions"
         :key="i"
@@ -317,7 +317,7 @@ function charCount(text: string | null | undefined): number {
           class="panel-suggestion-btn"
           :disabled="!!diggingSuggestion"
           @click="handleDig(s)"
-        >{{ diggingSuggestion === s ? '已发起深挖…' : '深挖' }}</button>
+        >{{ diggingSuggestion === s ? '已发起追问…' : '追问' }}</button>
       </div>
     </div>
   </section>
@@ -379,7 +379,7 @@ function charCount(text: string | null | undefined): number {
   font-weight: var(--fw-medium);
 }
 
-/* 建议深挖卡片 */
+/* 建议追问卡片 */
 .panel-suggestions {
   margin-top: var(--space-3);
 }

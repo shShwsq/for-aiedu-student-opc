@@ -208,7 +208,7 @@ def test_submit_message_during_review_starts_immediately(monkeypatch):
     monkeypatch.setattr(tasks_module, "is_task_finished", lambda tid: False)
 
     resp = tasks_module.submit_task_message(
-        task_id, SendMessageRequest(content="深挖一下"), db, None,
+        task_id, SendMessageRequest(content="追问一下"), db, None,
     )
 
     assert resp.accepted is True

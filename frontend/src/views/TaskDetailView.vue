@@ -2222,7 +2222,7 @@ async function handleWithdrawPendingMessage(messageId: string): Promise<void> {
 }
 
 /**
- * 侧栏"建议深挖":把检查助手的建议文本作为用户消息发出
+ * 侧栏"建议追问":把检查助手的建议文本作为用户消息发出
  *
  * 任务已 COMPLETED(agent1 结束即完成),后端走 resume 链路:
  * agent1 追加执行一轮 → 新一轮后台审查(老审查若仍在跑则并行,

@@ -9,7 +9,7 @@
 - 核查中追问:直接启动新一轮(不等老审查),老审查收尾不关总线
 - 异常路径:error 事件先于总线关闭推送(否则前端收不到错误横幅)
 - 单 agent 模式:无审查事件,review_status 不动
-- suggestions 落库契约(前端解析 type=suggestions 渲染深挖卡片)
+- suggestions 落库契约(前端解析 type=suggestions 渲染追问卡片)
 - 临时结果助手 _replace_interim_results:按轮清理后落单条
 """
 import json
@@ -237,7 +237,7 @@ def test_review_failure_keeps_interim_results(monkeypatch):
 
 
 # ============================================================
-# suggestions 落库契约(前端深挖卡片的数据源)
+# suggestions 落库契约(前端追问卡片的数据源)
 # ============================================================
 
 
@@ -247,7 +247,7 @@ def test_record_agent2_review_persists_suggestions_json():
     db = MagicMock()
 
     with_suggestions = _mk_review_result(
-        suggestions=["深挖依赖漏洞供应链", "复核第 2 条结论的误报"],
+        suggestions=["追问依赖漏洞供应链", "复核第 2 条结论的误报"],
     )
     orchestrator._record_agent2_review(db, task, 1, with_suggestions)
 
@@ -256,7 +256,7 @@ def test_record_agent2_review_persists_suggestions_json():
                          and c.type == "suggestions"]
     assert len(suggestions_convs) == 1
     payload = json.loads(suggestions_convs[0].content)
-    assert payload["suggestions"] == ["深挖依赖漏洞供应链", "复核第 2 条结论的误报"]
+    assert payload["suggestions"] == ["追问依赖漏洞供应链", "复核第 2 条结论的误报"]
     # 审查结论卡 + 最终总结卡同轮落库
     assert [c.type for c in added if isinstance(c, Conversation)] == [
         "review", "suggestions", "summary",

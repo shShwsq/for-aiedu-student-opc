@@ -14,8 +14,8 @@
    check_reference 核对存在性与来源可靠性
 4. 提炼重点与知识点:从 agent1 全程产出提炼有学习价值的知识点(results),
    供侧栏展示与自动生成练习题
-5. 建议深挖方向(suggestions,兜底):仅对"确属缺失且无法自查"的维度
-   给出 0-3 条建议,由用户决定是否让 agent1 继续深挖
+5. 建议追问方向(suggestions,兜底):仅对"确属缺失且无法自查"的维度
+   给出 0-3 条建议,由用户决定是否让 agent1 继续追问
 
 设计要点(继承自原项目 user_agent 的成熟机制):
 - agent2 不直接执行审查,只做核查与提炼;可用三类工具:
@@ -245,7 +245,7 @@ def run_agent2(
             "covered": [...],
             "missing": [...],
             "reasoning": str,
-            "suggestions": [...],      # 建议深挖方向(0-3 条)
+            "suggestions": [...],      # 建议追问方向(0-3 条)
             "results": [...],          # 重点与知识点
             "grouping": {...} | null,
         }
@@ -331,7 +331,7 @@ def run_agent2(
         user_msg_parts.append(
             "\n\n任务已完成,请对以上执行结果做完整审查:核查覆盖情况与结论质量,"
             "提炼重点与知识点(results),并对确属缺失且无法自查的方向给出"
-            "建议深挖方向(suggestions)。"
+            "建议追问方向(suggestions)。"
         )
         if history_prefix:
             user_msg_parts.append(

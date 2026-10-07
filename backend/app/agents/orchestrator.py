@@ -5,15 +5,15 @@
 2. agent1 summary 作为临时结果落库,任务即标记 COMPLETED(推 agent1_done,
    事件总线保持打开)—— 用户感知的"任务完成"以 agent1 结束为准
 3. agent2 在同一后台线程内做**后台审查**:只读核查/动态验证/引用复核,
-   整理重点与知识点(results)替换临时结果,发现缺口输出"建议深挖方向"
-   (suggestions,由用户决定是否让 agent1 继续深挖)
+   整理重点与知识点(results)替换临时结果,发现缺口输出"建议追问方向"
+   (suggestions,由用户决定是否让 agent1 继续追问)
 4. 审查完成推 review_done + done;练习题生成/记忆归纳在审查后链式触发
 
 纯对话轮(本轮 agent1 无任何工具调用,回答完全来自历史上下文)在步骤 2
 之前直接收尾:跳过审查/结果替换/练习题/记忆归纳,保留既有结果与审查状态
 —— 交互对齐 Codex 式问答,纯追问即回答,不触发审查流水线。
 
-resume(用户追加消息/点击建议深挖):
+resume(用户追加消息/点击建议追问):
 - 用户消息直接交给 agent1 跑一轮(不经 agent2 转述;agent1 跨轮历史
   由 react_agent._build_history_messages 以结构化 messages 注入,
   用户追问原文作为独立 user 消息),随后走后台审查
@@ -724,7 +724,7 @@ def _record_agent2_review(
     """把 agent2 审查模式的输出记录到 Conversation 表(侧栏展示)
 
     - type="review":审查结论(不进主界面,主界面只放真追问 evaluation)
-    - type="suggestions":建议深挖方向(JSON,前端渲染成卡片+深挖按钮)
+    - type="suggestions":建议追问方向(JSON,前端渲染成卡片+追问按钮)
     - type="summary":沿承旧版最终总结卡(侧栏 summaries 分组)
     """
     ua_result["_recorded"] = True
@@ -753,7 +753,7 @@ def _record_agent2_review(
         reasoning=full_eval,
     )
 
-    # 建议深挖卡(有建议才落库;JSON 内容由前端解析渲染)
+    # 建议追问卡(有建议才落库;JSON 内容由前端解析渲染)
     if suggestions:
         _add_conversation(
             db, task, round_idx=round_idx,

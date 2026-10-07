@@ -1301,7 +1301,7 @@ def _build_markdown_report(
             for r in results:
                 _append_result_md(lines, r, meta_fields)
 
-    # 详细对话(按轮组织的结论类对话,含 agent2 每轮审查结论/建议深挖;
+    # 详细对话(按轮组织的结论类对话,含 agent2 每轮审查结论/建议追问;
     # 跳过 thinking/tool_call/tool_result/history_compress 等过程类)
     trace = _collect_conversation_trace(task)
     if trace:
@@ -1446,7 +1446,7 @@ def _build_html_report(
             for r in results:
                 _append_result_html(parts, r, meta_fields)
 
-    # 详细对话(按轮组织的结论类对话,含 agent2 每轮审查结论/建议深挖)
+    # 详细对话(按轮组织的结论类对话,含 agent2 每轮审查结论/建议追问)
     trace = _collect_conversation_trace(task)
     if trace:
         parts.append("<h2>详细对话</h2>")
@@ -1538,7 +1538,7 @@ _CONVERSATION_TRACE_TYPES = {
     "question",    # 用户某轮发言(首轮以 question 落库,后续轮为 message)
     "submit",      # agent1 提交结果(按轮从 thinking 合成)
     "review",      # agent2 后台审查结论(reasoning 存完整 covered/missing/判断)
-    "suggestions", # agent2 建议深挖方向(JSON,报告渲染为列表)
+    "suggestions", # agent2 建议追问方向(JSON,报告渲染为列表)
     "summary",     # agent2 最终总结
     "message",     # 用户追加消息(前端主对话流右对齐展示)
     "error",       # 错误(关键失败原因,属于结论而非过程)
@@ -1560,7 +1560,7 @@ _CONVERSATION_TYPE_LABELS = {
     "question": "用户提问",
     "submit": "提交结果",
     "review": "审查结论",
-    "suggestions": "建议深挖方向",
+    "suggestions": "建议追问方向",
     "summary": "总结",
     "message": "用户消息",
     "error": "错误",
@@ -1595,7 +1595,7 @@ def _strip_question_memory_block(content: str) -> str:
 
 
 def _format_suggestions(raw: str) -> str:
-    """agent2 建议深挖卡落库为 JSON {"suggestions": [...]},渲染为可读列表
+    """agent2 建议追问卡落库为 JSON {"suggestions": [...]},渲染为可读列表
 
     解析失败(老数据/异常形态)退回原文,避免丢信息。
     """

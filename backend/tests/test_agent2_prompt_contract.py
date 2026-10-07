@@ -3,7 +3,7 @@
 agent2 职责收敛为后台审查(单 prompt):
 - AGENT2_REVIEW_PROMPT:agent1 结束后的单次完整后台审查,
   输出 covered/missing/reasoning/suggestions/results/grouping,
-  无 followup_query/done 轮次语义;追问降级为"建议深挖方向"。
+  无 followup_query/done 轮次语义;缺口降级为"建议追问方向"。
   resume 时用户消息直接交给 agent1,不经 agent2 分析转述。
 
 AGENT2_SYSTEM_PROMPT 为审查模式的兼容别名。
@@ -58,7 +58,7 @@ def test_review_prompt_ship_conclusion_is_conditional():
 
 
 def test_review_prompt_has_suggestions_contract():
-    """建议深挖契约:0-3 条、具体可执行、最后手段(能自查的不列建议)。"""
+    """建议追问契约:0-3 条、具体可执行、最后手段(能自查的不列建议)。"""
     assert "suggestions" in AGENT2_REVIEW_PROMPT
     assert "0-3" in AGENT2_REVIEW_PROMPT
     assert "最后手段" in AGENT2_REVIEW_PROMPT
