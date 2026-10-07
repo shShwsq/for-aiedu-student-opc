@@ -117,6 +117,10 @@ class Settings(BaseSettings):
     # ---- 工作区保留 ----
     # 任务完成后 session(含克隆的工作区)保留秒数,超时后惰性清理
     # (原硬编码 3600;教育场景默认放宽到 24h 便于当天回顾)
+    # 这是**后端会话**的寿命,不等于容器还在:容器受 SANDBOX_TIMEOUT_MINUTES 约束。
+    # 会话比容器活得久的那段窗口里,浏览端点会探活发现容器已回收 → 丢弃会话 +
+    # 回 410 + 工作区信息回 available=false,前端据此引导「重新克隆」
+    # (探活顺带续期,正在阅读的工作区不会突然过期)
     WORKSPACE_TTL_AFTER_COMPLETE: int = 86400
 
     # 用户上传 skill 存储目录(默认相对后端运行目录)
@@ -232,10 +236,12 @@ class Settings(BaseSettings):
     # 沙箱镜像:必须预装 git / ripgrep(rg) / python3 / awk / coreutils
     # 官方 ubuntu 镜像不含 git 和 rg,需按 docs/opensandbox-deploy.md 构建自定义镜像
     SANDBOX_IMAGE: str = "ubuntu"
-    # 沙箱超时(分钟)
+    # 沙箱超时(分钟):Server 到点就回收容器。与 WORKSPACE_TTL_AFTER_COMPLETE
+    # (后端会话保留期)是两套时限,差量靠探活补齐,不要求两者对齐
     SANDBOX_TIMEOUT_MINUTES: int = 30
-    # 沙箱续期间隔(分钟):会话被访问时距上次续期超过此值就 renew TTL,
-    # 防长任务(多轮协作/用户等待)拖过 TTL 被 Server 回收(回收后任何命令 404)
+    # CLI(ACP)prompt 等长阻塞段的后台续期间隔(分钟):这段时间命令由 CLI 自己
+    # 在沙箱里跑,不触发后端的会话访问,只能靠 auto_renew 线程撑住 TTL
+    # (普通访问路径的续期已并入探活,节流见 sandbox_tools._SANDBOX_PROBE_INTERVAL)
     SANDBOX_RENEW_INTERVAL_MINUTES: int = 5
     # 是否走 Server 代理访问沙箱(跨机部署必须开;本机部署开了也能用)
     # True=所有沙箱请求经 Server 8080 端口转发,后端只需连 Server 一个端口

@@ -6,6 +6,13 @@ import {
   filenameFromDisposition,
   normalizeBlobError,
 } from './download'
+import { HttpDetailError, extractErrorMessage, isHttpStatus } from './error'
+
+/** 浏览器形态的 Blob(有 text());jsdom 自带的 Blob 没实现 text()/arrayBuffer(),
+ * 拿它直接测会因读不回正文而假负(降级链最后一级返空串)*/
+function textualBlob(text: string): Blob {
+  return Object.assign(new Blob([text]), { text: () => Promise.resolve(text) })
+}
 
 describe('filenameFromDisposition', () => {
   it('优先 RFC 5987 的 filename*(中文名靠它才不失真)', () => {
@@ -64,5 +71,20 @@ describe('normalizeBlobError', () => {
     })
     expect(axios.isAxiosError(err)).toBe(true)
     expect(await normalizeBlobError(err)).toBe(err)
+  })
+
+  it('换成可读错误时保留状态码(410 工作区已过期靠它分流到重新克隆)', async () => {
+    const detail = '沙箱已过期:实例已被回收'
+    const err = Object.assign(new Error('Request failed with status code 410'), {
+      isAxiosError: true,
+      response: { status: 410, data: textualBlob(JSON.stringify({ detail })) },
+    })
+
+    const normalized = await normalizeBlobError(err)
+    expect(normalized).toBeInstanceOf(HttpDetailError)
+    // 文案与状态两件事都不能丢:前者给人看,后者决定要不要亮出恢复入口
+    expect(extractErrorMessage(normalized)).toBe(detail)
+    expect(isHttpStatus(normalized, 410)).toBe(true)
+    expect(isHttpStatus(normalized, 404)).toBe(false)
   })
 })

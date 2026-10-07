@@ -546,9 +546,9 @@ SANDBOX_IMAGE=secondlook-sandbox:latest
 # 沙箱超时(分钟)
 SANDBOX_TIMEOUT_MINUTES=30
 
-# 可选:会话 TTL 续期间隔(分钟,默认 5)
-# 会话被访问时距上次续期超过此值就自动 renew TTL,
-# 防长任务(多轮协作/用户等待/CLI 长执行)拖过 TTL 被 Server 回收(回收后命令 404)
+# 可选:CLI(ACP)prompt 等长阻塞段的后台续期间隔(分钟,默认 5)
+# 那段时间命令由 CLI 自己在沙箱里跑,不触发后端会话访问,只能靠 auto_renew 撑 TTL
+# (普通访问路径的续期已并入探活:sandbox_tools._SANDBOX_PROBE_INTERVAL,默认 60s)
 SANDBOX_RENEW_INTERVAL_MINUTES=5
 
 # 可选:挂载宿主机 SSH key(第三节)
@@ -639,13 +639,34 @@ SANDBOX_MEMORY=4Gi
 
 后端会通过 SDK 的 `resource` 参数传给 Server。注意:**不要**在 `~/.sandbox.toml` 的 `[docker]` 段找 `memory` / `cpus` 字段——官方配置没有这两项,资源限制只能通过 SDK 在创建沙箱时传入。
 
+### 6.8 报错 `[DOCKER::SANDBOX_NOT_FOUND] Sandbox <uuid> not found`
+
+含义:**Server 本身是活的**(它能回结构化错误 + `request_id`),但它手上已经没这个
+沙箱实例了 —— 而后端内存里的会话还带着完好的 `repo_path`,于是每条命令都撞 404。
+
+常见成因(按概率):1. **容器 TTL 到期被回收**(`SANDBOX_TIMEOUT_MINUTES`,默认 30min;
+后端会话却保留 `WORKSPACE_TTL_AFTER_COMPLETE`,默认 24h,两个时限不一致);
+2. **opensandbox.service 重启过**(内存里的沙箱注册表丢了);
+3. **容器被 docker 侧抹掉**:`docker container prune` / 磁盘压力回收 / OOM 后被清
+(第七节第 5 条的定期 prune 就属于这一类)/ 手动 `docker rm -f`;
+4. 后端 `SANDBOX_SERVER_URL` 指向了另一台 Server(沙箱建在 A,请求打到 B)。
+
+排查:比对后端日志里最后一条 `TTL 已续期 +N 分钟` 与报错时间(`+N` ≈ 报错时刻即 TTL
+回收)、`systemctl status opensandbox` 的启动时间、`docker ps -a` 里容器是否还在。
+
+系统现在的处理(无需人工干预):浏览端点会探活发现回收→丢弃会话并回 **410**,前端
+展示"工作区已过期"并亮出「重新克隆」;会话复用时发现已回收会重建新容器。
+想减少发生频率就调大 `SANDBOX_TIMEOUT_MINUTES`(活跃阅读会探活续期,闲置的不受影响)。
+
 ## 七、生产环境注意事项
 
 1. **API Key 鉴权**:生产环境一定要给 Server 设 `[server].api_key`,否则任何人都能创建沙箱
 2. **网络隔离**:Server 端口只对后端服务开放,不要暴露到公网
 3. **资源配额**:用 `SANDBOX_CPU` / `SANDBOX_MEMORY` 限制单沙箱资源,防恶意消耗
 4. **日志留存**:Server 日志要收集,便于排查沙箱执行问题
-5. **定期清理**:沙箱意外退出可能留下 dangling 容器,定期 `docker container prune`
+5. **定期清理**:沙箱意外退出可能留下 dangling 容器,定期 `docker container prune`。
+   注意它会一并抹掉崩溃过(如 OOM)的沙箱容器,使 Server 回 `[DOCKER::SANDBOX_NOT_FOUND]`
+   (见 6.8);跑着长任务时先 `docker ps` 确认再清
 
 ## 配置项对照表
 

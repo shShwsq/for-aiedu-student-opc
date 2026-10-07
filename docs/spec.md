@@ -476,6 +476,13 @@ Result(任务结果项,通用)
   - `run_command_background(cmd)` → execution_id(非阻塞,用于启动 ACP bridge 等长驻服务)
   - `get_background_logs(execution_id)` → 累积日志
   - `write_file` / `read_file` / `get_endpoint(port)` / `close()`
+  - `renew()` / `auto_renew()`(续期 TTL)/ `probe_alive()`(活性探针,顺带续期;只有
+    "确认不存在"才报死,网络抖动按活着处理)/ `mark_gone()`(标实例已回收,close 不再
+    徒劳调 destroy)
+- **沙箱类异常归一(`client._sdk`)**:SDK 的 SandboxApiException 只继承 Exception 且不区分
+  "路径不存在"与"实例不存在",故 `is_sandbox_gone` 按错误码/措辞识别后者并抛
+  `SandboxGoneError`(RuntimeError 子类)。不归一的后果:"沙箱没了"会被列目录逻辑当成
+  "Server 不支持该 API"再回退 shell(二次 404),最后被路由兜底成 500(见 §9.6)
 - 三类执行场景:
   1. **跑仓库代码本身**:沙箱预装多语言 runtime(Python/Node/Go 等),用于跑用户仓库的测试或启动服务观察运行时行为
   2. **跑 agent 生成的验证脚本**:react_agent 写小脚本验证漏洞是否可利用(如构造 payload 测注入点),在沙箱执行取回结果
@@ -629,7 +636,10 @@ react_agent 维护跨轮 plan 状态:
 
 ### 9.6 工作区浏览
 
-前端可浏览已 clone 仓库的文件结构和内容(`backend/app/routers/workspace.py`,session 生命周期:运行中 clone 完成即可浏览 / 完成后保留 1 小时 TTL / 超时惰性清理):
+前端可浏览已 clone 仓库的文件结构和内容(`backend/app/routers/workspace.py`)。**两套生命周期**:后端会话为"供用户回看"保留 `WORKSPACE_TTL_AFTER_COMPLETE`(默认 24h),容器却按 `SANDBOX_TIMEOUT_MINUTES`(默认 30min)被 Server 回收;会话超时后惰性清理(访问任意端点时触发):
+- **探活与过期处理(`sandbox_tools._probe_session`)**:浏览/恢复路径每次取会话都先探活(节流 `_SANDBOX_PROBE_INTERVAL`,默认 60s),探针就是 SDK 的 `renew`——一次往返同时拿到"容器还在吗"与"TTL 往后推",所以**活跃阅读的工作区不会突然过期**。确认已回收(`client.is_sandbox_gone` 认 `[DOCKER::SANDBOX_NOT_FOUND]` / "Sandbox <id> not found",路径 404 不算)则丢弃本地会话:`.../workspace` 回 `available=false` 让前端亮出「重新克隆」,浏览端点回 **410**。网络抖动/Server 短暂不可用一律按"仍活着"处理——瞬时故障不能被判成过期而白丢已 clone 好的工作区
+- **为何必须探活**:不探的话死会话仍带着完好的 `repo_path`,前端拿到 `available=true` 去列文件只能收到一个错误,而「重新克隆」按钮的渲染条件是 `!available` —— 永远不出现;`workspace_restore.status` 的对账也会被同一个 `repo_path` 骗成"已就绪"而根本不重克隆。`_get_or_create_session` 复用前同样探活,已回收则重建新容器(新容器为空,由克隆/智能体重新 clone)
+- **错误分档(`workspace._workspace_http_error`,五条沙箱类端点共用)**:410 过期 / 404 不可用与不存在(含路径穿越)/ 500 仅给未知异常且正文截断 300 字。历史形态是过期被兜底成 500 并把 `[DOCKER::SANDBOX_NOT_FOUND]` + `request_id` 原样贴进文件树;`client._sdk` 把 SDK 异常归一,`_list_files_sandbox` 也因此不再对过期做 shell 回退(那次回退必然再撞同一个 404)
 - 端点:`GET /tasks/{id}/workspace`(工作区信息:available / repo_path / mode / has_uploads / **can_restore**)、`.../tree`(整树快照,首屏一次拉取 + 短 TTL 缓存)、`.../files`(单层懒加载树)、`.../file`(原文 + offset/maxLines 分页,行号前端自行渲染)、`.../download`(原始字节下载,二进制文件的出口)
 - **二进制拦截(两种模式口径一致,判定表 `app/file_kinds.py`)**:后缀命中(docx/pdf/图片/压缩包/可执行…)或头部 8192 字节含 NUL → `read_file` 与 `.../workspace/file` 都回 `binary=true` + 占位文案,不回传内容。此前 sandbox 模式走 execd 文本通道(`wc -l` + `awk`)不做任何判定,docx 的原始字节被当文本回传:前端渲染成乱码,同一函数还把它喂进了智能体上下文。刻意**不**按"UTF-8 解码失败"判二进制(那会把 GBK 中文文本也拦掉,这类文件现在按文本回、个别字符以替换字符呈现)。文本响应 `size` 恒 0(字节数只在二进制卡片上用)
 - **下载**:`GET .../workspace/download?path=`(流式,sandbox 走 SDK `read_bytes_stream`、local 直接 open 宿主文件)与 `GET .../workspace/uploads/download?path=`(不经沙箱,上传保留期内可取回原件)。单文件上限 `WORKSPACE_DOWNLOAD_MAX_MB`(默认 50MB,超限 413);`.git/**`、`id_rsa`、`*.pem` 等凭证/密钥路径一律 403——带 token 的 clone URL 会落进 `.git/config`,文件树虽已剪掉 `.git`,下载端收的是任意 path,不拦就等于一键发凭证。文件名走 RFC 5987 `filename*=UTF-8''`(交付物多为中文名)
@@ -758,7 +768,7 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 
 **出题上下文增强**:
 - **选题优先级**:agent2 标记的学习点(`metadata.practice_worthy=true`)优先且保持标记顺序,不足 `max_findings` 再按 created_at 补未标记的;无标记(单 agent 模式 / 老任务)行为与按 created_at 取前 N 条一致,向后兼容。含 `learning_note` 的发现注入出题提示,引导题目聚焦值得学的点
-- **源码注入**:沙箱未销毁时(默认保留 1 小时),出题过程可注入相关源码文件内容
+- **源码注入**:沙箱未销毁时(受容器 TTL `SANDBOX_TIMEOUT_MINUTES` 约束,活跃访问会探活续期),出题过程可注入相关源码文件内容
 - **迷你工具循环**:generator 内置轻量循环(read_file / search_code / find_files,`MAX_TOOL_ROUNDS=6`,结果截断 3000 字符)增强出题质量,不复用重型 react_agent
 - **工作区恢复**:沙箱过期后支持重新 clone 仓库。**两条路径不同语义**:出题侧自动恢复受用户级开关 `restore_workspace_for_practice` 控制(默认关闭,避免意外拉取大仓库);做题页的“重新拉取代码”为用户主动触发,不受该开关限制,且走“发起 job + 轮询状态”的异步链路(见 §9.6)
 
@@ -807,7 +817,7 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - **Gitee refresh token 机制**:Gitee 的 access_token 带有效期,`GitProvider.refresh_access_token(refresh_token)` 在 token 过期时用 refresh_token 换新(返回新的 OAuthTokenSet,refresh_token 可能被轮转);GitHub 不支持刷新(refresh_token=None)。绑定数据存 `user_git_bindings` 时加密保存 refresh_token,克隆前自动判断并刷新
 - **克隆深度与超时**:`REPO_CLONE_DEPTH`(0=完整克隆默认,保留 git 历史供 log/blame 追溯;>0=浅克隆 `--depth N`)+ `REPO_CLONE_TIMEOUT`(默认 600s)
 - **克隆跳过**(`clone_skip.py`):用户可在克隆阶段点击跳过预克隆,一次性标志让 orchestrator 终止当前 clone 并降级为 react_agent 自主克隆
-- **沙箱续期**:`SANDBOX_RENEW_INTERVAL_MINUTES`(默认 5),会话被访问时距上次续期超过此值就 renew TTL,防长任务拖过 TTL 被 Server 回收
+- **沙箱续期与探活**:`SANDBOX_RENEW_INTERVAL_MINUTES`(默认 5)现仅用于 CLI(ACP)prompt 等长阻塞段的 `auto_renew` 后台线程(那段时间命令由 CLI 自己在沙箱里跑,不触发后端会话访问);普通访问路径的续期已并入探活(节流见 `sandbox_tools._SANDBOX_PROBE_INTERVAL`),回收后的处置见 §9.6
 - **CLI 挂死兜底**:`ACP_IDLE_TIMEOUT_OUTPUT_SECONDS`(默认 300,无活动工具时)/ `ACP_IDLE_TIMEOUT_TOOL_SECONDS`(默认 1800,有工具在跑时),超时 cancel + 用已累积输出收尾,防 CLI 静默挂死
 - **CLI 崩溃/流中断兜底**:SSE 流在收到 JSON-RPC 最终响应前结束(如 Node OOM 崩溃)时,bridge 关流前推 `event: stream_error`(含原因:cli_exit / stdout_eof / read_error),后端 `ACPClient._rpc` 抛 `ACPStreamAborted`;`prompt()` 捕获后与挂死超时同款善后——cancel + 置 `last_prompt_truncated` + 用已累积输出收尾,summary 标注"本轮输出不完整"让 agent2 知情,不再把崩溃当作正常完成
 - **LLM 限流退避**:`LLM_RATE_LIMIT_MAX_RETRIES`(默认 3),429 时指数退避 + 抖动重试,厂商返回 Retry-After 时优先采用

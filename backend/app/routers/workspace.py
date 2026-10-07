@@ -16,8 +16,12 @@
 
 session 生命周期:
 - 任务运行中:clone 完成后即可浏览
-- 任务完成后:session 保留 1 小时(TTL),供用户回看
-- 超时后惰性清理(下次访问任意 workspace 端点时触发)
+- 任务结束后:后端会话保留 WORKSPACE_TTL_AFTER_COMPLETE(默认 24h)供回看,
+  但容器按 SANDBOX_TIMEOUT_MINUTES(默认 30min)被 Server 回收 —— 两套时限
+- 探活顺带续期:活跃浏览/读取会推后容器 TTL,所以"正在看"的工作区不会突然过期;
+  闲置过久则容器先没,此时浏览端点回 410、工作区信息回 available=false,
+  前端据此亮出「重新克隆」(见 sandbox_tools._probe_session)
+- 会话超时后惰性清理(下次访问任意 workspace 端点时触发)
 
 上传回退浏览(uploads/tree / uploads/file):
 - 沙箱 session 过期后,仓库代码可 restore 重 clone,但用户上传是不可再生的
@@ -50,6 +54,7 @@ from app.file_kinds import (
 )
 from app.models.task import Task
 from app.models.user import User
+from app.sandbox.client import SandboxGoneError
 from app.services import workspace_restore
 from app.services.upload_layout import (
     UploadSlot,
@@ -105,6 +110,36 @@ def _task_upload_slots(task: Task) -> list[UploadSlot]:
         except UploadError:
             metas[uid] = {}
     return compute_upload_layout(creation_ids, followup_ids, metas)
+
+
+# 未知错误透给前端的正文截断长度:留够诊断线索,又不把一整段 traceback /
+# Docker 内部错误码贴进界面
+_UNKNOWN_ERROR_MAX_CHARS = 300
+
+
+def _workspace_http_error(exc: Exception, log_msg: str, prefix: str) -> HTTPException:
+    """沙箱类浏览端点的异常 → HTTPException(四条路径共用一套口径)
+
+    - SandboxGoneError → 410 Gone:容器已被 Server 回收。这是"可预期的过期"
+      而不是故障,会话已随异常被 sandbox_tools 丢弃,前端重查可用性就会拿到
+      available=false + can_restore 而亮出「重新克隆」。绝不能落到下面的 500:
+      历史上正是那条把 [DOCKER::SANDBOX_NOT_FOUND] + request_id 原样贴到
+      文件树上,用户既看不懂又找不到恢复入口
+    - RuntimeError / FileNotFoundError / ValueError → 404:未 clone、路径不存在、
+      越界(与不存在同语义,不透露"存在但在根外")
+    - 其他 → 500,带完整 traceback 入日志(过期与"不存在"不值得刷 traceback)
+    """
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, SandboxGoneError):
+        logger.info(f"{log_msg}: 沙箱已过期({exc})")
+        return HTTPException(status_code=status.HTTP_410_GONE, detail=str(exc))
+    if isinstance(exc, (RuntimeError, FileNotFoundError, ValueError)):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    logger.exception(log_msg)
+    return HTTPException(
+        status_code=500, detail=f"{prefix}: {str(exc)[:_UNKNOWN_ERROR_MAX_CHARS]}"
+    )
 
 
 # ============================================================
@@ -261,13 +296,10 @@ def list_workspace_files(
 
     try:
         return sandbox_tools.browse_files(str(task_id), subdir)
-    except RuntimeError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
-        logger.exception(f"[task={task_id}] 列出工作区文件失败: subdir={subdir}")
-        raise HTTPException(status_code=500, detail=f"列出文件失败: {e}")
+        raise _workspace_http_error(
+            e, f"[task={task_id}] 列出工作区文件失败: subdir={subdir}", "列出文件失败"
+        ) from e
 
 
 @router.get("/tasks/{task_id}/workspace/tree")
@@ -293,11 +325,10 @@ def get_workspace_tree(
 
     try:
         return sandbox_tools.browse_tree(str(task_id), max_depth, max_entries, refresh)
-    except RuntimeError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
-        logger.exception(f"[task={task_id}] 获取工作区树快照失败")
-        raise HTTPException(status_code=500, detail=f"获取文件树失败: {e}")
+        raise _workspace_http_error(
+            e, f"[task={task_id}] 获取工作区树快照失败", "获取文件树失败"
+        ) from e
 
 
 @router.get("/tasks/{task_id}/workspace/file")
@@ -341,13 +372,12 @@ def read_workspace_file(
 
     try:
         return sandbox_tools.browse_read_file(str(task_id), path, offset, max_lines)
-    except RuntimeError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
-        logger.exception(f"[task={task_id}] 读取工作区文件失败: path={path}")
-        raise HTTPException(status_code=500, detail=f"读取文件失败: {e}")
+        raise _workspace_http_error(
+            e,
+            f"[task={task_id}] 读取工作区文件失败: path={path}",
+            "读取文件失败",
+        ) from e
 
 
 @router.get("/tasks/{task_id}/workspace/download")
@@ -372,9 +402,11 @@ def download_workspace_file(
 
     try:
         size, chunks = sandbox_tools.browse_download(str(task_id), rel)
-    except (RuntimeError, FileNotFoundError, ValueError) as e:
-        # 路径穿越(ValueError)与不存在同语义,不区分辨护根目录结构
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        # 路径穿越(ValueError)与不存在同语义,护根目录结构;过期则 410 引导重新克隆
+        raise _workspace_http_error(
+            e, f"[task={task_id}] 准备工作区下载失败: path={path}", "下载文件失败"
+        ) from e
     _enforce_download_limit(size)
 
     filename = PurePosixPath(rel).name or "download"

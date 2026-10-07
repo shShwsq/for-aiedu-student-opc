@@ -10,7 +10,6 @@
   路由 submit_task_message completed 分支把附件累积进 params 并透传给 resume
 """
 import io
-import time
 import uuid
 import zipfile
 from pathlib import Path
@@ -68,8 +67,9 @@ def _clean_sessions():
 def _mk_local_session(task_id: str, workspace: Path) -> dict:
     """预置一个 local 模式会话 ctx(绕过真实沙箱创建)
 
-    local 模式下 _get_or_create_session 命中已存在的 ctx 即直接返回,
-    且续期逻辑只对 sandbox 模式生效,故无需 session 对象参与传输。
+    local 模式下 _get_or_create_session 命中已存在的 ctx 即直接返回:探活只
+    对 sandbox 模式生效(local 工作区是宿主临时目录,无容器可问),
+    故无需真 session 对象参与传输。
     """
     workspace.mkdir(parents=True, exist_ok=True)
     ctx = {
@@ -77,7 +77,6 @@ def _mk_local_session(task_id: str, workspace: Path) -> dict:
         "mode": "local",
         "local_dir": str(workspace),
         "repo_path": str(workspace),
-        "_last_renew": time.monotonic(),
     }
     sandbox_tools._sessions[task_id] = ctx
     return ctx

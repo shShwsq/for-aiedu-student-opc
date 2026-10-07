@@ -87,7 +87,8 @@
 
 #### 前端体验
 
-- **工作区浏览**:前端可浏览 agent1 clone 的工作区文件结构和内容(任务完成后保留 1 小时)。
+- **工作区浏览**:前端可浏览 agent1 clone 的工作区文件结构和内容(会话保留期可配
+  `WORKSPACE_TTL_AFTER_COMPLETE`,容器被回收后如实报过期并支持重新克隆)。
 - **思考链流式推送**:LLM 的 reasoning_content 通过 SSE thinking_delta 事件实时推给前端(打字机效果)。
 - **多厂商 LLM 支持**:DashScope(通义千问)/ DeepSeek / 智谱 / 月之暗面 / 豆包 / MiniMax 等,通过 models_catalog.json 统一管理差异。
 - **代码审查场景模板**:除安全审计外,新增 code_review 场景(预设提示词 + 推荐 skill)。
@@ -386,7 +387,10 @@ uvicorn app.main:app --reload
 - ✅ 任务异步执行(后台线程 threading,暂未用 Celery/RQ)
 - ✅ 沙箱部署脚本(scripts/build-sandbox-image.sh)
 - ✅ 资源限制(沙箱 CPU/内存/执行时间限制;react_agent MAX_ITERATIONS + 循环检测)
-- ✅ 沙箱 TTL 自动续期(SANDBOX_RENEW_INTERVAL_MINUTES)+ 克隆深度/超时可配(REPO_CLONE_DEPTH / REPO_CLONE_TIMEOUT)
+- ✅ 沙箱 TTL 自动续期(访问路径探活顺带续期;CLI 长阻塞段走 `SANDBOX_RENEW_INTERVAL_MINUTES`
+  的 `auto_renew`)+ 克隆深度/超时可配(REPO_CLONE_DEPTH / REPO_CLONE_TIMEOUT)
+- ✅ 沙箱实例回收后的自适应:过期被归一为 `SandboxGoneError` → 丢弃会话 + 回 410 +
+  引导重新克隆,复用会话时发现已回收则重建容器(避免"看着可用、什么也读不到")
 - ✅ LLM 429 限流退避重试(LLM_RATE_LIMIT_MAX_RETRIES)+ CLI 挂死兜底(ACP_IDLE_TIMEOUT_*)
 - ⬜ 任务队列(Celery/RQ):当前用 threading,生产环境需切换
 - ⬜ 监控与日志系统

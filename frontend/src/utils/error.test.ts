@@ -1,5 +1,5 @@
 /**
- * extractErrorMessage 单元测试
+ * extractErrorMessage / isHttpStatus 单元测试
  *
  * 覆盖从 axios 错误 / Error 实例 / 未知值提取人类可读消息的优先级链:
  * 1. axios 错误 → 后端 detail 字段(字符串 / FastAPI 校验数组)
@@ -8,10 +8,13 @@
  * 4. 其他 HTTP 状态 → "请求失败(status)"
  * 5. Error 实例 → message
  * 6. 兜底 → 未知错误
+ *
+ * isHttpStatus:按状态码分流(后端用 410 表"工作区已过期"这类可恢复状态,
+ * 靠 detail 文案认不出来)。
  */
 import { describe, expect, it } from 'vitest'
 
-import { extractErrorMessage } from './error'
+import { extractErrorMessage, isHttpStatus } from './error'
 
 // 辅助:构造一个会被 axios.isAxiosError() 识别为 axios 错误的对象。
 //
@@ -200,5 +203,26 @@ describe('extractErrorMessage', () => {
     const err = makeAxiosError(400, { detail: 'axios 路径' })
     expect(extractErrorMessage(err)).toBe('axios 路径')
     expect(extractErrorMessage(err)).not.toBe('request failed')
+  })
+})
+
+describe('isHttpStatus', () => {
+  it('命中指定状态码(410 工作区已过期)', () => {
+    expect(isHttpStatus(makeAxiosError(410, { detail: '沙箱已过期' }), 410)).toBe(true)
+  })
+
+  it('其他状态码不命中', () => {
+    // 500 不能被视为过期:否则一次未知故障就会把"可恢复"的文案交给用户
+    expect(isHttpStatus(makeAxiosError(500, { detail: 'boom' }), 410)).toBe(false)
+    expect(isHttpStatus(makeAxiosError(404, undefined), 410)).toBe(false)
+  })
+
+  it('无 response(断网/超时)不命中', () => {
+    expect(isHttpStatus(makeNetworkError(), 410)).toBe(false)
+  })
+
+  it('非 axios 错误不命中', () => {
+    expect(isHttpStatus(new Error('410'), 410)).toBe(false)
+    expect(isHttpStatus({ response: { status: 410 } }, 410)).toBe(false)
   })
 })

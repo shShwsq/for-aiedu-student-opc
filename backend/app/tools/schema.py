@@ -13,6 +13,7 @@ import contextvars
 import uuid
 from typing import Any
 
+from app.sandbox.client import SandboxGoneError
 from app.tools import sandbox_tools
 from app.tools.cve_tools import query_cve
 from app.tools.dependency_tools import list_dependencies
@@ -639,13 +640,24 @@ def execute_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
     自动从 ContextVar 注入 task_id 和 git_tokens,LLM 看不到这两个参数。
     git_tokens 只对 clone_repo 注入(其他工具不接受该参数,避免误传)。
     command_confirm_mode 只对 run_command 注入(控制危险命令是否弹窗确认)。
+
+    沙箱容器被 Server 回收(SandboxGoneError)时顺手丢掉本地会话:下一个工具调用
+    会重建一个新容器。不等探活节流(最长 60s)才处理,是因为一次过期会让整轮工具
+    调用全部砸在同一个死会话上,模型只会反复看到同一个错;先清干净,重试时
+    至多就是"工作区空了,得重新 clone"。
     """
     if tool_name not in TOOL_FUNCTIONS:
         raise ValueError(f"未知工具: {tool_name}")
     func = TOOL_FUNCTIONS[tool_name]
-    arguments["task_id"] = _CURRENT_TASK_ID.get()
+    task_id = _CURRENT_TASK_ID.get()
+    arguments["task_id"] = task_id
     if tool_name == "clone_repo":
         arguments["git_tokens"] = _CURRENT_GIT_TOKENS.get()
     if tool_name == "run_command":
         arguments["command_confirm_mode"] = _CURRENT_EXECUTOR_COMMAND_CONFIRM.get()
-    return func(**arguments)
+    try:
+        return func(**arguments)
+    except SandboxGoneError:
+        if task_id:
+            sandbox_tools.drop_gone_session(str(task_id))
+        raise

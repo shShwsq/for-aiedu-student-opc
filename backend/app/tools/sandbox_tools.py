@@ -35,7 +35,13 @@ from app.file_kinds import (
 from app.git_provider import get_provider_for_url
 from app.pause_controller import wait_if_paused
 from app.perf import perf_log, perf_timer
-from app.sandbox.client import SandboxSession, check_local_write_permission, create_sandbox
+from app.sandbox.client import (
+    SANDBOX_GONE_MESSAGE,
+    SandboxGoneError,
+    SandboxSession,
+    check_local_write_permission,
+    create_sandbox,
+)
 from app.services.repo_cache import cache_key as repo_cache_key
 from app.services.repo_cache import ensure_bare_cache, force_rmtree, sandbox_mount
 from app.services.repo_cache import normalize_repo_url
@@ -68,6 +74,13 @@ _tree_cache: dict[str, tuple[float, dict]] = {}
 _CLEANUP_SCAN_INTERVAL = 60.0
 _last_cleanup_scan = 0.0
 _cleanup_scan_lock = threading.Lock()
+
+# 沙箱探活节流(秒):会话缓存与容器是两套生命周期 —— 会话为"供用户回看"保留
+# WORKSPACE_TTL_AFTER_COMPLETE(默认 24h),容器却按 SANDBOX_TIMEOUT_MINUTES(默认
+# 30min)被 Server 回收。光看 ctx 里有没有 repo_path 分辨不出这段"看着完好、实
+# 际已死"的窗口,只能问 Server。1 分钟一次既够及时,又不至于让每个浏览请求都
+# 多一次往返。探活本身顺带续期,所以活跃浏览的工作区不会被 TTL 扫掉。
+_SANDBOX_PROBE_INTERVAL = 60.0
 
 # 同任务克隆互斥锁:task_id -> RLock
 # 同一任务的 clone 入口不止一个(orchestrator 预克隆、降级后的 clone_repo 工具、
@@ -107,9 +120,14 @@ def _get_or_create_session(
 ) -> dict[str, Any]:
     """获取或创建任务的沙箱上下文
 
-    复用已有会话时顺带做"访问续期":距上次续期超过
-    SANDBOX_RENEW_INTERVAL_MINUTES 就 renew 一次 TTL,防长任务
-    (多轮协作/用户等待)拖过创建时的 TTL 被 Server 回收(回收后 404)。
+    复用已有会话前先探活(顺带续期 TTL):容器已被 Server 回收时丢掉旧会话并
+    重建一个新容器 —— 不这么做,"过期"会是个永久态:任何命令都回
+    SANDBOX_NOT_FOUND,而恢复流程又复用 `_sessions` 里那个死会话、拿 repo_path
+    当"已就绪"短路,用户点重新克隆也救不回来。
+
+    重建出的新容器是空的(agent 下一个工具调用会看到"目录不存在"进而重
+    clone)。这里不做自动重 clone:克隆需要 repo_url/git_tokens/协议与分支回退链,
+    那是 clone_repo_with_fallback 的职责,不属于会话层。
 
     repo_url/branch/git_tokens(可选,仅新建会话时生效;复用已有会话的
     调用方不感知——容器已建好,挂载无法追加):
@@ -119,51 +137,119 @@ def _get_or_create_session(
     - local 模式:不在此接缓存(clone 阶段直接从宿主机 bare 目录克隆),
       只写会话元信息供进程重启后孤儿目录恢复。
     """
-    if task_id not in _sessions:
-        extra_volumes: list[tuple[str, str, bool]] = []
-        if settings.SANDBOX_MODE == "sandbox" and repo_url:
-            try:
-                bare_dir = ensure_bare_cache(
-                    repo_url, branch=branch, git_tokens=git_tokens, task_id=task_id
-                )
-                mount_info = sandbox_mount(repo_url)
-                if bare_dir and mount_info:
-                    # 只读挂载本任务仓库的 bare 子目录(非缓存根,跨租户隔离)
-                    extra_volumes.append((mount_info[0], mount_info[1], True))
-            except Exception as e:
-                logger.warning(
-                    f"[sandbox] task={task_id} 仓库缓存挂载准备失败"
-                    f"(降级全量远程克隆): {e}"
-                )
-        # [perf] 新建沙箱会话(拉镜像/启容器/等 healthy,可能是大耗时点)
-        with perf_timer(task_id, "sandbox_session", reused=False, mode=settings.SANDBOX_MODE):
-            session = create_sandbox(extra_volumes=extra_volumes or None)
-        ctx = {"session": session, "repo_path": "", "mode": settings.SANDBOX_MODE}
-        # local 模式:复用 SandboxSession 自有的本地临时目录(单一临时目录,
-        # 避免过去 session 一份、ctx 一份的双份临时目录问题)
-        if settings.SANDBOX_MODE == "local":
-            ctx["local_dir"] = session.local_dir
-            _write_local_session_meta(task_id, session.local_dir)
-        # sandbox 模式:缓存挂载成功才记录,clone 阶段据此走容器内本地克隆
-        if settings.SANDBOX_MODE == "sandbox" and len(extra_volumes) == 1 and repo_url:
-            ctx["cache_key"] = repo_cache_key(repo_url)
-            ctx["cache_mount"] = extra_volumes[0][1]
-        # 创建即起算 TTL,记下起点供后续访问续期节流判断
-        ctx["_last_renew"] = time.monotonic()
-        _sessions[task_id] = ctx
-    else:
+    ctx = _sessions.get(task_id)
+    if ctx is not None and _probe_session(task_id, ctx):
         # [perf] 复用已有会话(无容器创建开销)
         perf_log(task_id, "sandbox_session", reused=True)
-        ctx = _sessions[task_id]
-        # 访问续期(节流):sandbox 模式才需要,间隔内不重复调 Server API
-        renew_interval = settings.SANDBOX_RENEW_INTERVAL_MINUTES * 60
-        if (
-            ctx.get("mode") == "sandbox"
-            and time.monotonic() - ctx.get("_last_renew", 0.0) >= renew_interval
-        ):
-            if ctx["session"].renew():
-                ctx["_last_renew"] = time.monotonic()
-    return _sessions[task_id]
+        return ctx
+    if ctx is not None:
+        logger.warning(
+            f"[task={task_id}] 沙箱实例已被回收,重建会话(工作区为空,需重新 clone)"
+        )
+
+    extra_volumes: list[tuple[str, str, bool]] = []
+    if settings.SANDBOX_MODE == "sandbox" and repo_url:
+        try:
+            bare_dir = ensure_bare_cache(
+                repo_url, branch=branch, git_tokens=git_tokens, task_id=task_id
+            )
+            mount_info = sandbox_mount(repo_url)
+            if bare_dir and mount_info:
+                # 只读挂载本任务仓库的 bare 子目录(非缓存根,跨租户隔离)
+                extra_volumes.append((mount_info[0], mount_info[1], True))
+        except Exception as e:
+            logger.warning(
+                f"[sandbox] task={task_id} 仓库缓存挂载准备失败"
+                f"(降级全量远程克隆): {e}"
+            )
+    # [perf] 新建沙箱会话(拉镜像/启容器/等 healthy,可能是大耗时点)
+    with perf_timer(task_id, "sandbox_session", reused=False, mode=settings.SANDBOX_MODE):
+        session = create_sandbox(extra_volumes=extra_volumes or None)
+    ctx = {"session": session, "repo_path": "", "mode": settings.SANDBOX_MODE}
+    # local 模式:复用 SandboxSession 自有的本地临时目录(单一临时目录,
+    # 避免过去 session 一份、ctx 一份的双份临时目录问题)
+    if settings.SANDBOX_MODE == "local":
+        ctx["local_dir"] = session.local_dir
+        _write_local_session_meta(task_id, session.local_dir)
+    # sandbox 模式:缓存挂载成功才记录,clone 阶段据此走容器内本地克隆
+    if settings.SANDBOX_MODE == "sandbox" and len(extra_volumes) == 1 and repo_url:
+        ctx["cache_key"] = repo_cache_key(repo_url)
+        ctx["cache_mount"] = extra_volumes[0][1]
+    # 创建即起算 TTL。_last_probe 同时是"上次续期时刻":探活本体就是 renew,
+    # 两个时间戳分开记只会多一次多余的 Server 往返
+    ctx["_last_probe"] = time.monotonic()
+    _sessions[task_id] = ctx
+    return ctx
+
+
+def _probe_session(task_id: str, ctx: dict[str, Any]) -> bool:
+    """按需探活(节流 _SANDBOX_PROBE_INTERVAL):容器已回收就丢掉本地会话
+
+    返回 False 表示"这个 ctx 不能用"(会话已被本函数丢弃),调用方要么重建
+    会话(_get_or_create_session),要么把过期如实告知前端(browse_* 抛
+    SandboxGoneError)。
+
+    local 模式恒为 True:工作区是宿主机临时目录,回收由我们自己控制,问 Server
+    既无意义也无从问起。session 不是 SandboxSession 实例(测试替身等)时同样
+    不判定 —— 没有可靠探针就宁可当活着,不能瞎猜过期。
+    """
+    if ctx.get("mode") != "sandbox":
+        return True
+    session = ctx.get("session")
+    if not isinstance(session, SandboxSession):
+        return True
+    if session.is_closed:
+        # 已经关掉(或被标为已回收)的会话不该继续留在缓存里给人虚假的"可用"
+        drop_gone_session(task_id)
+        return False
+
+    now = time.monotonic()
+    # ctx 里没这个时间戳 = 从没探过活,立即探一次(拿 0.0 当默认值会在刚开机
+    # 不满一个节流窗口的机器上把"从未探活"误当成"刚探过")
+    last_probe = ctx.get("_last_probe")
+    if last_probe is not None and now - last_probe < _SANDBOX_PROBE_INTERVAL:
+        return True
+    ctx["_last_probe"] = now
+
+    # 探活成功即等于 TTL 已往后推(_last_probe 兼任"上次续期时刻")
+    if session.probe_alive():
+        return True
+
+    logger.warning(
+        f"[task={task_id}] 沙箱实例已被回收,丢弃本地会话(工作区需重新克隆)"
+    )
+    drop_gone_session(task_id)
+    return False
+
+
+def drop_gone_session(task_id: str) -> None:
+    """丢掉容器已被回收的会话(不调 destroy:实例早没了,再问只会撞回 404)
+
+    与 close_session 的分工:那条服务于"仍然活着的沙箱"的正常销毁(兜底捕获
+    diff、停 bridge、销毁容器),这些动作全依赖沙箱活着;这里只清理后端侧状态。
+
+    先 mark_gone() 再清 bridge 缓存:bridge 驻在已消失的容器里,标了 gone 之后的
+    interrupt 会短路,只把 `_bridge_cache` 里那个指向死会话的条目摘掉(否则后续
+    轮次会拿着一个连不上的 endpoint 反复重试)。
+
+    `_clone_locks` 不动:克隆可能正在别的线程里跑着这把锁,摘掉它等于给并发克隆
+    放行;它终会随 close_session / 下次重建被复用。
+    """
+    ctx = _sessions.pop(task_id, None)
+    if ctx is None:
+        return
+    _tree_cache.pop(task_id, None)
+
+    session = ctx.get("session")
+    if isinstance(session, SandboxSession):
+        session.mark_gone()
+
+    try:
+        # 延迟导入避免循环依赖(acp_base 依赖 sandbox_tools)
+        from app.agents.acp_base import stop_task_bridge
+        stop_task_bridge(task_id)
+    except Exception as e:
+        logger.warning(f"[task={task_id}] 清 ACP bridge 缓存失败(忽略): {e}")
 
 
 def precreate_session_for_repo(
@@ -303,11 +389,20 @@ def close_session(task_id: str, save_diff: bool = False) -> None:
 def get_workspace_info(task_id: str) -> dict[str, Any] | None:
     """获取任务的工作区信息(供前端浏览)
 
-    返回 None 表示 session 不存在(任务未执行 clone 或已清理)。
+    返回 None 表示 session 不存在(任务未执行 clone、已清理,或容器已被 Server
+    回收而会话刚被丢弃)。
     返回 dict: { repo_path, mode, completed }
+
+    这里必须探活而不能只看 ctx:容器被回收后 ctx 仍带着完好的 repo_path,拿它
+    判 available=true 的后果是前端去列文件、收到一个过期错误,而「重新克隆」
+    按钮的渲染条件是 available=false —— 永远不出现,用户既看不了也没恢复入口。
+    恢复流程(workspace_restore.status / POST restore)也走这条,否则会被那个死
+    ctx 的 repo_path 骗成"已就绪"而根本不重克隆。
     """
     ctx = _sessions.get(task_id)
     if ctx is None:
+        return None
+    if not _probe_session(task_id, ctx):
         return None
     return {
         "repo_path": ctx.get("repo_path", ""),
@@ -323,14 +418,11 @@ def browse_files(task_id: str, subdir: str = "") -> dict:
     - 不需要传 repo_path(从 _sessions 取)
     - task_id 必填(前端按任务浏览)
     - 返回结构一致,前端可直接渲染树
-    """
-    ctx = _sessions.get(task_id)
-    if ctx is None:
-        raise RuntimeError("工作区不可用:任务未 clone 仓库或会话已过期清理")
 
-    repo_path = ctx.get("repo_path", "")
-    if not repo_path:
-        raise RuntimeError("工作区不可用:尚未 clone 仓库")
+    抛出:RuntimeError(无会话/未 clone)/ SandboxGoneError(容器已回收)/
+          FileNotFoundError(目录不存在)
+    """
+    ctx, repo_path = _browse_repo_root(task_id)
 
     # 复用 list_files 的实现(local / sandbox 分支)
     mode = ctx["mode"]
@@ -371,18 +463,15 @@ def browse_tree(
     }
 
     结果带短 TTL 缓存(_TREE_CACHE_TTL),refresh=True 绕过。
+
+    探活先于缓存:否则过期后的 30s 窗口里会拿旧快照继续报"可用",点开文件才
+    发现读不到。drop_gone_session 会一并清掉树缓存。
     """
+    ctx, repo_path = _browse_repo_root(task_id)
+
     cached = _tree_cache.get(task_id)
     if not refresh and cached is not None and time.time() - cached[0] < _TREE_CACHE_TTL:
         return cached[1]
-
-    ctx = _sessions.get(task_id)
-    if ctx is None:
-        raise RuntimeError("工作区不可用:任务未 clone 仓库或会话已过期清理")
-
-    repo_path = ctx.get("repo_path", "")
-    if not repo_path:
-        raise RuntimeError("工作区不可用:尚未 clone 仓库")
 
     if ctx["mode"] == "local":
         payload = _browse_tree_local(repo_path, max_depth, max_entries)
@@ -451,6 +540,10 @@ def _browse_tree_sandbox(ctx: dict, repo_path: str, max_depth: int, max_entries:
 
     try:
         output = session.run_command(cmd, timeout=30)
+    except SandboxGoneError:
+        # 容器没了就明说:降级走单层列出同样会抛 SandboxGoneError,
+        # 中间只差一次必败的往返
+        raise
     except Exception as e:
         logger.warning(f"[workspace] find 树快照失败,降级根目录单层列出: {e}")
         return _fallback_single_level()
@@ -481,11 +574,18 @@ def _browse_tree_sandbox(ctx: dict, repo_path: str, max_depth: int, max_entries:
 def _browse_repo_root(task_id: str) -> tuple[dict, str]:
     """前端浏览/下载共用的工作区前置检查,返回 (会话上下文, repo_path)
 
-    两条错误文案与 browse_read_file 原有实现一致(前端据此区分"未 clone"与"已过期")。
+    两类异常文案与处置完全不同,前端据此分流(旧版只到 RuntimeError 一档,
+    于是"容器被回收"和"还没克隆"在界面上长得一样,后者还不给恢复入口):
+    - RuntimeError:会话不存在 / 尚未 clone —— 工作区本就不可用
+    - SandboxGoneError:会话还在但容器已被 Server 回收(本函数已顺手丢弃该会话,
+      下一次请求就落到上一档;路由把这条映射成 410 而非 500)
     """
     ctx = _sessions.get(task_id)
     if ctx is None:
         raise RuntimeError("工作区不可用:任务未 clone 仓库或会话已过期清理")
+
+    if not _probe_session(task_id, ctx):
+        raise SandboxGoneError(SANDBOX_GONE_MESSAGE)
 
     repo_path = ctx.get("repo_path", "")
     if not repo_path:
@@ -1403,6 +1503,8 @@ def _list_files_sandbox(
 
     比旧方案(test -d + ls 两次远程 shell)快得多。
     SDK 调用异常(非目录不存在)时自动回退 shell 实现,兼容旧 Server。
+    实例已被回收则不回退:那条路只会再撞一次同样的 404,并把成因盖成
+    "Failed to run command"(历史上的 500 + Docker 错误码进界面就是这么来的)。
     """
     session: SandboxSession = ctx["session"]
     full_path = (
@@ -1412,6 +1514,8 @@ def _list_files_sandbox(
 
     try:
         raw = session.list_directory(full_path)
+    except SandboxGoneError:
+        raise
     except FileNotFoundError:
         raise FileNotFoundError(f"目录不存在: {subdir or '(根)'}")
     except Exception as e:
@@ -3473,6 +3577,11 @@ def _clone_repo_fallback(
             logger.info(f"[clone_fallback] task={task_id} 缓存容器内克隆成功")
             return result
         except CloneSkippedError:
+            # 用户主动跳过:向上传播(沙箱内的半成品目录已由 _clone_repo_sandbox 清掉)
+            raise
+        except SandboxGoneError:
+            # 容器被回收:继续走远程链只会在同一个死会话上再失败 N 次(每次含克隆
+            # 超时,分钟级),不如把干净的过期原因交给调用方(前端可重新克隆)
             raise
         except Exception as e:
             logger.warning(
@@ -3530,6 +3639,10 @@ def _clone_repo_fallback(
                 # 用户主动跳过:直接向上传播,不进协议回退/错误聚合
                 # (本次克隆落在哪个目录只有 _clone_repo_local 知道,半成品已由它清理;
                 # 这里不能再按仓名猜目录去删,否则会抹掉避让保护的外来工作区)
+                raise
+            except SandboxGoneError:
+                # 容器已回收:协议回退救不了它(每一种都打同一个不存在的实例),
+                # 反而把真正原因埋进"已尝试 N 种协议"的聚合错误里
                 raise
             except Exception as e:
                 err_msg = str(e)[:300]

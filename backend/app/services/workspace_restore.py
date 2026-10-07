@@ -132,6 +132,11 @@ def status(task_id: str) -> dict[str, Any] | None:
 
     running 但工作区其实已就绪(别的入口先完成了克隆,如出题前恢复)→ 直接判 done,
     不让前端一直转圈等一个不会再有进展的 job。
+
+    就绪与否必须问 get_workspace_info 而不是自己扫 `_sessions`:前者会探活,
+    容器已被回收的死会话在那里会被丢弃并返回 None。否则这个对账会把"会话里还
+    记着 repo_path、容器早没了"当成已就绪,直接报 done + 100%,用户看着克隆完了,
+    点开文件树又是一个过期错误(旧版就卡在这里)。
     """
     with _lock:
         _purge_locked(time.time())

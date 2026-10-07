@@ -6,7 +6,8 @@
  * 错误文案,写三遍必然漂;文本文件(尤其 md)原先干脆没有取回入口。
  *
  * source 决定走哪条端点:
- * - workspace:沙箱工作区文件,依赖 session —— 过期后后端 404,提示走「重新克隆」
+ * - workspace:沙箱工作区文件,依赖 session —— 容器被回收后后端回 410(已过期),
+ *   提示走「重新克隆」;回调见 run 的 onExpired
  * - uploads:用户上传原件,不经沙箱,保留期内始终可取回
  *
  * 令牌只门控**错误文案**,不门控**送达**:用户点过下载就该收到文件,哪怕他随后
@@ -16,7 +17,11 @@
  */
 import { ref } from 'vue'
 
-import { downloadWorkspaceFile, downloadWorkspaceUploadsFile } from '@/api/workspace'
+import {
+  downloadWorkspaceFile,
+  downloadWorkspaceUploadsFile,
+  isWorkspaceExpiredError,
+} from '@/api/workspace'
 import { extractErrorMessage } from '@/utils/error'
 import { basenameOf, triggerBlobDownload } from '@/utils/download'
 
@@ -43,11 +48,16 @@ export function useFileDownload() {
    *
    * taskId/path 缺失直接返回 false(不发起请求,也不报错——按钮本就禁用);
    * 重复点击由 downloading 拦下(同一按钮连点不会排队多个大文件请求)。
+   *
+   * onExpired:工作区已过期(HTTP 410)时的后续动作。不能只留一行错误文案——
+   * 沙箱已经没了,这个任务的工作区在重新克隆前任何读取都不会成功,调用方
+   * 据此重查可用性才能亮出「重新克隆」入口。
    */
   async function run(
     taskId: string,
     path: string,
     source: FileDownloadSource = 'workspace',
+    onExpired?: () => void | Promise<void>,
   ): Promise<boolean> {
     if (!taskId || !path || downloading.value) return false
     // 占位错误令牌:此后若发生切换(clearError)或新的下载,本次的失败就不再展示
@@ -65,6 +75,14 @@ export function useFileDownload() {
       return true
     } catch (err) {
       if (my === errorToken) downloadError.value = extractErrorMessage(err)
+      // 过期单独走恢复入口(仍受同一令牌门控:切走之后的失败不该再打扰当前文件)
+      if (my === errorToken && isWorkspaceExpiredError(err)) {
+        try {
+          await onExpired?.()
+        } catch {
+          // 恢复入口自身的失败不掩盖下载错误
+        }
+      }
       return false
     } finally {
       downloading.value = false

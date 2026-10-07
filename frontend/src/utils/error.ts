@@ -16,6 +16,40 @@ function isClientTimeout(err: AxiosError): boolean {
   return /timeout of \d+ms exceeded/i.test(err.message ?? '')
 }
 
+/** 带 HTTP 状态码的错误(状态与可读文案一并保留)
+ *
+ * responseType='blob' 的失败经 `normalizeBlobError` 还原成普通 Error 时会丢掉
+ * response,于是状态码分流(如 410 工作区已过期)在错误链上第二条路径里失效。
+ * 归一时把状态码带上,调用方仍能用 isHttpStatus 分流。
+ */
+export class HttpDetailError extends Error {
+  readonly status: number | undefined
+
+  constructor(message: string, status?: number) {
+    super(message)
+    this.name = 'HttpDetailError'
+    this.status = status
+  }
+}
+
+/** 取错误的 HTTP 状态码(拿不到返回 undefined) */
+export function httpStatusOf(err: unknown): number | undefined {
+  if (axios.isAxiosError(err)) return err.response?.status
+  if (err instanceof HttpDetailError) return err.status
+  return undefined
+}
+
+/**
+ * 判断错误是否为指定 HTTP 状态码
+ *
+ * 后端有些状态不是"坏了"而是"可预期的状态",靠 detail 文案认不出来(文案会改、
+ * 会本地化),得按状态码分流。例:410 = 工作区沙箱已被回收 → 前端应重新查可用性
+ * 并亮出「重新克隆」,而不是只把一行错误摆在文件树里。
+ */
+export function isHttpStatus(err: unknown, status: number): boolean {
+  return httpStatusOf(err) === status
+}
+
 /**
  * 从未知错误中提取人类可读的消息
  *

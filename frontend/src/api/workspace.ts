@@ -11,9 +11,13 @@
  * - GET /tasks/{id}/workspace/uploads/download 回退下载上传文件
  * - POST /tasks/{id}/workspace/restore 发起过期工作区重新 clone(后台执行)
  * - GET  /tasks/{id}/workspace/restore/status 查询恢复进度(轮询)
+ *
+ * 沙箱类浏览端点(files/tree/file/download)的 410 = 工作区已过期,用
+ * isWorkspaceExpiredError 分流(见下方)。
  */
 import client from './client'
 import { basenameOf, filenameFromDisposition, normalizeBlobError } from '@/utils/download'
+import { isHttpStatus } from '@/utils/error'
 import type {
   WorkspaceDownloadResult,
   WorkspaceFileResponse,
@@ -27,6 +31,16 @@ import type {
 /** 获取工作区信息(是否可浏览) */
 export function getWorkspaceInfo(taskId: string): Promise<WorkspaceInfo> {
   return client.get(`/tasks/${taskId}/workspace`).then((r) => r.data)
+}
+
+/** 工作区已过期(HTTP 410):沙箱实例已被 Server 回收,容器里的文件不可再读
+ *
+ * 后端报错时已顺手丢弃会话缓存,收到这个状态就该重新查可用性:那之后
+ * available=false,「重新克隆」按钮才会出现。旧版把这一档归到 500,界面只剩
+ * 一行 [DOCKER::SANDBOX_NOT_FOUND] 和永远出不来的按钮。
+ */
+export function isWorkspaceExpiredError(err: unknown): boolean {
+  return isHttpStatus(err, 410)
 }
 
 /** 获取整树快照(首屏一次拉取,替代逐级懒加载) */

@@ -24,6 +24,7 @@ import FileContentViewer from './FileContentViewer.vue'
 import {
   getWorkspaceInfo,
   getWorkspaceTree,
+  isWorkspaceExpiredError,
   listWorkspaceFiles,
   readWorkspaceFile,
 } from '@/api/workspace'
@@ -196,6 +197,19 @@ function buildTreeFromSnapshot(entries: { path: string; type: 'file' | 'dir' }[]
   treeRoot.value = root
 }
 
+/** 工作区已过期(HTTP 410):切到不可用态,让「重新拉取代码」按钮出现
+ *
+ * 沙箱容器被 Server 回收后后端会回 410(并已丢弃会话)。本组件的恢复入口只在
+ * !available 时渲染,不接这一步就只会卡在"看着可用、什么也加载不出来"。
+ * 返回 true 表示已按过期处理,调用方不该再走常规降级重试。
+ */
+function markExpiredUnavailable(err: unknown): boolean {
+  if (!isWorkspaceExpiredError(err)) return false
+  available.value = false
+  unavailableReason.value = extractErrorMessage(err)
+  return true
+}
+
 /** 懒加载某目录的子条目(单层) */
 async function loadChildren(node: TreeNode): Promise<void> {
   if (!props.taskId || node.loaded || node.loading) return
@@ -208,8 +222,9 @@ async function loadChildren(node: TreeNode): Promise<void> {
     sortChildren(node)
     node.loaded = true
     node.expanded = true
-  } catch {
-    // 加载失败保持收起,允许重试
+  } catch (e) {
+    // 加载失败保持收起,允许重试;工作区已过期则改走重新拉取入口
+    markExpiredUnavailable(e)
   } finally {
     node.loading = false
   }
@@ -265,7 +280,8 @@ async function loadTree(): Promise<void> {
     } else {
       buildTreeFromSnapshot(res.entries)
     }
-  } catch {
+  } catch (e) {
+    if (markExpiredUnavailable(e)) return
     // 快照失败(如 session 刚被清理):退回懒加载
     lazyMode.value = true
     await loadChildren(treeRoot.value)
@@ -383,9 +399,16 @@ async function pageFile(delta: number): Promise<void> {
   }
 }
 
-/** 下载当前选中的文件原文(工作区 session 过期后后端会 404,提示重新拉取) */
+/** 下载当前选中的文件原文(容器被回收后后端回 410 → 重走 init 切到不可用态) */
 async function downloadSelectedFile(): Promise<void> {
-  await runFileDownload(props.taskId ?? '', selectedFile.value ?? '')
+  await runFileDownload(
+    props.taskId ?? '',
+    selectedFile.value ?? '',
+    'workspace',
+    // 工作区已没:重新拉一次可用性(拿到后端的不可用文案 + 「重新拉取代码」入口),
+    // 不在前端另写一份过期文案:那份只在后端一处,写两处必然漂
+    () => init(),
+  )
 }
 
 /** 高亮当前题目定位行(若落在本页)并滚动到中间;否则清空高亮 */
@@ -536,7 +559,7 @@ watch(
         {{ unavailableReason || '工作区不可用' }}
       </p>
       <p class="cs-unavailable-hint">
-        沙箱默认保留 1 小时,过期后可重新拉取仓库代码。
+        沙箱工作区只保留一段时间,过期后仓库代码可重新拉取(不影响仓库本身)。
       </p>
       <button class="cs-restore-btn" :disabled="restoring" @click="handleRestore">
         {{ restoring

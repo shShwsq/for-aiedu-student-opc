@@ -16,6 +16,7 @@ import {
   getWorkspaceInfo,
   getWorkspaceTree,
   getWorkspaceUploadsTree,
+  isWorkspaceExpiredError,
   listWorkspaceFiles,
   readWorkspaceFile,
   readWorkspaceUploadsFile,
@@ -715,16 +716,31 @@ async function checkAvailable(): Promise<void> {
 
 /**
  * 拉整树快照一次建好文件树(首屏提速:1 次请求替代逐级懒加载)
- * 失败时降级为根目录懒加载,功能不受损
+ * 失败时降级为根目录懒加载,功能不受损;工作区已过期则改走恢复入口
  */
 async function loadTreeSnapshot(refresh: boolean = false): Promise<void> {
   if (!selectedTaskId.value) return
   try {
     const res = await getWorkspaceTree(selectedTaskId.value, refresh)
     buildTreeFromSnapshot(res)
-  } catch {
+  } catch (e) {
+    if (await handleIfExpired(e)) return
     await loadDir(treeRoot)
   }
+}
+
+/**
+ * 工作区已过期(HTTP 410):重查可用性,返回是否已按过期处理
+ *
+ * 后端报这个错时已经顺手丢弃了本地会话,所以再拉一次 /workspace 会拿到
+ * available=false + can_restore —— 「重新克隆」按钮的渲染条件正是 !available。
+ * 不接这一步的话,用户只看到一行错误文字,既看不了文件也找不到恢复入口
+ * (旧版的过期被当成 500,连错误文字都是一串 Docker 错误码)。
+ */
+async function handleIfExpired(err: unknown): Promise<boolean> {
+  if (!isWorkspaceExpiredError(err)) return false
+  await checkAvailable()
+  return true
 }
 
 /** 收集当前处于展开态的目录路径(刷新快照时保持展开状态) */
@@ -923,6 +939,7 @@ async function loadDir(node: TreeNode): Promise<void> {
     node.loaded = true
   } catch (e) {
     errorMsg.value = extractErrorMessage(e)
+    await handleIfExpired(e)
   } finally {
     node.loading = false
   }
@@ -985,6 +1002,8 @@ async function downloadSelectedFile(): Promise<void> {
     selectedTaskId.value ?? '',
     selectedFilePath.value ?? '',
     selectedFileSource.value,
+    // 工作区已过期(410):重查可用性把面板切到"不可用 + 重新克隆"(上传那条不会走到这)
+    () => checkAvailable(),
   )
 }
 
@@ -1021,6 +1040,7 @@ async function loadFileContent(): Promise<void> {
     fileContent.value = ''
     fileBinary.value = false
     fileBinarySize.value = 0
+    await handleIfExpired(e)
   } finally {
     loadingFile.value = false
   }
@@ -1064,7 +1084,8 @@ async function refreshTree(): Promise<void> {
   try {
     const res = await getWorkspaceTree(selectedTaskId.value!, true)
     buildTreeFromSnapshot(res, expandedPaths)
-  } catch {
+  } catch (e) {
+    if (await handleIfExpired(e)) return
     // 快照失败降级:重新拉根目录(懒加载)
     treeRoot.loaded = false
     await loadDir(treeRoot)

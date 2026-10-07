@@ -15,10 +15,16 @@
 - SandboxSession.read_file(path) -> str
 - SandboxSession.close()
 
+沙箱实例的回收与后端会话缓存是两套生命周期:Server 按 TTL 回收容器,后端会话为
+"供用户回看"保留更久。中间那段窗口里 SDK 一律回 [DOCKER::SANDBOX_NOT_FOUND],
+本模块把这类错误归一为 SandboxGoneError(见下),让调用方能区分"实例没了"与
+"这次命令失败"。
+
 参考:https://github.com/alibaba/OpenSandbox
 """
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -27,8 +33,8 @@ import sys
 import tempfile
 import threading
 import uuid
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from collections.abc import Generator
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -66,6 +72,46 @@ def _kill_bg_proc_tree(proc: subprocess.Popen) -> None:
                 proc.terminate()
         except Exception:
             pass
+
+
+# ============================================================
+# 沙箱实例已回收(过期)
+# ============================================================
+
+# 面向用户的文案:不含 Docker 错误码 / request_id(那些进日志,不进界面)
+SANDBOX_GONE_MESSAGE = "沙箱已过期:实例已被回收,工作区需重新克隆后才能浏览"
+
+# Server 侧"实例不存在"的错误码/措辞(docker 驱动回 [DOCKER::SANDBOX_NOT_FOUND],
+# 命令通道再包一层 "Failed to run command failed: Sandbox <uuid> not found")
+_SANDBOX_GONE_TOKENS = ("sandbox_not_found", "sandbox not found")
+_SANDBOX_GONE_RE = re.compile(r"sandbox[^。\n]{0,80}?not found", re.IGNORECASE)
+
+
+class SandboxGoneError(RuntimeError):
+    """沙箱实例已被 Server 回收/销毁:后端会话对象还在,容器已经不在了
+
+    继承 RuntimeError 是为了让既有的 `except RuntimeError` 兜底仍能接住它;单独
+    立类的理由是处置方式完全不同:
+    - 命令执行失败:真实报错,原样回给调用方/模型
+    - 实例已回收:可预期的过期态,要丢会话 + 回 410 + 引导重新克隆
+
+    过去没有这一层,过期被路由兜底成 500,还把 [DOCKER::SANDBOX_NOT_FOUND] 和
+    request_id 原样显示在工作区文件树里,用户既看不懂也没有恢复入口。
+    """
+
+
+def is_sandbox_gone(exc: BaseException) -> bool:
+    """判断异常是否表示"沙箱实例不存在"(而不是文件/目录不存在)
+
+    SDK 的 SandboxApiException 只继承 Exception,路径 404 与实例 404 共用同一个
+    status_code,只能靠错误码/措辞区分。认不出的一律按"不是过期"处理 —— 宁可让
+    调用方走原有分支,也不能把普通的"文件不存在"误判成过期而白丢整个工作区。
+    """
+    msg = str(exc)
+    lower = msg.lower()
+    if any(token in lower for token in _SANDBOX_GONE_TOKENS):
+        return True
+    return bool(_SANDBOX_GONE_RE.search(msg))
 
 
 # ============================================================
@@ -118,6 +164,40 @@ class SandboxSession:
         if self._local_dir is None:
             raise RuntimeError("当前模式无 local_dir(sandbox 模式使用沙箱内路径)")
         return self._local_dir
+
+    def _sdk(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """SDK 调用统一入口:把"实例已被回收"的错误归一为 SandboxGoneError
+
+        不归一的后果很具体:SandboxApiException 只继承 Exception,各调用方靠自己的
+        文案猜"是不是路径不存在",于是"沙箱没了"会被 _list_files_sandbox 当成
+        "Server 不支持该 API"而回退 shell(必然二次 404,多一次往返),最后被
+        路由兜底成 500 + 一段 Docker 内部错误码。原始错误记入日志后以
+        面向用户的文案上抛。
+        """
+        try:
+            return fn(*args, **kwargs)
+        except SandboxGoneError:
+            raise
+        except Exception as e:
+            if is_sandbox_gone(e):
+                logger.warning(f"[sandbox] 沙箱实例已不存在(原始错误: {e})")
+                raise SandboxGoneError(SANDBOX_GONE_MESSAGE) from e
+            raise
+
+    @property
+    def is_closed(self) -> bool:
+        """会话是否已关闭(含被 mark_gone() 标记为"实例已不在")"""
+        return self._closed
+
+    def mark_gone(self) -> None:
+        """标记实例已被回收:后续的 close / interrupt 都不再徒劳地调 Server
+
+        仅用于 sandbox 模式下"Server 已确认实例不存在"的清理路径 —— 容器已经不
+        在了,再发 destroy / interrupt 只会撞回同一个 404。不能用在 local 模式:
+        那里的 close() 负责删宿主机临时目录。
+        """
+        if self.mode == "sandbox":
+            self._closed = True
 
     # ---------- 通用 ----------
 
@@ -203,7 +283,7 @@ class SandboxSession:
         """取沙箱内单文件的字节数(SDK 原生文件系统 API,供下载前限流检查)
 
         仅 sandbox 模式可用(local 模式调用方直接用 Path.stat,与列目录同惯例)。
-        文件不存在抛 FileNotFoundError。
+        文件不存在抛 FileNotFoundError;实例已回收抛 SandboxGoneError。
         """
         if self._closed:
             raise RuntimeError("沙箱已关闭")
@@ -214,7 +294,9 @@ class SandboxSession:
         # SDK 会抛 SandboxApiException(纯 Exception,非 FileNotFoundError),不归一
         # 会让下载端点漏捕 → 500(而非应有的 404)
         try:
-            infos = self.sandbox.files.get_file_info([path])
+            infos = self._sdk(self.sandbox.files.get_file_info, [path])
+        except SandboxGoneError:
+            raise
         except FileNotFoundError:
             raise
         except Exception as e:
@@ -237,13 +319,29 @@ class SandboxSession:
         而 `_local_resolve_path` 会把绝对宿主机路径往临时目录里映射,借道反而出错。
 
         SDK 侧为惰性生成器:调用方在消费时才发起 HTTP,超大文件不会整份进内存。
+        也因如此,"实例已回收"可能在流中途才暴露(响应头已发出,只能断流);
+        路由在开流前的 stat_size 就能拦住大部分过期,回 410 而非半截文件。
         """
         if self._closed:
             raise RuntimeError("沙箱已关闭")
         if self.mode != "sandbox":
             raise RuntimeError("read_bytes_stream 仅 sandbox 模式可用")
 
-        return self.sandbox.files.read_bytes_stream(path, chunk_size=chunk_size)
+        return self._guard_stream(
+            self.sandbox.files.read_bytes_stream(path, chunk_size=chunk_size)
+        )
+
+    def _guard_stream(self, chunks: Generator[bytes, None, None]) -> Generator[bytes, None, None]:
+        """把流式读取中的"实例已回收"也归一为 SandboxGoneError(SDK 是惰性生成器)"""
+        try:
+            yield from chunks
+        except SandboxGoneError:
+            raise
+        except Exception as e:
+            if is_sandbox_gone(e):
+                logger.warning(f"[sandbox] 流式读取中沙箱实例被回收(原始错误: {e})")
+                raise SandboxGoneError(SANDBOX_GONE_MESSAGE) from e
+            raise
 
     def list_directory(self, path: str, depth: int | None = None) -> list[dict]:
         """列出目录内容(SDK 原生文件系统 API,单次 HTTP,无需起 shell 进程)
@@ -254,7 +352,9 @@ class SandboxSession:
         返回归一化条目列表:[{"name": str, "is_dir": bool, "size": int, "path": str}]
         path 为 SDK 返回的沙箱内绝对路径。
 
-        目录不存在时抛 FileNotFoundError;其他 SDK 异常原样抛出(调用方可回退 shell)。
+        目录不存在时抛 FileNotFoundError;实例已回收时抛 SandboxGoneError(必须比
+        下面的 404 归一先走:否则"沙箱没了"会被当成"目录不存在"报 404);
+        其他 SDK 异常原样抛出(调用方可回退 shell)。
         """
         if self._closed:
             raise RuntimeError("沙箱已关闭")
@@ -264,9 +364,12 @@ class SandboxSession:
         from opensandbox.models.filesystem import DirectoryListEntry
 
         try:
-            infos = self.sandbox.files.list_directory(
-                DirectoryListEntry(path=path, depth=depth)
+            infos = self._sdk(
+                self.sandbox.files.list_directory,
+                DirectoryListEntry(path=path, depth=depth),
             )
+        except SandboxGoneError:
+            raise
         except FileNotFoundError:
             raise
         except Exception as e:
@@ -311,7 +414,7 @@ class SandboxSession:
             raise RuntimeError("沙箱已关闭")
 
         if self.mode == "sandbox":
-            ep = self.sandbox.get_endpoint(port)
+            ep = self._sdk(self.sandbox.get_endpoint, port)
             url = ep.endpoint
             # SDK 返回的 endpoint 可能不含 scheme(如 "host:port/path"),
             # httpx 要求完整 URL,补上 http://
@@ -360,8 +463,9 @@ class SandboxSession:
             raise RuntimeError("沙箱已关闭")
 
         if self.mode == "sandbox":
-            logs = self.sandbox.commands.get_background_command_logs(
-                execution_id, cursor=cursor
+            logs = self._sdk(
+                self.sandbox.commands.get_background_command_logs,
+                execution_id, cursor=cursor,
             )
             return logs.content, logs.cursor
         else:
@@ -378,7 +482,7 @@ class SandboxSession:
             raise RuntimeError("沙箱已关闭")
 
         if self.mode == "sandbox":
-            st = self.sandbox.commands.get_command_status(execution_id)
+            st = self._sdk(self.sandbox.commands.get_command_status, execution_id)
             return bool(st.running), st.exit_code
         else:
             entry = self._local_bg_procs.get(execution_id)
@@ -394,11 +498,21 @@ class SandboxSession:
             return
 
         if self.mode == "sandbox":
-            self.sandbox.commands.interrupt(execution_id)
+            self._sdk(self.sandbox.commands.interrupt, execution_id)
         else:
             entry = self._local_bg_procs.pop(execution_id, None)
             if entry:
                 _kill_bg_proc_tree(entry[0])
+
+    def _renew_once(
+        self, minutes: int,
+    ) -> tuple[bool, BaseException | None, Any]:
+        """调一次 SDK renew,返回 (是否成功, 异常, 响应体)(不在这里下结论怎么处置)"""
+        try:
+            resp = self.sandbox.renew(timedelta(minutes=minutes))
+            return True, None, resp
+        except Exception as e:  # noqa: BLE001 — 由调用方分类(过期 / 瞬时故障)
+            return False, e, None
 
     def renew(self, timeout_minutes: int | None = None) -> bool:
         """续期沙箱 TTL:新过期时间 = 当前时间 + timeout(SDK renew 语义)
@@ -410,6 +524,7 @@ class SandboxSession:
 
         timeout_minutes:续期时长,默认用 SANDBOX_TIMEOUT_MINUTES。
         返回是否成功。失败不抛异常(可能已过期,由后续命令自行报错);
+        要据此判定活性请用 probe_alive()(它区分"真没了"与"网络抖动")。
         local 模式无 TTL 概念,直接返回 True。
         """
         if self._closed:
@@ -418,14 +533,41 @@ class SandboxSession:
             return True
 
         minutes = timeout_minutes or settings.SANDBOX_TIMEOUT_MINUTES
-        try:
-            resp = self.sandbox.renew(timedelta(minutes=minutes))
+        ok, err, resp = self._renew_once(minutes)
+        if ok:
             expires = getattr(resp, "expires_at", None) or getattr(resp, "expiration_time", None)
             logger.info(f"[sandbox] TTL 已续期 +{minutes} 分钟(过期时间: {expires})")
             return True
-        except Exception as e:
-            logger.warning(f"[sandbox] TTL 续期失败(沙箱可能已被回收): {e}")
+        logger.warning(f"[sandbox] TTL 续期失败(沙箱可能已被回收): {err}")
+        return False
+
+    def probe_alive(self, timeout_minutes: int | None = None) -> bool:
+        """活性探针:确认容器还在,顺带把 TTL 往后推,返 False 则代表实例已不存在
+
+        为什么用 renew 当探针:会话缓存比容器活得久(后端为"供用户回看"保留会话,
+        Server 却按 TTL 回收容器),光看 ctx 里有没有 repo_path 分辨不出两者。renew
+        打在实例记录上:实例还在 → 200 且顺带续期(活跃浏览的工作区不会被 TTL 扫
+        掉);实例没了 → 明确的 SANDBOX_NOT_FOUND。
+
+        失败的分类比结果更重要:只有"确认不存在"才返回 False。网络抖动 / Server
+        短暂不可用一律按仍活着处理 —— 宁可让用户下一次撞到真实报错,也不能把
+        瞬时故障误判成过期而白丢整个已 clone 好的工作区。
+        local 模式跑在宿主机临时目录上(回收由我们自己控制),直接返回 True。
+        """
+        if self._closed:
             return False
+        if self.mode != "sandbox" or self.sandbox is None:
+            return True
+
+        minutes = timeout_minutes or settings.SANDBOX_TIMEOUT_MINUTES
+        ok, err, _resp = self._renew_once(minutes)
+        if ok:
+            return True
+        if err is not None and is_sandbox_gone(err):
+            logger.warning(f"[sandbox] 实例已被 Server 回收(原始错误: {err})")
+            return False
+        logger.warning(f"[sandbox] 活性探针失败,按仍存活处理(不让瞬时故障看起来像过期): {err}")
+        return True
 
     @contextmanager
     def auto_renew(self, interval_minutes: float | None = None) -> Generator[None, None, None]:
@@ -501,12 +643,12 @@ class SandboxSession:
         """在真实沙箱里执行命令(SandboxSync.commands.run 同步调用)
 
         SDK 的 run() 不接受 timeout kwarg,超时通过 RunCommandOpts(timeout=timedelta) 传入。
-        check=True 时,退出码非零抛 RuntimeError(含 stderr)。
+        check=True 时,退出码非零抛 RuntimeError(含 stderr);实例已回收抛 SandboxGoneError。
         """
         from opensandbox.models.execd import RunCommandOpts
 
         opts = RunCommandOpts(timeout=timedelta(seconds=timeout))
-        execution = self.sandbox.commands.run(cmd, opts=opts)
+        execution = self._sdk(self.sandbox.commands.run, cmd, opts=opts)
 
         # SDK 的 Execution.text 属性已按 \n 正确拼接 stdout(每条 OutputMessage 是一行)
         stdout = execution.text or ""
@@ -525,14 +667,14 @@ class SandboxSession:
         """在真实沙箱里写文件"""
         from opensandbox.models.filesystem import WriteEntry
 
-        self.sandbox.files.write_files([
-            WriteEntry(path=path, data=content, mode=644)
-        ])
+        self._sdk(
+            self.sandbox.files.write_files,
+            [WriteEntry(path=path, data=content, mode=644)],
+        )
 
     def _sandbox_read_file(self, path: str) -> str:
         """在真实沙箱里读文件"""
-        content = self.sandbox.files.read_file(path)
-        return content
+        return self._sdk(self.sandbox.files.read_file, path)
 
     def _sandbox_run_background(
         self,
@@ -551,7 +693,7 @@ class SandboxSession:
             working_directory=work_dir,
             envs=envs,
         )
-        execution = self.sandbox.commands.run(cmd, opts=opts)
+        execution = self._sdk(self.sandbox.commands.run, cmd, opts=opts)
         if not execution.id:
             raise RuntimeError(f"后台命令启动失败,无 execution_id: {cmd}")
         logger.info(f"[sandbox] 后台命令已启动: execution_id={execution.id}, cmd={cmd[:100]}")

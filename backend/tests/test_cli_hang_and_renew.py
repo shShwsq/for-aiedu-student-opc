@@ -6,7 +6,8 @@
   配置 0 关闭、读取层错误透传
 - ACPClient.prompt 捕获 PromptIdleTimeout → cancel + 空结果 + 截断标记
 - SandboxSession.renew / auto_renew(sandbox 模式调 SDK,local 模式 no-op)
-- sandbox_tools._get_or_create_session 复用会话时按间隔节流续期
+- sandbox_tools._get_or_create_session 复用会话时按探活节流续期(探活已并入
+  _probe_session,见 test_sandbox_session_expiry.py)
 """
 import threading
 import time
@@ -283,40 +284,45 @@ def test_auto_renew_local_mode_noop():
 
 
 # ============================================================
-# sandbox_tools:会话复用时按间隔节流续期
+# sandbox_tools:会话复用时按探活节流续期
+# (探活走真 SandboxSession.probe_alive,它内部就是 SDK 的 renew —— 一次往返
+# 同时拿到"容器还在吗"和"TTL 往后推",所以不再有单独的 renew 节流分支)
 # ============================================================
 
 
+def _sandbox_session_with_mock():
+    """真 SandboxSession + mock 的 SDK 对象(探活只对自家会话生效)"""
+    mock_sb = MagicMock()
+    return SandboxSession(mode="sandbox", sandbox=mock_sb), mock_sb
+
+
 def test_session_reuse_renews_after_interval(monkeypatch):
-    mock_session = MagicMock()
-    mock_session.renew.return_value = True
-    monkeypatch.setattr(sandbox_tools, "create_sandbox", lambda **kw: mock_session)
+    monkeypatch.setattr(sandbox_tools, "_SANDBOX_PROBE_INTERVAL", 0.0)
+    session, mock_sb = _sandbox_session_with_mock()
+    monkeypatch.setattr(sandbox_tools, "create_sandbox", lambda **kw: session)
     monkeypatch.setattr(settings, "SANDBOX_MODE", "sandbox")
-    monkeypatch.setattr(settings, "SANDBOX_RENEW_INTERVAL_MINUTES", 0)
 
     tid = "test-renew-task"
     sandbox_tools._sessions.pop(tid, None)
     try:
         sandbox_tools._get_or_create_session(tid)
-        assert mock_session.renew.call_count == 0  # 创建即起算 TTL,不续期
+        assert mock_sb.renew.call_count == 0  # 创建即起算 TTL,不续期
         sandbox_tools._get_or_create_session(tid)
-        assert mock_session.renew.call_count == 1  # 间隔=0:复用即续期
+        assert mock_sb.renew.call_count == 1  # 节流=0:复用即探活顺带续期
     finally:
         sandbox_tools._sessions.pop(tid, None)
 
 
 def test_session_reuse_throttles_renew_within_interval(monkeypatch):
-    mock_session = MagicMock()
-    mock_session.renew.return_value = True
-    monkeypatch.setattr(sandbox_tools, "create_sandbox", lambda **kw: mock_session)
+    session, mock_sb = _sandbox_session_with_mock()
+    monkeypatch.setattr(sandbox_tools, "create_sandbox", lambda **kw: session)
     monkeypatch.setattr(settings, "SANDBOX_MODE", "sandbox")
-    monkeypatch.setattr(settings, "SANDBOX_RENEW_INTERVAL_MINUTES", 5)
 
     tid = "test-renew-task-2"
     sandbox_tools._sessions.pop(tid, None)
     try:
         sandbox_tools._get_or_create_session(tid)
-        sandbox_tools._get_or_create_session(tid)  # 间隔内复用
-        assert mock_session.renew.call_count == 0  # 不调 Server API
+        sandbox_tools._get_or_create_session(tid)  # 节流窗口内复用
+        assert mock_sb.renew.call_count == 0  # 不调 Server API
     finally:
         sandbox_tools._sessions.pop(tid, None)

@@ -11,6 +11,8 @@
  */
 import axios from 'axios'
 
+import { HttpDetailError } from './error'
+
 /** 从 Content-Disposition 解析下载文件名
  *
  * 优先 RFC 5987 的 `filename*=UTF-8''…`(中文名在这里才不失真),
@@ -82,11 +84,15 @@ async function readBlobText(blob: Blob): Promise<string> {
  *
  * 返回原错误时调用方仍由 extractErrorMessage 给出通用文案(网络/超时/状态码);
  * 只有错误体确实是带 detail 的 JSON 时才替换,避免把 HTML 错误页整段抛给用户。
+ * 替换时把状态码一并带在新错误上(HttpDetailError):否则按状态分流的逻辑
+ * (如 410 工作区已过期 → 引导重新克隆)在 blob 这条路径上会集体失效。
  */
 export async function normalizeBlobError(err: unknown): Promise<unknown> {
   if (!axios.isAxiosError(err)) return err
   const data = err.response?.data
   if (!(data instanceof Blob)) return err
   const detail = detailFromErrorBody(await readBlobText(data))
-  return detail ? new Error(detail) : err
+  return detail
+    ? new HttpDetailError(detail, err.response?.status)
+    : err
 }

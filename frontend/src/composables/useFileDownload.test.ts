@@ -8,6 +8,8 @@
  * - 导航不等于取消:下载途中切文件(clearError),已点下去的那次**仍要送达**,
  *   只有它的失败文案被丢弃(那失败已不属于当前浏览的文件)
  * - 令牌只门控错误:任何终态都要把 downloading 归位,否则按钮永久禁用
+ * - 工作区已过期(HTTP 410):额外回调 onExpired 供调用方亮出「重新克隆」入口,
+ *   同一令牌门控(已切走的不替别的文件刷 UI)
  */
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 
@@ -15,10 +17,16 @@ import { downloadWorkspaceFile, downloadWorkspaceUploadsFile } from '@/api/works
 import { triggerBlobDownload } from '@/utils/download'
 import { useFileDownload } from './useFileDownload'
 
-vi.mock('@/api/workspace', () => ({
-  downloadWorkspaceFile: vi.fn(),
-  downloadWorkspaceUploadsFile: vi.fn(),
-}))
+vi.mock('@/api/workspace', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('@/api/workspace')>()
+  return {
+    ...mod,
+    downloadWorkspaceFile: vi.fn(),
+    downloadWorkspaceUploadsFile: vi.fn(),
+    // isWorkspaceExpiredError 用真实现:mock 整个模块却不导出它,调用时就是
+    // undefined 直接报错,而且过期分流的本意(按真 axios 错误的 status 判)也会丢
+  }
+})
 
 // triggerBlobDownload 依赖 URL.createObjectURL / DOM 点击,jsdom 下不真跑
 vi.mock('@/utils/download', async (importOriginal) => {
@@ -31,6 +39,15 @@ const uploadsMock = downloadWorkspaceUploadsFile as Mock
 const fireMock = triggerBlobDownload as Mock
 
 const blob = { kind: 'blob' } as unknown as Blob
+
+/** 造一个后端回 410(工作区已过期)时的 axios 错误形态 */
+function makeExpiredError(detail: string): unknown {
+  return {
+    isAxiosError: true,
+    message: 'Request failed with status code 410',
+    response: { status: 410, statusText: '', headers: {}, config: {}, data: { detail } },
+  }
+}
 
 describe('useFileDownload', () => {
   beforeEach(() => {
@@ -133,5 +150,41 @@ describe('useFileDownload', () => {
     await expect(inFlight).resolves.toBe(false)
     expect(downloadError.value).toBe('')
     expect(downloading.value).toBe(false)
+  })
+
+  it('工作区已过期(410):调用 onExpired 亮出重新克隆入口', async () => {
+    wsMock.mockRejectedValue(makeExpiredError('沙箱已过期:实例已被回收'))
+    const expired: number[] = []
+    const { run, downloadError } = useFileDownload()
+
+    await expect(run('t1', 'a.docx', 'workspace', () => { expired.push(1) })).resolves.toBe(false)
+    expect(expired).toEqual([1])
+    // 失败文案仍照旧(不让回调替后端编报错)
+    expect(downloadError.value).toBe('沙箱已过期:实例已被回收')
+  })
+
+  it('非过期的失败不触发 onExpired(不能把任意错误都当工作区已没)', async () => {
+    wsMock.mockRejectedValue(new Error('文件不存在: a.md'))
+    const expired: number[] = []
+    const { run } = useFileDownload()
+
+    await expect(run('t1', 'a.md', 'workspace', () => { expired.push(1) })).resolves.toBe(false)
+    expect(expired).toEqual([])
+  })
+
+  it('已切走才报过期:不替别的文件刷 UI,onExpired 同受令牌门控', async () => {
+    let rejectStale: (e: unknown) => void = () => {}
+    wsMock.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectStale = reject }),
+    )
+    const expired: number[] = []
+    const { run, clearError } = useFileDownload()
+
+    const inFlight = run('t1', 'old.md', 'workspace', () => { expired.push(1) })
+    clearError()
+    rejectStale(makeExpiredError('沙箱已过期'))
+
+    await expect(inFlight).resolves.toBe(false)
+    expect(expired).toEqual([])
   })
 })
