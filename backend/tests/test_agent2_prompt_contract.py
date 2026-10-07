@@ -45,9 +45,15 @@ def test_review_prompt_grouping_defaults_to_null():
 
 
 def test_review_prompt_ship_conclusion_is_conditional():
-    """「敢不敢上线」结论:仅当用户意图涉及上线/采用决策时才要求,非硬性。"""
-    assert "仅当用户意图" in AGENT2_REVIEW_PROMPT
-    # 旧的硬性要求表述已移除
+    """落地决策结论:仅当用户意图涉及采用/发布/签署等决策时才附,且措辞场景中立。
+
+    agent2 是全场景共用的验证者,决策措辞不绑定 code-centric 的「敢不敢上线」;
+    “能否上线”只是代码任务下的一个实例,由 reasoning 说明按任务类型自行选择。
+    """
+    assert "当用户意图" in AGENT2_REVIEW_PROMPT
+    # 泛化为场景中立措辞:不硬编码「敢不敢上线/敢不敢用」
+    assert "敢不敢上线" not in AGENT2_REVIEW_PROMPT
+    # 旧的硬性/绑码表述均已移除
     assert "必须给出「敢不敢上线" not in AGENT2_REVIEW_PROMPT
 
 
