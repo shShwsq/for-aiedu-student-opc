@@ -11,7 +11,8 @@
  * (/workspace/files)。文件内容复用 /workspace/file(原始文本 + 分页),
  * 交给 FileContentViewer 以只读 CodeMirror 渲染(IDE 行号 + 语法高亮,
  * Markdown 文件可切「预览」)。二进制文件(docx/pdf/图片)后端不回内容,
- * 改渲染 FileBinaryCard(下载原件到本地看)。
+ * 改渲染 FileBinaryCard(下载原件到本地看)。分页预览看不全的长文档由头部
+ * 的下载按钮整份取回(文本/二进制同一入口)。
  *
  * 定位:父组件传入 locateFile/locateLine(来自当前题的 source_file/source_lines),
  * 变化时自动展开对应目录、打开文件并滚动高亮。
@@ -26,6 +27,7 @@ import {
   listWorkspaceFiles,
   readWorkspaceFile,
 } from '@/api/workspace'
+import { useFileDownload } from '@/composables/useFileDownload'
 import { useWorkspaceRestore } from '@/composables/useWorkspaceRestore'
 import { extractErrorMessage } from '@/utils/error'
 import { isLikelyBinaryPath } from '@/utils/fileKind'
@@ -297,6 +299,17 @@ interface FileContentViewerHandle {
 }
 const fileViewerRef = ref<FileContentViewerHandle | null>(null)
 
+// ---- 下载当前文件 ----
+// 文本文件(含 md)原先只有二进制卡片带下载按钮,而题目材料常是长文档:分页
+// 预览看不全,得能整份取回。动作与 FileBinaryCard 共用 useFileDownload。
+// 本栏只浏览工作区(无上传回退树),故 source 恒为 workspace
+const {
+  downloading: fileDownloading,
+  downloadError,
+  run: runFileDownload,
+  reset: resetFileDownload,
+} = useFileDownload()
+
 const fileLineCount = computed(() => (fileContent.value ? fileContent.value.split('\n').length : 0))
 const pageEndLine = computed(() => fileStartLine.value + fileLineCount.value - 1)
 const fileOffset = computed(() => fileStartLine.value)
@@ -308,6 +321,7 @@ async function openFile(
 ): Promise<void> {
   if (!props.taskId) return
   selectedFile.value = path
+  resetFileDownload() // 上个文件的下载失败文案不跟着串过来
   highlightStart.value = targetLine
   highlightEnd.value = endLine ?? targetLine
   // 后缀已知二进制:不发内容请求,直接给下载卡片(题目材料极少是二进制,
@@ -368,6 +382,11 @@ async function pageFile(delta: number): Promise<void> {
   }
 }
 
+/** 下载当前选中的文件原文(工作区 session 过期后后端会 404,提示重新拉取) */
+async function downloadSelectedFile(): Promise<void> {
+  await runFileDownload(props.taskId ?? '', selectedFile.value ?? '')
+}
+
 /** 高亮当前题目定位行(若落在本页)并滚动到中间;否则清空高亮 */
 function applyFocus(): void {
   const v = fileViewerRef.value
@@ -409,6 +428,7 @@ async function init(): Promise<void> {
   unavailableReason.value = ''
   repoPath.value = ''
   resetRestore()
+  resetFileDownload()
   selectedFile.value = null
   fileContent.value = ''
   highlightStart.value = null
@@ -629,7 +649,36 @@ watch(
                 @click="pageFile(1)"
               >↓</button>
             </div>
+            <!-- 下载当前文件:文本(含 md)分页预览看不全,得能整份取回;
+                 二进制文件卡片里另有大按钮,这里同口径可下 -->
+            <button
+              class="cs-file-dl-btn"
+              :disabled="!taskId || !selectedFile || fileDownloading"
+              :title="fileDownloading ? '下载中…' : '下载该文件'"
+              :aria-label="fileDownloading ? '下载中' : '下载该文件'"
+              @click="downloadSelectedFile"
+            >
+              <span v-if="fileDownloading" class="cs-spinner" aria-hidden="true" />
+              <svg
+                v-else
+                viewBox="0 0 24 24"
+                width="13"
+                height="13"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+            </button>
           </div>
+          <!-- 下载失败原因(会话过期/超上限/凭证路径),换文件即清 -->
+          <p v-if="downloadError" class="cs-file-error" role="alert">{{ downloadError }}</p>
           <FileBinaryCard
             v-if="fileBinary"
             :task-id="taskId ?? ''"
@@ -1003,6 +1052,43 @@ watch(
 .cs-pager-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* 下载按钮:与翻页按钮同尺寸同描边,保持文件栏头部一条水平线 */
+.cs-file-dl-btn {
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all var(--transition-fast);
+}
+
+.cs-file-dl-btn:hover:not(:disabled) {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.cs-file-dl-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 下载失败提示条:紧贴头部下方,不侵入内容区 */
+.cs-file-error {
+  flex-shrink: 0;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-xs);
+  color: var(--color-danger);
+  border-bottom: 1px solid var(--color-border);
+  word-break: break-all;
 }
 
 .cs-pager-info {

@@ -9,13 +9,14 @@
  * source 决定调哪条端点:
  * - workspace:沙箱工作区文件,会话过期后下载会失败(提示走「重新克隆」)
  * - uploads:用户上传原件,不经沙箱,保留期内始终可取回
+ *
+ * 下载动作本身在 useFileDownload 里(文件面板头部的下载按钮走同一套)。
  */
-import { computed, ref } from 'vue'
+import { computed, watch } from 'vue'
 
-import { downloadWorkspaceFile, downloadWorkspaceUploadsFile } from '@/api/workspace'
+import { useFileDownload, type FileDownloadSource } from '@/composables/useFileDownload'
 import { formatBytes } from '@/utils/bytes'
-import { basenameOf, triggerBlobDownload } from '@/utils/download'
-import { extractErrorMessage } from '@/utils/error'
+import { basenameOf } from '@/utils/download'
 import { fileSuffix } from '@/utils/fileKind'
 
 const props = withDefaults(
@@ -24,15 +25,19 @@ const props = withDefaults(
     /** 工作根内相对路径 */
     path: string | null
     /** 文件来源(决定下载端点与过期文案) */
-    source?: 'workspace' | 'uploads'
+    source?: FileDownloadSource
     /** 后端 binary 响应带回的字节数;0 表示未提供 */
     size?: number
   }>(),
   { source: 'workspace', size: 0 },
 )
 
-const downloading = ref(false)
-const errorMsg = ref('')
+const {
+  downloading, downloadError: errorMsg, run: runDownload, reset: resetDownload,
+} = useFileDownload()
+
+// 卡片实例在切换文件时被复用(父级 v-else-if 不重建),上个文件的失败文案要清掉
+watch(() => [props.taskId, props.path, props.source], resetDownload)
 
 const filename = computed(() => basenameOf(props.path))
 const kindLabel = computed(() => {
@@ -47,19 +52,7 @@ const hint = computed(() =>
 )
 
 async function download(): Promise<void> {
-  if (!props.taskId || !props.path || downloading.value) return
-  downloading.value = true
-  errorMsg.value = ''
-  try {
-    const fetcher = props.source === 'uploads' ? downloadWorkspaceUploadsFile : downloadWorkspaceFile
-    const { blob, filename: servedName } = await fetcher(props.taskId, props.path)
-    // 服务端给的中文名优先(路径末段可能是 {i}-name/ 前缀下的原名,二者通常一致)
-    triggerBlobDownload(blob, servedName || filename.value)
-  } catch (err) {
-    errorMsg.value = extractErrorMessage(err)
-  } finally {
-    downloading.value = false
-  }
+  await runDownload(props.taskId, props.path ?? '', props.source)
 }
 </script>
 

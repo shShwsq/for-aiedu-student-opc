@@ -5,7 +5,7 @@
  * - GET /tasks/{id}/workspace          工作区信息
  * - GET /tasks/{id}/workspace/files    列出目录
  * - GET /tasks/{id}/workspace/file     读取文件
- * - GET /tasks/{id}/workspace/download 下载文件(二进制文件的出口)
+ * - GET /tasks/{id}/workspace/download 下载文件(二进制的唯一出口;文本也走这条整份取回)
  * - GET /tasks/{id}/workspace/uploads/tree 沙箱过期后回退浏览用户上传文件树
  * - GET /tasks/{id}/workspace/uploads/file 回退读取上传文件内容
  * - GET /tasks/{id}/workspace/uploads/download 回退下载上传文件
@@ -117,7 +117,7 @@ async function fetchWorkspaceBlob(
   }
 }
 
-/** 下载工作区文件(二进制文件的出口;沙箱 session 过期后不可用) */
+/** 下载工作区文件(二进制文件的出口,长文本整份取回也走它;沙箱 session 过期后不可用) */
 export function downloadWorkspaceFile(
   taskId: string,
   path: string,

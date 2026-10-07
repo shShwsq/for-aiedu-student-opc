@@ -20,6 +20,7 @@ import {
   readWorkspaceFile,
   readWorkspaceUploadsFile,
 } from '@/api/workspace'
+import { useFileDownload } from '@/composables/useFileDownload'
 import { useWorkspaceRestore } from '@/composables/useWorkspaceRestore'
 import {
   deleteTask,
@@ -612,6 +613,16 @@ interface FileContentViewerHandle {
 }
 const fileViewerRef = ref<FileContentViewerHandle | null>(null)
 
+// ---- 下载当前文件 ----
+// 文本文件(尤其 md)原先只有二进制卡片带下载按钮,长文档分页看不全就没法整份取回;
+// 这里给所有选中文件统一一个入口,动作本身与 FileBinaryCard 共用 useFileDownload
+const {
+  downloading: fileDownloading,
+  downloadError,
+  run: runFileDownload,
+  reset: resetFileDownload,
+} = useFileDownload()
+
 // ---- 错误提示 ----
 const errorMsg = ref('')
 
@@ -645,6 +656,8 @@ function resetFileTree(): void {
   uploadsTruncated.value = false
   loadingUploads.value = false
   uploadsTreeLoaded = false
+  // 下载状态一并重置(切换任务时不残留上个任务的失败文案,并作废进行中的请求)
+  resetFileDownload()
 }
 
 // ============================================================
@@ -936,6 +949,7 @@ async function selectFile(
   fileOffset.value = 1
   highlightLine.value = null // 手动选文件时清除高亮
   filePanelHidden.value = false // 重新选文件时恢复面板显示
+  resetFileDownload() // 上个文件的下载失败文案不跟着串过来
   // 后缀已知二进制:不发内容请求(后端本来也会拦,但那一趟会把几 MB 占位/乱码
   // 拉过网络),直接进下载卡片;size 未知由卡片自身留空展示
   if (isLikelyBinaryPath(node.path)) {
@@ -962,6 +976,15 @@ function showFilePanelAgain(): void {
   if (selectedFilePath.value) {
     filePanelHidden.value = false
   }
+}
+
+/** 下载当前选中的文件原文(按选中来源分流,与读内容同一口径) */
+async function downloadSelectedFile(): Promise<void> {
+  await runFileDownload(
+    selectedTaskId.value ?? '',
+    selectedFilePath.value ?? '',
+    selectedFileSource.value,
+  )
 }
 
 async function loadFileContent(): Promise<void> {
@@ -1849,6 +1872,33 @@ defineExpose({ openTaskFile })
             </svg>
           </button>
         </div>
+        <!-- 下载当前文件:文本(含 md)分页预览看不全,长文档要能整份取回;
+             二进制文件卡片里另有大按钮,这里同口径可下 -->
+        <button
+          class="icon-btn file-download-btn"
+          :disabled="!selectedFilePath || !selectedTaskId || fileDownloading"
+          :title="fileDownloading ? '下载中…' : '下载该文件'"
+          :aria-label="fileDownloading ? '下载中' : '下载该文件'"
+          @click="downloadSelectedFile"
+        >
+          <span v-if="fileDownloading" class="spinner-sm" aria-hidden="true" />
+          <svg
+            v-else
+            viewBox="0 0 24 24"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+        </button>
         <button
           class="icon-btn file-close-btn"
           title="隐藏文件查看面板"
@@ -1870,6 +1920,10 @@ defineExpose({ openTaskFile })
             <line x1="6" y1="6" x2="18" y2="18" />
           </svg>
         </button>
+      </div>
+      <!-- 下载失败原因(会话过期/超上限/凭证路径),换文件即清 -->
+      <div v-if="downloadError" class="file-panel-error" role="alert">
+        {{ downloadError }}
       </div>
       <div class="file-content">
         <div v-if="loadingFile" class="file-loading">
@@ -2706,6 +2760,21 @@ defineExpose({ openTaskFile })
 
 .file-close-btn:hover {
   color: var(--color-danger);
+}
+
+.file-download-btn {
+  flex-shrink: 0;
+}
+
+/* 下载失败提示条:紧贴头部下方,不侵入内容区 */
+.file-panel-error {
+  flex-shrink: 0;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-xs);
+  color: var(--color-danger);
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+  word-break: break-all;
 }
 
 /* 内容容器:定位基准供加载浮层;查看器自带滚动 */

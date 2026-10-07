@@ -108,7 +108,8 @@ def _task_upload_slots(task: Task) -> list[UploadSlot]:
 
 
 # ============================================================
-# 下载(二进制文件的出口:预览只给文本,原始字节走这条)
+# 下载(二进制文件的出口:预览只给文本,原始字节走这条;分页看不全的长文本
+# 含 md 也由前端下载按钮走同一条整份取回)
 # ============================================================
 
 def _check_download_path(path: str) -> str:
@@ -356,7 +357,8 @@ def download_workspace_file(
     db: Session = Depends(get_db),
     current_user: User | None = Depends(get_optional_user),
 ) -> StreamingResponse:
-    """下载工作区文件的原始字节(预览只覆盖文本;docx/pdf/图片靠这条)
+    """下载工作区文件的原始字节(预览只覆盖文本;docx/pdf/图片靠这条,
+    长文档(含 md)要整份拿走也走这条)
 
     - 字节流不经 shell:sandbox 模式走 SDK read_bytes_stream,local 模式直接 open
       宿主文件 —— execd 的文本通道会改写原始字节,那正是 docx 乱码的成因
