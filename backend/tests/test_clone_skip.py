@@ -158,13 +158,15 @@ def test_local_clone_non_cancellable_no_skip_check(monkeypatch, tmp_path):
 
     fake = _DoneProc()
     monkeypatch.setattr(st.subprocess, "Popen", lambda *a, **kw: fake)
-    monkeypatch.setattr(st.Path, "rglob", lambda self, pattern: iter([]))
+    # 本用例只关"不消费跳过标志";文件数按契约必须非空(0 文件现在被判为
+    # 失败:空仓库/缓存无 ref 不能再报"克隆完成但目录是空的"),故把计数固定为 1
+    monkeypatch.setattr(st, "_count_repo_files", lambda _p: 1)
     request_skip_clone(task_id)
     result = st._clone_repo_local(
         _fake_local_ctx(tmp_path), "https://github.com/foo/bar", "bar",
         None, task_id=task_id, cancellable=False,
     )
-    assert result["files_count"] == 0
+    assert result["files_count"] == 1
     assert is_skip_requested(task_id)  # 标志未被消费
     clear_skip_state(task_id)
 

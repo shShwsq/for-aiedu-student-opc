@@ -264,14 +264,14 @@ async function toggleNode(node: TreeNode): Promise<void> {
   }
 }
 
-async function loadTree(): Promise<void> {
+async function loadTree(refresh = false): Promise<void> {
   if (!props.taskId) return
   lazyMode.value = false
   treeRoot.value = {
     name: '', path: '', type: 'dir', expanded: true, loaded: false, loading: false, children: [],
   }
   try {
-    const res = await getWorkspaceTree(props.taskId)
+    const res = await getWorkspaceTree(props.taskId, refresh)
     if (res.truncated) {
       // 快照截断:退回根目录逐级懒加载
       lazyMode.value = true
@@ -407,7 +407,7 @@ async function downloadSelectedFile(): Promise<void> {
     'workspace',
     // 工作区已没:重新拉一次可用性(拿到后端的不可用文案 + 「重新拉取代码」入口),
     // 不在前端另写一份过期文案:那份只在后端一处,写两处必然漂
-    () => init(),
+    () => init(false),
   )
 }
 
@@ -447,7 +447,7 @@ async function locateInTree(path: string): Promise<void> {
 // ============================================================
 // 初始化与任务/题目切换
 // ============================================================
-async function init(): Promise<void> {
+async function init(refreshTree = false): Promise<void> {
   available.value = false
   unavailableReason.value = ''
   repoPath.value = ''
@@ -465,7 +465,7 @@ async function init(): Promise<void> {
     repoPath.value = info.repo_path ?? ''
     unavailableReason.value = info.available ? '' : (info.reason || '工作区不可用')
     if (info.available) {
-      await loadTree()
+      await loadTree(refreshTree)
       await applyLocate()
     }
   } catch (err) {
@@ -495,7 +495,9 @@ async function applyLocate(): Promise<void> {
 async function handleRestore(): Promise<void> {
   const taskId = props.taskId
   if (!taskId) return
-  await runRestore(taskId, init)
+  // 刚克隆完必须绕过整树快照缓存(refresh=true):否则 30s 内仍会拿到克隆前的空态快照,
+  // 用户看到的就是"克隆完成但目录是空的"
+  await runRestore(taskId, () => init(true))
 }
 
 // 任务切换:重新初始化

@@ -20,11 +20,13 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 import app.tools.sandbox_tools as st
 from app.clone_skip import clear_skip_state, request_skip_clone
+from app.sandbox.client import SandboxGoneError, SandboxSession
 
 GITEE_URL = "https://gitee.com/shwsq/overleaf.git"
 GITEE_SSH = "git@gitee.com:shwsq/overleaf.git"
@@ -37,12 +39,25 @@ def _ctx(tmp_path, repo_path="", clone_source=None):
     return ctx
 
 
-def _sandbox_ctx(repo_path="/home/user/repos/bar", clone_source=None):
-    """sandbox 模式 ctx(repo_path 是容器内路径,宿主机上不存在)"""
+def _sandbox_ctx(repo_path="/home/user/repos/bar", clone_source=None, session=None):
+    """sandbox 模式 ctx(repo_path 是容器内路径,宿主机上不存在)
+
+    session 缺省不填:复用判定拿不到真 SandboxSession 时宁可信记录(不把复用
+    变成死代码);要验"容器内目录还在"的行为则传一个真 SandboxSession。
+    """
     ctx = {"mode": "sandbox", "repo_path": repo_path}
+    if session is not None:
+        ctx["session"] = session
     if clone_source is not None:
         ctx["clone_source"] = clone_source
     return ctx
+
+
+def _sandbox_session_with_stdout(stdout: str) -> SandboxSession:
+    """真 SandboxSession + 假 SDK:commands.run 回给定 stdout(完好性探测用)"""
+    sb = MagicMock()
+    sb.commands.run.return_value = MagicMock(text=stdout)
+    return SandboxSession(mode="sandbox", sandbox=sb)
 
 
 def _src(url: str = GITEE_URL, branch: str = "", path: str = ""):
@@ -228,10 +243,11 @@ def test_reuse_existing_clone_same_source(tmp_path):
 
 
 def test_reuse_existing_clone_works_in_sandbox_mode(tmp_path):
-    """sandbox 模式也必须能复用:repo_path 是容器内路径,宿主机探不到。
+    """sandbox 模式也必须能复用:repo_path 是容器内路径,宿主机上不存在。
 
     回归用例:存在性探测曾无条件跑在 mode 判断之前,把 sandbox 复用变成死代码
     —— 重复 clone 回到 rm -rf + 重下,顺带抹掉 agent 在容器里的工作区修改。
+    无可靠会话对象可验时仍走"信记录"分支,这条契约不能坏。
     """
     container_path = "/home/user/repos/bar"
     ctx = _sandbox_ctx(
@@ -241,6 +257,63 @@ def test_reuse_existing_clone_works_in_sandbox_mode(tmp_path):
     assert result is not None
     assert result["path"] == container_path
     assert result["reused"] is True
+
+
+def test_reuse_existing_clone_sandbox_absent_in_container_forces_reclone():
+    """容器里那个目录已经不在 → 不能复用
+
+    这就是"点重新克隆却秒回 done、文件树是个空目录"的主因:恢复流程命中一条
+    "克隆过"的记录就根本不重下。现在进容器验 .git 在不在,不在则重克隆。
+    """
+    container_path = "/home/user/repos/bar"
+    ctx = _sandbox_ctx(
+        repo_path=container_path,
+        clone_source=_src(branch="main", path=container_path),
+        session=_sandbox_session_with_stdout("ABSENT\n"),
+    )
+    assert st._reuse_existing_clone(ctx, GITEE_URL, "main") is None
+
+
+def test_reuse_existing_clone_sandbox_present_in_container_reuses():
+    """完好性探测通过 → 依旧复用,不白花一次重下(探测不能把复用打死)"""
+    container_path = "/home/user/repos/bar"
+    ctx = _sandbox_ctx(
+        repo_path=container_path,
+        clone_source=_src(branch="main", path=container_path),
+        session=_sandbox_session_with_stdout("PRESENT\n"),
+    )
+    result = st._reuse_existing_clone(ctx, GITEE_URL, "main")
+    assert result is not None and result["reused"] is True
+
+
+def test_reuse_existing_clone_sandbox_probe_error_still_reuses():
+    """探测本身报错(网络/超时)不算"工作区不在":宁可复用,不能因一次抖动重下仓库"""
+    container_path = "/home/user/repos/bar"
+    broken = _sandbox_session_with_stdout("")
+    broken.sandbox.commands.run.side_effect = RuntimeError("connection reset")
+    ctx = _sandbox_ctx(
+        repo_path=container_path,
+        clone_source=_src(branch="main", path=container_path),
+        session=broken,
+    )
+    result = st._reuse_existing_clone(ctx, GITEE_URL, "main")
+    assert result is not None and result["reused"] is True
+
+
+def test_reuse_existing_clone_sandbox_gone_propagates():
+    """探测回"容器已回收"时上抛:这不是"不可复用",而是整条会话都该重建"""
+    container_path = "/home/user/repos/bar"
+    dead = _sandbox_session_with_stdout("")
+    dead.sandbox.commands.run.side_effect = RuntimeError(
+        "[DOCKER::SANDBOX_NOT_FOUND] Sandbox 632edc0c not found"
+    )
+    ctx = _sandbox_ctx(
+        repo_path=container_path,
+        clone_source=_src(branch="main", path=container_path),
+        session=dead,
+    )
+    with pytest.raises(SandboxGoneError):
+        st._reuse_existing_clone(ctx, GITEE_URL, "main")
 
 
 def test_reuse_existing_clone_rejects_when_repo_path_repointed(tmp_path):
@@ -442,6 +515,39 @@ def test_local_clone_failure_keeps_foreign_repo_untouched(tmp_path, monkeypatch)
     assert foreign.exists()
     assert (foreign / "README.md").exists()
     assert not (tmp_path / "bar-2").exists()
+
+
+def test_local_clone_empty_result_is_failure_not_empty_workspace(tmp_path, monkeypatch):
+    """exit 0 但 0 文件 = 失败,不能报"克隆完成"后留一个空目录
+
+    git clone 对"没有任何 ref 的 bare 缓存"和真空仓库都是 exit 0 + 一句
+    warning: You appear to have cloned an empty repository。只看退出码就返成功,
+    用户拿到的是"恢复完成但文件树空荡"且日志里写着成功的现场。
+    空壳同时被清掉:目录解析会把"带 .git 的目录"当已有工作区避让换名到 bar-2。
+    """
+
+    class _EmptyRepoProc(_ExitProc):
+        """空仓库形态:只有 .git,没有任何工作树文件"""
+
+        def __init__(self, dest: str):
+            super().__init__(dest)
+            (Path(dest) / "README.md").unlink()
+
+    monkeypatch.setattr(
+        st.subprocess, "Popen", lambda cmd, *a, **kw: _EmptyRepoProc(cmd[-1]),
+    )
+    with pytest.raises(RuntimeError, match="克隆结果为空") as exc:
+        st._clone_repo_local(_ctx(tmp_path), GITEE_URL, "bar", None)
+    assert "空仓库" in str(exc.value)
+    assert not (tmp_path / "bar").exists()
+
+
+def test_reject_empty_clone_names_the_causes():
+    """两种模式共用同一句话:把"为什么空"说到可行动"""
+    with pytest.raises(RuntimeError) as exc:
+        st._reject_empty_clone("/home/user/repos/bar", "https://gitee.com/x/y.git")
+    msg = str(exc.value)
+    assert "克隆结果为空" in msg and "该分支无提交" in msg and "gitee.com/x/y.git" in msg
 
 
 def test_git_error_tail_flags_progress_only_output(tmp_path):

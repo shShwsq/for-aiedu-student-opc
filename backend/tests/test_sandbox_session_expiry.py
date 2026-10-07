@@ -251,6 +251,49 @@ def test_browse_read_file_raises_gone(task_id):
         sandbox_tools.browse_read_file(task_id, "a.py")
 
 
+def test_browse_tree_drops_session_when_command_reports_gone(task_id):
+    """命令层(而非探活)发现的过期也要当场丢会话
+
+    探活有 60s 节流,不丢的话死会话能谎报整整一个窗口:期间 POST restore 会被它
+    的 repo_path 短路成"工作区已就绪"而根本不克隆,用户点完「重新克隆」就是一个
+    空目录。丢弃之后下一次 checkAvailable 拿不到会话,无需等窗口到点就亮出按钮。
+    """
+    sb = MagicMock()
+    sb.renew.return_value = MagicMock(expires_at=None)  # 探活说:还在
+    sb.commands.run.side_effect = SdkError(GONE_MSG)     # find 说:容器已经没了
+    _seed(task_id, _sandbox_session(sb))
+
+    with pytest.raises(SandboxGoneError):
+        sandbox_tools.browse_tree(task_id)
+    assert task_id not in sandbox_tools._sessions
+
+
+def test_browse_read_file_drops_session_when_command_reports_gone(task_id):
+    """读文件同样反应式丢会话(不能只有 browse_files 一条路径会洗干净)"""
+    sb = MagicMock()
+    sb.renew.return_value = MagicMock(expires_at=None)
+    sb.commands.run.side_effect = SdkError(GONE_MSG)
+    _seed(task_id, _sandbox_session(sb))
+
+    with pytest.raises(SandboxGoneError):
+        sandbox_tools.browse_read_file(task_id, "a.py")
+    assert task_id not in sandbox_tools._sessions
+
+
+def test_set_repo_path_invalidates_tree_cache(task_id):
+    """克隆改写工作区后必须失效整树快照
+
+    否则恢复完成后的首屏仍命中 30s TTL 内那份"刚 mkdir -p、还没检出"的空快照,
+    就是"克隆完成但目录是空的"另一个成因(后端不洗,前端只能靠 refresh=true)。
+    """
+    _seed(task_id, _sandbox_session(_live_sandbox()))
+    sandbox_tools._tree_cache[task_id] = (time.time(), {"entries": [{"path": "a.py", "type": "file"}]})
+
+    sandbox_tools._set_repo_path(task_id, "/home/user/repos/x")
+    assert task_id not in sandbox_tools._tree_cache
+    assert sandbox_tools._sessions[task_id]["repo_path"] == "/home/user/repos/x"
+
+
 def test_browse_tree_raises_gone(task_id):
     _seed(task_id, _sandbox_session(_gone_sandbox()))
     with pytest.raises(SandboxGoneError):

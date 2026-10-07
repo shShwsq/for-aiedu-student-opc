@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -252,6 +252,23 @@ def drop_gone_session(task_id: str) -> None:
         logger.warning(f"[task={task_id}] 清 ACP bridge 缓存失败(忽略): {e}")
 
 
+@contextmanager
+def _browse_call(task_id: str) -> Iterator[Any]:
+    """浏览/下载调用的统一善后:命令层暴露的过期也要当场丢会话
+
+    为什么不能只靠探活:探活有 _SANDBOX_PROBE_INTERVAL(60s)节流,而"命令真的打
+    不到容器"才是实例已回收的第一手证据。不在这里丢会话,死会话最长能谎报 60s:
+    期间 /workspace 仍回 available=true、POST restore 的幂等短路直接回"工作区已
+    就绪"(根本不克隆),前端点完「重新克隆」就是一个空目录 + 消失的恢复入口。
+    丢了之后下一次 checkAvailable 拿不到会话,无需等节流窗口到点就能亮出按钮。
+    """
+    try:
+        yield
+    except SandboxGoneError:
+        drop_gone_session(task_id)
+        raise
+
+
 def precreate_session_for_repo(
     task_id: str, repo_url: str,
     branch: str | None = None, git_tokens: dict | None = None,
@@ -286,8 +303,15 @@ def _write_local_session_meta(task_id: str, local_dir: Path) -> None:
 
 
 def _set_repo_path(task_id: str, repo_path: str) -> None:
+    """记下工作区路径,并失效整树快照
+
+    克隆会改写整个工作区(先 rm -rf 再 mkdir -p 后检出),之前缓存的快照从此就
+    是另一个目录的状态:不丢的话,恢复完前端首屏拉一次仍能命中 30s 内的旧快照,
+    看到"克隆完成但文件树是空的"。
+    """
     if task_id in _sessions:
         _sessions[task_id]["repo_path"] = repo_path
+    _tree_cache.pop(task_id, None)
 
 
 def mark_task_completed(task_id: str) -> None:
@@ -426,9 +450,9 @@ def browse_files(task_id: str, subdir: str = "") -> dict:
 
     # 复用 list_files 的实现(local / sandbox 分支)
     mode = ctx["mode"]
-    if mode == "local":
-        return _list_files_local(repo_path, subdir, 500)
-    else:
+    with _browse_call(task_id):
+        if mode == "local":
+            return _list_files_local(repo_path, subdir, 500)
         return _list_files_sandbox(ctx, repo_path, subdir, 500)
 
 
@@ -473,10 +497,11 @@ def browse_tree(
     if not refresh and cached is not None and time.time() - cached[0] < _TREE_CACHE_TTL:
         return cached[1]
 
-    if ctx["mode"] == "local":
-        payload = _browse_tree_local(repo_path, max_depth, max_entries)
-    else:
-        payload = _browse_tree_sandbox(ctx, repo_path, max_depth, max_entries)
+    with _browse_call(task_id):
+        if ctx["mode"] == "local":
+            payload = _browse_tree_local(repo_path, max_depth, max_entries)
+        else:
+            payload = _browse_tree_sandbox(ctx, repo_path, max_depth, max_entries)
 
     _tree_cache[task_id] = (time.time(), payload)
     return payload
@@ -605,9 +630,10 @@ def browse_read_file(task_id: str, file_path: str, offset: int = 1, max_lines: i
     (见 app/file_kinds.py 的判定口径)。
     """
     ctx, repo_path = _browse_repo_root(task_id)
-    if ctx["mode"] == "local":
-        return _read_file_local(repo_path, file_path, max_lines, offset, with_line_numbers=False)
-    return _read_file_sandbox(ctx, repo_path, file_path, max_lines, offset, with_line_numbers=False)
+    with _browse_call(task_id):
+        if ctx["mode"] == "local":
+            return _read_file_local(repo_path, file_path, max_lines, offset, with_line_numbers=False)
+        return _read_file_sandbox(ctx, repo_path, file_path, max_lines, offset, with_line_numbers=False)
 
 
 def _iter_local_file(path: Path, chunk_size: int) -> Iterator[bytes]:
@@ -635,19 +661,20 @@ def browse_download(task_id: str, file_path: str, chunk_size: int = 65536) -> tu
     """
     ctx, repo_path = _browse_repo_root(task_id)
 
-    if ctx["mode"] == "local":
-        root = Path(repo_path).resolve()
-        full_path = Path(repo_path) / file_path
-        if not full_path.resolve().is_relative_to(root):
-            raise ValueError("非法路径:不能超出仓库根目录")
-        if not full_path.is_file():
-            raise FileNotFoundError(f"文件不存在: {file_path}")
-        return full_path.stat().st_size, _iter_local_file(full_path, chunk_size)
+    with _browse_call(task_id):
+        if ctx["mode"] == "local":
+            root = Path(repo_path).resolve()
+            full_path = Path(repo_path) / file_path
+            if not full_path.resolve().is_relative_to(root):
+                raise ValueError("非法路径:不能超出仓库根目录")
+            if not full_path.is_file():
+                raise FileNotFoundError(f"文件不存在: {file_path}")
+            return full_path.stat().st_size, _iter_local_file(full_path, chunk_size)
 
-    session: SandboxSession = ctx["session"]
-    full_path = f"{repo_path.rstrip('/')}/{file_path.lstrip('/')}"
-    size = session.stat_size(full_path)
-    return size, session.read_bytes_stream(full_path, chunk_size=chunk_size)
+        session: SandboxSession = ctx["session"]
+        full_path = f"{repo_path.rstrip('/')}/{file_path.lstrip('/')}"
+        size = session.stat_size(full_path)
+        return size, session.read_bytes_stream(full_path, chunk_size=chunk_size)
 
 
 # ============================================================
@@ -1059,8 +1086,14 @@ def _reuse_existing_clone(ctx: dict, repo_url: str, want_branch: str | None) -> 
     分支取宽松口径 —— 任一侧没写分支都算不冲突(远端默认分支与任务参数常对不上,
     严格判等会退化成重新克隆)。
 
-    完好性探测只对 local 模式做:sandbox 模式记的是容器内路径
-    (/home/user/repos/xxx),宿主机上必然不存在,探测会把复用变成死代码。
+    完好性探测的口径按模式分岔:
+    - local:直接探盘(目录 + .git 都在才算完好)
+    - sandbox:记的是容器内路径(/home/user/repos/xxx),宿主机上必然不存在 —— 以前
+      因此直接"只信记录",结果恢复流程会命中一条"容器里根本没这个目录"的记录而
+      秒回 done、根本不克隆(前端就是一个空目录)。现在进容器验一把:一次轻量
+      `test -d` 往返相比重下整个仓库可以忽略。
+      只有真实 SandboxSession 才能验(测替身等拿不到可靠回答时宁可信记录,也
+      不能让探测把复用变成死代码 —— 那是当年踩过的坑)。
     """
     recorded = str(ctx.get("repo_path") or "")
     source = ctx.get("clone_source")
@@ -1085,7 +1118,30 @@ def _reuse_existing_clone(ctx: dict, repo_url: str, want_branch: str | None) -> 
         except (OSError, ValueError):
             return None
         result["files_count"] = _count_repo_files(recorded_path)
-    # sandbox:只信记录(无容器内路径可探),files_count 需进容器统计,不为展示多走一次往返
+    else:
+        session = ctx.get("session")
+        if isinstance(session, SandboxSession):
+            # .git 在才算完好:半途被打断的 rm -rf + mkdir -p 会留下无 .git 的空壳,
+            # 复用这种目录等于把"恢复成功"报给用户而工作区是空的
+            probe_cmd = (
+                f"if test -d {shlex.quote(recorded.rstrip('/') + '/.git')}; "
+                f"then echo PRESENT; else echo ABSENT; fi"
+            )
+            try:
+                probe = session.run_command(probe_cmd, timeout=30)
+            except SandboxGoneError:
+                # 容器已回收是"不可复用",不是探测失败:让上层去重建会话
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"[clone_fallback] 容器内完好性探测失败(仍复用记录): {e}"
+                )
+            else:
+                if "ABSENT" in probe:
+                    logger.info(
+                        f"[clone_fallback] 记录的容器内工作区已不在,重新克隆: {recorded}"
+                    )
+                    return None
     logger.info(f"[clone_fallback] 复用会话已 clone 的工作区: {recorded}")
     return result
 
@@ -1224,6 +1280,11 @@ def _clone_repo_local(
         )
 
     files_count = _count_repo_files(repo_dir)
+    if files_count == 0:
+        # 空壳也得清:目录解析逻辑会把"带 .git 的目录"当已有工作区避让换名,
+        # 留着它下一次尝试会克隆到 bar-2 而不是原地重下
+        _remove_local_tree(repo_dir)
+        _reject_empty_clone(str(repo_dir), clone_url)
     # local 模式下,path 返回本地路径(后续 read/search 工具会用 Python 直接读)
     return {"path": str(repo_dir), "files_count": files_count}
 
@@ -1264,6 +1325,22 @@ def _git_error_tail(stderr_lines: list[str], limit: int = 1200) -> str:
     text = "".join(kept)
     # 全是进度行(被 kill 在检出中途等):明确说出来,不让上层拿到空白错误
     return text[-limit:] if text else "(仅剩进度输出,疑似中途被打断)"
+
+
+def _reject_empty_clone(repo_dir: str, clone_url: str) -> None:
+    """克隆回来 0 文件 = 空工作区,不能当成功返回
+
+    `git clone` 对"没有任何 ref 的 bare 缓存"和真空仓库都是 **exit 0 + 一句
+    warning: You appear to have cloned an empty repository**。只看退出码就会把
+    "恢复完成"报给用户,而文件树就是一片空白(日志里却写着成功,根本无从查起)。
+
+    报错而不是警告:缓存快路径抛异常会自动降级远程克隆(缓存无 ref 正是这种
+    情形),远程也为空则带着真实原因进入回退链聚合错误,前端看得到。
+    """
+    raise RuntimeError(
+        f"克隆结果为空({repo_dir} 下无任何文件,已排除 .git):"
+        f"空仓库、该分支无提交,或克隆源({clone_url})不含可用 ref"
+    )
 
 
 def _clone_repo_sandbox(
@@ -1408,6 +1485,9 @@ def _clone_repo_sandbox(
 
     count_cmd = f"find {shlex.quote(repo_dir)} -type f -not -path '*/.git/*' | wc -l"
     files_count = int(session.run_command(count_cmd).strip() or "0")
+    if files_count == 0:
+        # 不额外发一次 rm:下一次尝试开头就是 rm -rf + mkdir -p,容器里不会残留
+        _reject_empty_clone(repo_dir, clone_url)
 
     return {"path": repo_dir, "files_count": files_count}
 

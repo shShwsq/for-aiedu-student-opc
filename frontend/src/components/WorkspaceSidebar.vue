@@ -525,7 +525,9 @@ async function handleRestore(): Promise<void> {
     // 恢复期间用户可能已切走:仅仍停留在该任务时刷新树
     if (selectedTaskId.value === taskId) {
       resetFileTree()
-      await checkAvailable()
+      // 刚克隆完要绕过整树快照缓存:克隆前那份空态快照仍在后端 30s TTL 里,
+      // 拿它就等于让用户看到"克隆完成但目录是空的"
+      await checkAvailable(true)
     }
   })
 }
@@ -689,7 +691,7 @@ const flatTree = computed<FlatNode[]>(() => {
 // 工作区初始化 + 轮询
 // ============================================================
 
-async function checkAvailable(): Promise<void> {
+async function checkAvailable(refreshTree: boolean = false): Promise<void> {
   if (!selectedTaskId.value) return
   checkingAvailable.value = true
   try {
@@ -700,7 +702,7 @@ async function checkAvailable(): Promise<void> {
     hasUploads.value = info.has_uploads ?? false
     canRestore.value = info.can_restore ?? false
     if (info.available && !treeRoot.loaded) {
-      await loadTreeSnapshot()
+      await loadTreeSnapshot(refreshTree)
     }
     // 上传树与工作区可用性无关:上传区独立展示,重新克隆后(仓库不含上传
     // 文件)仍要可见。运行中不加载(与其它兜底一致,完成后会再检查)
