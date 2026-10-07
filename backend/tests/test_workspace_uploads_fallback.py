@@ -5,7 +5,7 @@
 - get_workspace.has_uploads:纯 params 推导,零存储访问
 - 回退树形状:单上传平铺 / 多上传 {i}-{name}(含前缀目录链,防前端孤儿丢枝)
   / followup 布局 / GC 占位 unavailable / 条目截断
-- 回退读文件:内容分页 / 二进制占位 / 超限 400 / 路径反解失败 404 / 穿越 404
+- 回退读文件:内容分页 / 二进制占位与 binary 标记 / 超限 400 / 路径反解失败 404 / 穿越 404
 - 树缓存:TTL 内命中陈旧缓存,refresh 强制重建
 - 存储后端异常(非 UploadError)→ 500
 """
@@ -345,15 +345,39 @@ def test_read_file_followup_path():
 
 
 def test_read_file_binary_placeholder():
-    """非 UTF-8 内容:占位文案,行号全 0"""
+    """二进制:占位文案 + binary 标记 + 真实字节数(行号全 0)
+
+    判定口径与 sandbox_tools 同源(后缀命中或含 NUL),不再按 UTF-8 解码失败判。
+    """
     meta = save_upload(b"\xff\xfe\x00bin", "blob.bin", "u1")
     task = _task(params={"upload_ids": [meta["upload_id"]]})
     res = _read(task, "blob.bin")
     assert res["content"] == "(二进制文件,无法显示)"
+    assert res["binary"] is True
+    assert res["size"] == 6
     assert res["start_line"] == 0
     assert res["end_line"] == 0
     assert res["total_lines"] == 0
     assert res["truncated"] is False
+
+
+def test_read_file_docx_binary_by_suffix():
+    """docx 未含可判定的 NUL 也按后缀拦下(合同类交付物的常见形态)"""
+    meta = save_upload(b"PK\x03\x04no-nul-here", "合同.docx", "u1")
+    task = _task(params={"upload_ids": [meta["upload_id"]]})
+    res = _read(task, "合同.docx")
+    assert res["binary"] is True
+    assert res["content"] == "(二进制文件,无法显示)"
+
+
+def test_read_file_binary_flag_on_text():
+    """文本态:binary=False,size 恒 0(与 workspace/file 契约一致)"""
+    meta = save_upload(b"hello\nworld", "a.txt", "u1")
+    task = _task(params={"upload_ids": [meta["upload_id"]]})
+    res = _read(task, "a.txt")
+    assert res["binary"] is False
+    assert res["size"] == 0
+    assert res["total_lines"] == 2
 
 
 def test_read_file_oversize_400(monkeypatch):

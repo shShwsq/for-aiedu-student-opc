@@ -7,8 +7,10 @@
 - GET /tasks/{task_id}/workspace/files    列出目录(懒加载树,单层)
 - GET /tasks/{task_id}/workspace/tree     整树快照(首屏一次拉取,带短 TTL 缓存)
 - GET /tasks/{task_id}/workspace/file     读取文件内容(原始文本 + 分页,前端自行渲染行号)
+- GET /tasks/{task_id}/workspace/download 下载工作区文件(原始字节,二进制文件的出口)
 - GET /tasks/{task_id}/workspace/uploads/tree 沙箱过期后回退浏览用户上传文件树
 - GET /tasks/{task_id}/workspace/uploads/file 回退读取上传文件内容(同 workspace/file 形状)
+- GET /tasks/{task_id}/workspace/uploads/download 回退下载上传文件(沙箱过期后仍可取回)
 - POST /tasks/{task_id}/workspace/restore 发起过期工作区重新 clone(后台执行,立即返回 job)
 - GET  /tasks/{task_id}/workspace/restore/status 查询恢复进度(前端轮询)
 
@@ -26,14 +28,26 @@ session 生命周期:
 - upload_id 只从 task.params 解析(不接受前端指定,防 IDOR)
 """
 import logging
+import mimetypes
 import time
 import uuid
+from pathlib import PurePosixPath
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.deps import get_optional_user
+# 二进制判定与占位文案(与 sandbox_tools 读取路径同源)
+from app.file_kinds import (
+    BINARY_PLACEHOLDER,
+    has_nul_bytes,
+    is_denied_download_path,
+    is_likely_binary,
+)
 from app.models.task import Task
 from app.models.user import User
 from app.services import workspace_restore
@@ -91,6 +105,83 @@ def _task_upload_slots(task: Task) -> list[UploadSlot]:
         except UploadError:
             metas[uid] = {}
     return compute_upload_layout(creation_ids, followup_ids, metas)
+
+
+# ============================================================
+# 下载(二进制文件的出口:预览只给文本,原始字节走这条)
+# ============================================================
+
+def _check_download_path(path: str) -> str:
+    """下载路径守卫,返回归一化的工作根相对路径
+
+    - 空 / 绝对 / 含 `..` 段 → 404(与 resolve_path 失败同语义,不透露"存在但在根外")
+    - 凭证与密钥类(.git/**、id_rsa、*.pem…)→ 403。这条是**必须**的:带 token 的
+      clone URL 会落进 .git/config,文件树虽已剪掉 .git,下载端点收的是任意 path,
+      不拦就等于把用户的 OAuth 凭证做成一键可得
+    """
+    normalized = (path or "").replace("\\", "/").strip()
+    parts = PurePosixPath(normalized).parts
+    if not normalized or normalized.startswith("/") or ".." in parts:
+        raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
+    normalized = normalized.strip("/")
+    if is_denied_download_path(normalized):
+        raise HTTPException(
+            status_code=403, detail="该文件不支持下载(凭证 / 密钥类路径)"
+        )
+    return normalized
+
+
+def _enforce_download_limit(size: int) -> None:
+    """下载上限检查(必须在开始响应/读取之前调用:流已开始就改不了状态码)"""
+    limit = settings.WORKSPACE_DOWNLOAD_MAX_MB * 1024 * 1024
+    if size > limit:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=(
+                f"文件过大({size / (1024 * 1024):.1f}MB),"
+                f"下载上限 {settings.WORKSPACE_DOWNLOAD_MAX_MB}MB"
+            ),
+        )
+
+
+def _download_headers(filename: str, content_length: int | None = None) -> dict:
+    """附件响应头
+
+    中文名交付物(如「大学生AI创新创业组-….pdf」)必须走 RFC 5987 的 filename*,
+    否则 latin-1 兜底下会乱码;filename= 只作 ASCII 回退(给老客户端)。
+    content_length 仅在字节已全部在手时给(沙箱流式路径不知道总长,宁可让
+    浏览器显示"未知大小"也不要因 stat 与实际流不一致而截断)。
+    """
+    ascii_name = (
+        filename.encode("ascii", "ignore").decode().replace('"', "").replace("\\", "")
+    ).strip() or "download"
+    headers = {
+        "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}",
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if content_length is not None:
+        headers["Content-Length"] = str(content_length)
+    return headers
+
+
+def _guess_media_type(filename: str) -> str:
+    """按文件名猜 MIME,猜不到一律 octet-stream(配合 nosniff 不做内容嗅探)"""
+    return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+def _uploads_binary_result(path: str, size: int) -> dict:
+    """上传回退读取的二进制响应体(形状与 sandbox_tools._binary_read_result 一致)"""
+    return {
+        "path": path,
+        "content": BINARY_PLACEHOLDER,
+        "start_line": 0,
+        "end_line": 0,
+        "total_lines": 0,
+        "truncated": False,
+        "binary": True,
+        "size": int(size),
+    }
 
 
 @router.get("/tasks/{task_id}/workspace")
@@ -229,6 +320,9 @@ def read_workspace_file(
     注意:与 LLM 工具 read_file 不同,此处 content 不带行号前缀。
     前端 WorkspaceSidebar 用 start_line + 行索引自行渲染行号,
     若后端再带行号会造成两列行号重复。
+
+    二进制文件(docx/pdf/图片…)不回传原始字节:binary=True + 占位文案,
+    前端据此改渲染下载卡片(见 .../workspace/download)。
     """
     _check_task_access(task_id, db, current_user)
     sandbox_tools.cleanup_expired_sessions_bg()
@@ -242,6 +336,40 @@ def read_workspace_file(
     except Exception as e:
         logger.exception(f"[task={task_id}] 读取工作区文件失败: path={path}")
         raise HTTPException(status_code=500, detail=f"读取文件失败: {e}")
+
+
+@router.get("/tasks/{task_id}/workspace/download")
+def download_workspace_file(
+    task_id: uuid.UUID,
+    path: str = Query(..., description="仓库内文件相对路径"),
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_user),
+) -> StreamingResponse:
+    """下载工作区文件的原始字节(预览只覆盖文本;docx/pdf/图片靠这条)
+
+    - 字节流不经 shell:sandbox 模式走 SDK read_bytes_stream,local 模式直接 open
+      宿主文件 —— execd 的文本通道会改写原始字节,那正是 docx 乱码的成因
+    - 上限 WORKSPACE_DOWNLOAD_MAX_MB(超限 413),.git/** 与密钥类路径 403
+    - 不设 Content-Length:流式总量以实际产出为准,避免 stat 与流不一致时静默截断
+    - 工作区过期(session 已清)后仓库文件不可下载,前端提示走「重新克隆」
+    """
+    _check_task_access(task_id, db, current_user)
+    rel = _check_download_path(path)
+    sandbox_tools.cleanup_expired_sessions_bg()
+
+    try:
+        size, chunks = sandbox_tools.browse_download(str(task_id), rel)
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        # 路径穿越(ValueError)与不存在同语义,不区分辨护根目录结构
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    _enforce_download_limit(size)
+
+    filename = PurePosixPath(rel).name or "download"
+    return StreamingResponse(
+        chunks,
+        media_type=_guess_media_type(filename),
+        headers=_download_headers(filename),
+    )
 
 
 @router.get("/tasks/{task_id}/workspace/uploads/tree")
@@ -355,7 +483,8 @@ def read_workspace_uploads_file(
     """沙箱过期后回退读取上传文件内容(原始文本 + 分页)
 
     响应形状与 /workspace/file 一致(content 无行号,前端自行渲染行号列);
-    二进制文件返回占位文案;超过 5MB 的文件不提供在线查看(400)。
+    二进制文件回 binary=True + 占位文案(判定口径与 sandbox_tools 同源);
+    超过 5MB 的**文本**文件不提供在线查看(400,可走 .../uploads/download 下载)。
     """
     task = _check_task_access(task_id, db, current_user)
     sandbox_tools.cleanup_expired_sessions_bg()
@@ -368,28 +497,26 @@ def read_workspace_uploads_file(
     backend = get_backend()
     try:
         size = backend.stat_file(upload_id, relpath)
+        # 后缀已可判定的二进制:直接回占位,不为"确认它读不了"而整份下载
+        if is_likely_binary(relpath):
+            return _uploads_binary_result(path, size)
         if size > _UPLOADS_READ_MAX_BYTES:
             raise HTTPException(
                 status_code=400,
-                detail=f"文件过大({size // (1024 * 1024)}MB),仅支持在线查看不超过 5MB 的文件",
+                detail=(
+                    f"文件过大({size // (1024 * 1024)}MB),"
+                    "仅支持在线查看不超过 5MB 的文件,可改用下载获取"
+                ),
             )
         data = backend.read_file(upload_id, relpath)
     except UploadError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    # 解码 + 分页语义与 sandbox_tools._read_file_local 一致
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        return {
-            "path": path,
-            "content": "(二进制文件,无法显示)",
-            "start_line": 0,
-            "end_line": 0,
-            "total_lines": 0,
-            "truncated": False,
-        }
+    # NUL 探测 + 解码 + 分页语义与 sandbox_tools._read_file_local 一致
+    if has_nul_bytes(data):
+        return _uploads_binary_result(path, size)
 
+    text = data.decode("utf-8", errors="replace")
     all_lines = text.splitlines()
     total_lines = len(all_lines)
     start_idx = max(0, min(offset - 1, total_lines))
@@ -405,7 +532,48 @@ def read_workspace_uploads_file(
         "end_line": end_line,
         "total_lines": total_lines,
         "truncated": end_line < total_lines,
+        "binary": False,
+        "size": 0,
     }
+
+
+@router.get("/tasks/{task_id}/workspace/uploads/download")
+def download_workspace_uploads_file(
+    task_id: uuid.UUID,
+    path: str = Query(..., description="工作根内上传文件相对路径"),
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_user),
+) -> Response:
+    """回退下载用户上传文件(沙箱过期后依然可取)
+
+    上传是不可再生的用户资产,而 .../workspace/download 依赖沙箱 session —— 
+    session 一过 TTL 就没了,合同原件必须由这条从上传存储(local 目录 / S3)读。
+
+    upload_id 只从 task.params 解析(不接受前端指定,防 IDOR)。
+    抽象层没有流式接口,故整份缓冲:上限即单次响应的内存上限(50MB)。
+    """
+    task = _check_task_access(task_id, db, current_user)
+    rel = _check_download_path(path)
+
+    resolved = resolve_path(_task_upload_slots(task), rel)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
+    upload_id, relpath = resolved
+
+    backend = get_backend()
+    try:
+        # 先 stat 再读:超限的文件不该被整份拉进内存
+        _enforce_download_limit(backend.stat_file(upload_id, relpath))
+        data = backend.read_file(upload_id, relpath)
+    except UploadError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    filename = PurePosixPath(rel).name or "download"
+    return Response(
+        content=data,
+        media_type=_guess_media_type(filename),
+        headers=_download_headers(filename, content_length=len(data)),
+    )
 
 
 @router.post("/tasks/{task_id}/workspace/restore")

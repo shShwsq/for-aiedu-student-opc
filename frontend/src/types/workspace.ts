@@ -85,4 +85,15 @@ export interface WorkspaceFileResponse {
   end_line: number
   total_lines: number
   truncated: boolean
+  /** 二进制文件(docx/pdf/图片…):content 为占位文案,改渲染下载卡片 */
+  binary: boolean
+  /** 文件字节数(仅 binary=true 时有意义;文本态后端回 0) */
+  size: number
+}
+
+/** 下载文件的响应(blob + 服务端建议的文件名) */
+export interface WorkspaceDownloadResult {
+  blob: Blob
+  /** 服务端 Content-Disposition 给出的文件名(中文名靠它),缺失时回落路径末段 */
+  filename: string
 }

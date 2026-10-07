@@ -239,6 +239,7 @@ Task creation offers three deliverable source tabs: Git repository / upload ZIP 
 | `UPLOAD_MAX_EXTRACT_MB` | Max total extracted size for a ZIP (MB) | `300` |
 | `UPLOAD_MAX_SINGLE_FILE_MB` | Max single file inside a ZIP (MB) | `50` |
 | `UPLOAD_MAX_FILES` | Max file count inside a ZIP | `2000` |
+| `WORKSPACE_DOWNLOAD_MAX_MB` | Max size of a single workspace/uploaded file served through the download endpoint (binary files are not previewed, only downloaded; over the limit → 413) | `50` |
 
 #### Sandbox (OpenSandbox)
 

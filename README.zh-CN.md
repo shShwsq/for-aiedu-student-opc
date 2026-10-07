@@ -239,6 +239,7 @@ GitHub 和 Gitee 二者均支持,按需配置。留空的平台对应路由会�
 | `UPLOAD_MAX_EXTRACT_MB` | ZIP 解压后总大小上限(MB) | `300` |
 | `UPLOAD_MAX_SINGLE_FILE_MB` | ZIP 内单文件大小上限(MB) | `50` |
 | `UPLOAD_MAX_FILES` | ZIP 内文件数上限 | `2000` |
+| `WORKSPACE_DOWNLOAD_MAX_MB` | 工作区/上传文件单文件下载上限(MB)。二进制文件(docx/pdf/图片…)不做在线预览,只能下载;超限返回 413 | `50` |
 
 #### 沙箱(OpenSandbox)
 

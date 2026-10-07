@@ -199,6 +199,38 @@ class SandboxSession:
         else:
             return self._local_read_file(path)
 
+    def stat_size(self, path: str) -> int:
+        """取沙箱内单文件的字节数(SDK 原生文件系统 API,供下载前限流检查)
+
+        仅 sandbox 模式可用(local 模式调用方直接用 Path.stat,与列目录同惯例)。
+        文件不存在抛 FileNotFoundError。
+        """
+        if self._closed:
+            raise RuntimeError("沙箱已关闭")
+        if self.mode != "sandbox":
+            raise RuntimeError("stat_size 仅 sandbox 模式可用")
+
+        infos = self.sandbox.files.get_file_info([path])
+        info = infos.get(path) if isinstance(infos, dict) else None
+        if info is None:
+            raise FileNotFoundError(f"文件不存在: {path}")
+        return int(getattr(info, "size", 0) or 0)
+
+    def read_bytes_stream(self, path: str, chunk_size: int = 65536) -> Generator[bytes, None, None]:
+        """按块读取沙箱内文件的原始字节(下载用,不走 shell 文本通道)
+
+        仅 sandbox 模式可用:local 模式的下载在 sandbox_tools 里直接 open 本地文件,
+        而 `_local_resolve_path` 会把绝对宿主机路径往临时目录里映射,借道反而出错。
+
+        SDK 侧为惰性生成器:调用方在消费时才发起 HTTP,超大文件不会整份进内存。
+        """
+        if self._closed:
+            raise RuntimeError("沙箱已关闭")
+        if self.mode != "sandbox":
+            raise RuntimeError("read_bytes_stream 仅 sandbox 模式可用")
+
+        return self.sandbox.files.read_bytes_stream(path, chunk_size=chunk_size)
+
     def list_directory(self, path: str, depth: int | None = None) -> list[dict]:
         """列出目录内容(SDK 原生文件系统 API,单次 HTTP,无需起 shell 进程)
 

@@ -193,6 +193,12 @@ class Settings(BaseSettings):
     # 单次提交(任务创建 / 一条追问)可关联的上传文件个数上限
     UPLOAD_MAX_FILES_PER_MESSAGE: int = 10
 
+    # ---- 工作区浏览 / 下载 ----
+    # 单文件下载上限(MB)。二进制文件不进预览、只能下载,这条同时兜住
+    # "沙箱里一个巨型构建产物被整份拉回后端"的内存/带宽风险;超限返回 413,
+    # 提示用户回源仓库获取。上传回退路径为缓冲读,该值即单次响应的内存上限。
+    WORKSPACE_DOWNLOAD_MAX_MB: int = 50
+
     # ---- 交付物存储后端(Stage 1 永久层)----
     # 部署级选择(一套部署一个后端):local=本地磁盘 UPLOADS_DIR / s3=S3 兼容对象存储
     # 详见 app/services/upload_storage.py

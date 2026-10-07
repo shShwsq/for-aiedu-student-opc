@@ -51,6 +51,8 @@ from sqlalchemy.orm import Session
 
 import openai
 from app.config import settings
+# 二进制占位文案(与 sandbox_tools 读取路径同源;判定口径见 app/file_kinds.py)
+from app.file_kinds import BINARY_PLACEHOLDER
 from app.llm.client import LLMClient
 from app.models.practice import (
     BUILTIN_TOPIC_DEFS,
@@ -274,7 +276,9 @@ def _prefetch_materials(
                 )
                 continue
             content = str((res or {}).get("content") or "").strip()
-            if not content or content.startswith("(二进制文件"):
+            # 二进制文件(docx/pdf/图片…)没有可出题的材料:占位文案与 binary
+            # 标记都拦下(标记来自 sandbox_tools 的统一判定,文案是历史兼容面)
+            if not content or (res or {}).get("binary") or content.startswith(BINARY_PLACEHOLDER):
                 continue
             got.append(
                 (int((res or {}).get("start_line") or offset),

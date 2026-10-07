@@ -63,7 +63,7 @@
 **场景三:文书审核**(`document_review`)
 - 预设提示词:审核合同/协议文书敢不敢签,关注权责对等、付款与违约、知识产权归属、常见霸王条款,逐条定位到具体条款
 - 推荐 skill:无(前端语义为全部可用)
-- 说明:当前仅支持 txt/md 纯文本格式(docx/pdf 无解析),description 已引导用户上传文本格式
+- 说明:docx/pdf 不做正文解析——既不在线预览,智能体的 `read_file` 也会把它拦成占位文案(见 §9.6 二进制拦截),仅能在文件面板下载原件;description 已引导用户上传文本格式
 
 ### 2.3 场景扩展预留
 用户在前端选择场景,后端加载对应预设提示词与推荐 skill。审查维度由 agent2 按用户意图自行确定,不依赖场景定义。场景合并/更名后,旧 id 经 `app/scenarios/base.py` 的 `SCENARIO_ALIASES` + `resolve_scenario_id()` 统一解析(get_scenario、agent_policy 场景默认、skills 路由入口均经别名转换)。
@@ -629,11 +629,14 @@ react_agent 维护跨轮 plan 状态:
 ### 9.6 工作区浏览
 
 前端可浏览已 clone 仓库的文件结构和内容(`backend/app/routers/workspace.py`,session 生命周期:运行中 clone 完成即可浏览 / 完成后保留 1 小时 TTL / 超时惰性清理):
-- 端点:`GET /tasks/{id}/workspace`(工作区信息:available / repo_path / mode / has_uploads / **can_restore**)、`.../tree`(整树快照,首屏一次拉取 + 短 TTL 缓存)、`.../files`(单层懒加载树)、`.../file`(原文 + offset/maxLines 分页,行号前端自行渲染)
+- 端点:`GET /tasks/{id}/workspace`(工作区信息:available / repo_path / mode / has_uploads / **can_restore**)、`.../tree`(整树快照,首屏一次拉取 + 短 TTL 缓存)、`.../files`(单层懒加载树)、`.../file`(原文 + offset/maxLines 分页,行号前端自行渲染)、`.../download`(原始字节下载,二进制文件的出口)
+- **二进制拦截(两种模式口径一致,判定表 `app/file_kinds.py`)**:后缀命中(docx/pdf/图片/压缩包/可执行…)或头部 8192 字节含 NUL → `read_file` 与 `.../workspace/file` 都回 `binary=true` + 占位文案,不回传内容。此前 sandbox 模式走 execd 文本通道(`wc -l` + `awk`)不做任何判定,docx 的原始字节被当文本回传:前端渲染成乱码,同一函数还把它喂进了智能体上下文。刻意**不**按"UTF-8 解码失败"判二进制(那会把 GBK 中文文本也拦掉,这类文件现在按文本回、个别字符以替换字符呈现)。文本响应 `size` 恒 0(字节数只在二进制卡片上用)
+- **下载**:`GET .../workspace/download?path=`(流式,sandbox 走 SDK `read_bytes_stream`、local 直接 open 宿主文件)与 `GET .../workspace/uploads/download?path=`(不经沙箱,上传保留期内可取回原件)。单文件上限 `WORKSPACE_DOWNLOAD_MAX_MB`(默认 50MB,超限 413);`.git/**`、`id_rsa`、`*.pem` 等凭证/密钥路径一律 403——带 token 的 clone URL 会落进 `.git/config`,文件树虽已剪掉 `.git`,下载端收的是任意 path,不拦就等于一键发凭证。文件名走 RFC 5987 `filename*=UTF-8''`(交付物多为中文名)
 - **沙箱过期后的两条回退路径**(工作区不可用时):
   - 仓库代码——可重新 clone:`POST /tasks/{id}/workspace/restore` 发起后台 job **立即返回**(不在本请求里等克隆)+ `GET .../restore/status` 前端轮询进度的终态。改为“发起 + 轮询”的原因:clone 是分钟级操作,而 axios 客户端有全局 30s 超时——旧同步实现会先被打断并假报“网络错误”,真实结果几分钟后才落。进度不能走 event_bus(任务早已结束、总线已 finish,`clone_progress` 会被丢弃);job 表在进程内存(沿用单 worker 部署假设),进程重启后 status 返 idle 可重新发起。用户主动触发,不受出题侧 `restore_workspace_for_practice` 开关限制
-  - 用户上传——不可再生:回退直接从上传存储(local 目录 / S3)按 `upload_layout` 布局拼出与沙箱树同构的文件树,不经沙箱——`GET .../workspace/uploads/tree` + `.../uploads/file`(`upload_id` 只从 `task.params` 解析,不接受前端指定,防 IDOR;已被 GC 的上传以“已清理”占位)
+  - 用户上传——不可再生:回退直接从上传存储(local 目录 / S3)按 `upload_layout` 布局拼出与沙箱树同构的文件树,不经沙箱——`GET .../workspace/uploads/tree` + `.../uploads/file` + `.../uploads/download`(`upload_id` 只从 `task.params` 解析,不接受前端指定,防 IDOR;已被 GC 的上传以“已清理”占位)。仓库文件在 session 过期后不可下载,需先重新克隆;上传原件在保留期内随时可取
 - **只读代码展示组件 `FileContentViewer.vue`**(取代旧版手写逐行渲染):只读 CodeMirror(行号槽按页起始行偏移显示真实文件行号、软换行、按后缀经 `@codemirror/language-data` 惰性加载语法高亮),Markdown 文件额外提供「源码 / 预览」切换(marked + DOMPurify 净化);父组件加载完某页内容后调 `focusRange(真实起止行)` 做区间高亮 + 滚动到中间,分页仍由父组件负责。被 `WorkspaceSidebar.vue`(任务详情源码查阅)与 `PracticeCodeSidebar.vue`(答题时源码查阅)复用
+- **二进制视图 `FileBinaryCard.vue`**(取代把乱码塞进查看器):`binary=true` 时两个侧栏都不渲染源码,改展示文件名 / 类型 / 字节数 + 下载按钮;后缀已知二进制连内容请求都不发(前端后缀表 `utils/fileKind.ts` 与后端 `file_kinds.py` 同表,单测比对源码防分叉)。下载走 axios blob(`utils/download.ts`)而非裸链接——token 在 localStorage,裸请求带不上 Authorization 会被判 403;该请求显式覆盖 30s 全局超时,并把 blob 形态的 4xx 错误体还原成 detail 文案
 - 用于用户确认审计范围、理解 agent1 的分析上下文
 
 ### 9.7 SSE 事件体系(完整)

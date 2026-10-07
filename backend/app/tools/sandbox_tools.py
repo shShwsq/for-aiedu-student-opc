@@ -20,11 +20,18 @@ import time
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from app.clone_skip import consume_skip_clone
 from app.config import settings
 from app.event_bus import publish as publish_event
+# 二进制判定与占位文案(单一来源:三处读取路径与下载守卫共用,口径不一致则行为分裂)
+from app.file_kinds import (
+    BINARY_PLACEHOLDER,
+    NUL_PROBE_BYTES,
+    has_nul_bytes,
+    is_likely_binary,
+)
 from app.git_provider import get_provider_for_url
 from app.pause_controller import wait_if_paused
 from app.perf import perf_log, perf_timer
@@ -471,13 +478,10 @@ def _browse_tree_sandbox(ctx: dict, repo_path: str, max_depth: int, max_entries:
     }
 
 
-def browse_read_file(task_id: str, file_path: str, offset: int = 1, max_lines: int = 500) -> dict:
-    """面向前端的文件读取(复用 read_file 逻辑,但不带行号)
+def _browse_repo_root(task_id: str) -> tuple[dict, str]:
+    """前端浏览/下载共用的工作区前置检查,返回 (会话上下文, repo_path)
 
-    默认读 500 行(比 LLM 工具的 200 行多,前端查看用)。
-    与 read_file 工具的区别:content 返回原始文本(不带行号前缀),
-    因为前端 WorkspaceSidebar 会自己渲染行号列(start_line + i),
-    若后端再带行号会造成两列行号重复。
+    两条错误文案与 browse_read_file 原有实现一致(前端据此区分"未 clone"与"已过期")。
     """
     ctx = _sessions.get(task_id)
     if ctx is None:
@@ -486,12 +490,64 @@ def browse_read_file(task_id: str, file_path: str, offset: int = 1, max_lines: i
     repo_path = ctx.get("repo_path", "")
     if not repo_path:
         raise RuntimeError("工作区不可用:尚未 clone 仓库")
+    return ctx, repo_path
 
-    mode = ctx["mode"]
-    if mode == "local":
+
+def browse_read_file(task_id: str, file_path: str, offset: int = 1, max_lines: int = 500) -> dict:
+    """面向前端的文件读取(复用 read_file 逻辑,但不带行号)
+
+    默认读 500 行(比 LLM 工具的 200 行多,前端查看用)。
+    与 read_file 工具的区别:content 返回原始文本(不带行号前缀),
+    因为前端 WorkspaceSidebar 会自己渲染行号列(start_line + i),
+    若后端再带行号会造成两列行号重复。
+
+    二进制文件不再回传原始字节:返回 binary=True + 占位正文,前端转下载卡片
+    (见 app/file_kinds.py 的判定口径)。
+    """
+    ctx, repo_path = _browse_repo_root(task_id)
+    if ctx["mode"] == "local":
         return _read_file_local(repo_path, file_path, max_lines, offset, with_line_numbers=False)
-    else:
-        return _read_file_sandbox(ctx, repo_path, file_path, max_lines, offset, with_line_numbers=False)
+    return _read_file_sandbox(ctx, repo_path, file_path, max_lines, offset, with_line_numbers=False)
+
+
+def _iter_local_file(path: Path, chunk_size: int) -> Iterator[bytes]:
+    """本地文件分块产出(句柄在生成器结束时关闭)"""
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+
+def browse_download(task_id: str, file_path: str, chunk_size: int = 65536) -> tuple[int, Iterator[bytes]]:
+    """为前端下载准备 (文件字节数, 分块字节流)
+
+    返回字节数是为了在**开始响应之前**做上限检查(流已开始就无法再回 413)。
+
+    两种模式都不借道 shell:execd 的文本通道会改写原始字节(正是乱码的成因)。
+    - local:直接 open 宿主文件。不走 SandboxSession._local_resolve_path ——
+      它会把绝对宿主路径往临时目录里映射,与 _read_file_local 的路径口径不同
+    - sandbox:SDK read_bytes_stream 惰性产出,超大文件不会整份进后端内存
+
+    抛出:RuntimeError(工作区不可用)/ ValueError(路径穿越)/
+          FileNotFoundError(不存在或不是文件)
+    """
+    ctx, repo_path = _browse_repo_root(task_id)
+
+    if ctx["mode"] == "local":
+        root = Path(repo_path).resolve()
+        full_path = Path(repo_path) / file_path
+        if not full_path.resolve().is_relative_to(root):
+            raise ValueError("非法路径:不能超出仓库根目录")
+        if not full_path.is_file():
+            raise FileNotFoundError(f"文件不存在: {file_path}")
+        return full_path.stat().st_size, _iter_local_file(full_path, chunk_size)
+
+    session: SandboxSession = ctx["session"]
+    full_path = f"{repo_path.rstrip('/')}/{file_path.lstrip('/')}"
+    size = session.stat_size(full_path)
+    return size, session.read_bytes_stream(full_path, chunk_size=chunk_size)
 
 
 # ============================================================
@@ -1552,8 +1608,14 @@ def read_file(
         "start_line": int,     # 本次返回的起始行号
         "end_line": int,       # 本次返回的结束行号
         "total_lines": int,    # 文件总行数
-        "truncated": bool      # 是否还有更多未读(本次未读到文件尾)
+        "truncated": bool,     # 是否还有更多未读(本次未读到文件尾)
+        "binary": bool,        # 二进制文件(docx/pdf/图片…):content 为占位文案
+        "size": int            # 二进制文件的字节数(文本态恒 0)
     }
+
+    二进制文件不做内容回传:两种模式下原始字节既无法在文本通道/UTF-8 文本里
+    正确表达,喂给模型只会污染上下文。模型需要文档正文时,由用户下载后
+    以文本形式重新上传。
 
     特例:file_path 以 /home/user/.agent_memory/ 开头(记忆文件白名单)时,
     不受 repo_path 限制,直接读记忆目录文件(供查阅完整项目记忆 / 全局记忆)。
@@ -1581,6 +1643,51 @@ def _format_numbered_lines(lines: list[str], start_line: int) -> str:
     )
 
 
+def _read_head(path: Path, n: int) -> bytes:
+    """读文件前 n 字节(不整份进内存;空文件返回 b'')"""
+    with path.open("rb") as f:
+        return f.read(n)
+
+
+def _binary_read_result(file_path: str, size: int) -> dict:
+    """二进制文件的统一读取结果(三条读取路径共用)
+
+    行号字段全 0 + 占位正文:前端的分页条据此隐藏,调用方(generator 预读)
+    按占位文案跳过;binary 标记让前端不必匹配后缀表也能进入"下载卡片"视图。
+    """
+    return {
+        "path": file_path,
+        "content": BINARY_PLACEHOLDER,
+        "start_line": 0,
+        "end_line": 0,
+        "total_lines": 0,
+        "truncated": False,
+        "binary": True,
+        "size": int(size),
+    }
+
+
+def _text_read_result(
+    file_path: str, body: str,
+    start_line: int, end_line: int, total_lines: int,
+) -> dict:
+    """文本读取结果的统一形状
+
+    size 恒为 0:字节数只在二进制下载卡片上用(见 _binary_read_result),文本态
+    前端不展示它;两种模式都回 0,免得同一个字段按运行模式给出不同含义。
+    """
+    return {
+        "path": file_path,
+        "content": body,
+        "start_line": start_line,
+        "end_line": end_line,
+        "total_lines": total_lines,
+        "truncated": end_line < total_lines,
+        "binary": False,
+        "size": 0,
+    }
+
+
 def _read_file_local(
     repo_path: str, file_path: str, max_lines: int, offset: int,
     with_line_numbers: bool = True,
@@ -1599,17 +1706,15 @@ def _read_file_local(
     if not full_path.is_file():
         raise FileNotFoundError(f"文件不存在: {file_path}")
 
-    try:
-        content = full_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return {
-            "path": file_path,
-            "content": "(二进制文件,无法显示)",
-            "start_line": 0,
-            "end_line": 0,
-            "total_lines": 0,
-            "truncated": False,
-        }
+    size = full_path.stat().st_size
+    # 二进制判定:后缀命中(零 IO)或头部窗口含 NUL。刻意不按"UTF-8 解码失败"
+    # 判二进制 —— 那会把 GBK 中文文本也拦掉,而这些文件是有内容可看的。
+    if is_likely_binary(file_path) or has_nul_bytes(_read_head(full_path, NUL_PROBE_BYTES)):
+        return _binary_read_result(file_path, size)
+
+    # errors="replace":二进制已在上一步拦下,残余的非 UTF-8 字节(GBK 文本等)
+    # 以替换字符呈现,不再整份判为不可读
+    content = full_path.read_bytes().decode("utf-8", errors="replace")
 
     all_lines = content.splitlines()
     total_lines = len(all_lines)
@@ -1627,14 +1732,34 @@ def _read_file_local(
     else:
         body = "\n".join(selected)
 
-    return {
-        "path": file_path,
-        "content": body,
-        "start_line": start_line,
-        "end_line": end_line,
-        "total_lines": total_lines,
-        "truncated": end_line < total_lines,
-    }
+    return _text_read_result(
+        file_path, body, start_line, end_line, total_lines
+    )
+
+
+def _sandbox_file_size(session: SandboxSession, full_path: str) -> int:
+    """沙箱内二进制文件的字节数(仅命中二进制时查,文本路径不带这次额外往返)
+
+    后缀短路分支没做过存在性检查,这里一并判存在:不存在的 .docx 应与其它文件
+    一样抛 FileNotFoundError,而不是回一个 size=0 的"二进制"占位。
+    """
+    output = session.run_command(
+        f"if [ -f {shlex.quote(full_path)} ]; then wc -c < {shlex.quote(full_path)}; "
+        f"else echo MISSING; fi"
+    )
+    first = output.splitlines()[0].strip() if output.splitlines() else ""
+    if first == "MISSING" or not first:
+        raise FileNotFoundError(f"文件不存在: {full_path}")
+    return int(first) if first.isdigit() else 0
+
+
+def _sandbox_nul_probe(p: str) -> str:
+    """NUL 字节探测的 shell 片段(p 为已 shlex.quote 的路径)
+
+    `tr -dc '\000'` 只留 NUL,再由 wc -c 计数 —— 计数 > 0 即二进制。
+    只看头部窗口(head -c),避免大文件整份管道传输。
+    """
+    return f"head -c {NUL_PROBE_BYTES} {p} | tr -dc '\\000' | wc -c"
 
 
 def _read_file_sandbox(
@@ -1646,6 +1771,9 @@ def _read_file_sandbox(
     with_line_numbers:
         True(LLM 工具 read_file):content 带 cat -n 风格行号前缀
         False(前端 browse_read_file):content 为原始文本,前端自行渲染行号列
+
+    二进制拦截(必做,不是可选优化):本函数走 execd 的**文本通道**,原始字节会被
+    当成文本回传,docx/pdf 因此在浏览器里渲染成乱码、在智能体上下文里污染推理。
     """
     session: SandboxSession = ctx["session"]
     full_path = f"{repo_path.rstrip('/')}/{file_path.lstrip('/')}"
@@ -1654,26 +1782,42 @@ def _read_file_sandbox(
     end = start + max_lines - 1
     p = shlex.quote(full_path)
 
+    # 后缀命中直接拦下:零往返,连文件都不用打开
+    if is_likely_binary(file_path):
+        return _binary_read_result(file_path, _sandbox_file_size(session, full_path))
+
     if not with_line_numbers:
-        # 前端浏览路径:存在性检查 + 总行数 + 范围截取合并为单条命令(1 次往返替代 3 次)
-        # 输出约定:首行为总行数,其后为内容行;文件不存在时首行 MISSING
+        # 前端浏览路径:存在性检查 + 二进制探测 + 总行数 + 范围截取合并为单条命令
+        # (1 次往返,探测不额外加账)
+        # 输出约定:首行 MISSING=不存在 / BINARY=二进制,否则首行为总行数、其后为内容行
         awk_script = (
             f"NR>={start} && NR<={end} "
             f"{{printf \"%s\\n\", $0}}"
         )
         output = session.run_command(
-            f"if [ -f {p} ]; then wc -l < {p}; awk '{awk_script}' {p}; else echo MISSING; fi"
+            f"if [ -f {p} ]; then "
+            f"if [ \"$({_sandbox_nul_probe(p)})\" -gt 0 ]; then echo BINARY; "
+            f"else wc -l < {p}; awk '{awk_script}' {p}; fi; "
+            f"else echo MISSING; fi"
         )
         out_lines = output.splitlines()
         if not out_lines or out_lines[0].strip() == "MISSING":
             raise FileNotFoundError(f"文件不存在: {file_path}")
+        if out_lines[0].strip() == "BINARY":
+            return _binary_read_result(file_path, _sandbox_file_size(session, full_path))
         total_str = out_lines[0].strip()
         total_lines = int(total_str) if total_str.isdigit() else 0
         content = "\n".join(out_lines[1:])
     else:
-        check = session.run_command(f"test -f {p} && echo OK || echo MISSING")
+        check = session.run_command(
+            f"if [ -f {p} ]; then "
+            f"if [ \"$({_sandbox_nul_probe(p)})\" -gt 0 ]; then echo BINARY; else echo OK; fi; "
+            f"else echo MISSING; fi"
+        )
         if "MISSING" in check:
             raise FileNotFoundError(f"文件不存在: {file_path}")
+        if "BINARY" in check:
+            return _binary_read_result(file_path, _sandbox_file_size(session, full_path))
 
         total_lines_str = session.run_command(f"wc -l < {p}").strip()
         total_lines = int(total_lines_str) if total_lines_str.isdigit() else 0
@@ -1688,14 +1832,7 @@ def _read_file_sandbox(
     start_line = min(start, total_lines) if total_lines > 0 else 0
     end_line = min(end, total_lines) if total_lines > 0 else 0
 
-    return {
-        "path": file_path,
-        "content": content,
-        "start_line": start_line,
-        "end_line": end_line,
-        "total_lines": total_lines,
-        "truncated": end_line < total_lines,
-    }
+    return _text_read_result(file_path, content, start_line, end_line, total_lines)
 
 
 # ============================================================

@@ -10,13 +10,15 @@
  * 树加载策略:优先整树快照(/workspace/tree);快照截断时退回逐级懒加载
  * (/workspace/files)。文件内容复用 /workspace/file(原始文本 + 分页),
  * 交给 FileContentViewer 以只读 CodeMirror 渲染(IDE 行号 + 语法高亮,
- * Markdown 文件可切「预览」)。
+ * Markdown 文件可切「预览」)。二进制文件(docx/pdf/图片)后端不回内容,
+ * 改渲染 FileBinaryCard(下载原件到本地看)。
  *
  * 定位:父组件传入 locateFile/locateLine(来自当前题的 source_file/source_lines),
  * 变化时自动展开对应目录、打开文件并滚动高亮。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
+import FileBinaryCard from './FileBinaryCard.vue'
 import FileContentViewer from './FileContentViewer.vue'
 import {
   getWorkspaceInfo,
@@ -26,6 +28,7 @@ import {
 } from '@/api/workspace'
 import { useWorkspaceRestore } from '@/composables/useWorkspaceRestore'
 import { extractErrorMessage } from '@/utils/error'
+import { isLikelyBinaryPath } from '@/utils/fileKind'
 import { toWorkspaceRelative } from '@/utils/workspacePath'
 
 const props = defineProps<{
@@ -279,6 +282,10 @@ const fileStartLine = ref(0)
 const fileTotalLines = ref(0)
 const fileTruncated = ref(false)
 const loadingFile = ref(false)
+/** 当前文件是否二进制(后缀预判或后端 binary 标记):真则改渲染下载卡片 */
+const fileBinary = ref(false)
+/** 二进制文件字节数(卡片展示用) */
+const fileBinarySize = ref(0)
 /** 高亮行号区间(题目 source_lines 定位用) */
 const highlightStart = ref<number | null>(null)
 const highlightEnd = ref<number | null>(null)
@@ -300,18 +307,33 @@ async function openFile(
   endLine: number | null,
 ): Promise<void> {
   if (!props.taskId) return
-  loadingFile.value = true
   selectedFile.value = path
   highlightStart.value = targetLine
   highlightEnd.value = endLine ?? targetLine
+  // 后缀已知二进制:不发内容请求,直接给下载卡片(题目材料极少是二进制,
+  // 真遇到时也比把乱码当源码展示好)
+  if (isLikelyBinaryPath(path)) {
+    fileBinary.value = true
+    fileBinarySize.value = 0
+    fileContent.value = ''
+    fileStartLine.value = 0
+    fileTotalLines.value = 0
+    fileTruncated.value = false
+    return
+  }
+  loadingFile.value = true
   const offset = targetLine ? Math.max(1, targetLine - 20) : 1
   try {
     const res = await readWorkspaceFile(props.taskId, path, offset, PAGE_LINES)
+    fileBinary.value = res.binary === true
+    fileBinarySize.value = res.binary ? res.size || 0 : 0
     fileContent.value = res.content
     fileStartLine.value = res.start_line
     fileTotalLines.value = res.total_lines
     fileTruncated.value = res.truncated
   } catch (err) {
+    fileBinary.value = false
+    fileBinarySize.value = 0
     fileContent.value = `读取失败: ${extractErrorMessage(err)}`
     fileStartLine.value = 0
     fileTotalLines.value = 0
@@ -331,6 +353,8 @@ async function pageFile(delta: number): Promise<void> {
   loadingFile.value = true
   try {
     const res = await readWorkspaceFile(props.taskId, selectedFile.value, next, PAGE_LINES)
+    fileBinary.value = res.binary === true
+    fileBinarySize.value = res.binary ? res.size || 0 : 0
     fileContent.value = res.content
     fileStartLine.value = res.start_line
     fileTotalLines.value = res.total_lines
@@ -588,7 +612,7 @@ watch(
               {{ selectedFile }}
               <span v-if="loadingFile" class="cs-file-loading">读取中…</span>
             </span>
-            <div class="cs-file-pager">
+            <div v-if="!fileBinary" class="cs-file-pager">
               <button
                 class="cs-pager-btn"
                 :disabled="fileOffset <= 1 || loadingFile"
@@ -606,7 +630,15 @@ watch(
               >↓</button>
             </div>
           </div>
+          <FileBinaryCard
+            v-if="fileBinary"
+            :task-id="taskId ?? ''"
+            :path="selectedFile"
+            source="workspace"
+            :size="fileBinarySize"
+          />
           <FileContentViewer
+            v-else
             ref="fileViewerRef"
             class="cs-viewer"
             :content="fileContent"

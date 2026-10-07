@@ -26,7 +26,9 @@ import {
   listTasks,
   updateTaskTitle,
 } from '@/api/task'
+import FileBinaryCard from '@/components/FileBinaryCard.vue'
 import { extractErrorMessage } from '@/utils/error'
+import { isLikelyBinaryPath } from '@/utils/fileKind'
 import { toWorkspaceRelative } from '@/utils/workspacePath'
 import FileContentViewer from './FileContentViewer.vue'
 import type { TaskListItem, TaskStatus } from '@/types/task'
@@ -594,6 +596,10 @@ const fileTotalLines = ref(0)
 const fileTruncated = ref(false)
 const loadingFile = ref(false)
 const fileOffset = ref(1)
+/** 当前文件是否二进制(后端 binary 标记或后缀预判):真则改渲染下载卡片 */
+const fileBinary = ref(false)
+/** 二进制文件字节数(仅卡片展示用;文本态后端回 0) */
+const fileBinarySize = ref(0)
 /** 高亮行号(由结果清单点击跳转设置,滚动定位后保留高亮) */
 const highlightLine = ref<number | null>(null)
 /** 文件查看面板是否被手动隐藏(点击隐藏按钮后为 true,重新选文件时重置) */
@@ -620,6 +626,8 @@ function resetFileTree(): void {
   selectedFilePath.value = null
   selectedFileSource.value = 'workspace'
   fileContent.value = ''
+  fileBinary.value = false
+  fileBinarySize.value = 0
   available.value = false
   unavailableReason.value = ''
   repoPath.value = ''
@@ -928,6 +936,19 @@ async function selectFile(
   fileOffset.value = 1
   highlightLine.value = null // 手动选文件时清除高亮
   filePanelHidden.value = false // 重新选文件时恢复面板显示
+  // 后缀已知二进制:不发内容请求(后端本来也会拦,但那一趟会把几 MB 占位/乱码
+  // 拉过网络),直接进下载卡片;size 未知由卡片自身留空展示
+  if (isLikelyBinaryPath(node.path)) {
+    fileBinary.value = true
+    fileBinarySize.value = 0
+    fileContent.value = ''
+    fileTotalLines.value = 0
+    fileStartLine.value = 0
+    fileEndLine.value = 0
+    fileTruncated.value = false
+    errorMsg.value = ''
+    return
+  }
   await loadFileContent()
 }
 
@@ -968,9 +989,14 @@ async function loadFileContent(): Promise<void> {
     fileEndLine.value = res.end_line
     fileTotalLines.value = res.total_lines
     fileTruncated.value = res.truncated
+    // 后缀表未覆盖的二进制(如未知后缀的 ELF)由后端标记兜住
+    fileBinary.value = res.binary === true
+    fileBinarySize.value = res.binary ? res.size || 0 : 0
   } catch (e) {
     errorMsg.value = extractErrorMessage(e)
     fileContent.value = ''
+    fileBinary.value = false
+    fileBinarySize.value = 0
   } finally {
     loadingFile.value = false
   }
@@ -1118,6 +1144,8 @@ async function expandToPath(filePath: string): Promise<TreeNode | null> {
 
 /** 跳转到指定行:翻到该行所在分页,由查看器滚动 + 高亮 */
 async function jumpToLine(line: number): Promise<void> {
+  // 二进制文件没有行概念(结果清单极少指向它,但路径可能被 LLM 填成 docx)
+  if (fileBinary.value) return
   highlightLine.value = line
   const pageSize = 500
   const targetOffset = Math.floor((line - 1) / pageSize) * pageSize + 1
@@ -1771,7 +1799,8 @@ defineExpose({ openTaskFile })
     <section v-if="showFilePanel" class="file-panel">
       <div class="file-panel-header">
         <span class="file-path" :title="selectedFilePath ?? undefined">{{ selectedFileName }}</span>
-        <div class="file-pagination">
+        <!-- 二进制文件没有行概念,分页条整体隐藏 -->
+        <div v-if="!fileBinary" class="file-pagination">
           <button
             class="page-btn"
             title="上一页"
@@ -1846,7 +1875,16 @@ defineExpose({ openTaskFile })
         <div v-if="loadingFile" class="file-loading">
           <span class="spinner-sm" /> 加载中...
         </div>
+        <!-- 二进制文件:不渲染源码,给"是什么 + 多大 + 下载" -->
+        <FileBinaryCard
+          v-else-if="fileBinary"
+          :task-id="selectedTaskId ?? ''"
+          :path="selectedFilePath"
+          :source="selectedFileSource"
+          :size="fileBinarySize"
+        />
         <FileContentViewer
+          v-else
           ref="fileViewerRef"
           class="file-viewer"
           :content="fileContent"

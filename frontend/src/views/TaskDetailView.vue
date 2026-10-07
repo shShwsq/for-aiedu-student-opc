@@ -54,6 +54,7 @@ import { listArtifacts } from '@/api/taskArtifacts'
 import { clientLog } from '@/utils/clientLog'
 import { extractErrorMessage } from '@/utils/error'
 import { parseDiffFileSegments } from '@/utils/diffFiles'
+import { triggerBlobDownload } from '@/utils/download'
 import { renderMarkdown } from '@/utils/markdown'
 import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
 import { findRetiredCardConvId } from '@/utils/thinkingReconcile'
@@ -512,14 +513,7 @@ async function exportMarkdown(): Promise<void> {
   exporting.value = true
   try {
     const blob = await downloadTaskReportMarkdown(String(task.value.id))
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `task-${task.value.id}.md`
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    URL.revokeObjectURL(url)
+    triggerBlobDownload(blob, `task-${task.value.id}.md`)
   } catch (err) {
     error.value = extractErrorMessage(err)
   } finally {
