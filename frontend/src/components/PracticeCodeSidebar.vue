@@ -12,7 +12,7 @@
  * 交给 FileContentViewer 以只读 CodeMirror 渲染(IDE 行号 + 语法高亮,
  * Markdown 文件可切「预览」)。二进制文件(docx/pdf/图片)后端不回内容,
  * 改渲染 FileBinaryCard(下载原件到本地看)。分页预览看不全的长文档由头部
- * 的下载按钮整份取回(文本/二进制同一入口)。
+ * 的下载按钮整份取回(仅文本文件;二进制用卡片里的大按钮,不重复设入口)。
  *
  * 定位:父组件传入 locateFile/locateLine(来自当前题的 source_file/source_lines),
  * 变化时自动展开对应目录、打开文件并滚动高亮。
@@ -302,12 +302,13 @@ const fileViewerRef = ref<FileContentViewerHandle | null>(null)
 // ---- 下载当前文件 ----
 // 文本文件(含 md)原先只有二进制卡片带下载按钮,而题目材料常是长文档:分页
 // 预览看不全,得能整份取回。动作与 FileBinaryCard 共用 useFileDownload。
+// 二进制隐藏头部按钮(卡片自带大按钮,两个入口各持一份 downloading 会状态打架)。
 // 本栏只浏览工作区(无上传回退树),故 source 恒为 workspace
 const {
   downloading: fileDownloading,
   downloadError,
   run: runFileDownload,
-  reset: resetFileDownload,
+  clearError: clearFileDownloadError,
 } = useFileDownload()
 
 const fileLineCount = computed(() => (fileContent.value ? fileContent.value.split('\n').length : 0))
@@ -321,7 +322,7 @@ async function openFile(
 ): Promise<void> {
   if (!props.taskId) return
   selectedFile.value = path
-  resetFileDownload() // 上个文件的下载失败文案不跟着串过来
+  clearFileDownloadError() // 上个文件的下载失败文案不跟着串过来
   highlightStart.value = targetLine
   highlightEnd.value = endLine ?? targetLine
   // 后缀已知二进制:不发内容请求,直接给下载卡片(题目材料极少是二进制,
@@ -428,7 +429,7 @@ async function init(): Promise<void> {
   unavailableReason.value = ''
   repoPath.value = ''
   resetRestore()
-  resetFileDownload()
+  clearFileDownloadError()
   selectedFile.value = null
   fileContent.value = ''
   highlightStart.value = null
@@ -649,9 +650,11 @@ watch(
                 @click="pageFile(1)"
               >↓</button>
             </div>
-            <!-- 下载当前文件:文本(含 md)分页预览看不全,得能整份取回;
-                 二进制文件卡片里另有大按钮,这里同口径可下 -->
+            <!-- 下载当前文件:文本(含 md)分页预览看不全,得能整份取回。
+                 二进制隐藏此按钮——FileBinaryCard 自带大按钮,两个入口各持一份
+                 downloading 会状态打架(点一个另一个不禁用,还能并行下同一文件) -->
             <button
+              v-if="!fileBinary"
               class="cs-file-dl-btn"
               :disabled="!taskId || !selectedFile || fileDownloading"
               :title="fileDownloading ? '下载中…' : '下载该文件'"

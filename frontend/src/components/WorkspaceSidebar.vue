@@ -615,12 +615,13 @@ const fileViewerRef = ref<FileContentViewerHandle | null>(null)
 
 // ---- 下载当前文件 ----
 // 文本文件(尤其 md)原先只有二进制卡片带下载按钮,长文档分页看不全就没法整份取回;
-// 这里给所有选中文件统一一个入口,动作本身与 FileBinaryCard 共用 useFileDownload
+// 这里给文本文件补上入口(二进制仍由 FileBinaryCard 的大按钮负责,头部按钮对二进制
+// 隐藏,两个入口各持一份状态会打架)。动作本身与卡片共用 useFileDownload
 const {
   downloading: fileDownloading,
   downloadError,
   run: runFileDownload,
-  reset: resetFileDownload,
+  clearError: clearFileDownloadError,
 } = useFileDownload()
 
 // ---- 错误提示 ----
@@ -656,8 +657,8 @@ function resetFileTree(): void {
   uploadsTruncated.value = false
   loadingUploads.value = false
   uploadsTreeLoaded = false
-  // 下载状态一并重置(切换任务时不残留上个任务的失败文案,并作废进行中的请求)
-  resetFileDownload()
+  // 下载失败文案一并清掉(切任务不残留上个任务的报错;进行中的下载照常送达)
+  clearFileDownloadError()
 }
 
 // ============================================================
@@ -949,7 +950,7 @@ async function selectFile(
   fileOffset.value = 1
   highlightLine.value = null // 手动选文件时清除高亮
   filePanelHidden.value = false // 重新选文件时恢复面板显示
-  resetFileDownload() // 上个文件的下载失败文案不跟着串过来
+  clearFileDownloadError() // 上个文件的下载失败文案不跟着串过来
   // 后缀已知二进制:不发内容请求(后端本来也会拦,但那一趟会把几 MB 占位/乱码
   // 拉过网络),直接进下载卡片;size 未知由卡片自身留空展示
   if (isLikelyBinaryPath(node.path)) {
@@ -1872,9 +1873,11 @@ defineExpose({ openTaskFile })
             </svg>
           </button>
         </div>
-        <!-- 下载当前文件:文本(含 md)分页预览看不全,长文档要能整份取回;
-             二进制文件卡片里另有大按钮,这里同口径可下 -->
+        <!-- 下载当前文件:文本(含 md)分页预览看不全,长文档要能整份取回。
+             二进制隐藏此按钮——FileBinaryCard 自带大按钮,两个入口各持一份
+             downloading 会状态打架(点一个另一个不禁用,还能并行下同一文件) -->
         <button
+          v-if="!fileBinary"
           class="icon-btn file-download-btn"
           :disabled="!selectedFilePath || !selectedTaskId || fileDownloading"
           :title="fileDownloading ? '下载中…' : '下载该文件'"

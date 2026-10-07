@@ -9,10 +9,12 @@
  * - workspace:沙箱工作区文件,依赖 session —— 过期后后端 404,提示走「重新克隆」
  * - uploads:用户上传原件,不经沙箱,保留期内始终可取回
  *
- * 竞态用 seq 令牌防住:下载中切换文件/任务时(reset),旧请求既不能把失败文案
- * 写进当前 UI,也不能在几分钟后凭空弹出一个上个文件的下载。
+ * 令牌只门控**错误文案**,不门控**送达**:用户点过下载就该收到文件,哪怕他随后
+ * 去点别的文件/关掉面板(大文件流式可达 120s,等待中顺手浏览是常态)。把导航
+ * 当成取消会静默丢弃这次下载且毫无提示 —— 那是浏览器行为的反直觉面,不是中止按钮。
+ * 代价:切走之后那次下载的失败不再显示(它已不属于当前文件,冒出来反而误导)。
  */
-import { getCurrentInstance, onUnmounted, ref } from 'vue'
+import { ref } from 'vue'
 
 import { downloadWorkspaceFile, downloadWorkspaceUploadsFile } from '@/api/workspace'
 import { extractErrorMessage } from '@/utils/error'
@@ -27,13 +29,12 @@ export function useFileDownload() {
   /** 失败信息(空=无错误);由调用方渲染在文件面板内 */
   const downloadError = ref('')
 
-  /** 竞态令牌:reset/新一次 run 都会自增,旧请求据此停笔 */
-  let seq = 0
+  /** 错误令牌:clearError/新一次 run 都会自增,旧请求的失败据此不写进当前 UI */
+  let errorToken = 0
 
-  /** 清状态并作废进行中的请求(切换文件/任务、面板重开时调用) */
-  function reset(): void {
-    seq += 1
-    downloading.value = false
+  /** 只清失败文案(切换文件/任务时调用);进行中的下载不受影响,照常送达 */
+  function clearError(): void {
+    errorToken += 1
     downloadError.value = ''
   }
 
@@ -41,7 +42,7 @@ export function useFileDownload() {
    * 下载一个文件;返回是否成功(失败原因写进 downloadError)
    *
    * taskId/path 缺失直接返回 false(不发起请求,也不报错——按钮本就禁用);
-   * 重复点击由 downloading 拦下。
+   * 重复点击由 downloading 拦下(同一按钮连点不会排队多个大文件请求)。
    */
   async function run(
     taskId: string,
@@ -49,7 +50,8 @@ export function useFileDownload() {
     source: FileDownloadSource = 'workspace',
   ): Promise<boolean> {
     if (!taskId || !path || downloading.value) return false
-    const my = ++seq
+    // 占位错误令牌:此后若发生切换(clearError)或新的下载,本次的失败就不再展示
+    const my = ++errorToken
     downloading.value = true
     downloadError.value = ''
 
@@ -57,21 +59,17 @@ export function useFileDownload() {
       const fetcher =
         source === 'uploads' ? downloadWorkspaceUploadsFile : downloadWorkspaceFile
       const { blob, filename } = await fetcher(taskId, path)
-      // 已被 reset/新的下载作废:不要把上个文件的文件弹出去
-      if (my !== seq) return false
-      // 服务端给的中文名优先,缺失时回落路径末段
+      // 送达不看令牌:用户点过的下载必须落到本地
+      // 服务端给的中文名优先,缺失时回落路径末段(path 为调用时快照,不会错标)
       triggerBlobDownload(blob, filename || basenameOf(path))
       return true
     } catch (err) {
-      if (my === seq) downloadError.value = extractErrorMessage(err)
+      if (my === errorToken) downloadError.value = extractErrorMessage(err)
       return false
     } finally {
-      if (my === seq) downloading.value = false
+      downloading.value = false
     }
   }
 
-  // 脱离组件作用域调用时(如单元测试)跳过生命周期注册
-  if (getCurrentInstance()) onUnmounted(() => { seq += 1 })
-
-  return { downloading, downloadError, run, reset }
+  return { downloading, downloadError, run, clearError }
 }

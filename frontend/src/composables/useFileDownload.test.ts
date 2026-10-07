@@ -1,12 +1,13 @@
 /**
- * useFileDownload 单测:端点选择 + 文件名回落 + 竞态停笔
+ * useFileDownload 单测:端点选择 + 文件名回落 + 送达不被导航打断
  *
  * 覆盖「文本文件(含 md)新增下载入口」的关键行为:
  * - source 分流:uploads 走上传原件端点,workspace 走沙箱端点
  * - 文件名:服务端 Content-Disposition 优先,缺失时回落路径末段
  * - 失败:把后端 detail(经 extractErrorMessage)写进 downloadError 并复位 downloading
- * - 下载途中切换文件(reset):旧请求既不弹出上个文件的下载,也不把错误写进当前 UI,
- *   且 downloading 必须复位(否则新文件的下载按钮永久禁用)
+ * - 导航不等于取消:下载途中切文件(clearError),已点下去的那次**仍要送达**,
+ *   只有它的失败文案被丢弃(那失败已不属于当前浏览的文件)
+ * - 令牌只门控错误:任何终态都要把 downloading 归位,否则按钮永久禁用
  */
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 
@@ -33,7 +34,10 @@ const blob = { kind: 'blob' } as unknown as Blob
 
 describe('useFileDownload', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    // resetAllMocks 而非 clearAllMocks:clear 只清调用记录,持久实现
+    // (mockResolvedValue / mockImplementation)会跨用例泄漏,后续用例忘设 mock 时
+    // 会拿到上个用例遗留的挂起 Promise 而静默超时
+    vi.resetAllMocks()
   })
 
   it('默认走工作区端点,并采用服务端给出的中文名', async () => {
@@ -84,7 +88,7 @@ describe('useFileDownload', () => {
     expect(downloadError.value).toBe('')
   })
 
-  it('重复点击只发一次请求', async () => {
+  it('下载中再点(同文件或换文件)被拦下:不排队并发请求', async () => {
     let resolveFirst: (v: { blob: Blob; filename: string }) => void = () => {}
     wsMock.mockImplementation(
       () => new Promise((resolve) => { resolveFirst = resolve }),
@@ -93,35 +97,41 @@ describe('useFileDownload', () => {
 
     const first = run('t1', 'a.md')
     await expect(run('t1', 'a.md')).resolves.toBe(false)
+    await expect(run('t1', 'b.md')).resolves.toBe(false)
     expect(wsMock).toHaveBeenCalledTimes(1)
     resolveFirst({ blob, filename: 'a.md' })
     await expect(first).resolves.toBe(true)
   })
 
-  it('下载途中切文件(reset):旧请求停笔,不弹出下载、不写错误,且可再次下载', async () => {
+  it('下载途中切文件:已点下去的下载仍要送达(导航不等于取消)', async () => {
     let resolveStale: (v: { blob: Blob; filename: string }) => void = () => {}
     wsMock.mockImplementationOnce(
       () => new Promise((resolve) => { resolveStale = resolve }),
     )
-    const { run, reset, downloading, downloadError } = useFileDownload()
+    const { run, clearError, downloading } = useFileDownload()
 
-    const stale = run('t1', 'old.md')
-    reset() // 模拟切换文件/任务
+    const inFlight = run('t1', 'docs/大合同.docx')
+    clearError() // 用户切去浏览别的文件
+    resolveStale({ blob, filename: '大合同.docx' })
+
+    await expect(inFlight).resolves.toBe(true)
+    expect(fireMock).toHaveBeenCalledWith(blob, '大合同.docx')
     expect(downloading.value).toBe(false)
+  })
 
-    let resolveStaleErr: (e: unknown) => void = () => {}
+  it('切走之后那次下载才失败:过期失败不写进当前 UI,但状态照常归位', async () => {
+    let rejectStale: (e: unknown) => void = () => {}
     wsMock.mockImplementationOnce(
-      () => new Promise((_resolve, reject) => { resolveStaleErr = reject }),
+      () => new Promise((_resolve, reject) => { rejectStale = reject }),
     )
-    const next = run('t1', 'new.md')
-    resolveStale({ blob, filename: 'old.md' })
-    await expect(stale).resolves.toBe(false)
-    expect(fireMock).not.toHaveBeenCalled()
+    const { run, clearError, downloadError, downloading } = useFileDownload()
 
-    // reset 后新一次下载照常成立:自己的错误写进自己的文案位
-    resolveStaleErr(new Error('文件过大(80.0MB),下载上限 50MB'))
-    await expect(next).resolves.toBe(false)
-    expect(downloadError.value).toBe('文件过大(80.0MB),下载上限 50MB')
+    const inFlight = run('t1', 'old.md')
+    clearError()
+    rejectStale(new Error('工作区不可用:尚未 clone 仓库'))
+
+    await expect(inFlight).resolves.toBe(false)
+    expect(downloadError.value).toBe('')
     expect(downloading.value).toBe(false)
   })
 })

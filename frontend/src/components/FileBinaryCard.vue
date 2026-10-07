@@ -10,7 +10,9 @@
  * - workspace:沙箱工作区文件,会话过期后下载会失败(提示走「重新克隆」)
  * - uploads:用户上传原件,不经沙箱,保留期内始终可取回
  *
- * 下载动作本身在 useFileDownload 里(文件面板头部的下载按钮走同一套)。
+ * 下载动作本身在 useFileDownload 里。二进制文件下本卡片是大按钮的唯一持有者:
+ * 面板头部的下载按钮对二进制隐藏,免得两个入口各持一份 downloading 状态、
+ * 点两下并行下同一文件。
  */
 import { computed, watch } from 'vue'
 
@@ -33,11 +35,12 @@ const props = withDefaults(
 )
 
 const {
-  downloading, downloadError: errorMsg, run: runDownload, reset: resetDownload,
+  downloading, downloadError: errorMsg, run: runDownload, clearError: clearDownloadError,
 } = useFileDownload()
 
-// 卡片实例在切换文件时被复用(父级 v-else-if 不重建),上个文件的失败文案要清掉
-watch(() => [props.taskId, props.path, props.source], resetDownload)
+// 卡片实例在切换文件时被复用(父级 v-else-if 不重建),上个文件的失败文案要清掉;
+// 只清文案 —— 已经点下去的下载要继续送达
+watch(() => [props.taskId, props.path, props.source], clearDownloadError)
 
 const filename = computed(() => basenameOf(props.path))
 const kindLabel = computed(() => {
