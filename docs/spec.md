@@ -312,6 +312,7 @@ Result(任务结果项,通用)
 - **多平台抽象**:统一 `GitProvider` 抽象层(GitHub / Gitee),按仓库 URL 主机自动识别平台并选用对应 token
 - clone 协议回退:HTTPS+token → SSH → HTTPS 匿名
 - token 注入格式按平台差异:GitHub 用 `x-access-token:{token}@github.com`,Gitee 用 `oauth2:{token}@gitee.com`
+- **token 不落盘到工作区**:git 会把"从哪个 URL 取的数据"原样记进 `.git/config`(remote.origin.url)、`.git/FETCH_HEAD`,以及 `.git/logs/` 下的 reflog(HEAD 与被检出分支那份)——不处理的话,用户授权的 OAuth token 就长期躺在可预览/可下载的工作区里。克隆成功后由 `sandbox_tools._scrub_clone_credentials` ①`git remote set-url origin <匿名 URL>` ②按模式剥离这些文件里 URL 的 userinfo ③复查残留并记 error(清理失败不推翻克隆结果)。剥离用模式匹配而非替换 token 字面值:token 从不进命令行(否则会落进 execd 记录的命令里,等于换个泄漏面)。bare 缓存侧早有同一纪律(`repo_cache._build_bare_cache` 建完即 set-url 并校验 config 不含 token),这里补齐工作区侧。副作用(有意):清洗后工作区不再带联网凭证,agent 在其中对私有仓库跑 `git fetch/pull` 会匿名失败——审计快照不需要写回远端
 
 ### 7.2 微信内容安全
 - 审计报告中可能含敏感词(如 "漏洞"、代码片段中的关键字)

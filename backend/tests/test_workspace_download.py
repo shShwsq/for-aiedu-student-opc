@@ -353,3 +353,99 @@ def test_uploads_download_denied_path_403(uploads_env):
         with pytest.raises(HTTPException) as ei:
             _uploads_download(task, bad)
         assert ei.value.status_code == 403
+
+
+# ============================================================
+# 回归:stat_size 归一 SDK 异常(未归一时下载不存在文件 → 500)
+# ============================================================
+
+
+class _FakeApiException(Exception):
+    """模拟 SandboxApiException:纯 Exception 子类(非 FileNotFoundError),带 status_code"""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _sandbox_session_get_file_info(side_effect: Exception | None = None, ret=None):
+    from app.sandbox.client import SandboxSession
+
+    mock_sb = MagicMock()
+    if side_effect is not None:
+        mock_sb.files.get_file_info.side_effect = side_effect
+    else:
+        mock_sb.files.get_file_info.return_value = ret
+    return SandboxSession(mode="sandbox", sandbox=mock_sb)
+
+
+def test_stat_size_returns_size_on_success():
+    s = _sandbox_session_get_file_info(ret={"/repo/a.pdf": MagicMock(size=42)})
+    assert s.stat_size("/repo/a.pdf") == 42
+
+
+def test_stat_size_normalizes_404_status_to_file_not_found():
+    s = _sandbox_session_get_file_info(
+        _FakeApiException("Get file info failed: HTTP 404", status_code=404)
+    )
+    with pytest.raises(FileNotFoundError):
+        s.stat_size("/repo/gone.docx")
+
+
+def test_stat_size_normalizes_not_exist_message():
+    """无 status_code 属性时按消息文本兜底归一(对齐 list_directory 口径)"""
+    s = _sandbox_session_get_file_info(Exception("path does not exist"))
+    with pytest.raises(FileNotFoundError):
+        s.stat_size("/repo/gone.docx")
+
+
+def test_stat_size_reraises_non_not_found():
+    """非"不存在"类 SDK 异常(如 500)原样抛出,不误判成 FileNotFoundError"""
+    s = _sandbox_session_get_file_info(
+        _FakeApiException("Get file info failed: HTTP 500", status_code=500)
+    )
+    with pytest.raises(_FakeApiException):
+        s.stat_size("/repo/x.docx")
+
+
+# ============================================================
+# 回归:_download_headers 剔除文件名中的控制字符(CR/LF 泄漏 → h11 断连)
+# ============================================================
+
+
+def test_download_headers_strip_control_chars():
+    cd = ws_router._download_headers("evil\r\nX-Injected: 1.pdf")["Content-Disposition"]
+    # 响应头里绝不能残留原始 CR/LF(否则整条头被判非法)
+    assert "\r" not in cd and "\n" not in cd
+    # 内容仍在(只是并进 filename 值里,不再是独立头行);filename* 走百分号编码
+    assert "filename=\"evilX-Injected: 1.pdf\"" in cd
+    assert "%0D%0A" in cd
+
+
+# ============================================================
+# 回归:预览端点套用凭证拒绝清单(与下载同口径)
+# ============================================================
+
+
+def _preview(task, path):
+    return ws_router.read_workspace_file(
+        task.id, path=path, db=_db(task), current_user=_user()
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [".git/config", "sub/.git/config", ".GIT/config", "id_rsa", "keys/server.pem"],
+)
+def test_read_workspace_file_denied_paths_403(bad_path):
+    tid = f"t-{uuid.uuid4()}"
+    _register_sandbox_session(tid, FakeSandboxSession(), repo_path="/repo")
+    task = _make_task("u1", {})
+    task.id = tid
+    try:
+        with pytest.raises(HTTPException) as ei:
+            _preview(task, bad_path)
+        assert ei.value.status_code == 403
+    finally:
+        _cleanup(tid)
+

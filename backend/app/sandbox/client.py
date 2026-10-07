@@ -210,7 +210,21 @@ class SandboxSession:
         if self.mode != "sandbox":
             raise RuntimeError("stat_size 仅 sandbox 模式可用")
 
-        infos = self.sandbox.files.get_file_info([path])
+        # 与 list_directory 同口径归一 SDK 异常:execd 对缺失文件逐路径返回 404,
+        # SDK 会抛 SandboxApiException(纯 Exception,非 FileNotFoundError),不归一
+        # 会让下载端点漏捕 → 500(而非应有的 404)
+        try:
+            infos = self.sandbox.files.get_file_info([path])
+        except FileNotFoundError:
+            raise
+        except Exception as e:
+            if getattr(e, "status_code", None) == 404:
+                raise FileNotFoundError(f"文件不存在: {path}") from e
+            msg = str(e).lower()
+            if "not exist" in msg or "no such" in msg or "404" in msg:
+                raise FileNotFoundError(f"文件不存在: {path}") from e
+            raise
+
         info = infos.get(path) if isinstance(infos, dict) else None
         if info is None:
             raise FileNotFoundError(f"文件不存在: {path}")

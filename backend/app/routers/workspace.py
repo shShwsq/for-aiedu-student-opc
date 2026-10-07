@@ -152,9 +152,12 @@ def _download_headers(filename: str, content_length: int | None = None) -> dict:
     content_length 仅在字节已全部在手时给(沙箱流式路径不知道总长,宁可让
     浏览器显示"未知大小"也不要因 stat 与实际流不一致而截断)。
     """
-    ascii_name = (
-        filename.encode("ascii", "ignore").decode().replace('"', "").replace("\\", "")
-    ).strip() or "download"
+    # CR/LF 属 ASCII:encode(..., "ignore") 与 .strip() 都清不掉文件名中间的控制字符,
+    # 残留会让 h11 判整个响应头非法(LocalProtocolError)而断连——故显式剔除控制字符
+    sanitized = "".join(
+        ch for ch in filename.encode("ascii", "ignore").decode() if ch >= " " and ch != "\x7f"
+    )
+    ascii_name = (sanitized.replace('"', "").replace("\\", "")).strip() or "download"
     headers = {
         "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}",
         "Cache-Control": "no-store",
@@ -326,6 +329,14 @@ def read_workspace_file(
     """
     _check_task_access(task_id, db, current_user)
     sandbox_tools.cleanup_expired_sessions_bg()
+
+    # 凭证/密钥类路径与下载端点同口径拒绝:预览接受任意 path,?path=.git/config
+    # 会把带 token 的 clone URL 按文本读出(文件树虽剪掉 .git,直连 URL 拦不住)
+    if is_denied_download_path(path or ""):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="该文件不支持预览(凭证 / 密钥类路径)",
+        )
 
     try:
         return sandbox_tools.browse_read_file(str(task_id), path, offset, max_lines)

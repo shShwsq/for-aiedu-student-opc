@@ -3198,6 +3198,126 @@ def str_replace_editor(
 
 
 # ============================================================
+# 辅助:克隆凭证清理(工作区里不留 token)
+# ============================================================
+
+# git 会把"这次从哪个 URL 取的数据"原样记进工作区:
+# - `.git/config` 的 remote.origin.url(长期生效)
+# - `.git/FETCH_HEAD` 的 "… of <url>"(上次 fetch 的账本)
+# - `.git/logs/` 下的 reflog:"clone: from <url>" —— clone 同时写 HEAD 与被检出的
+#   分支 ref(`logs/refs/heads/main`),只清 logs/HEAD 会漏掉分支那份
+# 私有仓库走的是 `https://{user}:{token}@host/...`,于是用户授权的 OAuth token
+# 会长期躺在可预览、可下载的工作区里。与 bare 缓存同一套纪律(repo_cache 建立缓存后
+# 立刻 set-url 并校验 config 不含 token):克隆成功后把 URL 里的凭证抹掉。
+_GIT_URL_RECORD_FILES = (".git/config", ".git/FETCH_HEAD")
+_GIT_LOG_DIR = ".git/logs"
+
+# 只剥 http(s) URL 的 userinfo:SSH 形态的 git@host:path 不是凭证注入,不该被误伤
+_URL_USERINFO_RE = re.compile(r"(\bhttps?://)[^/\s@]+@", re.IGNORECASE)
+
+# 上面那条正则在沙箱侧的两个等价写法(集中一份,避免"洗的口径"与"复查的口径"分叉):
+# - sed 用 @ 作分隔符(URL 里有 /),只替换 userinfo,不动主机与路径
+# - grep -E 用于复查残留
+_SANDBOX_STRIP_USERINFO_SED = "s@(https?://)[^[:space:]/@]+@\\1@"
+_URL_USERINFO_GREP = "https?://[^[:space:]/@]+@"
+
+
+def _looks_credentialed(url: str) -> bool:
+    """URL 是否在 userinfo 里带了凭证(HTTPS+token 形态)"""
+    return bool(_URL_USERINFO_RE.search(url or ""))
+
+
+def _scrub_url_userinfo(text: str) -> str:
+    """抹掉文本里所有 http(s) URL 的 userinfo
+
+    按模式匹配而非替换 token 字面值:既不需要把 token 传进 shell 命令(那会让它
+    出现在命令行与 execd 记录的命令里,等于换个泄漏面),也能覆盖 config/FETCH_HEAD/
+    reflog 各处不同写法。
+    """
+    return _URL_USERINFO_RE.sub(r"\1", text)
+
+
+def _credential_record_files(repo_path: str) -> list[Path]:
+    """local 模式:列出 git 记过克隆 URL 的既存普通文件(config/FETCH_HEAD/全部 reflog)"""
+    root = Path(repo_path)
+    files = [root / rel for rel in _GIT_URL_RECORD_FILES]
+    log_dir = root / _GIT_LOG_DIR
+    if log_dir.is_dir():
+        files.extend(p for p in sorted(log_dir.rglob("*")) if p.is_file())
+    return [p for p in files if p.is_file()]
+
+
+def _scrub_clone_credentials(
+    ctx: dict, repo_path: str, used_url: str, anon_url: str, task_id: str = "",
+) -> None:
+    """克隆成功后把带 token 的 URL 从工作区里抹掉
+
+    步骤:① `git remote set-url origin <匿名 URL>`(今后 remote 指向无凭证形态)
+    ② 清洗 git 记过 URL 的文本文件(config / FETCH_HEAD / logs/ 下全部 reflog)
+    ③ 复查仍含 userinfo 则记 error —— 但**不推翻克隆结果**(工作区已就绪是主目标,
+    失败面只在这一处,且匿名化后 agent 也拿不到凭证原文)
+
+    副作用(有意为之):清洗后工作区不再具备联网凭证,agent 在里面跑 `git fetch/pull`
+    对私有仓库会匿名失败。审计快照本就不需要写回远端,而把 token 留在盘上才是真风险。
+    """
+    if not _looks_credentialed(used_url):
+        return  # 匿名 HTTPS / SSH 克隆:git 记的 URL 本就不含凭证
+    session: SandboxSession = ctx["session"]
+    repo = str(repo_path)
+    try:
+        if ctx.get("mode") == "local":
+            # 不经 shell:Windows cmd.exe 没有 POSIX 引号规则,argv 才可靠
+            session.run_command_argv(
+                ["git", "-C", repo, "remote", "set-url", "origin", anon_url],
+                timeout=30,
+            )
+            residual = []
+            for f in _credential_record_files(repo):
+                text = f.read_text(encoding="utf-8", errors="replace")
+                cleaned = _scrub_url_userinfo(text)
+                if cleaned != text:
+                    f.write_text(cleaned, encoding="utf-8")
+                # 回读复查:写失败/只读属性(Windows 的 git pack 文件)都在这暴露
+                if _looks_credentialed(f.read_text(encoding="utf-8", errors="replace")):
+                    residual.append(str(f))
+        else:
+            q = shlex.quote(repo)
+            # 固定两处 + logs 目录整树:reflog 除 logs/HEAD 还有分支那份
+            # (logs/refs/heads/main),用 find -exec 枚举 —— 它按 NUL 分组传参,
+            # 不像 $(find …) 那样被路径里的空格拆坏
+            plain = " ".join(f"{q}/{rel}" for rel in _GIT_URL_RECORD_FILES)
+            log_dir = f"{q}/{_GIT_LOG_DIR}"
+            scrub = (
+                f"for p in {plain}; do [ -f \"$p\" ] && "
+                f"sed -i -E '{_SANDBOX_STRIP_USERINFO_SED}' \"$p\"; done; "
+                f"[ -d {log_dir} ] && find {log_dir} -type f "
+                f"-exec sed -i -E '{_SANDBOX_STRIP_USERINFO_SED}' {{}} +; true"
+            )
+            scan = (
+                f"for p in {plain}; do [ -f \"$p\" ] && "
+                f"grep -El '{_URL_USERINFO_GREP}' \"$p\"; done; "
+                f"[ -d {log_dir} ] && find {log_dir} -type f "
+                f"-exec grep -El '{_URL_USERINFO_GREP}' {{}} +; true"
+            )
+            session.run_command(
+                f"git -C {q} remote set-url origin {shlex.quote(anon_url)}; {scrub}",
+                timeout=30,
+            )
+            residual = [ln.strip() for ln in session.run_command(scan).splitlines() if ln.strip()]
+        if residual:
+            logger.error(
+                f"[task={task_id}] 克隆凭证清理未彻底,仍含 URL 凭证: {residual}"
+            )
+        else:
+            logger.info(f"[task={task_id}] 已清除工作区内的克隆凭证 URL 记录")
+    except Exception as e:
+        # 清理失败不推翻克隆:工作区可用是主目标,但要留下可排查的显式记录
+        logger.error(
+            f"[task={task_id}] 克隆凭证清理失败(工作区可能仍留有 token URL): {str(e)[:200]}"
+        )
+
+
+# ============================================================
 # 辅助:URL 转换(委托给 git_provider 抽象,按主机识别平台)
 # ============================================================
 
@@ -3396,6 +3516,11 @@ def _clone_repo_fallback(
                     )
                 _set_repo_path(task_id, result["path"])
                 _record_clone_source(ctx, repo_url, attempt_branch, result["path"])
+                # token 不落盘:带凭证的 HTTPS 克隆会把 URL 写进 .git/config、
+                # FETCH_HEAD 与初始 reflog,克隆成功后一律抹掉
+                _scrub_clone_credentials(
+                    ctx, result["path"], url, https_anon, task_id=task_id
+                )
                 logger.info(f"[clone_fallback] task={task_id} 克隆成功(协议 {safe_url})")
                 return result
             except CloneSkippedError:
