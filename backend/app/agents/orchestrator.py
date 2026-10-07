@@ -1364,25 +1364,6 @@ def _followup_upload_ids(params: dict | None) -> list[str]:
     return extract_followup_ids(params)
 
 
-def _followup_slot_paths(followup_ids: list[str]) -> list[str]:
-    """追问附件在工作根下的相对路径(委托 upload_layout,与传输/回退浏览同一布局)
-
-    只为“恢复流程已重放过”的那条路径服务:重放在 _restore_workspace_if_needed
-    里做完,本轮不重复传(大 zip 重传代价可观),提示文案里的路径就按布局算出来。
-    meta 读取失败(已被 GC)不阻断:槽位名回退 uid 前缀,与传输侧口径一致。
-    """
-    from app.services.upload_layout import compute_upload_layout
-    from app.services.uploads import load_upload_meta
-
-    metas: dict[str, dict] = {}
-    for uid in followup_ids:
-        try:
-            metas[uid] = load_upload_meta(uid)
-        except Exception:
-            metas[uid] = {}
-    return [s.prefix for s in compute_upload_layout([], followup_ids, metas) if s.prefix]
-
-
 def _warn_followup_uploads_unavailable(
     task: Task, db: Session, round_idx: int | None, reason: str,
 ) -> None:
@@ -1437,27 +1418,35 @@ def _transfer_followup_uploads(
 def _followup_attachment_note(
     task: Task, db: Session, task_id_str: str, upload_ids: list[str],
     restored: bool, round_idx: int,
+    followup_replay: dict | None = None,
 ) -> str:
     """本轮追问附件的工作区提示(拼在追问文本末尾)
 
-    成功:路径取**实际落位结果**(restored=True 时恢复流程已重放,按同一布局取
-    路径、不重复传输),附上工作根绝对路径,模型不必自己猜;
-    失败:如实告知附件未送达(防模型臆测),可见告警已由
-    _transfer_followup_uploads 落库。
+    路径**只来自真的传输结果**,不再按布局猜:
+    - 恢复段已把本轮全部 ids 重放过 → 用它的实际落位列表(不重复传输,
+      大 zip 重传代价可观);重放一个也没落地时拼如实告知提示 —— 告警已由
+      _transfer_followup_uploads 在恢复段落库,不再重传也避掉第二份告警
+    - 其余情形(会话存活 / 本轮新 ids 没被恢复段重放)→ 亲自传一遍
 
-    旧实现是无条件拼固定文案:传没传成都说"已放入 followup_uploads/",模型
-    对着不存在的文件编答案,用户也毫无线索。
+    为何不能按布局算路径(旧实现):恢复段重放失败时工作区里根本没有那些目录,
+    提示却照旧说"已放入工作区",恰好是本次改动要消除的"把不存在的文件说成
+    已就位";而本轮新 ids 没进 params 的边缘情况下,猜出的下标还会指向从未
+    传输过的槽位(提示路径与实际落位不符)。
     """
     merged_ids = _followup_upload_ids(task.params)
     for uid in upload_ids:
         if uid and uid not in merged_ids:
             merged_ids.append(uid)  # 防御:params 未含本轮 ids 的边缘情况
-    added = (
-        _followup_slot_paths(merged_ids) if restored
-        else _transfer_followup_uploads(
+    replay_ids = list((followup_replay or {}).get("ids") or [])
+    replay_covers_all = bool(replay_ids) and all(
+        uid in replay_ids for uid in merged_ids
+    )
+    if restored and replay_covers_all:
+        added = list((followup_replay or {}).get("added") or [])
+    else:
+        added = _transfer_followup_uploads(
             task, db, task_id_str, merged_ids, round_idx=round_idx,
         )
-    )
     if not added:
         return ATTACHMENT_UNAVAILABLE_NOTE
     ws_root = (sandbox_tools.get_workspace_info(task_id_str) or {}).get("repo_path", "")
@@ -1609,7 +1598,7 @@ def _write_memory_files_for_task(
 
 def _restore_workspace_if_needed(
     task: Task, db: Session, task_id_str: str, git_tokens: dict | None = None,
-    round_idx: int | None = None,
+    round_idx: int | None = None, followup_replay: dict | None = None,
 ) -> bool:
     """沙箱会话已被回收且任务配了仓库 → 重新克隆恢复工作区
 
@@ -1627,6 +1616,11 @@ def _restore_workspace_if_needed(
 
     round_idx(可选):仅用于追问附件重放失败时的告警落库轮号(由 resume 传入
     本轮轮号);不传则重放失败只进日志(如重试链路)。
+
+    followup_replay(可选,out 参数):本次真重放过追问附件时写入
+    {"ids": 重放的 upload_id 列表, "added": 实际落位的相对路径}。
+    调用方要靠它区分"没重放"(键缺失)与"重放了但全失败"(added 为空),
+    否则给模型的附件提示只能靠布局猜(与实际是否就位无关)。
     """
     params = task.params or {}
     repo_url = params.get("repo_url")
@@ -1663,10 +1657,14 @@ def _restore_workspace_if_needed(
     # 传输到 followup_uploads/,与运行中追问落地位置一致(agent 目录级感知)。
     # 失败不阻断恢复(创建内容已就位,追问文件缺失仅影响该部分上下文)——
     # 不中断但要可见,告警落库由 _transfer_followup_uploads 统一负责。
+    # 重放结果写回 followup_replay 出参:调用方的附件提示只能拿实际落位路径。
     if followup_ids:
-        _transfer_followup_uploads(
+        added = _transfer_followup_uploads(
             task, db, task_id_str, followup_ids, round_idx=round_idx,
         )
+        if followup_replay is not None:
+            followup_replay["ids"] = list(followup_ids)
+            followup_replay["added"] = added
     return True
 
 
@@ -1769,8 +1767,11 @@ def resume_audit_with_message(
     # 重试链路进入本函数前已自行恢复过工作区,此处会话存活会自然跳过,不会双重 clone
     _t0 = time.perf_counter()
     repo_url = (task.params or {}).get("repo_url")
+    # 追问附件重放结果(出参):{ids, added};没重放过就保持空
+    followup_replay: dict = {}
     restored = _restore_workspace_if_needed(
-        task, db, task_id_str, git_tokens, round_idx=start_round_idx,
+        task, db, task_id_str, git_tokens,
+        round_idx=start_round_idx, followup_replay=followup_replay,
     )
     if not restored:
         _write_memory_files_for_task(task, db, task_id_str, repo_url)
@@ -1783,14 +1784,15 @@ def resume_audit_with_message(
     # 本轮追问附带的文件:传输进工作区 followup_uploads/(不重定向 repo_path;
     # 无工作根的纯对话任务则由传输原语按需建根,见 _ensure_upload_work_root)。
     # restored=True 时 _restore_workspace_if_needed 已按 params.followup_upload_ids
-    # 重放(API 端点在调用前已把本轮新 ids 写入 params),此处按同一布局取路径、
-    # 不重复传输;restored=False(会话存活)时传**全量累积列表**而非仅本轮新 ids ——
-    # 全局下标与重放/工作区回退浏览一致,避免每轮下标从 0 重启导致的路径
-    # 漂移与同名清洗目录被 clear_dest 覆盖丢文件(旧附件已被 GC 时由
+    # 重放(API 端点在调用前已把本轮新 ids 写入 params),提示直接用那份**实际
+    # 落位结果**、不重复传输;restored=False(会话存活)时传**全量累积列表**而非仅
+    # 本轮新 ids —— 全局下标与重放/工作区回退浏览一致,避免每轮下标从 0 重启
+    # 导致的路径漂移与同名清洗目录被 clear_dest 覆盖丢文件(旧附件已被 GC 时由
     # add_uploads_to_workspace 逐上传容错跳过)。
     attachment_note = (
         _followup_attachment_note(
             task, db, task_id_str, upload_ids, restored, start_round_idx,
+            followup_replay=followup_replay,
         )
         if upload_ids else ""
     )

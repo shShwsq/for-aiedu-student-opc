@@ -729,8 +729,8 @@ def test_followup_attachment_note_uses_transferred_paths(monkeypatch):
     assert note != ATTACHMENT_UNAVAILABLE_NOTE
 
 
-def test_followup_attachment_note_restored_skips_retransfer(monkeypatch):
-    """restored=True:恢复已重放,本轮不再传一次,路径按同一布局算出"""
+def test_followup_attachment_note_restored_uses_replay_result(monkeypatch):
+    """restored=True 且恢复段已重放本轮全部 ids:用它的实际落位结果,不再传一次"""
     calls: list[tuple] = []
     monkeypatch.setattr(
         orchestrator.sandbox_tools, "add_uploads_to_workspace",
@@ -745,11 +745,97 @@ def test_followup_attachment_note_restored_skips_retransfer(monkeypatch):
 
     note = orchestrator._followup_attachment_note(
         task, MagicMock(), "t", ["fu1"], restored=True, round_idx=2,
+        followup_replay={"ids": ["fu1"], "added": ["followup_uploads/0-fu1"]},
     )
 
     assert calls == []
-    # meta 不存在(未真上传)→ 槽位名回退 uid 前缀,与传输侧口径一致
     assert "followup_uploads/0-fu1" in note
+    assert "/home/user/repos/repo" in note
+
+
+def test_followup_attachment_note_restored_replay_failure_not_claimed(monkeypatch):
+    """恢复段重放一个也没落地:提示不得说"已入工作区",也不重传(不叠第二份告警)"""
+    calls: list[tuple] = []
+    warnings: list[dict] = []
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "add_uploads_to_workspace",
+        lambda *a, **k: calls.append(a) or ["should-not-be-used"],
+    )
+    monkeypatch.setattr(
+        orchestrator, "_add_conversation",
+        lambda db, task, **kw: warnings.append(kw) or MagicMock(id="c"),
+    )
+    task = MagicMock()
+    task.params = {"repo_url": "https://github.com/a/b", "followup_upload_ids": ["fu1"]}
+
+    note = orchestrator._followup_attachment_note(
+        task, MagicMock(), "t", ["fu1"], restored=True, round_idx=2,
+        followup_replay={"ids": ["fu1"], "added": []},
+    )
+
+    assert note == ATTACHMENT_UNAVAILABLE_NOTE
+    assert calls == []
+    assert warnings == []  # 告警已在恢复段落一次
+
+
+def test_followup_attachment_note_restored_but_unreplayed_id_transferred(monkeypatch):
+    """本轮新 ids 没被恢复段重放(未进 params 的边缘情况):亲自传一遍
+
+    保证"提示里的路径 == 真正落地的路径":不按布局猜下标(猜出来的会指向
+    从未传输过的槽位)。
+    """
+    transferred: list[list[str]] = []
+
+    def _fake_transfer(tid, ids, subdir):
+        transferred.append(list(ids))
+        return [f"{subdir}/{i}-x" for i in range(len(ids))]
+
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "add_uploads_to_workspace", _fake_transfer,
+    )
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "get_workspace_info",
+        lambda tid: {"repo_path": "/home/user/repos/repo"},
+    )
+    task = MagicMock()
+    task.params = {"repo_url": "https://github.com/a/b", "followup_upload_ids": ["fu0"]}
+
+    note = orchestrator._followup_attachment_note(
+        task, MagicMock(), "t", ["fu-new"], restored=True, round_idx=2,
+        followup_replay={"ids": ["fu0"], "added": ["followup_uploads/0-x"]},
+    )
+
+    # 传的是全量累积列表(全局下标稳定),而不是只传本轮新 id
+    assert transferred == [["fu0", "fu-new"]]
+    assert "followup_uploads/1-x" in note
+
+
+def test_restore_reports_replay_result_into_out_param(monkeypatch):
+    """恢复段把重放的 ids 与实际落位路径写回出参(调用方据此拼提示)"""
+    monkeypatch.setattr(orchestrator, "_publish_status", lambda _t: None)
+    monkeypatch.setattr(
+        orchestrator, "_prepare_repo_context", MagicMock(return_value=(None, "")),
+    )
+    live = iter([None, {"repo_path": "/home/user/repos/repo"}])
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "get_workspace_info", lambda _tid: next(live),
+    )
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "add_uploads_to_workspace",
+        lambda tid, ids, subdir: [f"{subdir}/0-a.txt"],
+    )
+    task = MagicMock()
+    task.id = "task-restore-fu-out"
+    task.params = {"repo_url": "https://github.com/a/b", "followup_upload_ids": ["fu1"]}
+    task.current_stage = ""
+    replay: dict = {}
+
+    restored = orchestrator._restore_workspace_if_needed(
+        task, MagicMock(), "task-restore-fu-out", {}, followup_replay=replay,
+    )
+
+    assert restored is True
+    assert replay == {"ids": ["fu1"], "added": ["followup_uploads/0-a.txt"]}
 
 
 def test_followup_attachment_note_failure_is_honest(monkeypatch):
