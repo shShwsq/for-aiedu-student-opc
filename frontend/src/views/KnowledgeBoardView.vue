@@ -186,15 +186,25 @@ function sectionAnchor(topicKey: string): string {
   return `topic-${topicKey}`
 }
 
-/** 目录点击:即刻高亮 + 展开目标区(收起态只滚到区头看不到卡片)+ 平滑滚动 */
-function goSection(sec: TopicSection): void {
-  activeKey.value = sec.topicKey
-  openMap.value = { ...openMap.value, [sec.topicKey]: true }
+/**
+ * 展开目标主题区并平滑定位过去(目录点击 / 改主题后定位共用)
+ *
+ * 折叠区缺省只在含薄弱/待复习卡时展开;空区刚接收卡片时往往是收起态,
+ * 其内卡片的「专项练习」入口也就点不到,故需显式展开再滚过去。
+ */
+function revealSection(topicKey: string): void {
+  activeKey.value = topicKey
+  openMap.value = { ...openMap.value, [topicKey]: true }
   nextTick(() => {
     document
-      .getElementById(sectionAnchor(sec.topicKey))
+      .getElementById(sectionAnchor(topicKey))
       ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   })
+}
+
+/** 目录点击:即刻高亮 + 展开目标区(收起态只滚到区头看不到卡片)+ 平滑滚动 */
+function goSection(sec: TopicSection): void {
+  revealSection(sec.topicKey)
 }
 
 /** <details> 原生开合(toggle 事件)同步回受控状态 */
@@ -299,10 +309,12 @@ function isKnownTopic(key: string): boolean {
 }
 
 /**
- * 改知识点主题:成功后整板刷新让卡片流入新分区
+ * 改知识点主题:成功后整板刷新让卡片流入新分区,并展开/定位到目标区
  *
  * 与当前主题相同则忽略(下拉初次渲染不会误触发);后端会级联更新该
  * 知识点下全部题目,故练习页/「练这个主题」会按新主题命中。
+ * 刷新后目标区若无薄弱/待复习卡会缺省折叠,卡片连同「专项练习」入口
+ * 都随之不可见,所以 revealSection 主动展开目标区并滚过去。
  */
 async function changeTopic(c: KnowledgePointCard, event: Event): Promise<void> {
   const el = event.target as HTMLSelectElement
@@ -314,6 +326,7 @@ async function changeTopic(c: KnowledgePointCard, event: Event): Promise<void> {
     await setKnowledgeTopic(c.knowledge_key, newKey)
     topicStatus.value = `已将「${c.knowledge_name}」移到新主题`
     await loadBoard()
+    revealSection(newKey)
   } catch (err) {
     topicStatus.value = extractErrorMessage(err)
     // :value 绑定值未变时 Vue 不会重写 el.value,失败后需手动把下拉刷回真实主题
