@@ -2,12 +2,14 @@
 
 覆盖计划 §9 的追问链路:
 - sandbox_tools 传输原语:_safe_dirname 清洗、add_uploads_to_workspace
-  (不改 repo_path / 不清空既有内容 / 多文件各归子目录 / git exclude 幂等)、
-  transfer_uploads_to_workspace_root(创建多文件布局)
+  (不改 repo_path / 不清空既有内容 / 多文件各归子目录 / git exclude 幂等 /
+  无工作根时按需建根)、transfer_uploads_to_workspace_root(创建多文件布局)
 - 运行中追问 seam:push_user_message 携带 upload_ids → drain 取出;
   _format_injected_user_messages 拼接 attachment_note
 - 完成后追问 seam:_restore_workspace_if_needed 重放 followup_upload_ids;
   路由 submit_task_message completed 分支把附件累积进 params 并透传给 resume
+- 附件提示口径:路径取实际落位结果,传不成如实告知 + 落库 system/warning
+  (旧行为:无仓库任务 repo_path 为空 → 抛错被吞 → 模型仍被告知文件已在工作区)
 """
 import io
 import uuid
@@ -23,12 +25,18 @@ import app.models.task_artifact  # noqa: F401  单跑本文件时注册 TaskArti
 import app.models.user_git_binding  # noqa: F401  单跑本文件时注册 UserGitBinding,User mapper 才能初始化
 import app.routers.tasks as tasks_router
 import app.tools.sandbox_tools as sandbox_tools
-from app.prompts.executor import format_injected_user_messages as _format_injected_user_messages
+from app.prompts.executor import (
+    ATTACHMENT_UNAVAILABLE_NOTE,
+    format_followup_attachment_note,
+    format_injected_user_messages as _format_injected_user_messages,
+    format_resume_attachment_note,
+)
 from app.config import settings
 from app.models.task import Task, TaskStatus
 from app.schemas.task import SendMessageRequest
 from app.services.uploads import save_upload
 from app.tools.sandbox_tools import (
+    UPLOAD_WORK_ROOT_NAME,
     _safe_dirname,
     add_uploads_to_workspace,
     transfer_uploads_to_workspace_root,
@@ -178,15 +186,68 @@ def test_add_uploads_empty_ids_returns_empty():
     assert add_uploads_to_workspace("any-task", [], "followup_uploads") == []
 
 
-def test_add_uploads_no_workspace_raises(tmp_path):
-    """工作区未就绪(repo_path 为空)→ RuntimeError,由调用方处置"""
-    task_id = "task-fu-nows"
-    ctx = _mk_local_session(task_id, tmp_path / "ws")
+def test_add_uploads_creates_local_root_when_repo_path_empty(tmp_path):
+    """local 模式 + repo_path 为空(纯对话开场、无仓库无创建上传):按需建工作根
+
+    旧行为是抛"工作区尚未就绪"让调用方吞掉 —— 用户的附件于是根本没进工作区,
+    模型却照旧被告知"文件已在 followup_uploads/"。建根是这条链路的正解。
+    """
+    task_id = "task-fu-root-local"
+    workspace = tmp_path / "ws"
+    ctx = _mk_local_session(task_id, workspace)
     ctx["repo_path"] = ""
+    u1 = save_upload(b"doc body", "lecture.pptx", "u1")["upload_id"]
+
+    added = add_uploads_to_workspace(task_id, [u1], "followup_uploads")
+
+    # 工作根 = {local_dir}/uploaded_files(与创建上传同一命名/同一口径)
+    assert ctx["repo_path"] == str(workspace / UPLOAD_WORK_ROOT_NAME)
+    assert added == ["followup_uploads/0-lecture.pptx"]
+    assert (
+        workspace / UPLOAD_WORK_ROOT_NAME / "followup_uploads" / "0-lecture.pptx"
+        / "lecture.pptx"
+    ).read_bytes() == b"doc body"
+
+
+def test_add_uploads_creates_sandbox_root_on_demand(monkeypatch):
+    """sandbox 模式:建 /home/user/repos/uploaded_files 根(mkdir -p 后 _set_repo_path)"""
+    task_id = "task-fu-root-sandbox"
+    session = MagicMock()
+    ctx = {"session": session, "mode": "sandbox", "repo_path": ""}
+    sandbox_tools._sessions[task_id] = ctx
+    copied: list[str] = []
+    # 沙箱 base64 传输链路由其它用例覆盖,这里只验建根与落点路径口径
+    monkeypatch.setattr(
+        sandbox_tools, "_copy_local_dir_into_workspace",
+        lambda c, src_local, dest_path, clear_dest: copied.append(dest_path) or dest_path,
+    )
     u1 = save_upload(b"x", "a.txt", "u1")["upload_id"]
 
-    with pytest.raises(RuntimeError, match="尚未就绪"):
-        add_uploads_to_workspace(task_id, [u1], "followup_uploads")
+    added = add_uploads_to_workspace(task_id, [u1], "followup_uploads")
+
+    root = f"/home/user/repos/{UPLOAD_WORK_ROOT_NAME}"
+    assert ctx["repo_path"] == root
+    assert added == ["followup_uploads/0-a.txt"]
+    assert copied == [f"{root}/followup_uploads/0-a.txt"]
+    first_cmd = session.run_command.call_args_list[0].args[0]
+    assert first_cmd.startswith(f"mkdir -p {root}")
+
+
+def test_ensure_upload_work_root_keeps_later_clone_source_free():
+    """建根不写 clone_source:之后真实 clone 同一仓库不会被当成已 clone 过而复用"""
+    task_id = "task-fu-root-clone"
+    session = MagicMock()
+    ctx = {"session": session, "mode": "sandbox", "repo_path": ""}
+    sandbox_tools._sessions[task_id] = ctx
+
+    root = sandbox_tools._ensure_upload_work_root(ctx, task_id)
+
+    assert root == f"/home/user/repos/{UPLOAD_WORK_ROOT_NAME}"
+    assert "clone_source" not in sandbox_tools._sessions[task_id]
+    # 幂等复用按 clone_source 判定:没 clone 过就绝不把上传根当仓库返回
+    assert sandbox_tools._reuse_existing_clone(
+        sandbox_tools._sessions[task_id], "https://github.com/a/b", None,
+    ) is None
 
 
 # ============================================================
@@ -409,6 +470,144 @@ def test_format_injected_empty_content_returns_empty():
 
 
 # ============================================================
+# 运行中追问的附件落地:react_agent drain 段
+# ============================================================
+
+def _mk_react_env(monkeypatch, tid: str):
+    """构造跑一回合 run_react_agent 的最小替身,返回 (task, db, llm_contexts)
+
+    llm_contexts 收集每次 LLM 调用看到的 messages(包含 drain 注入的那条),
+    据此断言附件提示到底注入了什么。
+    """
+    import app.agents.react_agent as react_agent
+
+    task = MagicMock()
+    task.id = tid
+    task.params = {}
+    task.user_id = None
+    task.scenario = "general"
+    task.user_input = "hi"
+    db = MagicMock()
+    # 幂等落库查询返回非 None → 跳过 question 重复落库
+    db.query.return_value.filter.return_value.first.return_value = MagicMock()
+
+    llm_contexts: list[list] = []
+
+    def _fake_stream(client, task, db, round_idx, iteration, messages, tools):
+        llm_contexts.append(list(messages))
+        return ("思考", "答案", [], "stop", "c1")
+
+    monkeypatch.setattr(react_agent, "_stream_llm_response", _fake_stream)
+    monkeypatch.setattr(react_agent, "set_current_task", lambda *a, **k: None)
+    monkeypatch.setattr(react_agent, "get_all_tools", lambda: [])
+    monkeypatch.setattr(react_agent, "wait_if_paused", lambda *a, **k: None)
+    monkeypatch.setattr(react_agent, "perf_log", lambda *a, **k: None)
+    monkeypatch.setattr(react_agent, "publish", lambda *a, **k: None)
+    drained_conv = MagicMock()
+    drained_conv.id = "drained-conv-id"
+    drained_conv.round_idx = 1
+    drained_conv.role = "user"
+    drained_conv.type = "message"
+    drained_conv.content = "这是什么文件"
+    drained_conv.reasoning = None
+    drained_conv.attachments = None
+    db.query.return_value.filter.return_value.all.return_value = [drained_conv]
+    clear_user_messages(tid)
+    return task, db, llm_contexts
+
+
+def _injected_user_text(llm_contexts: list[list]) -> str:
+    """取首次 LLM 调用里注入的那条用户补充消息正文"""
+    for m in llm_contexts[0]:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        if "这是什么文件" in (m.get("content") or ""):
+            return m["content"]
+    return ""
+
+
+def test_drain_attachment_success_injects_actual_paths(monkeypatch):
+    """运行中追问附件传成功:提示里是实际落位路径 + 工作根,不是写死的目录名"""
+    tid = "task-drain-ok"
+    task, db, llm_contexts = _mk_react_env(monkeypatch, tid)
+    monkeypatch.setattr(
+        sandbox_tools, "add_uploads_to_workspace",
+        lambda tids, ids, subdir: [f"{subdir}/0-a.txt"],
+    )
+    monkeypatch.setattr(
+        sandbox_tools, "get_workspace_info",
+        lambda tids: {"repo_path": "/home/user/repos/uploaded_files"},
+    )
+    push_user_message(
+        tid, "这是什么文件",
+        message_id=str(uuid.uuid4()), created_at="2026-01-01T00:00:00",
+        upload_ids=["u1"],
+    )
+    try:
+        import app.agents.react_agent as react_agent
+
+        react_agent.run_react_agent(
+            task, db, round_idx=1, followup_query=None,
+            client=MagicMock(), repo_context=None, previous_plan=None,
+        )
+
+        injected = _injected_user_text(llm_contexts)
+        assert "followup_uploads/0-a.txt" in injected
+        assert "/home/user/repos/uploaded_files" in injected
+        assert ATTACHMENT_UNAVAILABLE_NOTE not in injected
+        # 累积列表先落库再传输:params 是重放/回退浏览的唯一真源
+        assert task.params["followup_upload_ids"] == ["u1"]
+    finally:
+        clear_user_messages(tid)
+
+
+def test_drain_attachment_failure_is_visible(monkeypatch):
+    """运行中追问附件传不成:如实告知模型(防臆测)+ 落库 system/warning
+
+    旧行为是 catch+log 后什么也不说,模型对着不存在的文件编答案。
+    """
+    tid = "task-drain-fail"
+    task, db, llm_contexts = _mk_react_env(monkeypatch, tid)
+
+    def _boom(*a, **k):
+        raise RuntimeError("沙箱不可用")
+
+    monkeypatch.setattr(sandbox_tools, "add_uploads_to_workspace", _boom)
+    import app.agents.react_agent as react_agent
+
+    warnings: list[dict] = []
+
+    def _record(_db, _task, **kw):
+        if kw.get("type") == "warning":
+            warnings.append(kw)
+        return MagicMock(id="c")
+
+    monkeypatch.setattr(react_agent, "_add_conversation", _record)
+    push_user_message(
+        tid, "这是什么文件",
+        message_id=str(uuid.uuid4()), created_at="2026-01-01T00:00:00",
+        upload_ids=["u1"],
+    )
+    try:
+        react_agent.run_react_agent(
+            task, db, round_idx=1, followup_query=None,
+            client=MagicMock(), repo_context=None, previous_plan=None,
+        )
+
+        injected = _injected_user_text(llm_contexts)
+        # 文字消息照常规注入,但附件事实说清楚
+        assert "这是什么文件" in injected
+        assert ATTACHMENT_UNAVAILABLE_NOTE in injected
+        assert "followup_uploads" not in injected
+        assert len(warnings) == 1
+        assert warnings[0]["role"] == "system"
+        assert warnings[0]["round_idx"] == 1
+        assert "沙箱不可用" in warnings[0]["content"]
+    finally:
+        clear_user_messages(tid)
+
+
+# ============================================================
 # 完成后追问 seam:恢复工作区时重放 followup_upload_ids
 # ============================================================
 
@@ -477,6 +676,142 @@ def test_followup_upload_ids_helper():
     assert orchestrator._followup_upload_ids({"followup_upload_ids": ["", "f1"]}) == ["f1"]
     assert orchestrator._followup_upload_ids({}) == []
     assert orchestrator._followup_upload_ids(None) == []
+
+
+# ============================================================
+# 附件提示口径:路径按实际落位,传不成如实告知
+# ============================================================
+
+def test_attachment_note_lists_actual_paths_and_work_root():
+    """提示里是实际传成功的相对路径 + 工作根绝对路径(不写死目录名)"""
+    note = format_followup_attachment_note(
+        ["followup_uploads/0-report.pdf"], "/home/user/repos/uploaded_files",
+    )
+    assert "用户本轮附带了新文件" in note
+    assert "followup_uploads/0-report.pdf" in note
+    assert "/home/user/repos/uploaded_files" in note
+
+
+def test_attachment_note_empty_paths_returns_empty():
+    """一个也没落地 → 空串(没传成就不该说"已放入工作区")"""
+    assert format_followup_attachment_note([], "/home/user/repos/x") == ""
+    assert format_resume_attachment_note([], "") == ""
+
+
+def test_attachment_note_truncates_long_lists():
+    """附件超上限只列前 20 个,末尾报总数"""
+    paths = [f"followup_uploads/{i}-f.txt" for i in range(25)]
+    note = format_resume_attachment_note(paths, "")
+    assert "共 25 个" in note
+    assert "followup_uploads/24-f.txt" not in note
+
+
+def test_followup_attachment_note_uses_transferred_paths(monkeypatch):
+    """resume 提示:传成功后取实际落位路径 + 工作根"""
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "add_uploads_to_workspace",
+        lambda tid, ids, subdir: [f"{subdir}/{i}-x" for i in range(len(ids))],
+    )
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "get_workspace_info",
+        lambda tid: {"repo_path": "/home/user/repos/uploaded_files"},
+    )
+    task = MagicMock()
+    task.params = {"followup_upload_ids": ["u1", "u2"]}
+
+    note = orchestrator._followup_attachment_note(
+        task, MagicMock(), "t", ["u2"], restored=False, round_idx=3,
+    )
+
+    assert "followup_uploads/0-x" in note
+    assert "followup_uploads/1-x" in note
+    assert "/home/user/repos/uploaded_files" in note
+    assert note != ATTACHMENT_UNAVAILABLE_NOTE
+
+
+def test_followup_attachment_note_restored_skips_retransfer(monkeypatch):
+    """restored=True:恢复已重放,本轮不再传一次,路径按同一布局算出"""
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "add_uploads_to_workspace",
+        lambda *a, **k: calls.append(a),
+    )
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "get_workspace_info",
+        lambda tid: {"repo_path": "/home/user/repos/repo"},
+    )
+    task = MagicMock()
+    task.params = {"repo_url": "https://github.com/a/b", "followup_upload_ids": ["fu1"]}
+
+    note = orchestrator._followup_attachment_note(
+        task, MagicMock(), "t", ["fu1"], restored=True, round_idx=2,
+    )
+
+    assert calls == []
+    # meta 不存在(未真上传)→ 槽位名回退 uid 前缀,与传输侧口径一致
+    assert "followup_uploads/0-fu1" in note
+
+
+def test_followup_attachment_note_failure_is_honest(monkeypatch):
+    """传不成:如实告知模型(防臆测)+ 落库一条 system/warning(不再静默)"""
+    def _boom(*a, **k):
+        raise RuntimeError("沙箱命令失败")
+
+    monkeypatch.setattr(orchestrator.sandbox_tools, "add_uploads_to_workspace", _boom)
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        orchestrator, "_add_conversation",
+        lambda db, task, **kw: recorded.append(kw) or MagicMock(id="c"),
+    )
+    task = MagicMock()
+    task.params = {"followup_upload_ids": ["u1"]}
+
+    note = orchestrator._followup_attachment_note(
+        task, MagicMock(), "t", ["u1"], restored=False, round_idx=4,
+    )
+
+    assert note == ATTACHMENT_UNAVAILABLE_NOTE
+    assert len(recorded) == 1
+    assert recorded[0]["role"] == "system"
+    assert recorded[0]["type"] == "warning"
+    assert recorded[0]["round_idx"] == 4
+    assert "沙箱命令失败" in recorded[0]["content"]
+
+
+def test_restore_followup_replay_failure_warns_with_round(monkeypatch):
+    """恢复重放失败不阻断恢复(仍回 True),但传了 round_idx 就要落库告警"""
+    monkeypatch.setattr(orchestrator, "_publish_status", lambda _t: None)
+    monkeypatch.setattr(
+        orchestrator, "_prepare_repo_context", MagicMock(return_value=(None, "")),
+    )
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "get_workspace_info", lambda _tid: None,
+    )
+
+    def _boom(*a, **k):
+        raise RuntimeError("沙箱不可用")
+
+    monkeypatch.setattr(orchestrator.sandbox_tools, "add_uploads_to_workspace", _boom)
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        orchestrator, "_add_conversation",
+        lambda db, task, **kw: recorded.append(kw) or MagicMock(id="c"),
+    )
+    task = MagicMock()
+    task.id = "task-restore-fu-warn"
+    task.params = {
+        "repo_url": "https://github.com/a/b",
+        "followup_upload_ids": ["fu1"],
+    }
+    task.current_stage = ""
+
+    restored = orchestrator._restore_workspace_if_needed(
+        task, MagicMock(), "task-restore-fu-warn", {}, round_idx=7,
+    )
+
+    assert restored is True
+    assert recorded and recorded[0]["round_idx"] == 7
+    assert recorded[0]["type"] == "warning"
 
 
 # ============================================================

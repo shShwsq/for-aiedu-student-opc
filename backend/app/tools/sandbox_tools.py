@@ -764,8 +764,49 @@ def _copy_local_dir_into_workspace(
     return dest_path
 
 
+# 上传工作根目录名:创建上传铺在这里,无仓库任务(纯对话开场)首次收到追问
+# 附件时也按需建同名工作根 —— 两条路径共用一个名字,工作根口径才能与
+# upload_layout.compute_upload_layout(回退浏览按它拼树)保持一致
+UPLOAD_WORK_ROOT_NAME = "uploaded_files"
+
+
+def _uploads_work_root(
+    ctx: dict[str, Any], dest_name: str = UPLOAD_WORK_ROOT_NAME,
+) -> str:
+    """上传工作根的绝对路径(按模式:local=临时目录下子目录,sandbox=/home/user/repos/*)"""
+    if ctx["mode"] == "local":
+        return str(Path(ctx["local_dir"]) / dest_name)
+    return f"/home/user/repos/{dest_name}"
+
+
+def _ensure_upload_work_root(ctx: dict[str, Any], task_id: str) -> str:
+    """无工作根的任务按需建一个上传工作根,返回其绝对路径(已 _set_repo_path)
+
+    既没 repo_url 也没创建上传的任务(用户先发了句"hi")从来没有人设过
+    repo_path,追问附件因此无处可放:旧实现直接抛"工作区尚未就绪",调用方
+    catch+log 后静默丢文件,模型却照常收到"文件已在 followup_uploads/"的提示,
+    结果就是用户看着空工作区、模型对着不存在的文件编答案。这里补上缺失的
+    一步:建根 + 记路径,附件照常用 followup_uploads/{i}-{name} 布局落位,前端
+    工作区也从 available=false 变成可浏览。
+
+    与之后可能发生的真实 clone 不冲突:克隆的幂等复用按 ctx["clone_source"]
+    判定(本函数不写该字段),目标目录避让也认这条"只记了 repo_path 的目录
+    不能当残留删掉"的口径(见 _resolve_local_repo_dir)。
+    """
+    root = _uploads_work_root(ctx)
+    if ctx["mode"] == "local":
+        Path(root).mkdir(parents=True, exist_ok=True)
+    else:
+        # 只建不删:repo_path 为空不代表容器是新的(可能是降级/未 clone 的任务),
+        # 每个上传槽位由传输侧 clear_dest=True 各自清空,不会串内容
+        ctx["session"].run_command(f"mkdir -p {shlex.quote(root)}")
+    _set_repo_path(task_id, root)
+    logger.info(f"[uploads] 无工作根任务按需建根: task={task_id}, repo_path={root}")
+    return root
+
+
 def transfer_upload_to_workspace(
-    task_id: str, files_dir: str, dest_name: str = "uploaded_files",
+    task_id: str, files_dir: str, dest_name: str = UPLOAD_WORK_ROOT_NAME,
 ) -> str:
     """把服务端上传目录(files_dir)传输进任务沙箱工作区,返回 repo_path
 
@@ -786,10 +827,7 @@ def transfer_upload_to_workspace(
 
     ctx = _get_or_create_session(task_id)
     mode = ctx["mode"]
-    if mode == "local":
-        dest_path = str(Path(ctx["local_dir"]) / dest_name)
-    else:
-        dest_path = f"/home/user/repos/{dest_name}"
+    dest_path = _uploads_work_root(ctx, dest_name)
 
     repo_path = _copy_local_dir_into_workspace(ctx, src, dest_path, clear_dest=True)
     _set_repo_path(task_id, repo_path)
@@ -844,7 +882,8 @@ def add_uploads_to_workspace(
     调用方按 params.followup_upload_ids 全量累积列表传入(全局下标),
     与沙箱回收后的重放 / 工作区回退浏览共用同一布局约定。
     供运行中追问(react_agent drain)与完成后 resume 共用。
-    工作区未就绪(repo_path 为空)时抛 RuntimeError,由调用方处置。
+    工作区未就绪(repo_path 为空)时**按需建根**而不是报错(见
+    _ensure_upload_work_root):无仓库任务的追问附件同样要有落点。
 
     单个上传传输失败(如已被 GC 清理)仅跳过该上传并记 warning,不阻断
     其余上传 —— 全量重放语义下,一个过期旧附件不应拖垮本轮新文件。
@@ -856,7 +895,7 @@ def add_uploads_to_workspace(
     ctx = _get_or_create_session(task_id)
     repo_path = ctx.get("repo_path", "")
     if not repo_path:
-        raise RuntimeError("工作区尚未就绪,无法追加上传文件")
+        repo_path = _ensure_upload_work_root(ctx, task_id)
 
     added: list[str] = []
     for i, uid in enumerate(upload_ids):
@@ -885,7 +924,7 @@ def add_uploads_to_workspace(
 
 
 def transfer_uploads_to_workspace_root(
-    task_id: str, upload_ids: list[str], dest_name: str = "uploaded_files",
+    task_id: str, upload_ids: list[str], dest_name: str = UPLOAD_WORK_ROOT_NAME,
 ) -> str:
     """创建时的多上传:建空工作根 {dest_name}/ 并把每个上传拷进子目录,返回 repo_path
 
@@ -899,14 +938,12 @@ def transfer_uploads_to_workspace_root(
         raise ValueError("upload_ids 为空")
     ctx = _get_or_create_session(task_id)
     mode = ctx["mode"]
+    repo_path = _uploads_work_root(ctx, dest_name)
     if mode == "local":
-        root = Path(ctx["local_dir"]) / dest_name
-        if root.exists():
-            shutil.rmtree(root, ignore_errors=True)
-        root.mkdir(parents=True, exist_ok=True)
-        repo_path = str(root)
+        if Path(repo_path).exists():
+            shutil.rmtree(repo_path, ignore_errors=True)
+        Path(repo_path).mkdir(parents=True, exist_ok=True)
     else:
-        repo_path = f"/home/user/repos/{dest_name}"
         ctx["session"].run_command(
             f"rm -rf {shlex.quote(repo_path)} && mkdir -p {shlex.quote(repo_path)}"
         )

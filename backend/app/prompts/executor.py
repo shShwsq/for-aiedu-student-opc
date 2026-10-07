@@ -308,8 +308,9 @@ def format_injected_user_messages(
     多条消息按时间顺序合并为一条,加前缀说明这是用户在审计过程中追加的指令,
     引导模型理解为新的检查方向/补充要求,而非替换原始任务。
 
-    attachment_note:本批消息附带文件已传输进工作区的目录级提示(可空),
-    拼在正文后,让模型知道去 followup_uploads/ 查看新文件。
+    attachment_note:本批消息附带文件已传输进工作区的提示(可空,路径按实际
+    传输结果,见 format_followup_attachment_note),拼在正文后,让模型知道去
+    哪个目录读新文件。
 
     返回空字符串表示无可注入内容(消息 content 全为空)。
     """
@@ -341,17 +342,68 @@ def format_injected_user_messages(
 # 附带文件提示 + 轮次消息标记
 # ============================================================
 
-# react_agent 循环内:用户在执行中追加消息且本轮附带了新上传文件
-FOLLOWUP_ATTACHMENT_NOTE = (
-    "\n\n[用户本轮附带了新文件,已放入工作区 followup_uploads/ 目录,"
-    "可用 list_files / read_file 查看]"
+# 提示里最多列出的附件路径数(批量上传时正文会挤掉用户真正的那句话)
+_ATTACHMENT_NOTE_MAX_PATHS = 20
+
+# 附件未能写入工作区:如实告知。历史缺陷是无仓库任务 repo_path 为空 →
+# 传输抛错被调用方吞掉,提示却照旧注入,模型对着不存在的文件只能编答案
+# (或回答"工作区是空的"),用户完全看不出附件根本没送达。
+ATTACHMENT_UNAVAILABLE_NOTE = (
+    "\n\n[注:用户本轮附带的文件未能写入任务工作区,内容不可读。"
+    "请如实告知用户附件未送达(建议重新提交任务并以上传文件作为交付物来源),"
+    "不要根据文件名臆测内容]"
 )
 
-# resume 链路(orchestrator):用户追问消息附带新上传文件
-RESUME_ATTACHMENT_NOTE = (
-    "\n\n[本轮附带文件已放入工作区 followup_uploads/ 目录,"
-    "可用 list_files / read_file 查看]"
-)
+
+def format_attachment_note(
+    header: str, added_paths: list[str], work_root: str = "",
+) -> str:
+    """附件已入工作区的提示正文(路径取**实际传输结果**,不写死目录名)
+
+    header:提示首句(区分运行中追问 / resume 语境,由上层两个包装函数传入)
+    added_paths:相对工作根的路径(与文件树、沙箱过期后的回退浏览同一口径),
+        空列表时返回空串 —— 没传成就不该说"已放入"
+    work_root:工作根绝对路径(可空),附上后模型不必自己猜路径
+    """
+    if not added_paths:
+        return ""
+    shown = added_paths[:_ATTACHMENT_NOTE_MAX_PATHS]
+    lines = "\n".join(f"- {p}" for p in shown)
+    if len(added_paths) > len(shown):
+        lines += f"\n- ...(共 {len(added_paths)} 个,其余未列出)"
+    tail = f"\n工作区根目录: {work_root}" if work_root else ""
+    return (
+        f"\n\n{header}\n{lines}{tail}\n"
+        "用 list_files / read_file 查看(路径相对工作区根目录)"
+    )
+
+
+def format_followup_attachment_note(added_paths: list[str], work_root: str = "") -> str:
+    """react_agent 循环内:用户在执行中追加消息且本轮附带了新上传文件"""
+    return format_attachment_note(
+        "[用户本轮附带了新文件,已放入工作区:]", added_paths, work_root,
+    )
+
+
+def format_followup_upload_warning(reason: str) -> str:
+    """附件没进工作区的用户可见告警正文(落库 Conversation type=warning)
+
+    运行中追问(react_agent drain)与完成后追问(orchestrator resume)两条链路
+    共用,文案不再各写一份。reason 取异常正文或简要说明,截断后拼入。
+    """
+    return (
+        "用户附带的文件未能写入任务工作区,智能体读不到它:"
+        f"{(reason or '各附件均未能写入工作区')[:300]}\n"
+        "可在「用户上传」区确认附件内容,或重新提交任务并以上传文件作为交付物来源。"
+    )
+
+
+def format_resume_attachment_note(added_paths: list[str], work_root: str = "") -> str:
+    """resume 链路(orchestrator):用户追问消息附带新上传文件"""
+    return format_attachment_note(
+        "[本轮附带文件已放入工作区:]", added_paths, work_root,
+    )
+
 
 # 消息性质标记(拼到 user_intent 后供 agent2 审查理解语境)
 RETRY_MSG_LABEL = "[重试续跑]"

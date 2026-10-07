@@ -546,8 +546,14 @@ const uploadsUnavailable = ref<string[]>([])
 const loadingUploads = ref(false)
 /** 上传树条目超上限截断 */
 const uploadsTruncated = ref(false)
-/** 上传树是否已拉取(每次进入工作区只拉一次) */
-let uploadsTreeLoaded = false
+/**
+ * 上次拉到的上传树内容签名(路径集合 + 不可用数 + 截断标记)
+ *
+ * 取代旧"每次进入工作区只拉一次"的门闩:追问新附的附件会让 params 多一个槽位,
+ * 门闩拉过一次后新轮附件就再不重拉,用户看不到自己刚上传的文件(内容其实
+ * 一直在服务端)。签名列未变则跳过重建,不抖已展开目录的展示状态。
+ */
+let uploadsSignature = ''
 
 /** 上传回退树已就绪 */
 const uploadsTreeReady = computed(() => uploadsTreeRoot.value !== null)
@@ -659,7 +665,7 @@ function resetFileTree(): void {
   uploadsUnavailable.value = []
   uploadsTruncated.value = false
   loadingUploads.value = false
-  uploadsTreeLoaded = false
+  uploadsSignature = ''
   // 下载失败文案一并清掉(切任务不残留上个任务的报错;进行中的下载照常送达)
   clearFileDownloadError()
 }
@@ -701,7 +707,7 @@ async function checkAvailable(refreshTree: boolean = false): Promise<void> {
     repoPath.value = info.repo_path ?? ''
     hasUploads.value = info.has_uploads ?? false
     canRestore.value = info.can_restore ?? false
-    if (info.available && !treeRoot.loaded) {
+    if (info.available && (!treeRoot.loaded || refreshTree)) {
       await loadTreeSnapshot(refreshTree)
     }
     // 上传树与工作区可用性无关:上传区独立展示,重新克隆后(仓库不含上传
@@ -805,18 +811,27 @@ function sortTreeChildren(node: TreeNode): void {
 }
 
 /**
- * 沙箱不可用且有上传:拉上传文件树(独立于沙箱,保留期内内容可读)
- * 每次进入工作区只拉一次;失败提示错误但不影响其它兜底分区
+ * 拉上传文件树(独立于沙箱,保留期内内容可读)
+ *
+ * 只在非运行中调(见 checkAvailable):进入工作区 / 重新克隆完 / 一轮结束时各一次;
+ * 服务端自带 30s TTL 缓存,重复拉取不重复读盘。内容签名未变则不重建,
+ * 避免掉用户已展开的目录。
  */
 async function loadUploadsTree(): Promise<void> {
-  if (!selectedTaskId.value || uploadsTreeLoaded) return
+  if (!selectedTaskId.value) return
   loadingUploads.value = true
   try {
     const res = await getWorkspaceUploadsTree(selectedTaskId.value)
+    const sig = [
+      res.entries.map((e) => e.path).join('\n'),
+      res.unavailable.join('\n'),
+      res.truncated ? '1' : '0',
+    ].join('|')
+    if (sig === uploadsSignature && uploadsTreeRoot.value) return
+    uploadsSignature = sig
     uploadsTreeRoot.value = buildUploadsTree(res)
     uploadsUnavailable.value = res.unavailable
     uploadsTruncated.value = res.truncated
-    uploadsTreeLoaded = true
   } catch (e) {
     errorMsg.value = extractErrorMessage(e)
   } finally {
@@ -907,12 +922,13 @@ async function ensureInitialized(): Promise<void> {
 }
 
 // 选中任务从运行变为完成时,再检查一次(确保拿到最终状态)
+// 已经可用也要重拉:无仓库任务是在追问附件到达那一刻才"按需建根"的,
+// 轮前那个空态不调一次就永远停在"工作区不可用"上
 watch(
   () => selectedTaskRunning.value,
   (running, wasRunning) => {
-    if (wasRunning && !running && !available.value) {
-      checkAvailable()
-    }
+    if (!wasRunning || running) return
+    checkAvailable(available.value)
   },
 )
 
@@ -1734,7 +1750,7 @@ defineExpose({ openTaskFile })
             用户上传{{ uploadsUnavailable.length > 0 ? '（部分已过期清理）' : '' }}
           </div>
           <div class="changed-files-list">
-            <div v-if="loadingUploads" class="tree-loading">加载上传文件...</div>
+            <div v-if="loadingUploads && !uploadsTreeReady" class="tree-loading">加载上传文件...</div>
             <template v-else-if="uploadsTreeReady">
               <div v-if="uploadsTruncated" class="tree-truncated-hint">
                 文件过多,列表已截断

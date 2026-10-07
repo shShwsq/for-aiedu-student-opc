@@ -62,13 +62,15 @@ from app.models.user_llm_config import UserLLMConfig
 from app.pause_controller import clear_pause_state, wait_if_paused
 from app.perf import perf_log
 from app.prompts.executor import (
-    RESUME_ATTACHMENT_NOTE,
+    ATTACHMENT_UNAVAILABLE_NOTE,
     RETRY_MSG_LABEL,
     USER_FOLLOWUP_MSG_LABEL,
     build_first_round_question,
     build_retry_message,
     build_upload_header,
+    format_followup_upload_warning,
     format_repo_context_body,
+    format_resume_attachment_note,
 )
 from app.security import decrypt_secret
 from app.tools import sandbox_tools
@@ -1362,6 +1364,106 @@ def _followup_upload_ids(params: dict | None) -> list[str]:
     return extract_followup_ids(params)
 
 
+def _followup_slot_paths(followup_ids: list[str]) -> list[str]:
+    """追问附件在工作根下的相对路径(委托 upload_layout,与传输/回退浏览同一布局)
+
+    只为“恢复流程已重放过”的那条路径服务:重放在 _restore_workspace_if_needed
+    里做完,本轮不重复传(大 zip 重传代价可观),提示文案里的路径就按布局算出来。
+    meta 读取失败(已被 GC)不阻断:槽位名回退 uid 前缀,与传输侧口径一致。
+    """
+    from app.services.upload_layout import compute_upload_layout
+    from app.services.uploads import load_upload_meta
+
+    metas: dict[str, dict] = {}
+    for uid in followup_ids:
+        try:
+            metas[uid] = load_upload_meta(uid)
+        except Exception:
+            metas[uid] = {}
+    return [s.prefix for s in compute_upload_layout([], followup_ids, metas) if s.prefix]
+
+
+def _warn_followup_uploads_unavailable(
+    task: Task, db: Session, round_idx: int | None, reason: str,
+) -> None:
+    """附件没进工作区的显式告警(进对话流,而不是只留在日志里)
+
+    round_idx 为 None(调用方本轮轮次未知)时只记日志:落库需要轮号,猜一个
+    会把告警插到错误的轮里。本身失败绝不向上抛 —— 告警只是附带信息,
+    文字消息照常规走。
+    """
+    if round_idx is None:
+        return
+    try:
+        _add_conversation(
+            db, task, round_idx=round_idx,
+            role="system", type="warning",
+            content=format_followup_upload_warning(reason),
+        )
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 追问附件告警落库失败(忽略): {e}")
+
+
+def _transfer_followup_uploads(
+    task: Task, db: Session, task_id_str: str,
+    upload_ids: list[str], round_idx: int | None = None,
+) -> list[str]:
+    """把追问附件传输进工作区,返回已落入的相对路径(全失败时返回空列表)
+
+    旧实现是 catch+log 后静默:文件没进工作区,调用方却照旧给模型注入
+    “文件已在 followup_uploads/”的提示,于是模型对着不存在的文件编答案,
+    用户也毫无线索。现在本函数是“成败只有一个口径”的地方:要么返回真实
+    落位路径,要么落库一条 system/warning 并返回空列表。
+    """
+    if not upload_ids:
+        return []
+    try:
+        added = sandbox_tools.add_uploads_to_workspace(
+            task_id_str, upload_ids, "followup_uploads"
+        )
+    except Exception as e:
+        logger.warning(
+            f"[task={task.id}] 追问上传文件传输失败(文字消息照常处理): {e}"
+        )
+        _warn_followup_uploads_unavailable(task, db, round_idx, str(e))
+        return []
+    added = list(added or [])
+    if not added:
+        # 进不到这里很难(逐上传容错),但全被跳过就是“一个也没落地”
+        _warn_followup_uploads_unavailable(task, db, round_idx, "各附件均未能写入工作区")
+    return added
+
+
+def _followup_attachment_note(
+    task: Task, db: Session, task_id_str: str, upload_ids: list[str],
+    restored: bool, round_idx: int,
+) -> str:
+    """本轮追问附件的工作区提示(拼在追问文本末尾)
+
+    成功:路径取**实际落位结果**(restored=True 时恢复流程已重放,按同一布局取
+    路径、不重复传输),附上工作根绝对路径,模型不必自己猜;
+    失败:如实告知附件未送达(防模型臆测),可见告警已由
+    _transfer_followup_uploads 落库。
+
+    旧实现是无条件拼固定文案:传没传成都说"已放入 followup_uploads/",模型
+    对着不存在的文件编答案,用户也毫无线索。
+    """
+    merged_ids = _followup_upload_ids(task.params)
+    for uid in upload_ids:
+        if uid and uid not in merged_ids:
+            merged_ids.append(uid)  # 防御:params 未含本轮 ids 的边缘情况
+    added = (
+        _followup_slot_paths(merged_ids) if restored
+        else _transfer_followup_uploads(
+            task, db, task_id_str, merged_ids, round_idx=round_idx,
+        )
+    )
+    if not added:
+        return ATTACHMENT_UNAVAILABLE_NOTE
+    ws_root = (sandbox_tools.get_workspace_info(task_id_str) or {}).get("repo_path", "")
+    return format_resume_attachment_note(added, ws_root)
+
+
 def _prepare_upload_context(
     task: Task, db: Session, task_id_str: str,
 ) -> tuple[str, str]:
@@ -1507,6 +1609,7 @@ def _write_memory_files_for_task(
 
 def _restore_workspace_if_needed(
     task: Task, db: Session, task_id_str: str, git_tokens: dict | None = None,
+    round_idx: int | None = None,
 ) -> bool:
     """沙箱会话已被回收且任务配了仓库 → 重新克隆恢复工作区
 
@@ -1521,6 +1624,9 @@ def _restore_workspace_if_needed(
 
     上传任务(upload_id)同样适用:沙箱回收后重新传输上传内容
     (agent 无法自行重新获取,必须由服务端恢复)。
+
+    round_idx(可选):仅用于追问附件重放失败时的告警落库轮号(由 resume 传入
+    本轮轮号);不传则重放失败只进日志(如重试链路)。
     """
     params = task.params or {}
     repo_url = params.get("repo_url")
@@ -1555,16 +1661,12 @@ def _restore_workspace_if_needed(
         logger.warning(f"[task={task.id}] 恢复补回 diff 失败(忽略): {e}")
     # 追问上传同样需重放(沙箱回收后追问文件与创建文件一起丢失):
     # 传输到 followup_uploads/,与运行中追问落地位置一致(agent 目录级感知)。
-    # 失败不阻断恢复(创建内容已就位,追问文件缺失仅影响该部分上下文)。
+    # 失败不阻断恢复(创建内容已就位,追问文件缺失仅影响该部分上下文)——
+    # 不中断但要可见,告警落库由 _transfer_followup_uploads 统一负责。
     if followup_ids:
-        try:
-            sandbox_tools.add_uploads_to_workspace(
-                task_id_str, followup_ids, "followup_uploads"
-            )
-        except Exception as e:
-            logger.warning(
-                f"[task={task.id}] 恢复追问上传文件失败(忽略): {e}"
-            )
+        _transfer_followup_uploads(
+            task, db, task_id_str, followup_ids, round_idx=round_idx,
+        )
     return True
 
 
@@ -1667,7 +1769,9 @@ def resume_audit_with_message(
     # 重试链路进入本函数前已自行恢复过工作区,此处会话存活会自然跳过,不会双重 clone
     _t0 = time.perf_counter()
     repo_url = (task.params or {}).get("repo_url")
-    restored = _restore_workspace_if_needed(task, db, task_id_str, git_tokens)
+    restored = _restore_workspace_if_needed(
+        task, db, task_id_str, git_tokens, round_idx=start_round_idx,
+    )
     if not restored:
         _write_memory_files_for_task(task, db, task_id_str, repo_url)
     perf_log(
@@ -1676,29 +1780,20 @@ def resume_audit_with_message(
         time.perf_counter() - _t0,
     )
 
-    # 本轮追问附带的文件:传输进工作区 followup_uploads/(不重定向 repo_path)。
+    # 本轮追问附带的文件:传输进工作区 followup_uploads/(不重定向 repo_path;
+    # 无工作根的纯对话任务则由传输原语按需建根,见 _ensure_upload_work_root)。
     # restored=True 时 _restore_workspace_if_needed 已按 params.followup_upload_ids
-    # 重放(API 端点在调用前已把本轮新 ids 写入 params),此处跳过避免重复传输;
-    # restored=False(会话存活)时传**全量累积列表**而非仅本轮新 ids ——
+    # 重放(API 端点在调用前已把本轮新 ids 写入 params),此处按同一布局取路径、
+    # 不重复传输;restored=False(会话存活)时传**全量累积列表**而非仅本轮新 ids ——
     # 全局下标与重放/工作区回退浏览一致,避免每轮下标从 0 重启导致的路径
     # 漂移与同名清洗目录被 clear_dest 覆盖丢文件(旧附件已被 GC 时由
     # add_uploads_to_workspace 逐上传容错跳过)。
-    attachment_note = ""
-    if upload_ids:
-        if not restored:
-            merged_ids = _followup_upload_ids(task.params)
-            for uid in upload_ids:
-                if uid and uid not in merged_ids:
-                    merged_ids.append(uid)  # 防御:params 未含本轮 ids 的边缘情况
-            try:
-                sandbox_tools.add_uploads_to_workspace(
-                    task_id_str, merged_ids, "followup_uploads"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[task={task.id}] 追问上传文件传输失败(忽略,文字消息照常处理): {e}"
-                )
-        attachment_note = RESUME_ATTACHMENT_NOTE
+    attachment_note = (
+        _followup_attachment_note(
+            task, db, task_id_str, upload_ids, restored, start_round_idx,
+        )
+        if upload_ids else ""
+    )
 
     # agent1 本轮执行的追问文本(含附件提示,让 agent 感知新文件)
     followup_text = user_message + attachment_note

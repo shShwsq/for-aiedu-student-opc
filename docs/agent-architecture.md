@@ -82,6 +82,7 @@
 - **上传**:`task.params.upload_id` 指向 `POST /uploads`(multipart,需登录)上传的交付物。`upload_id` 与 `repo_url` 后端互斥(同时提供报 422);上传模式下任务说明(`user_input`)必填
 - **上传存储**:`.zip` 结尾的文件经校验(**zip-slip 防护** + 单文件 `UPLOAD_MAX_SINGLE_FILE_MB` + 解压总量 `UPLOAD_MAX_EXTRACT_MB` + 条目数 `UPLOAD_MAX_FILES` 上限)后解压存树,其余单文件原样存,根目录 `UPLOADS_DIR`(上传大小上限 `UPLOAD_MAX_FILE_MB`)
 - **进入工作区**:orchestrator 在准备阶段检测 `upload_id`(`_prepare_upload_context`)→ `sandbox_tools.transfer_upload_to_workspace` 把上传内容传输进沙箱工作区,产物与 clone 等价,后续 `read_file` / `search_code` / `list_files` 等工具的路径语义一致
+- **无交付物任务的工作根**:纯文本任务(既无 `repo_url` 也无创建上传)启动时 `repo_path` 为空,追问附件到达时由 `add_uploads_to_workspace` → `_ensure_upload_work_root` **按需建根**(sandbox 为 `/home/user/repos/uploaded_files`,local 为临时目录同名子目录)并 `_set_repo_path`,附件仍落 `followup_uploads/{i}-{name}`(与 `upload_layout` 回退浏览同一工作根口径)。建根不写 `clone_source`,因此之后真实 clone 不会被幂等复用误判为"已 clone 过";旧实现是抛"工作区尚未就绪"由调用方吞掉,用户看到的就是一直空着的工作区
 - **长期保留**:上传内容 agent 无法自行重新获取,必须由服务端保留——任务失败重试、完成后追问 resume 都可复用;沙箱被回收后支持重新传输上传内容恢复工作区
 - **可选**:上传为可选,不传交付物时为纯文本任务(仅 `user_input`)
 
@@ -333,7 +334,7 @@ def run_react_agent(
 
 每个迭代：
 1. **暂停检查点**：`wait_if_paused(task.id)`（粗粒度，工具调用前还有细粒度检查点）
-2. **用户补充消息注入**：`drain_user_messages(task.id)` 取用户在运行中/暂停中追加的消息：先按 `message_id` 查回已落库的 Conversation 逐条补推 `conversation` 事件（待处理条目转入对话流，推送失败仅记日志）；若本批消息带附件，先把新 `upload_ids` **全量累积**写入 `params.followup_upload_ids`（先落库再传输，保证与沙箱回收重放/工作区回退浏览同一布局）并 `add_uploads_to_workspace` 传进 `followup_uploads/`，拼接 `FOLLOWUP_ATTACHMENT_NOTE` 目录提示；最后经 `format_injected_user_messages` 合并为一条 user 消息注入 `messages`（附件传输失败 catch+log，不中断本轮，文字消息照常注入）
+2. **用户补充消息注入**：`drain_user_messages(task.id)` 取用户在运行中/暂停中追加的消息：先按 `message_id` 查回已落库的 Conversation 逐条补推 `conversation` 事件（待处理条目转入对话流，推送失败仅记日志）；若本批消息带附件，先把新 `upload_ids` **全量累积**写入 `params.followup_upload_ids`（先落库再传输，保证与沙箱回收重放/工作区回退浏览同一布局）并 `add_uploads_to_workspace` 传进 `followup_uploads/`（无工作根的纯文本任务在此按需建根，见 §1.3），提示文本由 `format_followup_attachment_note` 按**实际落位路径 + 工作根绝对路径**生成；传不成（全部附件都没落地）则改拼 `ATTACHMENT_UNAVAILABLE_NOTE` 如实告知模型不得臆测，并落库一条 `Conversation(role=system, type=warning)` 让用户也能看到；最后经 `format_injected_user_messages` 合并为一条 user 消息注入 `messages`（附件传输失败 catch+log，不中断本轮，文字消息照常注入）
 3. **流式调 LLM**：`_stream_llm_response` 返回 `reasoning_full / content_full / tool_calls_full / finish_reason / conv_id`（顺序即解包顺序，`finish_reason` 排在 `conv_id` 前）
 4. **落库 thinking**：`type=thinking` + `stream_conv_id=conv_id`，**并推 `conversation` 事件**：`thinking_delta` 是高频瞬时事件、事件总线不缓存，中途离开详情页再回来的订阅者只能靠这条落库事件补上那段思考；前端按 `stream_conv_id`（无则按文本）把对应的实时流式卡片退役成只读历史卡片，不会双份
 5. **提取 plan**：`_extract_plan(content_full)`（[runtime/plan.py](../backend/app/agents/runtime/plan.py) `extract_plan`，与 CLI 侧共用）从 `<plan>...</plan>` 块解析，`_merge_plan` 合并到 `current_plan`

@@ -263,9 +263,19 @@ def get_workspace(
         }
 
     repo_path = info.get("repo_path", "")
+    if repo_path:
+        reason = None
+    elif can_restore:
+        reason = "尚未 clone 仓库,请等待 AI助手 执行 clone_repo"
+    else:
+        # 无仓库交付物的任务(先发了句"hi")本就没有 clone 可等:首个追问附件
+        # 传输时会按需建根,工作区随之可浏览(见
+        # sandbox_tools._ensure_upload_work_root)—— 旧文案让用户去等一件
+        # 永远不会发生的事
+        reason = "本任务没有仓库交付物,工作区将在首个附件传输后就绪"
     return {
         "available": bool(repo_path),
-        "reason": None if repo_path else "尚未 clone 仓库,请等待 react_agent 执行 clone_repo",
+        "reason": reason,
         "repo_path": repo_path,
         "completed": info.get("completed", False),
         "mode": info.get("mode", ""),
