@@ -60,6 +60,7 @@
 - **知识点主题手动修正(知识点看板)**:看板每张卡片底部「改主题」下拉可修正自动匹配出错的主题(`PUT /practice/knowledge-points/{key}/topic`);改在知识点级并级联更新其下题目的 `learning_topic`(看板分组与「练这个主题」组卷均按知识点主题命中),目标主题须属于当前用户(含已停用),改后整板刷新让卡片流入新分区。
 - **出题模型三级解析**:task 级 > 用户级默认(`practice_settings.default_llm_config_id`)> env 默认;思考模式三态覆盖(follow/on/off)。
 - **异步 job + SSE**:出题后台线程执行,`/practice/generate/{job_id}/stream` 推送进度;出题日志落盘 `logs/practice_generate.log`。
+- **停止 / 继续出题**(出题进度侧栏):`POST /practice/generate/{job_id}/stop` 置一次性停止标志后立即返回,后台线程在检查点(逐条 finding 之间 / 并发 worker 入口 / 工作区恢复的克隆轮询)协作式收尾,job 终态新增 `cancelled`;**已生成的 draft 先 commit 再返回**(不白烧已付 token),仍可「确认入库」。「继续出题」不复活旧 job,而是用同一 `max_findings` 重发一次 `force_regenerate=false` 的请求 —— 本用户已出过题的 finding 后端会整条跳过,选题顺序确定,所以天然从断点接着跑。`stop_requested` 随 snapshot/job 列表下发,侧栏在生效前显示“正在停止…”(协作式取消可能滞后数十秒)。
 - **前端**:PracticeView(练习首页 / 会话答题 / 统计趋势 / 题库管理)、出题进度侧栏、生成确认弹窗、练习设置弹窗;`PRACTICE_ENABLED` 功能开关前后端联动。
 
 #### 工作区变更与智能体策略
@@ -67,6 +68,7 @@
 - **智能体策略独立表(agent_policies)**:用户级默认从 `user_preferences` JSONB 迁移为独立 1:1 表(agent2 启停 / 协作轮次 / 验证权限),任务级经 `task.params._agent_policy` 覆盖。(其中的“协作轮次 max_rounds”列已随 agent2 后台审查重构移除:初始运行 agent1 单轮即完成,多轮由用户 resume 驱动。)
 - **工作区变更捕获(workspace_diff)**:任务完成时捕获已跟踪 + 未跟踪文件合成 git patch,存 `task_artifacts`(kind=git_diff,上限 100 万字符);仓库树快照(kind=repo_tree)兜底;前端任务详情页展示变更区(按行着色、可折叠)。
 - (检查点评估与软中断功能曾在本阶段实现,后因价值/成本比不高整体移除:agent2 保留 round 边界完整评估,`AgentPolicy` 表的检查点/打断列一并清理。)
+- **终止检查**(`POST /tasks/{id}/review/stop`):后台审查可用户主动停下(有些对话不需要检查)。标志按轮登记在 `review_stop.py`,agent2 在工具循环边界与 LLM 流 chunk 边界(可选 `stop_check` 贯穿 runtime/stream_llm 与 LLMClient.chat_stream,命中即关流)协作式退出;`review_status` 新增 `stopped`(VARCHAR(16) 自由字符串,无需迁移),保留临时结果并改写其“整理中”标题,审查后下游链(记忆归纳/自动出题/预压缩)整体跳过。不用暂停(暂停仅接受 RUNNING,而审查发生在任务已完成后)。
 
 #### 代码审查能力增强
 

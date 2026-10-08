@@ -56,6 +56,10 @@ from app.pause_controller import (
     resume_task,
 )
 from app.perf import perf_log
+from app.review_stop import (
+    clear_review_stop_state,
+    request_stop as request_review_stop,
+)
 from app.scenarios.base import list_scenarios
 from app.schemas.task import (
     ScenarioInfo,
@@ -1079,6 +1083,64 @@ def resume_task_endpoint(
     return {"status": task.status.value, "message": "任务已恢复"}
 
 
+@router.post("/tasks/{task_id}/review/stop")
+def stop_task_review_endpoint(
+    task_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_user),
+) -> dict[str, Any]:
+    """终止 agent2 后台检查(仅审查进行中可用)
+
+    有些对话不需要检查:agent2 动辄数分钟的只读核查/PoC/引用复核可以直接停。
+    不能用 /pause 走这条路:暂停只接受 RUNNING,而后台审查发生在任务已
+    COMPLETED 之后;且把审查线程挂在检查点上只会白占 DB session 与事件活跃期。
+
+    语义:按轮登记终止标志后立即返回,审查线程在下一个检查点(LLM 流 chunk
+    边界 / 工具循环边界)协作式收尾,写 review_status=stopped + 推 review_done;
+    本轮知识点不会被写入,保留 agent1 的执行结果。
+
+    例外:没有审查线程在跑(后端重启后的遗留"检查中"角标)时无人会来收尾,
+    就地写终态并推事件,否则前端永远卡在"检查中"。
+    """
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.user_id is not None:
+        if current_user is None or current_user.id != task.user_id:
+            raise HTTPException(status_code=403, detail="无权操作此任务")
+
+    if task.review_status != "running":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"检查状态为 {task.review_status or '未开始'},"
+                "仅检查进行中可终止"
+            ),
+        )
+
+    stopped_round = request_review_stop(task.id)
+    if stopped_round is None:
+        # 无审查线程持有本轮:端点代它收尾(角标不能永久卡住)
+        task.review_status = "stopped"
+        task.current_stage = "任务完成(检查已终止,保留执行结果)"
+        db.commit()
+        _publish_task_status(task)
+        publish(task.id, "review_done", {"review_status": "stopped"})
+        logger.info(f"[task={task_id}] 无在跑审查,终止请求就地收尾")
+        return {"review_status": "stopped", "message": "检查已终止"}
+
+    # 标志已落:终态由审查线程写(它才持有本轮 round_idx 与事件活跃期),
+    # 先把阶段文案改一下给前端即时反馈(终态随 review_done 到达)
+    task.current_stage = "正在终止检查..."
+    db.commit()
+    _publish_task_status(task)
+    logger.info(f"[task={task_id}] 已提交终止检查请求(round={stopped_round})")
+    return {
+        "review_status": "running",
+        "message": "已提交终止请求,检查将在下一个检查点停止",
+    }
+
+
 @router.post("/tasks/{task_id}/skip_pre_clone")
 def skip_pre_clone_endpoint(
     task_id: uuid.UUID,
@@ -1178,9 +1240,11 @@ def delete_task(
         if current_user is None or current_user.id != task.user_id:
             raise HTTPException(status_code=403, detail="无权操作此任务")
 
-    # 先清理 in-memory 资源(暂停门控 + 跳过标志 + 沙箱 session),再删数据库记录
+    # 先清理 in-memory 资源(暂停门控 + 跳过标志 + 审查终止标志 + 沙箱 session),
+    # 再删数据库记录
     clear_pause_state(str(task_id))
     clear_skip_state(str(task_id))
+    clear_review_stop_state(str(task_id))
     try:
         sandbox_tools.close_session(str(task_id))
     except Exception as e:

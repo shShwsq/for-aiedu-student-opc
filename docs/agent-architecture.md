@@ -67,12 +67,13 @@
 - **agent2 后台审查**:在同一后台线程内单次完整核查(只读工具核对 / verify / check_reference),整理重点与知识点(`results + grouping`)替换**本轮**临时 Result(知识点按轮追加:仅删本轮 `round_idx`,跨轮保留),发现缺口输出"建议追问方向"(`suggestions`,0-3 条);审查完成 `review_status=done` → 推 `review_done`,再经 `_end_event_scope`(事件活跃期)收尾:自己是最后活跃流 → 推 `done` → `finish_task`;仍有并行流在跑 → 总线保持打开。agent2 只审不改
 - **纯对话轮跳过审查**:本轮 agent1 无任何工具调用(`_round_has_tool_calls` 查 Conversation 无 `role=agent1, type=tool_call` 记录;builtin 与 CLI 执行器均按此落库)→ 判定为纯对话轮,`_finish_conversation_round` 直接收尾(推 `agent1_done`,done/finish 经 `_end_event_scope` 统一判定),跳过审查/结果替换/练习题/记忆归纳,保留既有结果与审查状态
 - **审查失败/降级**:保留 agent1 summary 临时结果,`review_status=failed`,落警告对话,仍推 `review_done(review_status=failed)` → `done`;任务状态不回滚(审查失败 ≠ 任务失败)
+- **用户终止检查**(有些对话不需要检查):`POST /tasks/{id}/review/stop` → 仅 `review_status=running` 可用。与暂停不同:审查期间任务已 COMPLETED(暂停只接受 RUNNING),且把线程挂在检查点上会白占 DB session 与事件活跃期 —— 因此走**协作式取消**:标志按轮登记在 `app/review_stop.py`(与 pause_controller / clone_skip 同为进程内注册表),审查线程在检查点自行退出(工具循环顶部 / 每次工具执行之间 / LLM 流 chunk 边界 —— `stream_llm` 与 `LLMClient.chat_stream` 收到可选 `stop_check` 后逐 chunk 判断并关闭底层流,否则按钮要等一整次 16384-token 调用才生效)。`run_agent2` 返回 `stopped=true` → 不替换知识点(本轮本就没产出)、保留临时结果并把其标题从"执行结果(检查助手整理中)"改写为"执行结果(检查已终止)"、`review_status=stopped` + 推 `review_done(stopped)`,**审查后下游链(记忆归纳 / 自动出题 / 历史预压缩)整体跳过**。终止请求只作用于登记的那一轮(新一轮开始时清掉遗留标志,并行时老流收尾不清新流登记);若已无审查线程在跑(重启后的遗留角标),端点代它写终态并推事件,避免前端永久卡在"检查中"。不提供"重新检查"入口:用户追问即开启新一轮,新一轮自带后台审查
 - **无"协作总轮次"设置**:初始运行单轮,多轮协作由用户驱动(resume)。原 `AgentPolicy.max_rounds` 已移除(启动迁移 `migrate_agent_policy_drop_max_rounds_column` 幂等 DROP 老库列)
 - **单 agent 退化**:智能体策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无后台审查,`review_status` 保持 `NULL`
 - **resume(用户驱动多轮)**:用户追加消息 / 点击建议「追问」触发。**追问直达 agent1,不等老审查**:端点同步置 `RUNNING` 落库(消除 SSE 快照竞态 + 并发第二条消息按运行中语义入队,防双跑)后启动 resume;老审查(若仍在跑)与新轮 agent1 **并行**——各自落库自己轮次的知识点,`done`/`finish` 仅由最后活跃流推送(事件活跃期 scope 机制,`_begin_event_scope`/`_end_event_scope`,世代号单调递增,下游链仅最新流执行);总线:老审查在跑(打开)→ 不重置(SSE 不断线),上一轮已收尾 → 重置后启动。用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述,agent1 跨轮历史由 `_build_history_messages` 以结构化 messages 注入,用户追问原文作为独立 user 消息;plan 状态从 `task.params["_plan"]` 跨轮续接),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。每次 resume = agent1 一轮 + (分析轮)后台审查
 - **并行世代门控**(消除并行抖动):老审查被新流取代(用户追问/遗留续轮已启动新一轮)时——① verify/PoC 动态验证降级跳过(`run_agent2(superseded_check=...)`,与新轮共享沙箱不再执行 verifier,防端口/进程争抢);② 任务级字段(`review_status`/`current_stage`)与 `review_done` 事件归最新流所有,老审查跳过写入(防侧栏 badge 被收尾值短暂覆盖);知识点落库与审查结论卡不受影响(按轮追加,历史完整)
 - **并行已知限制**(接受的设计取舍):① 老审查的**只读核查**仍与新轮 agent1 共享同一任务沙箱——新轮改文件时老审查读到的可能是"移动靶"(执行类 PoC 已由世代门控降级跳过);② `task.params["_grouping"]` 每轮覆盖,历史轮知识点的分组声明以最新轮为准
-- **review_status 状态模型**:`NULL`(未审查:单 agent / 老任务)/ `running`(审查中)/ `done`(完成)/ `failed`(失败,任务仍 COMPLETED)。启动迁移 `migrate_stale_review_status` 把遗留 `running` 置 `failed`(后端重启后审查线程已死)
+- **review_status 状态模型**:`NULL`(未审查:单 agent / 老任务)/ `running`(审查中)/ `done`(完成)/ `failed`(失败,任务仍 COMPLETED)/ `stopped`(用户终止检查,任务仍 COMPLETED 且保留临时结果)。列为 `VARCHAR(16)` 自由字符串(非 DB 枚举),新增取值无需迁移。启动迁移 `migrate_stale_review_status` 把遗留 `running` 置 `failed`(后端重启后审查线程已死)
 
 ### 1.3 交付物来源与上传链路(uploads → orchestrator)
 
@@ -129,7 +130,7 @@ def run_agent2(
 }
 ```
 
-> 失败降级时附 `degraded=true`(degrade_reason 见日志)→ 调用方标 `review_status=failed`,保留 agent1 临时结果。
+> 失败降级时附 `degraded=true`(degrade_reason 见日志)→ 调用方标 `review_status=failed`,保留 agent1 临时结果。用户终止检查时附 `stopped=true` → 调用方标 `review_status=stopped`(同样保留临时结果,但不再跑审查后下游链)。
 
 ### 2.4 上下文构造
 
@@ -888,7 +889,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | `verify_action` | verifier_agent | 验证动作授权请求(`per_action` 模式,前端 VerifyActionDialog) |
 | `command_confirm` | sandbox_tools (local 模式) | 危险命令确认(前端 CommandConfirmDialog) |
 | `agent1_done` | orchestrator | agent1 轮结束、任务标记 COMPLETED(非终止事件,总线保持打开;data `{status:"completed"}`) |
-| `review_done` | orchestrator | 后台审查结束(非终止事件;data `{review_status:"done"/"failed"}`) |
+| `review_done` | orchestrator | 后台审查结束(非终止事件;data `{review_status:"done"/"failed"/"stopped"}`,stopped = 用户终止检查) |
 | `done` / `error` | orchestrator | 任务终止事件 |
 
 ---

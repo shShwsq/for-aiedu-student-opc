@@ -42,6 +42,7 @@ import {
   retryTask,
   sendTaskMessage,
   skipPreClone,
+  stopTaskReview,
   submitVerifyAction,
   submitCommandConfirm,
   updateTaskVerifierConfig,
@@ -715,7 +716,8 @@ function connectSSE(taskId: string): void {
       }
     },
     onReviewDone: async (data) => {
-      // 后台审查结束:done=重点与知识点已替换临时结果 / failed=保留执行结果
+      // 后台审查结束:done=重点与知识点已替换临时结果 / failed=审查失败
+      // / stopped=用户终止检查(两者都保留 agent1 执行结果)
       // 拉快照同步最终 results 与 suggestions(终止 done 事件随后到达)
       if (task.value) {
         task.value.review_status = data.review_status
@@ -2004,6 +2006,43 @@ const isAgent2Running = computed(
 /** 暂停/恢复按钮 loading 态(防止重复点击) */
 const pausing = ref(false)
 
+/**
+ * 终止检查请求已提交(后台审查线程收尾前保持置灰)
+ *
+ * 后端是协作式取消:LLM 流 chunk 边界/工具循环边界才生效,可能滞后数十秒。
+ * review_status 离开 running(收到 review_done=stopped 或新一轮重置)即复位。
+ */
+const stoppingReview = ref(false)
+
+watch(
+  () => task.value?.review_status,
+  (s) => { if (s !== 'running') stoppingReview.value = false },
+)
+
+/**
+ * 点击"终止检查":有些对话不需要检查,停下后台核查
+ *
+ * 终态由审查线程写并随 review_done 事件送达(本函数不轮询等终态)。
+ * 例外:后端发现已无审查线程在跑(遗留"检查中"角标)时会就地收尾,
+ * 此时拉一次快照兜底,避免 SSE 已断时前端停在旧状态。
+ */
+async function handleStopReview(): Promise<void> {
+  if (!task.value?.id || stoppingReview.value) return
+  stoppingReview.value = true
+  const taskId = String(task.value.id)
+  try {
+    const res = await stopTaskReview(taskId)
+    clientLog(taskId, 'stop_review', { review_status: res.review_status })
+    if (res.review_status !== 'running') {
+      const fresh = await getTask(taskId)
+      if (fresh && !unmountedFlag) applyTaskSnapshot(fresh, false)
+    }
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+    stoppingReview.value = false  // 失败允许重试
+  }
+}
+
 /** 点击暂停/恢复按钮:根据当前状态调对应 API */
 async function handleTogglePause(): Promise<void> {
   if (!task.value?.id || pausing.value) return
@@ -3016,7 +3055,9 @@ function toggleResult(id: string): void {
           :streaming-items="streamingItems"
           :is-running="isAgent2Running"
           :review-status="task.review_status"
+          :stopping-review="stoppingReview"
           @send-suggestion="handleSuggestionDig"
+          @stop-review="handleStopReview"
         />
 
         <!-- 重点与知识点(原"结果清单";分组由 task.params._grouping 驱动,卡片默认折叠;置底展示) -->
@@ -3034,6 +3075,14 @@ function toggleResult(id: string): void {
               title="检查助手正在后台核查,当前为临时结果,完成后自动更新"
             >
               检查助手整理中
+            </span>
+            <!-- 用户终止检查:临时结果就是最终结果(不会再有知识点替换) -->
+            <span
+              v-else-if="task.review_status === 'stopped'"
+              class="review-interim-hint is-stopped"
+              title="已终止检查,保留 AI助手执行结果;如需检查可继续追问(新一轮会自动重新核查)"
+            >
+              检查已终止
             </span>
             <!-- 本任务的出题 job 运行中时,隐藏「生成练习题」入口,改为展示跳转练习页看实时进度 -->
             <button
@@ -3359,6 +3408,12 @@ function toggleResult(id: string): void {
   border-radius: 50%;
   background: var(--color-primary);
   animation: gen-pulse 1.4s ease-in-out infinite;
+}
+
+/* 检查已终止:临时结果就是最终结果,呼吸点静止(不再暗示"还在跑") */
+.review-interim-hint.is-stopped::before {
+  background: var(--color-text-secondary);
+  animation: none;
 }
 
 /* 出题进度跳转入口(位于结果清单标题行,与「生成练习题」按钮互斥;呼吸红点提示运行中) */

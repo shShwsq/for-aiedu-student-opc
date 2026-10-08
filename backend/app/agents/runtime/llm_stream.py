@@ -18,7 +18,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from app.event_bus import publish
 from app.perf import perf_log
@@ -146,12 +146,15 @@ class StreamResult:
     - finish_reason:流结束原因('stop' / 'tool_calls' / 'length' 等),
       None 表示异常中断前的状态(异常时直接 raise)
     - conv_id:本次调用的流式卡片标识(前端按此 key 累积 thinking_delta)
+    - stopped:调用方 stop_check 命中而提前收流(拿到的是部分输出,
+      结果不可用,调用方据此走终止分支;不传 stop_check 时恒为 False)
     """
     conv_id: str
     reasoning: str
     content: str
     tool_calls: list[dict[str, Any]]
     finish_reason: str | None
+    stopped: bool = False
 
 
 def stream_llm(
@@ -167,6 +170,7 @@ def stream_llm(
     iteration: int | None = None,
     extra: dict[str, Any] | None = None,
     phase_start: bool = True,
+    stop_check: Callable[[], bool] | None = None,
 ) -> StreamResult:
     """流式调用 LLM:边收 token 边推 thinking_delta 事件给前端
 
@@ -185,6 +189,9 @@ def stream_llm(
         extra: 附加到每条 thinking_delta 的字段(如 verifier 的 verify=True)
         phase_start: 是否推流开始事件(verifier 的 start 事件由
             run_verifier_agent 自行发布,避免重复 → False)
+        stop_check: 可选的逐 chunk 终止检查(agent2 被用户终止时秒级收流);
+            命中后正常收尾(推 end 事件关闭前端卡片)并标 stopped=True,
+            已收到的 reasoning 照常落库。不传时对底层调用一字不改。
 
     事件序列:phase=start(可选) → reasoning / content 增量 →
     error(异常,先推事件再原样 raise)/ end。降级策略(重试/兜底)由
@@ -219,9 +226,15 @@ def stream_llm(
     try:
         _t0 = time.perf_counter()
         _first_chunk = True
-        for chunk in client.chat_stream(
-            messages, tools=tools, tool_choice="auto", max_tokens=max_tokens
-        ):
+        # 仅在调用方传了 stop_check 时才多传一个参数:存量调用方与按 kwargs
+        # 断言的测试(替身 client)看到的调用形状完全不变
+        stream_kwargs: dict[str, Any] = {
+            "messages": messages, "tools": tools,
+            "tool_choice": "auto", "max_tokens": max_tokens,
+        }
+        if stop_check is not None:
+            stream_kwargs["stop_check"] = stop_check
+        for chunk in client.chat_stream(**stream_kwargs):
             if _first_chunk:
                 _first_chunk = False
                 perf_log(
@@ -265,10 +278,15 @@ def stream_llm(
         raise
 
     publish(task_id, "thinking_delta", _payload("end"))
+    # 终止判定放在收流之后:底层生成器命中 stop_check 时直接 return,
+    # 这里再用同一条检查点把它显式标出来(也是"流自然结束但期间被终止"
+    # 的情形 —— 调用方下一层的循环边界同样会命中,不会丢)
+    stopped = stop_check is not None and bool(stop_check())
     logger.info(
         f"[task={task_id}] {role} 流式结束,finish={finish_reason}, "
         f"reasoning={len(reasoning_full)}字符, content={len(content_full)}字符, "
         f"tool_calls={len(acc)}"
+        + (", 已被调用方终止" if stopped else "")
     )
     return StreamResult(
         conv_id=conv_id,
@@ -276,4 +294,5 @@ def stream_llm(
         content=content_full,
         tool_calls=acc.tool_calls,
         finish_reason=finish_reason,
+        stopped=stopped,
     )

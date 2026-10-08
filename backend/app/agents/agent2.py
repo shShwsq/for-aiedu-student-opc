@@ -40,7 +40,7 @@
 import json
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 
 from json_repair import repair_json
@@ -217,6 +217,7 @@ def run_agent2(
     agent_policy: dict[str, Any] | None = None,
     repo_path: str | None = None,
     superseded_check: Any = None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """执行一次 agent2 后台审查
 
@@ -239,6 +240,10 @@ def run_agent2(
             动态验证(verifier 的 run_python_code 与新轮 agent1 共享同一任务
             沙箱,并行会争抢端口/进程,且新轮正在改文件使 PoC 结论不可信),
             仅完成只读核查。
+        stop_check: 可选回调() -> bool。返回 True 表示用户已按下"终止检查",
+            在检查点(工具循环边界、每次工具执行之间、LLM 流 chunk 边界)
+            协作式退出,返回带 stopped=true 的结果(调用方据此标
+            review_status=stopped,保留 agent1 临时结果)。不传时行为与旧版一致。
 
     返回:agent2 的结构化输出
         {
@@ -377,19 +382,35 @@ def run_agent2(
     verify_count = 0
     reference_count = 0
     degraded_error: Exception | None = None
+
+    def _invoke_stream(msgs: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]], str]:
+        """调 _stream_agent2_llm:仅在需要时下传 stop_check
+
+        模块级包装的兼容面:存量测试按属性替身不接这个参数,
+        无终止需求时不传就不会 TypeError。
+        """
+        extra: dict[str, Any] = {}
+        if stop_check is not None:
+            extra["stop_check"] = stop_check
+        return _stream_agent2_llm(
+            client, msgs,
+            task_id=task_id, round_idx=round_idx, tools=tools, **extra,
+        )
+
+    stopped = False  # 用户终止检查:置位后在循环边界退出
     while True:
+        # 终止检查点(循环顶):上一次工具回灌后用户按了终止,不再多付一次 LLM 往返
+        if stop_check is not None and stop_check():
+            stopped = True
+            break
         try:
-            content, tool_calls, reasoning_chunk = _stream_agent2_llm(
-                client, messages, task_id=task_id, round_idx=round_idx, tools=tools
-            )
+            content, tool_calls, reasoning_chunk = _invoke_stream(messages)
         except Exception as e:
             logger.warning(
                 f"[task={task_id}] agent2 流式调用失败(第 1 次): {e},将重试一次"
             )
             try:
-                content, tool_calls, reasoning_chunk = _stream_agent2_llm(
-                    client, messages, task_id=task_id, round_idx=round_idx, tools=tools
-                )
+                content, tool_calls, reasoning_chunk = _invoke_stream(messages)
             except Exception as e2:
                 degraded_error = e2
                 logger.exception(
@@ -400,6 +421,12 @@ def run_agent2(
             # 思考链逐次落库(见 _record_agent2_thinking:刷新/中途离开页面可见,
             # 且降级/解析失败提前 return 时已写下的部分不丢)
             _record_agent2_thinking(db, task, task_id, round_idx, reasoning_chunk)
+
+        # 终止检查点(流式之后):stop_check 在 chunk 边界已把流收掉,
+        # 已收到的思考链上面照常落库,这里立即退出而不走工具/解析
+        if stop_check is not None and stop_check():
+            stopped = True
+            break
 
         # 兜底:结构化 tool_calls 为空但 content 里有 Hermes 风格文本
         # 工具调用块(GLM/Qwen 思考模式把工具调用写在正文,而非走结构化
@@ -435,6 +462,11 @@ def run_agent2(
         messages.append(assistant_msg)
 
         for tc in tool_calls:
+            # 终止检查点(工具之间):单个工具(verify / check_reference)
+            # 可阻塞数十秒,不在此拦截会白等一整个工具批次
+            if stop_check is not None and stop_check():
+                stopped = True
+                break
             fn_name = tc["name"]
             try:
                 args = json.loads(tc["arguments_str"]) if tc["arguments_str"] else {}
@@ -579,7 +611,30 @@ def run_agent2(
                 "content": verify_result,
             })
 
+        # 工具批次内被终止:不再回到 LLM(已 append 的 assistant 工具调用消息
+        # 不会有配对的 tool 结果,但本次审查已作废,不会再把 messages 送出去)
+        if stopped:
+            break
+
         # 循环回去:LLM 看到工具结果后,要么再调工具,要么输出 JSON 评估
+
+    # 用户终止检查:优先于降级/解析分支返回(部分输出不作审查结论),
+    # orchestrator 据此标 review_status=stopped,保留 agent1 临时结果
+    if stopped:
+        logger.info(
+            f"[task={task_id}] agent2 审查已被用户终止(round_idx={round_idx},"
+            f"已进工具调用: read={read_tool_count} verify={verify_count} "
+            f"reference={reference_count})"
+        )
+        return {
+            "covered": [],
+            "missing": [],
+            "reasoning": "检查已由用户终止,未得出审查结论。",
+            "suggestions": [],
+            "results": [],
+            "grouping": None,
+            "stopped": True,
+        }
 
     # 流式调用降级:重试仍失败时返回降级结果(不抛异常杀死任务)。
     # orchestrator 检测到 degraded=true 后标记审查失败
@@ -836,6 +891,7 @@ def _stream_agent2_llm(
     task_id: UUID | str,
     round_idx: int = 0,
     tools: list[dict[str, Any]] | None = None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> tuple[str, list[dict[str, Any]], str]:
     """流式调用 agent2 的 LLM(runtime.stream_llm 的薄包装)
 
@@ -850,12 +906,19 @@ def _stream_agent2_llm(
       侧栏只展示思考链(reasoning)
 
     返回 (content_full, tool_calls_full, reasoning_full)
+
+    stop_check 仅在非空时下传 runtime.stream_llm(保持存量替身/测试的调用形状)。
+    命中终止时拿到的是截至该点的部分输出,调用方靠 stop_check() 自己识别。
     """
+    extra_kwargs: dict[str, Any] = {}
+    if stop_check is not None:
+        extra_kwargs["stop_check"] = stop_check
     result = stream_llm(
         client, messages,
         task_id=task_id, round_idx=round_idx, role="agent2",
         tools=tools, max_tokens=UA_EVAL_MAX_TOKENS,
         publish_content=False,
+        **extra_kwargs,
     )
     return result.content, result.tool_calls, result.reasoning
 

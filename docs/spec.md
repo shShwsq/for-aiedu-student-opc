@@ -188,7 +188,8 @@ agent2 是**幕后质检者**(agent1 是台前回答者):其核查过程与知�
 - **agent2 后台审查**:agent1 完成后,agent2 在同一后台线程内做**单次完整审查**(只读核查 / PoC 验证 / 引用复核),整理"重点与知识点"替换**本轮**临时结果(知识点按轮追加,跨轮保留),并输出 0-3 条"建议追问方向"(suggestions)。审查只审不改
 - **纯对话轮跳过审查**:本轮 agent1 无任何工具调用(回答完全来自历史上下文/模型知识,未触碰工作区)时,判定为纯对话轮——直接完成任务,跳过审查/结果替换/练习题生成/记忆归纳,保留既有结果与审查状态。交互对齐 Codex 式问答:纯追问即回答,不为一次对话触发整条审查流水线
 - **审查终止条件**:agent2 确定的审查维度均有明确结论(有 / 无 / 无法确定),每个维度至少触及一个关键检查点;审查为一次性完成,无追问轮次上限概念(原"协作总轮次 max_rounds"已移除)
-- **审查状态**:`review_status` = running / done / failed;审查失败保留 agent1 临时结果,任务仍 COMPLETED
+- **审查状态**:`review_status` = running / done / failed / stopped;审查失败保留 agent1 临时结果,任务仍 COMPLETED
+- **终止检查**:有些对话不需要检查——检查中可点侧栏「终止检查」(`POST /tasks/{id}/review/stop`,仅 running 可用)。协作式取消:审查线程在检查点(LLM 流 chunk 边界 / 工具循环边界)自行退出,保留 agent1 临时结果(标题改为"执行结果(检查已终止)"),`review_status=stopped`,**审查后下游链(记忆归纳 / 自动出题 / 历史预压缩)整体跳过**。不用暂停机制(暂停只接受 RUNNING,而后台审查发生在任务已完成后);也不提供"重新检查"按钮(追问会开启新一轮,自带后台审查)
 
 **用户驱动多轮(resume)**:用户在任务完成后追加消息、或点击建议卡片的「追问」按钮,可触发新一轮执行。**追问直达 agent1,不等老审查**:老审查(若仍在跑)与新轮 agent1 并行,各自落库自己轮次的知识点,任务终止事件(done/finish)仅由最后活跃流推送(事件活跃期机制);前端 SSE 不断线,新轮事件经现有连接续达。用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述;agent1 跨轮历史由自身的历史记忆注入提供),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。多轮完全由用户驱动,无自动轮次上限。**重启会复用上一轮的 plan**(`task.params["_plan"]` 加载为 `previous_plan`):已完成项保持 done,只推进未完成项;追问若改变方向,LLM 可在 `<plan>` 更新中新增/调整步骤。
 
@@ -197,6 +198,7 @@ agent2 是**幕后质检者**(agent1 是台前回答者):其核查过程与知�
 - 后台线程在检查点(迭代边界 / 工具调用前)阻塞
 - `task.status` 变为 `paused`,前端展示暂停状态
 - 恢复后从阻塞点继续执行
+- 仅适用于 **AI助手 执行阶段**(status=RUNNING);后台检查助手已改为「终止检查」(见 3.6),暂停不适用于它
 
 ### 3.8 用户补充消息
 用户可在对话界面下方输入框发送补充消息:
@@ -247,7 +249,7 @@ Task(任务)
     - params._verifier: 验证智能体配置(auth_mode / auth_tokens / test_env_url,实验性)
   - allowed_skills: JSONB,用户选择的允许调用的 skill 名称列表(空=全部可用)
   - status: pending / running / paused / completed / failed
-  - review_status: 后台审查子状态(NULL 未审查 / running 审查中 / done 完成 / failed 失败;agent1 结束即 completed,审查在后台跑)
+  - review_status: 后台审查子状态(NULL 未审查 / running 审查中 / done 完成 / failed 失败 / stopped 用户终止检查;agent1 结束即 completed,审查在后台跑)
   - current_stage: 当前阶段描述(展示给前端)
   - error_message: 失败时的错误信息
   - llm_config_id: agent2 使用的 LLM 配置 ID

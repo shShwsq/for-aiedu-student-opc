@@ -206,10 +206,18 @@ RoundGroup { roundIdx, segments, planSteps }
    修正指令",不显示轮次数字),轮内含流式思考(SSE thinking_delta,
    verify 标记显示"动态验证")、历史思考链、工具核查(读码/PoC/引用复核,
    tool_call 与 tool_result 配对为单行摘要+展开)、评估结论、最终总结卡。
+   标题行右侧状态 badge 取 review_status(检查中 / 检查完成 / 检查失败 /
+   检查已终止);**审查中额外提供一个「终止检查」按钮**(POST /tasks/{id}/review/stop,
+   `stoppingReview` 置灰防重复点):后端是协作式取消(LLM 流 chunk 边界 / 工具
+   循环边界生效),终态随 review_done=stopped 事件送达,本视图不轮询等终态
+   (仅当后端告知"已无审查线程在跑"时拉一次快照兜底,防 SSE 已断时卡在"检查中")。
 5. **重点与知识点**(最底部,原"结果清单"):agent2 done=true 提炼的
    3-8 条精选知识点(老任务为全量发现,兼容);含 `learning_note` 的卡片
    带"值得学"徽标,展开时正文上方显示学习点引用块;按 `task.params._grouping`
    动态分组(如按严重度,老任务);文件类 meta 标签可点击打开左侧工作区文件。
+   标题行的临时结果提示随 review_status 分流:running →「检查助手整理中」
+   (呼吸点,完成后自动更新),stopped →「检查已终止」(静止中性点:临时结果
+   就是最终结果,不再等知识点替换;failed 不在这里另开提示,标题行 badge「检查失败」已说明)。
 
 > 历史说明:覆盖度看板(task.checklist 驱动的维度卡片网格)已随覆盖度清单功能移除。
 

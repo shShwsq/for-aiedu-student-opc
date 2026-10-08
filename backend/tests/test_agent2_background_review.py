@@ -11,6 +11,7 @@
 - 单 agent 模式:无审查事件,review_status 不动
 - suggestions 落库契约(前端解析 type=suggestions 渲染追问卡片)
 - 临时结果助手 _replace_interim_results:按轮清理后落单条
+- 用户终止检查:保留临时结果 + review_status=stopped + 跳过审查下游链
 """
 import json
 import uuid
@@ -693,3 +694,137 @@ def test_single_agent_mode_no_review_events(monkeypatch):
     assert not rec.events("review_done")
     assert len(rec.events("done")) == 1         # 单 agent:done 直接终止
     assert rec.index("done") < rec.index(("finish",))
+
+
+# ============================================================
+# 用户终止检查(review_status=stopped)
+# ============================================================
+
+
+def test_review_stopped_keeps_interim_and_skips_downstream(monkeypatch):
+    """终止检查:保留临时结果(不改知识点不删行)+ 把"整理中"标题改正
+    + review_status=stopped + 推 review_done(stopped) + 下游链整体跳过。"""
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+    db = MagicMock()
+    stopped = _mk_review_result(
+        results=[], reasoning="检查已由用户终止,未得出审查结论。",
+        stopped=True,
+    )
+
+    _patch_env(monkeypatch, executor, lambda *a, **k: stopped)
+    rec = _EventRecorder(monkeypatch)
+    import app.services.memory_summarize as memory_summarize
+    import app.services.practice.auto_generate as auto_generate
+    downstream = []
+    monkeypatch.setattr(
+        memory_summarize, "summarize_and_save_memory",
+        lambda *a, **k: downstream.append("memory"),
+    )
+    monkeypatch.setattr(
+        auto_generate, "auto_generate_practice_for_task",
+        lambda *a, **k: downstream.append("practice"),
+    )
+
+    orchestrator.run_dual_agent_audit(task, db)
+
+    assert task.status == TaskStatus.COMPLETED   # 终止不是任务失败
+    assert task.review_status == "stopped"
+    assert rec.events("review_done")[0][2] == {"review_status": "stopped"}
+    assert rec.index("review_done") < rec.index("done")
+    # 临时结果保留:只有 agent1 summary 那 1 条,未新增知识点
+    results_added = [
+        c.args[0] for c in db.add.call_args_list
+        if isinstance(c.args[0], Result)
+    ]
+    # 也没有为替换知识点而再删一轮:全链路只删过一次(临时结果落库前的本轮清理)
+    assert db.query.return_value.filter.return_value.delete.call_count == 1
+    # 本轮知识点未写入:db.add 只出现过 1 次 Result(上面那条临时结果)
+    assert len(results_added) == 1
+    # "整理中"标题已改写(否则结果卡永远写着还在等待审查)
+    updates = db.query.return_value.filter.return_value.update.call_args_list
+    assert any(
+        (call.args[0] or {}).get("title") == "执行结果(检查已终止)"
+        for call in updates
+    ), updates
+    # 终止后下游链整体不跑(记忆归纳 + 自动出题)
+    assert downstream == []
+
+
+def test_background_review_registers_round_and_stop_check(monkeypatch):
+    """审查按轮登记供终止端点定位;传入 agent2 的 stop_check 实时反映请求,
+    审查收尾(无论成败)都注销登记。"""
+    import app.review_stop as review_stop
+
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+    probe = {}
+
+    def _ua(*args, **kwargs):
+        check = kwargs.get("stop_check")
+        probe["registered"] = review_stop.has_active_review(str(task.id))
+        probe["callable"] = callable(check)
+        probe["before_request"] = check() if callable(check) else "missing"
+        review_stop.request_stop(task.id)
+        probe["after_request"] = check() if callable(check) else "missing"
+        return _mk_review_result(results=[], stopped=True)
+
+    _patch_env(monkeypatch, executor, _ua)
+    _EventRecorder(monkeypatch)
+
+    try:
+        orchestrator.run_dual_agent_audit(task, MagicMock())
+
+        assert probe["registered"] is True
+        assert probe["callable"] is True
+        assert probe["before_request"] is False
+        assert probe["after_request"] is True
+        # 收尾已注销登记(finally 路径),注册表不随任务数增长
+        assert review_stop.has_active_review(str(task.id)) is False
+    finally:
+        _clear_scopes(str(task.id))
+        clear_user_messages(str(task.id))
+        review_stop.clear_review_stop_state(str(task.id))
+
+
+def test_review_round_registered_before_review_thread_starts(monkeypatch):
+    """回归:agent1 完成时就登记审查轮,而不是等到审查真正开工。
+
+    工作区 diff 捕获(大仓库可数秒)落在 review_status=running 与审查开工之间;
+    这段窗口里点「终止检查」若因注册表为空而被判为"无审查在跑",端点会就地写
+    stopped,随后审查照常跑完把终态改成 done —— 用户看到角标闪回"检查完成"。
+    """
+    import app.review_stop as review_stop
+
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+    probe = {}
+
+    def _leftover(*args, **kwargs):
+        # 这就是 diff 捕获之后、审查开工之前的那个窗口
+        probe["registered"] = review_stop.has_active_review(str(task.id))
+        probe["round"] = review_stop.request_stop(task.id)
+        return False
+
+    _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result(stopped=True))
+    monkeypatch.setattr(
+        orchestrator, "_auto_resume_leftover_messages", _leftover,
+    )
+    _EventRecorder(monkeypatch)
+
+    try:
+        orchestrator.run_dual_agent_audit(task, MagicMock())
+
+        assert probe["registered"] is True
+        assert probe["round"] == 1            # 终止落在本轮审查上
+        assert task.review_status == "stopped"  # 审查收尾尊重终止请求
+    finally:
+        _clear_scopes(str(task.id))
+        clear_user_messages(str(task.id))
+        review_stop.clear_review_stop_state(str(task.id))

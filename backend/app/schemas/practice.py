@@ -52,8 +52,10 @@ class GenerateModelResponse(BaseModel):
 class GenerateJobStatusResponse(BaseModel):
     """生成进度与结果(GET /practice/generate/{job_id})
 
-    status: pending(排队) / running(出题中) / done(完成) / error(失败)
-    done/total: 已处理/总 finding 数;done 时 questions 为新 draft 列表。
+    status: pending(排队) / running(出题中) / done(完成) /
+      error(失败) / cancelled(用户已停止,已生成题目照常保留为 draft)。
+    done/total: 已处理/总 finding 数;done 时 questions 为新 draft 列表,
+      cancelled 时也带已生成的 questions(供预览入库)。
     """
 
     status: str
@@ -85,6 +87,11 @@ class GenerateJobSummary(BaseModel):
     skipped_findings: int = 0
     created_count: int = 0
     started_at: str | None = None
+    # 已请求停止但尚未进终态(后台线程还没跑到检查点):侧栏据此显示"正在停止…"
+    stop_requested: bool = False
+    # 本次出题的请求参数:侧栏「继续出题」据此重发(上限与重出开关不丢)
+    max_findings: int = 10
+    force_regenerate: bool = False
 
 
 class GenerateJobsResponse(BaseModel):

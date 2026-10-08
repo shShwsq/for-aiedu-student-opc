@@ -1,10 +1,11 @@
 /**
  * 练习展示格式化工具单元测试
  *
- * 覆盖三类容易在各组件走偏的口径:
+ * 覆盖四类容易在各组件走偏的口径:
  * 1. 无数据 → 统一占位符「—」(而不是 NaN / Invalid Date / undefined)
  * 2. 正确率与难度的小数位(百分比取整、难度整数不带小数)
  * 3. 选项下标越界与状态/题型标签兜底
+ * 4. 出题 job 状态文案(含已停止/正在停止这两个新中间与终态)
  */
 import { describe, expect, it } from 'vitest'
 
@@ -14,6 +15,7 @@ import {
   formatDateTime,
   formatDifficulty,
   formatPercent,
+  generateJobStatusLabel,
   optionLetter,
   questionStatusLabel,
   qtypeLabel,
@@ -96,5 +98,47 @@ describe('questionStatusLabel / qtypeLabel', () => {
     expect(qtypeLabel('true_false')).toBe('判断')
     expect(qtypeLabel('single_choice')).toBe('单选')
     expect(qtypeLabel(null)).toBe('单选')
+  })
+})
+
+describe('generateJobStatusLabel', () => {
+  it('进行中按 done/total 展示进度,total 缺失时用问号(不显示成 0/0)', () => {
+    expect(generateJobStatusLabel({ status: 'running', done: 2, total: 5 }))
+      .toBe('出题中 2/5')
+    expect(generateJobStatusLabel({ status: 'running', done: 0, total: 0 }))
+      .toBe('出题中 0/?')
+  })
+
+  it('已请求停止时拼上"正在停止":否则协作式取消看起来像按钮没生效', () => {
+    expect(
+      generateJobStatusLabel({ status: 'running', done: 2, total: 5, stop_requested: true }),
+    ).toBe('出题中 2/5 · 正在停止')
+    expect(generateJobStatusLabel({ status: 'pending', stop_requested: true }))
+      .toBe('正在停止')
+  })
+
+  it('排队中若正在恢复工作区,优先说真在做的阶段', () => {
+    expect(generateJobStatusLabel({ status: 'pending', restore: { phase: 'start' } }))
+      .toBe('恢复工作区中')
+    expect(generateJobStatusLabel({ status: 'pending', restore: { phase: 'progress' } }))
+      .toBe('恢复工作区中')
+    expect(generateJobStatusLabel({ status: 'pending', restore: { phase: 'done' } }))
+      .toBe('排队中')
+    expect(generateJobStatusLabel({ status: 'pending' })).toBe('排队中')
+  })
+
+  it('cancelled 是用户停止的终态,标"已停止"而不是"失败"', () => {
+    expect(generateJobStatusLabel({ status: 'cancelled', created_count: 3 }))
+      .toBe('已停止 · 3 题')
+    // 停止前尚未生成题:也要能说清(侧栏据此决定要不要给「确认入库」)
+    expect(generateJobStatusLabel({ status: 'cancelled', created_count: 0 }))
+      .toBe('已停止 · 0 题')
+  })
+
+  it('done / error / 缺失入参的兜底', () => {
+    expect(generateJobStatusLabel({ status: 'done', created_count: 7 })).toBe('已完成 · 7 题')
+    expect(generateJobStatusLabel({ status: 'error' })).toBe('失败')
+    expect(generateJobStatusLabel(null)).toBe(EMPTY_TEXT)
+    expect(generateJobStatusLabel(undefined)).toBe(EMPTY_TEXT)
   })
 })

@@ -81,6 +81,7 @@ const hasRunningGenJob = computed(() =>
   generateJobs.value.some((j) => j.status === 'pending' || j.status === 'running'),
 )
 
+/** 侧栏「继续出题」新建 job 后由 @refresh-jobs 立刻重拉一次,不等 5 秒轮询 */
 async function pollGenerateJobs(): Promise<void> {
   try {
     const res = await listGenerateJobs()
@@ -992,6 +993,7 @@ onBeforeUnmount(() => {
         :jobs="generateJobs"
         @close="genSidebarOpen = false"
         @confirm-preview="handleConfirmPreview"
+        @refresh-jobs="pollGenerateJobs"
       />
     </div>
 

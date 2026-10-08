@@ -20,7 +20,7 @@ import random
 import time
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import openai
 from openai import OpenAI
@@ -28,6 +28,20 @@ from openai import OpenAI
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _close_stream(stream: Any) -> None:
+    """关闭 OpenAI 流式响应(用户终止调用时在 chunk 边界提前收流)
+
+    openai.Stream 包着 httpx.Response,不显式 close 则连接回到池前会始终挂着
+    (底层 SSE 未读完)。关闭失败不影响调用方 —— 已经拿到的增量照常有用。
+    """
+    try:
+        stream.close()
+    except AttributeError:
+        pass  # 非标准流对象(测试替身等):无 close 可调
+    except Exception as e:
+        logger.debug(f"关闭流式响应失败(忽略): {str(e)[:200]}")
 
 
 # ============================================================
@@ -352,6 +366,7 @@ class LLMClient:
         max_tokens: int = 4096,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        stop_check: Callable[[], bool] | None = None,
     ) -> Generator["StreamChunk", None, None]:
         """流式对话(统一入口,所有 agent 都走这个)
 
@@ -368,6 +383,11 @@ class LLMClient:
         所以调用方需要按 index 累积 arguments 字符串,完整后才能 json.loads。
 
         参考:ai-plugin/lib/llm.js 的 _parseSSE
+
+        stop_check:可选的逐 chunk 终止检查(用户终止 agent2 检查等场景)。
+            返回 True 时先关掉底层 HTTP 流(否则已建立的流会继续读完),
+            再正常结束生成器 —— 调用方拿到的是截至该点的部分输出。
+            不传时行为与以前一致。
         """
         extras = build_thinking_extras(
             self.provider, self.model_meta, self.enable_thinking
@@ -411,6 +431,11 @@ class LLMClient:
         splitter = _ThinkTagSplitter()
 
         for chunk in stream:
+            # 终止检查点:逐 chunk 判断,命中即关流退出(未关闭的 OpenAI Stream
+            # 会继续读取剩余 token,既不省钱也不省时)
+            if stop_check is not None and stop_check():
+                _close_stream(stream)
+                return
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]

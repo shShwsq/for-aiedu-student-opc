@@ -57,6 +57,20 @@ export function getGenerateJob(jobId: string): Promise<GenerateJobStatus> {
 }
 
 /**
+ * 停止出题(协作式取消)
+ *
+ * 置标志后立即返回;后台线程在下一个检查点(逐条 finding 之间 / 并发 worker
+ * 入口 / 克隆轮询)命中标志自行收尾,把 job 写成 cancelled 并推 cancelled SSE 事件。
+ * 已生成的候选题照常保留为 draft(可在侧栏「确认入库」),不白烧已付 token。
+ * 在途的那一次 LLM 往返不能回收,故生效可能滞后数十秒(期间 stop_requested=true)。
+ */
+export function stopGenerateJob(
+  jobId: string,
+): Promise<{ status: string; message: string }> {
+  return client.post(`/practice/generate/${jobId}/stop`).then((r) => r.data)
+}
+
+/**
  * 当前用户的 job 列表(运行中优先,限最近 10 条)
  *
  * 练习页侧栏轮询发现正在运行的出题 job(默认 manual/auto);

@@ -82,6 +82,7 @@ from app.services.practice.explainer import (
     explain_knowledge_points,
 )
 from app.services.practice.generator import (
+    PracticeGenerateCancelled,
     PracticeGenerateError,
     generate_questions_for_task,
     resolve_explain_client_for_user,
@@ -178,6 +179,8 @@ def generate_questions(
         source="manual",
         task_id=str(task.id),
         task_title=task.title or task.user_input[:60],
+        max_findings=req.max_findings,
+        force_regenerate=req.force_regenerate,
     )
     gen_jobs.set_total(job_id, total=min(result_count, req.max_findings))
     thread = threading.Thread(
@@ -217,6 +220,7 @@ def _run_generate_job(
             event_callback=lambda etype, data: gen_jobs.append_event(
                 job_id, etype, data
             ),
+            should_stop=lambda: gen_jobs.is_stop_requested(job_id),
         )
         kp_by_id = {
             kp.id: kp
@@ -244,13 +248,22 @@ def _run_generate_job(
                 source_lines=q.source_lines,
             ))
         # done/total 由进度回调维护,此处不覆盖
+        # 被用户停过而且确实少跑了活 → cancelled(已生成的 draft 照常供预览入库);
+        # 请求落在最后一条之后(全部已处理)则按 done 收口,不误报"已停止"
+        cancelled = gen_jobs.is_cancelled(job_id, user_id)
         gen_jobs.update_job(
-            job_id, status="done", questions=items, skipped_findings=skipped
+            job_id, status="cancelled" if cancelled else "done",
+            questions=items, created_count=len(items), skipped_findings=skipped,
         )
         logger.info(
-            "[practice] 手动出题完成 job=%s task=%s: %d 题(%d 条 finding 未出题)",
+            "[practice] 手动出题%s job=%s task=%s: %d 题(%d 条 finding 未出题)",
+            "已按请求停止" if cancelled else "完成",
             job_id, task_id, len(items), skipped,
         )
+    except PracticeGenerateCancelled as e:
+        # 出题开始前(克隆/预读)被停止:无题可保留,cancelled 而不是 error
+        logger.info("[practice] 手动出题在出题前被停止 job=%s: %s", job_id, e)
+        gen_jobs.update_job(job_id, status="cancelled", created_count=0)
     except PracticeGenerateError as e:
         # 致命错误(额度/认证等):友好原因直接展示,无需堆栈
         logger.warning("[practice] 出题中止 job=%s: %s", job_id, e)
@@ -311,7 +324,7 @@ def stream_generate_job(
     - snapshot: 连接建立的初始快照(含 recent_text,中途接入兜底)
     - finding: 开始处理某条发现 / token: LLM 输出增量 /
       tool: 工具调用记录 / progress: 进度计数
-    - done / error: 终止事件
+    - done / error / cancelled(用户停止): 终止事件
 
     鉴权:EventSource 不能自定义 header,用 ?token=XXX 查询参数。
     """
@@ -350,11 +363,11 @@ def stream_generate_job(
                     yield _sse_pack(ev["type"], ev["data"])
                     after_seq = ev["seq"]
                     _sent += 1
-                    if ev["type"] in ("done", "error"):
+                    if ev["type"] in ("done", "error", "cancelled"):
                         _reason = f"终止事件 {ev['type']}"
                         return
                 if not res["events"]:
-                    if res["job"]["status"] in ("done", "error"):
+                    if gen_jobs.is_terminal_status(res["job"]["status"]):
                         _reason = "终态事件已送达"
                         return  # 已终态且事件已全部送达
                     yield ": keep-alive\n\n"
@@ -375,6 +388,36 @@ def stream_generate_job(
             "X-Accel-Buffering": "no",  # Nginx:禁用缓冲,确保实时推送
         },
     )
+
+
+@router.post("/generate/{job_id}/stop")
+def stop_generate_job(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """停止出题(协作式取消,仅未终态的 job 可停)
+
+    置标志后立即返回:出题线程在下一个检查点(逐条 finding 之间 / 并发 worker
+    入口 / 克隆轮询)命中标志自行收尾,把 job 写成终态 cancelled 并推 cancelled
+    SSE 事件。**已生成的候选题照常入库**(仍是 draft,可在侧栏「确认入库」),
+    不白烧已付的 token;未开始的 finding 不再付成本。
+
+    粒度说明:在途的那一次 LLM 往返不能回收(成本已付),所以下一条边界
+    可能要数十秒才到;期间列表/snapshot 的 stop_requested=true 让侧栏显示
+    "正在停止…",刷新页面也不丢这个中间态。
+    """
+    current = gen_jobs.request_stop(job_id, current_user.id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="生成任务不存在或已过期")
+    if gen_jobs.is_terminal_status(current):
+        raise HTTPException(
+            status_code=409,
+            detail=f"出题已结束(状态:{current}),无需停止",
+        )
+    return {
+        "status": current,
+        "message": "已提交停止请求,出题将在下一个检查点停止",
+    }
 
 
 @router.get("/generate/{job_id}", response_model=GenerateJobStatusResponse)

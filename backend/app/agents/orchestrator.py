@@ -72,6 +72,12 @@ from app.prompts.executor import (
     format_repo_context_body,
     format_resume_attachment_note,
 )
+from app.review_stop import (
+    begin_review as _begin_review_state,
+    clear_review_stop_state,
+    end_review as _end_review_state,
+    should_stop as _review_should_stop,
+)
 from app.security import decrypt_secret
 from app.tools import sandbox_tools
 from app.tools.schema import set_current_git_tokens, set_current_task
@@ -80,6 +86,11 @@ from app.user_messages import clear_user_messages, drain_user_messages
 from app.user_interaction import clear_pending_command_confirm, clear_pending_verify_action
 
 logger = logging.getLogger(__name__)
+
+# agent1 本轮 summary 落库的临时 Result 标题:审查完成后由知识点替换,
+# 审查失败/终止时保留。单独提到常量:终止收尾需按它定位行改写标题,
+# 字面量散落两处会改不到(与前端 task-detail-view-structure 的描述一致)
+INTERIM_RESULT_TITLE = "执行结果(检查助手整理中)"
 
 
 # ============================================================
@@ -493,6 +504,10 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         task.review_status = "running"
         db.commit()
         _publish_status(task)
+        # 紧标当前审查轮:终止请求可能在下面的工作区 diff 捕获(大仓库可数秒)
+        # 与审查线程真正开工之间到达。不在这里登记的话注册表是空的,
+        # 端点会误判"无审查在跑"而就地写 stopped,随后审查又跑完把终态改成 done
+        _begin_review_state(task_id_str, 1)
 
         # 领域事件:任务完成(双 agent 路径,时刻=agent1 结束,不含审查时长)
         emit(
@@ -606,6 +621,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             for cleanup_fn, name in [
                 (clear_pause_state, "暂停状态"),
                 (clear_skip_state, "跳过预克隆标志"),
+                (clear_review_stop_state, "审查终止标志"),
                 (clear_user_messages, "用户消息队列"),
                 (clear_pending_verify_action, "验证待授权状态"),
                 (clear_pending_command_confirm, "命令待确认状态"),
@@ -736,9 +752,12 @@ def _record_agent2_review(
     reasoning_text = ua_result.get("reasoning", "")
     suggestions = ua_result.get("suggestions", [])
     review_failed = bool(ua_result.get("degraded")) or bool(ua_result.get("parse_failed"))
+    review_stopped = bool(ua_result.get("stopped"))
 
     # 审查结论卡(侧栏)
-    if review_failed:
+    if review_stopped:
+        content = "检查已由用户终止:未得出审查结论,保留 AI助手执行结果"
+    elif review_failed:
         content = "审查未完成:核查未产出,保留 AI助手执行结果"
     else:
         content = f"审查完成:{len(covered)} 个维度通过,{len(missing)} 个待改进"
@@ -789,7 +808,7 @@ def _replace_interim_results(
         Result(
             task_id=task.id,
             round_idx=round_idx,
-            title="执行结果(检查助手整理中)",
+            title=INTERIM_RESULT_TITLE,
             content=summary or "(无总结)",
         )
     ]
@@ -797,6 +816,30 @@ def _replace_interim_results(
         db.add(r)
     db.commit()
     return len(interim)
+
+
+def _mark_interim_review_stopped(db: Session, task: Task, round_idx: int) -> None:
+    """终止检查后把本轮临时 Result 的"整理中"标题改正
+
+    知识点只在审查结束时一次性产出,中途终止意味着本轮没有可替换的整理结果,
+    留下的仍是 agent1 summary 临时结果 —— 标题写着"检查助手整理中",不改正会
+    永远误导用户(审查失败路径保留原样:失败可能是暂时的,用户会重试)。
+    只改本轮且标题仍是临时结果的那几条:并行轮次的临时结果属于另一条流。
+    """
+    try:
+        db.query(Result).filter(
+            Result.task_id == task.id,
+            Result.round_idx == round_idx,
+            Result.title == INTERIM_RESULT_TITLE,
+        ).update(
+            {"title": "执行结果(检查已终止)"}, synchronize_session=False
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning(
+            f"[task={task.id}] 改写终止后的临时结果标题失败(忽略): {e}"
+        )
 
 
 def _auto_resume_leftover_messages(task: Task, db: Session, task_id_str: str) -> bool:
@@ -924,11 +967,23 @@ def _run_background_review(
     ② 任务级字段(review_status/current_stage)与 review_done 事件归新流
     所有,本流跳过写入(防 badge 被老审查收尾值短暂覆盖);
     知识点落库与审查结论卡不受影响(按轮追加,历史完整)。
+
+    用户终止检查(review_status=stopped):agent2 在检查点协作式退出,本轮
+    保留临时结果,审查后下游链(记忆归纳/自动出题/历史预压缩)整体跳过 ——
+    "这条对话不需要检查"同时意味着不需要它带出的额外产出(需要时可手动
+    点「生成练习题」)。终止标志按轮登记,详见 app/review_stop.py。
     """
     def _superseded() -> bool:
         return not _is_latest_generation(task_id_str, flow_gen)
 
+    def _stop_check() -> bool:
+        return _review_should_stop(task_id_str, round_idx)
+
+    review_stopped = False
     try:
+        # 登记"本轮审查在跑":路由的终止请求据此定位当前轮;登记前收到的
+        # 请求会走"无审查在跑"分支直接写终态(不残留标志)
+        _begin_review_state(task_id_str, round_idx)
         if _superseded():
             # 审查启动前已被新流取代(如遗留消息自动续轮先启动):
             # 纯只读降级,不动任务级字段(stage/badge 归新流所有)
@@ -957,6 +1012,7 @@ def _run_background_review(
                 task=task, agent_policy=agent_policy,
                 repo_path=cur_repo_path,
                 superseded_check=_superseded,
+                stop_check=_stop_check,
             )
         except Exception as review_err:
             # run_agent2 内部已兜底降级,这里是最后防线(DB 异常等)
@@ -973,13 +1029,25 @@ def _run_background_review(
         )
         _record_agent2_review(db, task, round_idx, ua_result)
 
+        review_stopped = bool(ua_result.get("stopped"))
         review_failed = (
             bool(ua_result.get("degraded"))
             or bool(ua_result.get("parse_failed"))
             or not ua_result.get("results")
         )
 
-        if review_failed:
+        if review_stopped:
+            # 用户终止:不动知识点(本轮本就没产出),保留临时结果并改正标题,
+            # 只标子状态(被新流取代时任务级字段仍归新流所有)
+            _mark_interim_review_stopped(db, task, round_idx)
+            if not _superseded():
+                task.review_status = "stopped"
+                task.current_stage = "任务完成(检查已终止,保留执行结果)"
+            logger.info(
+                f"[task={task.id}] 后台审查已被用户终止"
+                f"(round={round_idx}),保留执行结果"
+            )
+        elif review_failed:
             # 审查失败:保留 agent1 summary 临时结果,只标记子状态
             # (被新流取代时跳过任务级字段:badge 归新流所有)
             if not _superseded():
@@ -1040,12 +1108,13 @@ def _run_background_review(
             db.commit()
             _publish_status(task)
 
-            # 领域事件 + perf 锚点:审查完成(含失败;对照实验的审查时延以此为准)
+            # 领域事件 + perf 锚点:审查完成(含失败/用户终止;对照实验的审查时延以此为准)
             emit(
                 REVIEW_COMPLETED, task.id,
                 review_status=task.review_status,
                 results_count=len(ua_result.get("results") or []),
                 suggestions_count=len(ua_result.get("suggestions") or []),
+                stopped=review_stopped,
             )
             perf_log(task.id, "review_done", review_status=task.review_status)
 
@@ -1055,6 +1124,11 @@ def _run_background_review(
         # 新一轮 agent1/resume)仍在跑时保持总线打开,由最后活跃流收尾
         # (被取代也必须调:注销自身 scope,否则总线永久悬挂)
         _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
+
+        # 终止语义:审查后下游链整体跳过(记忆归纳/自动出题/历史预压缩)
+        if review_stopped:
+            logger.info(f"[task={task.id}] 检查已终止,跳过审查下游链")
+            return
 
         # ---- 下游链(依赖最终结果,必须在审查后;仅最新流执行,避免并行重复)----
         if not _is_latest_generation(task.id, flow_gen):
@@ -1095,6 +1169,9 @@ def _run_background_review(
             _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
         except Exception:
             _end_event_scope(task.id, flow_gen)
+    finally:
+        # 注销审查登记(无论完成/失败/终止;按轮匹配才清,不误伤并行新轮)
+        _end_review_state(task_id_str, round_idx)
 
 
 def _publish_status(task: Task) -> None:
@@ -1873,6 +1950,8 @@ def resume_audit_with_message(
         task.review_status = "running"
         db.commit()
         _publish_status(task)
+        # 紧标当前审查轮(同初始运行路径):不让终止请求在 diff 捕获窗口里落空
+        _begin_review_state(task_id_str, start_round_idx)
 
         # 领域事件:任务完成(resume 路径,时刻=agent1 结束)
         emit(
@@ -1981,6 +2060,7 @@ def resume_audit_with_message(
             for cleanup_fn, name in [
                 (clear_pause_state, "暂停状态"),
                 (clear_skip_state, "跳过预克隆标志"),
+                (clear_review_stop_state, "审查终止标志"),
                 (clear_user_messages, "用户消息队列"),
                 (clear_pending_verify_action, "验证待授权状态"),
                 (clear_pending_command_confirm, "命令待确认状态"),

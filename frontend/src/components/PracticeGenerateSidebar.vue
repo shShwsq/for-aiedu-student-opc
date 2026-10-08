@@ -7,11 +7,17 @@
  * - 选中 job 后订阅 SSE(GET /practice/generate/{job_id}/stream),
  *   展示进度条、当前 finding、工具调用与 LLM 流式输出(打字机效果)
  * - 输出区自动滚动到底部;用户手动上滚时暂停跟随
+ * - 运行中可「停止出题」(协作式取消,已生成的题保留为 draft);
+ *   已停止可「继续出题」(重发一次同参请求:本用户已出过题的 finding
+ *   后端会整条跳过,所以天然从断点接着跑,不需要恢复旧 job)
  */
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 
+import { generateQuestions, stopGenerateJob } from '@/api/practice'
 import { subscribeGenerateStream } from '@/api/practiceStream'
+import { generateJobStatusLabel } from '@/utils/practiceFormat'
 import type {
+  GenerateCancelledData,
   GenerateDoneData,
   GenerateErrorData,
   GenerateExplainData,
@@ -33,6 +39,8 @@ const emit = defineEmits<{
   close: []
   /** 请求打开题目入库弹窗(携带 job 的来源任务 id,由父组件展示 PracticeGenerateDialog) */
   'confirm-preview': [taskId: string]
+  /** 继续出题已新建 job:让父组件立刻重拉 job 列表(不等 5 秒轮询) */
+  'refresh-jobs': []
 }>()
 
 // ============================================================
@@ -68,6 +76,20 @@ const streamText = ref('')
 const snapshotTerminal = ref(false)
 /** 出题前工作区恢复状态(沙箱已清理时重新 clone,首条 finding 到达后清除) */
 const restore = ref<GenerateRestoreData | null>(null)
+/**
+ * 已请求停止但尚未进终态(后台线程还在收尾)
+ *
+ * 初值取 job 摘要的 stop_requested:协作式取消可能滞后数十秒,
+ * 没有它用户会以为按钮没生效;刷新页面后也能恢复这个中间态。
+ */
+const stopRequested = ref(false)
+/** 停止/继续请求在飞(防重复点击) */
+const stopping = ref(false)
+const continuing = ref(false)
+/** 已停止时的断点信息(已生成题数 + done/total) */
+const cancelledInfo = ref<GenerateCancelledData | null>(null)
+/** 展示用错误(停止/继续失败),与 job 自身的生成失败分开 */
+const actionError = ref('')
 
 /** 输出区自动跟随(用户手动上滚时暂停) */
 const followBottom = ref(true)
@@ -75,6 +97,16 @@ const outputEl = ref<HTMLElement | null>(null)
 
 const selectedJob = computed<GenerateJobSummary | null>(
   () => props.jobs.find((j) => j.job_id === selectedJobId.value) ?? null,
+)
+
+/** 本次展示是否处于可停止的运行态(排队/出题中) */
+const isBusy = computed(
+  () => status.value === 'pending' || status.value === 'running',
+)
+
+/** 已生成的题是否值得保留展示(停止后决定要不要给「确认入库」入口) */
+const createdCount = computed(
+  () => cancelledInfo.value?.created ?? doneInfo.value?.created ?? 0,
 )
 
 /** 默认选中:运行中优先(jobs 已按运行中在前排序) */
@@ -170,6 +202,9 @@ function resetStreamState(): void {
   snapshotTerminal.value = false
   restore.value = null
   followBottom.value = true
+  stopRequested.value = false
+  cancelledInfo.value = null
+  actionError.value = ''
 }
 
 function closeStream(): void {
@@ -195,6 +230,8 @@ function subscribeToJob(job: GenerateJobSummary): void {
   total.value = job.total
   currentFinding.value = job.current_finding
   errorMsg.value = job.error
+  // 防重复点:列表里已标了"请求过停止"的 job,连接建立前就先把状态还原
+  stopRequested.value = !!job.stop_requested
 
   es = subscribeGenerateStream(job.job_id, {
     onSnapshot: handleSnapshot,
@@ -206,6 +243,7 @@ function subscribeToJob(job: GenerateJobSummary): void {
     onProgress: handleProgress,
     onDone: handleDone,
     onError: handleError,
+    onCancelled: handleCancelled,
   })
 }
 
@@ -224,14 +262,23 @@ function handleSnapshot(data: GenerateSnapshotData): void {
   total.value = data.total
   currentFinding.value = data.current_finding
   errorMsg.value = data.error
+  stopRequested.value = !!data.stop_requested
   // 中途接入时正在恢复工作区:用 snapshot 的 restore 字段兜底展示
   if (data.restore) restore.value = data.restore
   // 已终态的 job:只展示输出尾部文本,跳过事件重放(历史 job 一眼带过)
-  if (data.status === 'done' || data.status === 'error') {
+  if (data.status === 'done' || data.status === 'error' || data.status === 'cancelled') {
     snapshotTerminal.value = true
     streamText.value = data.recent_text
     if (data.status === 'done') {
       doneInfo.value = { created: data.created_count, skipped: data.skipped_findings }
+    } else if (data.status === 'cancelled') {
+      // 刷新/中途接入已停止的 job:断点信息从 snapshot 字段还原(不是事件重放)
+      cancelledInfo.value = {
+        created: data.created_count,
+        skipped: data.skipped_findings,
+        done: data.done,
+        total: data.total,
+      }
     }
     scheduleScroll()
   }
@@ -293,12 +340,31 @@ function handleDone(data: GenerateDoneData): void {
   status.value = 'done'
   doneInfo.value = data
   if (total.value > 0) done.value = total.value
+  stopRequested.value = false
   closeStream()
 }
 
 function handleError(data: GenerateErrorData): void {
   status.value = 'error'
   errorMsg.value = data.message
+  stopRequested.value = false
+  closeStream()
+}
+
+/**
+ * 用户停止出题的终止事件:状态置 cancelled,保留"已生成几题"与断点进度
+ *
+ * 已生成的 draft 仍在库里(与 done 同构),所以终止后仍可直接「确认入库」。
+ */
+function handleCancelled(data: GenerateCancelledData): void {
+  status.value = 'cancelled'
+  cancelledInfo.value = data
+  doneInfo.value = { created: data.created, skipped: data.skipped }
+  if (typeof data.total === 'number' && data.total > 0) {
+    total.value = data.total
+    done.value = data.done ?? data.total
+  }
+  stopRequested.value = false
   closeStream()
 }
 
@@ -320,22 +386,70 @@ const progressPercent = computed(() => {
   return Math.min(100, Math.round((done.value / total.value) * 100))
 })
 
+/** job 列表项状态文案(口径抽到 utils/practiceFormat 做单测) */
 function statusLabel(job: GenerateJobSummary): string {
-  if (job.status === 'pending') {
-    // 恢复工作区阶段(克隆可能耗时数十秒),给出明确状态避免误以为卡死
-    const phase = job.restore?.phase
-    if (phase === 'start' || phase === 'progress') return '恢复工作区中'
-    return '排队中'
-  }
-  if (job.status === 'running') return `出题中 ${job.done}/${job.total || '?'}`
-  if (job.status === 'done') return `已完成 · ${job.created_count} 题`
-  return '失败'
+  return generateJobStatusLabel(job)
 }
 
 /** 打开题目入库弹窗(仅 job 关联了来源任务时可用) */
 function handleConfirmPreview(): void {
   const taskId = selectedJob.value?.task_id
   if (taskId) emit('confirm-preview', taskId)
+}
+
+/**
+ * 停止出题:置后端标志后立即返回,真正生效在下一个检查点
+ *
+ * 本地先把 stopRequested 拉起来(不依赖下一轮轮询/snapshot),
+ * 终态 cancelled 仍由 SSE 事件送达 —— 单一写者,不会前后不一致。
+ */
+async function handleStop(): Promise<void> {
+  const jobId = selectedJobId.value
+  if (!jobId || stopping.value || !isBusy.value) return
+  stopping.value = true
+  actionError.value = ''
+  try {
+    await stopGenerateJob(jobId)
+    stopRequested.value = true
+  } catch (err) {
+    actionError.value = errMessage(err)
+  } finally {
+    stopping.value = false
+  }
+}
+
+/**
+ * 继续出题:重发一次同参请求(新建 job,不复活旧 job)
+ *
+ * 后端 force_regenerate=false 会把本用户已出过题的 finding 整条跳过,
+ * 因此"从断点接着跑"无需恢复旧 job 的线程与事件序号;_select_findings
+ * 顺序确定(practice_worthy 优先 + created_at),两次选到的集合一致。
+ * 同用户集合里已出过题的那部分会先被计入进度,所以一上来 done 会跳一大截。
+ */
+async function handleContinue(): Promise<void> {
+  const job = selectedJob.value
+  if (!job?.task_id || continuing.value) return
+  continuing.value = true
+  actionError.value = ''
+  try {
+    await generateQuestions({
+      task_id: job.task_id,
+      max_findings: job.max_findings ?? undefined,
+    })
+    // 解除手动锁定:下方 watch 会自动改订阅到新跑起来的 job
+    userPicked.value = false
+    emit('refresh-jobs')
+  } catch (err) {
+    actionError.value = errMessage(err)
+  } finally {
+    continuing.value = false
+  }
+}
+
+/** 接口错误文案(无 response 时是网络问题,不是后端 detail) */
+function errMessage(err: unknown): string {
+  const e = err as { response?: { data?: { detail?: string } }; message?: string }
+  return e?.response?.data?.detail || e?.message || '操作失败,请稍后重试'
 }
 </script>
 
@@ -392,6 +506,18 @@ function handleConfirmPreview(): void {
           正在出题:{{ currentFinding }}
         </p>
 
+        <!-- 运行中操作区:停止出题(协作式取消,已生成的题仍保留) -->
+        <div v-if="isBusy" class="gen-actions">
+          <button
+            class="gen-stop-btn"
+            :disabled="stopping || stopRequested"
+            :title="stopRequested
+              ? '已提交停止请求,已生成的题仍会保留,等待当前一条跑完'
+              : '停止后续出题;已生成的候选题仍会保留待确认'"
+            @click="handleStop"
+          >{{ stopping || stopRequested ? '正在停止...' : '停止出题' }}</button>
+        </div>
+
         <!-- 工作区恢复横幅(沙箱已清理时重新 clone,含克隆进度) -->
         <div v-if="restore" :class="['gen-restore', `gen-restore-${restore.phase}`]">
           <template v-if="restore.phase === 'failed'">
@@ -433,6 +559,30 @@ function handleConfirmPreview(): void {
         <div v-else-if="status === 'error'" class="gen-footer gen-footer-error">
           生成失败:{{ errorMsg || '未知错误' }}
         </div>
+        <!-- 已停止:说明断点与保留结果,给「继续出题」与「确认入库」入口 -->
+        <div v-else-if="status === 'cancelled'" class="gen-footer gen-footer-cancelled">
+          <p class="gen-done-text">
+            已停止出题<template v-if="total">(跑到 {{ done }}/{{ total }})</template>
+            <template v-if="createdCount > 0">· 已生成 {{ createdCount }} 道候选题仍待确认</template>
+            <template v-else>· 停止前未生成题目</template>
+          </p>
+          <button
+            v-if="selectedJob?.task_id"
+            class="btn-primary btn-small gen-confirm-btn"
+            title="接着未出题的发现继续(已出过题的发现会整条跳过,不重复花成本)"
+            :disabled="continuing"
+            @click="handleContinue"
+          >{{ continuing ? '提交中...' : '继续出题' }}</button>
+          <button
+            v-if="selectedJob?.task_id && createdCount > 0"
+            class="gen-secondary-btn gen-confirm-btn"
+            title="预览已生成的候选题并勾选入库"
+            @click="handleConfirmPreview"
+          >确认入库</button>
+        </div>
+
+        <!-- 停止/继续请求失败(与 job 自身的生成失败分开展示) -->
+        <p v-if="actionError" class="gen-action-error">{{ actionError }}</p>
       </div>
     </template>
   </aside>
@@ -575,6 +725,8 @@ function handleConfirmPreview(): void {
 .gen-status-done { color: var(--color-success, #16a34a); }
 .gen-status-error { color: var(--color-danger); }
 .gen-status-pending { color: var(--color-text-secondary); }
+/* 用户停止:中性色(不是失败,是"中途收手且结果已保留") */
+.gen-status-cancelled { color: var(--color-text-secondary); }
 
 /* ---- 详情区 ---- */
 .gen-detail {
@@ -735,8 +887,77 @@ function handleConfirmPreview(): void {
   width: 100%;
 }
 
+/* 运行中操作区(停止出题):靠右不抢进度条位置,与进度行之间留小间距 */
+.gen-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* 停止出题按钮:描边危险色(比实心主按钮弱一级,避免误读为"主操作") */
+.gen-stop-btn {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-danger);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.gen-stop-btn:hover:not(:disabled) {
+  border-color: var(--color-danger);
+  background: var(--color-bg-secondary);
+}
+
+.gen-stop-btn:disabled {
+  color: var(--color-text-secondary);
+  cursor: default;
+  opacity: 0.7;
+}
+
+/* 次要按钮(已停止后的「确认入库」,主位给「继续出题」) */
+.gen-secondary-btn {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-text);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.gen-secondary-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+/* 已停止区两个按钮上下堆叠(gen-confirm-btn 是 100% 宽),拉开一点间距 */
+.gen-footer-cancelled .gen-confirm-btn + .gen-confirm-btn {
+  margin-top: var(--space-1);
+}
+
 .gen-footer-error {
   color: var(--color-danger);
   background: var(--color-bg-secondary);
+}
+
+/* 已停止:中性底色(有保留结果要告知,但不是错误) */
+.gen-footer-cancelled {
+  color: var(--color-text);
+  background: var(--color-bg-secondary);
+}
+
+/* 停止/继续请求失败的一行提示(不与 job 生成失败混在一起) */
+.gen-action-error {
+  margin: 0;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--color-danger);
+  background: var(--color-bg-secondary);
+  border-radius: var(--radius-sm);
 }
 </style>

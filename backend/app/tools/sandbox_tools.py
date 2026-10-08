@@ -691,6 +691,30 @@ class CloneSkippedError(RuntimeError):
     """
 
 
+class CloneCancelledError(CloneSkippedError):
+    """调用方取消克隆(出题 job 被用户停止时的克隆阶段中断)
+
+    接在 CloneSkippedError 之后:回退链里现有的 `except CloneSkippedError:
+    raise` 传播点与半成品目录清理对它同样生效,不必逐个 catch 点改写。
+    区别于“跳过预克隆”(只是不走预克隆,任务继续):本异常必须一路冒到
+    调用方(出题 job 据此收尾为 cancelled),不能被当成“克隆失败”降级。
+    """
+
+
+def _clone_stop_reason(task_id: str, cancellable: bool, cancel_check) -> str:
+    """克隆检查点:返回终止原因("" = 继续跑)
+
+    外部取消(cancel_check)优先于“跳过预克隆”标志 —— 前者是调用方
+    (已停止的出题 job)的要求,必须中断;consume_skip_clone 是一次性
+    标志,只在 cancellable 路径消费,不能被误消费。
+    """
+    if cancel_check is not None and cancel_check():
+        return "cancelled"
+    if cancellable and consume_skip_clone(task_id):
+        return "skipped"
+    return ""
+
+
 def clone_repo(repo_url: str, branch: str | None = None, task_id: str = "", git_tokens: dict | None = None) -> dict:
     """克隆 Git 仓库(LLM 工具入口)
 
@@ -1201,6 +1225,7 @@ def _clone_repo_local(
     task_id: str = "", cancellable: bool = False,
     progress_callback: Callable[[int, str], None] | None = None,
     use_depth: bool = True,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """local 模式:本地 git clone(Popen 流式读进度 + 推 SSE)
 
@@ -1290,10 +1315,14 @@ def _clone_repo_local(
                 break
             # 暂停检查点:已暂停则阻塞到恢复,暂停时长不计入超时
             deadline = _pause_checkpoint(task_id, deadline)
-            # 跳过检查点:用户请求跳过预克隆 → kill 进程并抛(向上传播降级)
-            if cancellable and consume_skip_clone(task_id):
+            # 跳过/取消检查点:用户请求跳过预克隆 或 调用方已取消
+            # → kill 进程并抛(向上传播降级;跳过是一次性标志,仅 cancellable 消费)
+            reason = _clone_stop_reason(task_id, cancellable, cancel_check)
+            if reason:
                 proc.kill()
                 reader.join(timeout=2)
+                if reason == "cancelled":
+                    raise CloneCancelledError(f"调用方已取消克隆: {repo_name}")
                 raise CloneSkippedError(f"用户已跳过预克隆: {repo_name}")
             if time.monotonic() > deadline:
                 proc.kill()
@@ -1385,6 +1414,7 @@ def _clone_repo_sandbox(
     task_id: str = "", cancellable: bool = False,
     progress_callback: Callable[[int, str], None] | None = None,
     use_depth: bool = True,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """sandbox 模式:在沙箱里 git clone(后台命令 + 进度文件轮询流式推进度)
 
@@ -1439,13 +1469,16 @@ def _clone_repo_sandbox(
             # 不发 HTTP 请求),暂停时长不计入超时
             deadline = _pause_checkpoint(task_id, deadline)
 
-            # 跳过检查点:用户请求跳过预克隆 → 中断沙箱内命令并抛
-            # (向上传播降级;finally 会清理进度/退出码临时文件)
-            if cancellable and consume_skip_clone(task_id):
+            # 跳过/取消检查点:用户请求跳过预克隆 或 调用方已取消
+            # → 中断沙箱内命令并抛(向上传播降级;finally 会清理进度/退出码临时文件)
+            reason = _clone_stop_reason(task_id, cancellable, cancel_check)
+            if reason:
                 try:
                     session.interrupt_command(exec_id)
                 except Exception:
                     pass
+                if reason == "cancelled":
+                    raise CloneCancelledError(f"调用方已取消克隆: {repo_name}")
                 raise CloneSkippedError(f"用户已跳过预克隆: {repo_name}")
 
             # 1) 进度:读进度文件,按 \r/\n 拆行取最新进度行推前端
@@ -3550,6 +3583,7 @@ def clone_repo_with_fallback(
     repo_url: str, branch: str | None = None, task_id: str = "",
     git_tokens: dict | None = None, cancellable: bool = False,
     progress_callback: Callable[[int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """克隆仓库(同任务串行的对外入口,实际回退流程见 _clone_repo_fallback)
 
@@ -3564,6 +3598,7 @@ def clone_repo_with_fallback(
         return _clone_repo_fallback(
             repo_url, branch=branch, task_id=task_id, git_tokens=git_tokens,
             cancellable=cancellable, progress_callback=progress_callback,
+            cancel_check=cancel_check,
         )
 
 
@@ -3571,6 +3606,7 @@ def _clone_repo_fallback(
     repo_url: str, branch: str | None = None, task_id: str = "",
     git_tokens: dict | None = None, cancellable: bool = False,
     progress_callback: Callable[[int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """克隆仓库(协议回退:HTTPS+token → SSH → HTTPS 匿名)
 
@@ -3607,6 +3643,9 @@ def _clone_repo_fallback(
     provider = get_provider_for_url(repo_url)
     # 该 provider 的 token(未知主机则为空)
     token = git_tokens.get(provider.id, "") if provider else ""
+    # cancel_check 仅在非空时下传给内层克隆函数:
+    # 存量测试按属性替身不接这个参数,无取消需求时不传就不会 TypeError
+    cancel_kw: dict[str, Any] = {} if cancel_check is None else {"cancel_check": cancel_check}
 
     # 构造候选 URL:HTTPS+token、SSH、HTTPS 匿名(去重)
     if provider:
@@ -3663,7 +3702,7 @@ def _clone_repo_fallback(
                 result = _clone_repo_local(
                     ctx, str(bare_dir), repo_name, branch, task_id=task_id,
                     cancellable=cancellable, progress_callback=progress_callback,
-                    use_depth=False,
+                    use_depth=False, **cancel_kw,
                 )
                 _set_repo_path(task_id, result["path"])
                 _record_clone_source(ctx, repo_url, branch, result["path"])
@@ -3687,7 +3726,7 @@ def _clone_repo_fallback(
             result = _clone_repo_sandbox(
                 ctx, ctx["cache_mount"], repo_name, branch, task_id=task_id,
                 cancellable=cancellable, progress_callback=progress_callback,
-                use_depth=False,
+                use_depth=False, **cancel_kw,
             )
             _set_repo_path(task_id, result["path"])
             _record_clone_source(ctx, repo_url, branch, result["path"])
@@ -3721,10 +3760,13 @@ def _clone_repo_fallback(
                 f"回退为不带分支重试(用远端默认分支)"
             )
         for idx, url in enumerate(candidates):
-            # 跳过检查点(尝试前):已请求跳过则立即终止整个回退链,
+            # 跳过/取消检查点(尝试前):已终止则立即结束整个回退链,
             # 不再启动下一种协议(协议间间隙可能持续数十秒,轮询内
             # 检查点覆盖不到)
-            if cancellable and consume_skip_clone(task_id):
+            reason = _clone_stop_reason(task_id, cancellable, cancel_check)
+            if reason:
+                if reason == "cancelled":
+                    raise CloneCancelledError(f"调用方已取消克隆: {repo_name}")
                 raise CloneSkippedError(f"用户已跳过预克隆: {repo_name}")
             # 日志里不打印 token(脱敏)
             safe_url = url.split("@")[-1] if "@" in url else url
@@ -3737,11 +3779,13 @@ def _clone_repo_fallback(
                     result = _clone_repo_local(
                         ctx, url, repo_name, attempt_branch, task_id=task_id,
                         cancellable=cancellable, progress_callback=progress_callback,
+                        **cancel_kw,
                     )
                 else:
                     result = _clone_repo_sandbox(
                         ctx, url, repo_name, attempt_branch, task_id=task_id,
                         cancellable=cancellable, progress_callback=progress_callback,
+                        **cancel_kw,
                     )
                 _set_repo_path(task_id, result["path"])
                 _record_clone_source(ctx, repo_url, attempt_branch, result["path"])

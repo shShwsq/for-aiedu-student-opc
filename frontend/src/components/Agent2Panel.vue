@@ -7,9 +7,10 @@
  * 最终总结全部在本面板按轮折叠展示。
  *
  * 后台审查流程(agent1 结束即任务完成):
- * - reviewStatus=running:头部"检查中"badge,审查流式实时可见
+ * - reviewStatus=running:头部"检查中"badge,审查流式实时可见,可点"终止检查"
  * - reviewStatus=done:头部"检查完成"badge;建议追问卡(suggestions)可点"追问"
  * - reviewStatus=failed:头部"检查失败"badge(保留 AI助手执行结果)
+ * - reviewStatus=stopped:头部"检查已终止"badge(用户主动停,同样保留执行结果)
  *
  * 数据来源:
  * - conversations:任务 Conversation 列表(role=agent2 的历史消息)
@@ -53,11 +54,18 @@ const props = defineProps<{
   isRunning: boolean
   /** 后台审查状态(null=未审查:单 agent 模式/老任务) */
   reviewStatus?: ReviewStatus | null
+  /** 终止请求已提交但尚未生效(审查线程还在收尾):按钮置灰防重复点 */
+  stoppingReview?: boolean
 }>()
 
-/** 用户点击"追问"建议:交给父组件走现有发消息流程(resume) */
+/**
+ * 事件:
+ * - send-suggestion:用户点"追问"建议,交给父组件走现有发消息流程(resume)
+ * - stop-review:用户终止本次检查(有些对话不需要检查),父组件调 API
+ */
 const emit = defineEmits<{
   (e: 'send-suggestion', text: string): void
+  (e: 'stop-review'): void
 }>()
 
 // 后端落库的 tool_call 首行意图前缀(agents/agent2.py),展示时剥离
@@ -139,6 +147,7 @@ const reviewBadge = computed<{ text: string; cls: string } | null>(() => {
   if (props.reviewStatus === 'running') return { text: '检查中', cls: 'is-running' }
   if (props.reviewStatus === 'done') return { text: '检查完成', cls: 'is-done' }
   if (props.reviewStatus === 'failed') return { text: '检查失败', cls: 'is-failed' }
+  if (props.reviewStatus === 'stopped') return { text: '检查已终止', cls: 'is-stopped' }
   return null
 })
 
@@ -240,6 +249,19 @@ function charCount(text: string | null | undefined): number {
         {{ reviewBadge.text }}
       </span>
       <span v-else-if="isRunning" class="panel-live-dot" aria-hidden="true" />
+      <!-- 终止检查:审查动辄数分钟,有些对话不需要检查。
+           后端是协作式取消(LLM 流 chunk 边界/工具循环边界生效),
+           已提交未生效期间按 stoppingReview 置灰 -->
+      <button
+        v-if="reviewStatus === 'running'"
+        type="button"
+        class="panel-stop-btn"
+        :disabled="stoppingReview"
+        :title="stoppingReview
+          ? '已提交终止请求,检查将在下一个检查点停止'
+          : '停止本次后台核查,保留 AI助手执行结果'"
+        @click="emit('stop-review')"
+      >{{ stoppingReview ? '终止中...' : '终止检查' }}</button>
     </h2>
 
     <div v-for="g in rounds" :key="g.round_idx" class="panel-round">
@@ -348,7 +370,7 @@ function charCount(text: string | null | undefined): number {
   animation: panel-pulse 1.4s ease-in-out infinite;
 }
 
-/* 后台审查状态 badge(检查中/检查完成/检查失败) */
+/* 后台审查状态 badge(检查中/检查完成/检查失败/检查已终止) */
 .panel-review-badge {
   padding: 1px var(--space-2);
   font-size: var(--fs-xs);
@@ -371,6 +393,38 @@ function charCount(text: string | null | undefined): number {
 .panel-review-badge.is-failed {
   color: var(--color-warning);
   border-color: var(--color-warning);
+}
+
+/* 用户终止检查:中性偏灰(不是失败,是"没检查") */
+.panel-review-badge.is-stopped {
+  color: var(--color-text-secondary);
+  border-color: var(--color-border);
+}
+
+/* 终止检查按钮(右上角,靠 badge 推开;小尺寸不抢面板标题权重) */
+.panel-stop-btn {
+  margin-left: auto;
+  padding: 1px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-danger);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.panel-stop-btn:hover:not(:disabled) {
+  border-color: var(--color-danger);
+  background: var(--color-bg-secondary);
+}
+
+.panel-stop-btn:disabled {
+  color: var(--color-text-secondary);
+  cursor: default;
+  opacity: 0.7;
 }
 
 /* 审查结论(与评估同结构,中性色:审查不是修正指令) */

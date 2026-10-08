@@ -59,7 +59,7 @@ export interface GenerateModelInfo {
 
 /** 出题进度与结果(GET /practice/generate/{job_id}) */
 export interface GenerateJobStatus {
-  status: 'pending' | 'running' | 'done' | 'error'
+  status: 'pending' | 'running' | 'done' | 'error' | 'cancelled'
   done: number
   total: number
   error: string
@@ -70,7 +70,7 @@ export interface GenerateJobStatus {
 /** 出题 job 摘要(GET /practice/generate/jobs,与 SSE snapshot 同构) */
 export interface GenerateJobSummary {
   job_id: string
-  status: 'pending' | 'running' | 'done' | 'error'
+  status: 'pending' | 'running' | 'done' | 'error' | 'cancelled'
   done: number
   total: number
   error: string
@@ -86,6 +86,17 @@ export interface GenerateJobSummary {
   skipped_findings: number
   created_count: number
   started_at: string | null
+  /**
+   * 已请求停止但尚未进终态(后台线程还没跑到检查点)
+   *
+   * 侧栏据此显示"正在停止…":协作式取消可能滞后数十秒,
+   * 没有这个字段用户会以为按钮没生效(刷新页面也不丢这个中间态)
+   */
+  stop_requested?: boolean
+  /** 本次出题的 finding 上限(「继续出题」重发时沿用) */
+  max_findings?: number
+  /** 本次出题的重出开关(「继续出题」默认 false:已出过题的发现整条跳过) */
+  force_regenerate?: boolean
 }
 
 export interface GenerateJobsResponse {
@@ -160,6 +171,17 @@ export interface GenerateDoneData {
 /** 终止事件:失败 */
 export interface GenerateErrorData {
   message: string
+}
+
+/**
+ * 终止事件:用户停止出题
+ *
+ * 载荷与 done 同构(已生成题数/跳过数)+ done/total 断点进度:
+ * 侧栏用它说清"停下之前已生成几题、跑到第几条",并提供「继续出题」。
+ */
+export interface GenerateCancelledData extends GenerateDoneData {
+  done?: number
+  total?: number
 }
 
 export interface ConfirmQuestionsRequest {

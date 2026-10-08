@@ -9,11 +9,13 @@
  *     onSnapshot: (data) => { ... },   // 初始快照(含 recent_text 兜底)
  *     onToken: (data) => { ... },      // LLM 输出增量(打字机效果)
  *     onDone: (data) => { ... },
+ *     onCancelled: (data) => { ... },  // 用户停止出题(也是终止事件)
  *   })
  *   // 组件卸载/切换 job 时:es.close()
  */
 import { getAccessToken } from './client'
 import type {
+  GenerateCancelledData,
   GenerateDoneData,
   GenerateErrorData,
   GenerateExplainData,
@@ -45,6 +47,8 @@ export interface GenerateStreamCallbacks {
   onDone?: (data: GenerateDoneData) => void
   /** 生成失败(终止事件) */
   onError?: (data: GenerateErrorData) => void
+  /** 用户停止出题(终止事件;已生成的候选题仍保留为 draft) */
+  onCancelled?: (data: GenerateCancelledData) => void
 }
 
 /**
@@ -97,6 +101,7 @@ export function subscribeGenerateStream(
   register('progress', callbacks.onProgress)
   register('done', callbacks.onDone, true)
   register('error', callbacks.onError, true)
+  register('cancelled', callbacks.onCancelled, true)
 
   // [诊断] 原生连接错误(e.data 为 undefined)与业务 error 事件区分;
   // 同时记录连接耗时与断开原因,排查连接反复建立/中断

@@ -14,9 +14,10 @@ export type TaskStatus = 'pending' | 'running' | 'paused' | 'completed' | 'faile
  * - running: 审查进行中(侧栏显示"检查中"角标,SSE 持续接收审查事件)
  * - done: 审查完成(重点与知识点已替换临时结果)
  * - failed: 审查失败/降级(保留 agent1 执行结果,不影响任务状态)
+ * - stopped: 用户主动终止检查(保留 agent1 执行结果,审查后下游链整体跳过)
  * - null: 未审查(单 agent 模式 / 老任务)
  */
-export type ReviewStatus = 'running' | 'done' | 'failed'
+export type ReviewStatus = 'running' | 'done' | 'failed' | 'stopped'
 
 /**
  * 场景信息(后端 ScenarioInfo,精简模板)
@@ -358,8 +359,12 @@ export interface Agent1DoneEventData {
 
 /** review_done 事件 data(后台审查结束,前端拉快照替换临时结果) */
 export interface ReviewDoneEventData {
-  /** done: 审查完成(重点与知识点已替换临时结果)/ failed: 审查失败(保留执行结果) */
-  review_status: 'done' | 'failed'
+  /**
+   * done: 审查完成(重点与知识点已替换临时结果)
+   * failed: 审查失败(保留执行结果)
+   * stopped: 用户终止检查(保留执行结果,不再产生知识点)
+   */
+  review_status: 'done' | 'failed' | 'stopped'
 }
 
 /**

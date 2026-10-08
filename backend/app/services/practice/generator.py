@@ -114,6 +114,16 @@ class PracticeGenerateError(Exception):
     """
 
 
+class PracticeGenerateCancelled(Exception):
+    """用户在出题开始前停止了 job(克隆/主题分类阶段)
+
+    有意**不**继承 PracticeGenerateError:调用方的 `except PracticeGenerateError`
+    会把终止当成失败置 error 终态。本异常只可能在没有产出题目前抛出
+    (循环内停止走正常返回路径,已生成的题目先 commit 再返回),
+    job 层据此置 cancelled。
+    """
+
+
 def _fatal_llm_reason(e: Exception) -> str | None:
     """识别出题模型的不可重试致命错误(认证/额度),返回面向用户的原因
 
@@ -628,6 +638,7 @@ def _ensure_workspace(
     db: Session, task: Task, settings_row: PracticeSettings | None,
     event_callback: Callable[[str, dict], None] | None = None,
     git_tokens: dict[str, str] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict | None:
     """保障出题用的工作区,返回 workspace info(含 repo_path;不可用为 None)
 
@@ -641,6 +652,11 @@ def _ensure_workspace(
 
     git_tokens 可预先传入(主线程读库拿到):恢复可能跑在后台线程,
     而 SQLAlchemy Session 非线程安全 —— 传了就在线程内再查库。
+
+    cancel_check 非空时传给克隆轮询做取消检查点(用户停止出题时大仓库克隆
+    可能还要跑几分钟,不在这里拦的话停止按钮在克隆阶段完全不生效);
+    命中时抛 PracticeGenerateCancelled 而不是降级为无工具出题 ——
+    用户要的是"停下",不是"换种方式继续跑"。
     """
 
     def _emit(phase: str, **extra) -> None:
@@ -661,6 +677,10 @@ def _ensure_workspace(
         return info
     logger.info("[task=%s] 出题前沙箱已清理,重新 clone 恢复工作区", task.id)
     _emit("start")
+    # cancel_check 仅非空时下传:存量克隆替身不接这个参数
+    cancel_kw: dict[str, Any] = (
+        {} if cancel_check is None else {"cancel_check": cancel_check}
+    )
     try:
         sandbox_tools.clone_repo_with_fallback(
             repo_url,
@@ -671,11 +691,18 @@ def _ensure_workspace(
             progress_callback=lambda percent, message: _emit(
                 "progress", percent=percent, message=message,
             ),
+            **cancel_kw,
         )
         # 恢复的 session 属于已完成任务:纳入 TTL 清理序列,避免常驻泄漏
         sandbox_tools.mark_task_completed(task_id_str)
         _emit("done")
         return sandbox_tools.get_workspace_info(task_id_str)
+    except sandbox_tools.CloneCancelledError as e:
+        # 用户已停止出题:先推 restore/failed 让侧栏收起横幅,再把取消冒到 job 层。
+        # 必须排在 except Exception 之前:否则会被当成"克隆失败降级",
+        # 出题拿着空工作区继续跑,LLM 成本照付
+        _emit("failed", message="已按用户请求停止(克隆已中断)")
+        raise PracticeGenerateCancelled(str(e) or "出题已停止") from e
     except Exception as e:
         logger.warning("[task=%s] 出题前恢复工作区失败(降级为无工具出题): %s", task.id, e)
         _emit("failed", message=str(e)[:200])
@@ -1429,6 +1456,7 @@ def generate_questions_for_task(
     progress_callback: Callable[[int, int], None] | None = None,
     event_callback: Callable[[str, dict], None] | None = None,
     force_regenerate: bool = False,
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[list[Question], int]:
     """为任务的 Results 生成 draft 题目
 
@@ -1439,6 +1467,11 @@ def generate_questions_for_task(
     force_regenerate:False 时,本用户已就该 finding 出过题的**整条跳过**
       (去重原本发生在 LLM 之后:题目出完才发现 dedup_hash 撞上,钱已花);
       任务详情页「重新出题」显式传 True 才允许重出。
+    should_stop:可选回调() -> bool,用户已点「停止出题」时返回 True。命中时
+      在检查点退出:题目循环内停止走正常返回路径(**已生成的 draft 先
+      commit 再返回**,不白烧已付 token,收尾讲解阶段跳过);题开始前
+      (克隆/预读)命中则抛 PracticeGenerateCancelled(此时无题可保留)。
+      不传时与旧版行为一致。
     """
     if client is None:
         client = resolve_llm_client(db, task)
@@ -1478,6 +1511,11 @@ def generate_questions_for_task(
     probe = sandbox_tools.get_workspace_info(task_id_str)
     restore_in_bg = _workspace_restore_worth_bg(task, settings_row, probe)
     ws_box: dict[str, Any] = {}
+    # cancel_check 仅非空时下传:存量测试按属性替身 _ensure_workspace
+    # 不接这个参数,无停止需求时不传就不会 TypeError
+    restore_kw: dict[str, Any] = (
+        {} if should_stop is None else {"cancel_check": should_stop}
+    )
 
     def _run_workspace_restore() -> None:
         try:
@@ -1486,7 +1524,13 @@ def generate_questions_for_task(
                 event_callback=event_callback,
                 # Session 非线程安全:token 在主线程读好再带进线程
                 git_tokens=ws_box.get("git_tokens") or {},
+                **restore_kw,
             )
+        except PracticeGenerateCancelled as e:
+            # 用户停止出题:克隆已中断。线程里直接 raise 只会落到默认异常钩子,
+            # 主线程 join 后照常往下跑并把"停止"误当成"没代码上下文",
+            # 所以把取消原因存在盒子里交给主线程冒泡
+            ws_box["cancelled"] = str(e) or "出题已停止"
         except Exception as e:
             logger.warning("[task=%s] 后台恢复工作区异常(降级为无工具出题): %s", task.id, e)
             ws_box["info"] = probe
@@ -1507,6 +1551,10 @@ def generate_questions_for_task(
 
     # 主题自动匹配:规则先行 + LLM 批量兜底(每任务至多一次分类调用)
     topic_map = _match_finding_topics(task, findings, client, topic_defs)
+    # 停止检查点:分类是一整次 LLM 调用,中途按下的停止在这里拦(尚未建题,
+    # 直接冒取消而不是白做一次材料预读)
+    if should_stop is not None and should_stop():
+        raise PracticeGenerateCancelled("出题已停止(主题分类后,尚未生成题目)")
     # 主题开关过滤:规则捷径可能命中停用主题(如停用安全后 metadata 带 CWE 的
     # 发现),分类完成后统一拦截,并重算进度分母
     enabled_keys = {d["key"] for d in topic_defs}
@@ -1523,11 +1571,20 @@ def generate_questions_for_task(
     # 预读材料需要工作区路径:此处才等后台 clone 结束(分类/选题已与其重叠完成)
     if ws_thread is not None:
         ws_thread.join()
+        if ws_box.get("cancelled"):
+            # 克隆阶段被用户停止:此处尚未出题,直接冒取消给 job 层置 cancelled
+            raise PracticeGenerateCancelled(str(ws_box["cancelled"]))
     ws_info = (
         ws_box.get("info") if ws_thread is not None
-        else _ensure_workspace(db, task, settings_row, event_callback=event_callback)
+        else _ensure_workspace(
+            db, task, settings_row, event_callback=event_callback, **restore_kw,
+        )
     )
     repo_path = (ws_info or {}).get("repo_path") or ""
+
+    # 题开始前的最后一个检查点(材料预读要逐文件读工作区,大仓库也能耗数十秒)
+    if should_stop is not None and should_stop():
+        raise PracticeGenerateCancelled("出题已停止(尚未生成题目)")
 
     # 材料预读:按发现的源码定位一次性读好(同一文件的多条 finding 共用读取),
     # 命中预读的 finding 改用「按需补读」提示词变体 → LLM 往返从 2~4 次压到 1 次
@@ -1711,6 +1768,14 @@ def generate_questions_for_task(
     if concurrency <= 1:
         # 串行路径(默认):逐条出题 + 逐条推 SSE 事件
         for idx, finding in enumerate(pending):
+            # 停止检查点(逐条之间):未开始的 finding 不再付 LLM 成本,
+            # 已生成的题目在循环后的 commit 里照常入库
+            if should_stop is not None and should_stop():
+                logger.info(
+                    "[practice] task=%s 按用户请求停止出题:已处理 %d/%d 条",
+                    task.id, idx, len(pending),
+                )
+                break
             if event_callback:
                 try:
                     event_callback("finding", {
@@ -1737,6 +1802,25 @@ def generate_questions_for_task(
             futures = [pool.submit(_produce, f) for f in pending]
             finished = 0
             for fut in as_completed(futures):
+                if should_stop is not None and should_stop():
+                    # 先把已跑完的 worker 落库(结果已付 LLM 成本,不接收
+                    # 等于白烧),再取消尚未起跑的;在途的随 with 退出自然结束
+                    for done_fut in futures:
+                        if done_fut is not fut and done_fut.done():
+                            try:
+                                _consume(done_fut.result())
+                            except Exception as e:
+                                logger.warning(
+                                    "[practice] 停止时落库已到结果失败,跳过该条: %s", e,
+                                )
+                                skipped += 1
+                    for other in futures:
+                        other.cancel()
+                    logger.info(
+                        "[practice] task=%s 按用户请求停止出题(并发):已处理 %d/%d 条",
+                        task.id, finished, len(pending),
+                    )
+                    break
                 try:
                     work = fut.result()
                 except Exception as e:
@@ -1762,6 +1846,8 @@ def generate_questions_for_task(
                         other.cancel()
                     break
 
+    stopped_early = bool(should_stop is not None and should_stop())
+
     db.commit()
     for q in created:
         db.refresh(q)
@@ -1769,7 +1855,7 @@ def generate_questions_for_task(
     # 收尾批量更新知识点讲解:一次调用覆盖 ≤8 个知识点(不是每题一次),
     # 失败只记日志 —— 讲解是增益,不能拖垮已生成的题目
     explain_written = 0
-    if want_explain and explain_digests:
+    if want_explain and explain_digests and not stopped_early:
         try:
             explain_written = explain_knowledge_points(
                 db, user_id, explain_digests,
@@ -1789,6 +1875,14 @@ def generate_questions_for_task(
         task.id, len(created), skipped, total_findings, explain_written,
         f"(致命错误中止: {fatal_reason})" if fatal_reason else "",
     )
+    if stopped_early:
+        # 用户停止:已生成的 draft 已在上面 commit,不抛致命错误;
+        # 调用方按 is_stop_requested 把 job 置 cancelled 并展示部分结果
+        logger.info(
+            "[practice] task=%s 出题已停止:保留 %d 道已生成题(待确认)",
+            task.id, len(created),
+        )
+        return created, skipped
     if fatal_reason:
         # 已生成的 draft 照常保留;错误原因冒泡给 job 层展示
         suffix = f",中止前已生成 {len(created)} 题" if created else ""

@@ -105,7 +105,8 @@ async function generate(force = false): Promise<void> {
       task_id: props.taskId,
       force_regenerate: force || undefined,
     })
-    // 轮询直到 done/error;对话框关闭(token 失效)则中止
+    // 轮询直到 done/error/cancelled(三个终态都必须跳出,否则死循环轮询);
+    // 对话框关闭(token 失效)则中止
     for (;;) {
       if (token !== pollToken) return
       await new Promise((r) => setTimeout(r, 1500))
@@ -117,6 +118,17 @@ async function generate(force = false): Promise<void> {
       if (job.status === 'error') {
         errorMsg.value = job.error || '出题失败'
         phase.value = 'error'
+        return
+      }
+      // 用户在出题进度侧栏按了「停止出题」:已生成的题照常进预览(别丢掉已付的成本)
+      if (job.status === 'cancelled') {
+        skippedFindings.value = job.skipped_findings
+        if (job.questions.length === 0) {
+          errorMsg.value = '出题已停止(停止前未生成题目),可在侧栏点「继续出题」'
+          phase.value = 'error'
+          return
+        }
+        enterPreview(job.questions)
         return
       }
       if (job.status === 'done') {

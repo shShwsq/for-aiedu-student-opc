@@ -395,6 +395,9 @@ async function waitExplainJob(jobId: string, timeoutMs = 180000): Promise<number
     const job = await getGenerateJob(jobId)
     if (job.status === 'done') return job.done
     if (job.status === 'error') throw new Error(job.error || '讲解生成失败')
+    // 讲解 job 目前不提供给停止入口,但后端终态集合含 cancelled:
+    // 不在这里跳出会一直轮询到超时
+    if (job.status === 'cancelled') throw new Error('讲解生成已停止')
     if (Date.now() > deadline) throw new Error('讲解生成超时,请稍后刷新看板')
     explainStatus.value = `正在生成讲解 ${job.done}/${job.total || '…'}…`
     await new Promise((r) => setTimeout(r, EXPLAIN_POLL_MS))

@@ -16,6 +16,7 @@ from app.models.practice import PracticeSettings, Question
 from app.models.task import Result, Task
 from app.services.practice import jobs as gen_jobs
 from app.services.practice.generator import (
+    PracticeGenerateCancelled,
     PracticeGenerateError,
     generate_questions_for_task,
 )
@@ -96,7 +97,13 @@ def auto_generate_practice_for_task(task: Task, db: Session) -> int:
             event_callback=lambda etype, data: gen_jobs.append_event(
                 job_id, etype, data,
             ),
+            should_stop=lambda: gen_jobs.is_stop_requested(job_id),
         )
+    except PracticeGenerateCancelled as e:
+        # 用户在出题前停掉了自动出题 job(克隆阶段):无题可保留,cancelled 不是 error
+        logger.info("[task=%s] 自动出题在出题前被停止 job=%s: %s", task.id, job_id, e)
+        gen_jobs.update_job(job_id, status="cancelled")
+        return 0
     except PracticeGenerateError as e:
         # 致命错误(额度/认证等):友好原因置 job error 供侧栏展示,无需堆栈
         logger.warning("[task=%s] 自动出题中止 job=%s: %s", task.id, job_id, e)
@@ -106,6 +113,18 @@ def auto_generate_practice_for_task(task: Task, db: Session) -> int:
         logger.exception("[task=%s] 自动生成练习题失败 job=%s", task.id, job_id)
         gen_jobs.update_job(job_id, status="error", error=str(e)[:500])
         raise  # 保持原有语义:由调用方 try/except 兜底,不影响任务完成
+    if gen_jobs.is_cancelled(job_id, task.user_id):
+        # 部分题目已生成后被停止:照常保留(仍是 draft,需用户确认)
+        # 全部跑完才点到停止的请求走下面的 done,不误报"已停止"
+        gen_jobs.update_job(
+            job_id, status="cancelled",
+            created_count=len(created), skipped_findings=skipped,
+        )
+        logger.info(
+            "[task=%s] 自动出题已按请求停止 job=%s: %d 题已生成待确认",
+            task.id, job_id, len(created),
+        )
+        return len(created)
     gen_jobs.update_job(
         job_id, status="done",
         created_count=len(created), skipped_findings=skipped,

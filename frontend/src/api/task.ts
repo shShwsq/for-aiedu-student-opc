@@ -113,6 +113,21 @@ export function resumeTask(taskId: string): Promise<{ status: string; message: s
 }
 
 /**
+ * 终止 agent2 后台检查(仅 review_status=running 时可用)
+ *
+ * 有些对话不需要检查:置标志后立即返回,审查线程在下一个检查点
+ * (LLM 流 chunk 边界 / 工具循环边界)协作式收尾,写 review_status=stopped
+ * 并推 review_done 事件(前端据此收角标)。
+ * 本轮知识点不会写入,保留 agent1 的执行结果。
+ * 不能用 pauseTask 走这条路:暂停只接受 RUNNING,而后台审查发生在任务已完成后。
+ */
+export function stopTaskReview(
+  taskId: string,
+): Promise<{ review_status: string; message: string }> {
+  return client.post(`/tasks/${taskId}/review/stop`).then((r) => r.data)
+}
+
+/**
  * 请求跳过预克隆
  *
  * 克隆轮询循环在下一个检查点终止当前 clone,orchestrator 降级为

@@ -1,8 +1,8 @@
 /**
  * 练习模块展示层格式化(纯函数)
  *
- * 练习首页、历史面板、题目详情弹窗共用同一套口径,避免各组件各写一份
- * 导致同一个「正确率 / 日期 / 难度」在不同段落显示格式不一致。
+ * 练习首页、历史面板、题目详情弹窗、出题进度侧栏共用同一套口径,避免各组件各写一份
+ * 导致同一个「正确率 / 日期 / 难度 / job 状态」在不同段落显示格式不一致。
  * 无数据统一返回全角破折号「—」。
  */
 
@@ -75,4 +75,48 @@ export function questionStatusLabel(status: string | null | undefined): string {
 /** 题型中文标签(单选 / 判断) */
 export function qtypeLabel(qtype: string | null | undefined): string {
   return qtype === 'true_false' ? '判断' : '单选'
+}
+
+/** 出题 job 状态文案的输入形状(GenerateJobSummary 的子集,便于单测) */
+export interface GenerateJobStatusLike {
+  status: string
+  done?: number
+  total?: number
+  created_count?: number
+  /** 已请求停止但后台线程还在收尾(协作式取消可能滞后数十秒) */
+  stop_requested?: boolean
+  /** 工作区恢复阶段(start/progress 时排队中要改说"恢复工作区中") */
+  restore?: { phase?: string } | null
+}
+
+/**
+ * 出题 job 状态中文标签
+ *
+ * cancelled 是用户点「停止出题」的终态(不是失败);running/pending 期间
+ * 若已请求停止,拼上"正在停止" —— 不标的话按钮看起来像没生效。
+ */
+export function generateJobStatusLabel(
+  job: GenerateJobStatusLike | null | undefined,
+): string {
+  if (!job) return EMPTY_TEXT
+  switch (job.status) {
+    case 'pending': {
+      // 沙箱已清理时先重新 clone(可能数十秒),给出真实阶段避免误以为卡死
+      const phase = job.restore?.phase
+      if (phase === 'start' || phase === 'progress') return '恢复工作区中'
+      return job.stop_requested ? '正在停止' : '排队中'
+    }
+    case 'running': {
+      const progress = `出题中 ${job.done ?? 0}/${job.total || '?'}`
+      return job.stop_requested ? `${progress} · 正在停止` : progress
+    }
+    case 'done':
+      return `已完成 · ${job.created_count ?? 0} 题`
+    case 'cancelled':
+      return `已停止 · ${job.created_count ?? 0} 题`
+    case 'error':
+      return '失败'
+    default:
+      return job.status || EMPTY_TEXT
+  }
 }

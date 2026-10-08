@@ -29,11 +29,13 @@ class ReviewStatus(str, PyEnum):
     - running: 审查进行中(前端侧栏显示"检查中"角标,SSE 持续接收审查事件)
     - done:    审查完成(重点与知识点已替换临时结果)
     - failed:  审查失败/降级(保留 agent1 summary 临时结果,不影响任务状态)
+    - stopped: 用户主动终止检查(保留临时结果,审查后下游链整体跳过)
     NULL:      未审查(单 agent 模式 / 老任务)
     """
     RUNNING = "running"
     DONE = "done"
     FAILED = "failed"
+    STOPPED = "stopped"
 
 
 class Task(Base):
@@ -92,9 +94,11 @@ class Task(Base):
 
     # 后台审查状态(agent2 审查移到后台后的子状态,见 ReviewStatus)
     # agent1 结束即任务 COMPLETED,本字段表达"审查进行到哪一步":
-    # running(审查中)/done(完成)/failed(失败,保留临时结果)/NULL(单 agent 模式或老任务)
+    # running(审查中)/done(完成)/failed(失败,保留临时结果)/stopped(用户终止检查)
+    # /NULL(单 agent 模式或老任务)
     # 升级时需手动执行:ALTER TABLE tasks ADD COLUMN review_status VARCHAR(16);
     # (幂等迁移见 migrate_task_add_review_status_column)
+    # 列为自由字符串(非 DB 枚举),新增 stopped 取值无需迁移
     review_status: Mapped[str | None] = mapped_column(
         String(16), nullable=True, default=None
     )
