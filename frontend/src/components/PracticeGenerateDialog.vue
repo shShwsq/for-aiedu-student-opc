@@ -29,7 +29,7 @@ const emit = defineEmits<{
   (e: 'confirmed', confirmed: number): void
 }>()
 
-type Phase = 'generating' | 'preview' | 'error' | 'confirming' | 'done'
+type Phase = 'generating' | 'preview' | 'error' | 'stopped' | 'confirming' | 'done'
 const phase = ref<Phase>('generating')
 const errorMsg = ref('')
 const drafts = ref<DraftQuestion[]>([])
@@ -124,8 +124,10 @@ async function generate(force = false): Promise<void> {
       if (job.status === 'cancelled') {
         skippedFindings.value = job.skipped_findings
         if (job.questions.length === 0) {
-          errorMsg.value = '出题已停止(停止前未生成题目),可在侧栏点「继续出题」'
-          phase.value = 'error'
+          // 单独走 stopped 相位:用户主动停止不是"生成失败",也不该提供
+          // 「重试」(一键重试会悄悄新建一个全新出题 job,与停止意图相反)
+          errorMsg.value = '出题已停止(停止前未生成题目),可在「出题进度」侧栏点「继续出题」'
+          phase.value = 'stopped'
           return
         }
         enterPreview(job.questions)
@@ -249,6 +251,14 @@ function formatDifficulty(d: number): string {
                   title="忽略去重短路,重新对已出过题的发现调用 LLM(会产生额外费用)"
                   @click="generate(true)"
                 >重新出题(忽略去重)</button>
+              </div>
+            </div>
+
+            <!-- 已按用户请求停止(不是失败:不给「重试」,避免与停止意图相反) -->
+            <div v-else-if="phase === 'stopped'" class="phase-block">
+              <p>{{ errorMsg }}</p>
+              <div class="phase-actions">
+                <button class="btn-secondary" @click="handleClose">关闭</button>
               </div>
             </div>
 

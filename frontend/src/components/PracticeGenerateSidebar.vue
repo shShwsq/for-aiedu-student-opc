@@ -391,6 +391,22 @@ function statusLabel(job: GenerateJobSummary): string {
   return generateJobStatusLabel(job)
 }
 
+/**
+ * restore failed 横幅标题
+ *
+ * 后端在两种情形下都推 phase=failed:① 真的恢复失败(降级为无源码上下文继续
+ * 出题),② 用户在克隆阶段按了停止(job 直接收 cancelled,根本没继续出题)。
+ * ② 沿用①的文案会谎称"已降级继续出题",与旁边的"已停止"footer 自相矛盾
+ * (刷新/中途接入走 snapshot 路径时同样会看到这条横幅)。
+ */
+const restoreFailedText = computed(() => {
+  const msg = restore.value?.message || ''
+  if (msg.includes('用户请求停止') || status.value === 'cancelled') {
+    return '工作区恢复已按请求停止'
+  }
+  return '工作区恢复失败,已降级为无代码上下文出题'
+})
+
 /** 打开题目入库弹窗(仅 job 关联了来源任务时可用) */
 function handleConfirmPreview(): void {
   const taskId = selectedJob.value?.task_id
@@ -410,7 +426,10 @@ async function handleStop(): Promise<void> {
   actionError.value = ''
   try {
     await stopGenerateJob(jobId)
-    stopRequested.value = true
+    // await 期间可能已被 SSE 收口(handleCancelled 把标志复位并关了流),
+    // 也可能列表轮询使本 job 进终态后 watch 已切到新 job:
+    // 只在"还是那个 job、仍在跑"时置位,否则这个 true 会残留或写到新 job 上
+    if (selectedJobId.value === jobId && isBusy.value) stopRequested.value = true
   } catch (err) {
     actionError.value = errMessage(err)
   } finally {
@@ -521,7 +540,7 @@ function errMessage(err: unknown): string {
         <!-- 工作区恢复横幅(沙箱已清理时重新 clone,含克隆进度) -->
         <div v-if="restore" :class="['gen-restore', `gen-restore-${restore.phase}`]">
           <template v-if="restore.phase === 'failed'">
-            <p class="gen-restore-text">工作区恢复失败,已降级为无代码上下文出题</p>
+            <p class="gen-restore-text">{{ restoreFailedText }}</p>
             <p v-if="restore.message" class="gen-restore-msg">{{ restore.message }}</p>
           </template>
           <template v-else-if="restore.phase === 'done'">

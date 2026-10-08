@@ -1765,6 +1765,10 @@ def generate_questions_for_task(
                     ),
                 )
 
+    # 已处理条数(串行/并发共用):既喂 progress 口径,也用于下面的
+    # 「是否真的少跑了活」判定(旧写法在并发分支里另起 finished,停止路径
+    # 又不累加,导致日志与断点进度都少报)
+    finished = 0
     if concurrency <= 1:
         # 串行路径(默认):逐条出题 + 逐条推 SSE 事件
         for idx, finding in enumerate(pending):
@@ -1773,7 +1777,7 @@ def generate_questions_for_task(
             if should_stop is not None and should_stop():
                 logger.info(
                     "[practice] task=%s 按用户请求停止出题:已处理 %d/%d 条",
-                    task.id, idx, len(pending),
+                    task.id, finished, len(pending),
                 )
                 break
             if event_callback:
@@ -1786,9 +1790,10 @@ def generate_questions_for_task(
                 except Exception:
                     pass
             _consume(_produce(finding))
+            finished += 1
             if progress_callback:
                 progress_callback(
-                    min(pre_skipped + idx + 1, total_findings), total_findings,
+                    min(pre_skipped + finished, total_findings), total_findings,
                 )
             if fatal_reason:
                 break
@@ -1800,20 +1805,32 @@ def generate_questions_for_task(
             thread_name_prefix=f"practice-gen-{task_id_str[:8]}",
         ) as pool:
             futures = [pool.submit(_produce, f) for f in pending]
-            finished = 0
+            # 已消费(落库或异常计入)的 future:停止时只能补收还没收过的那些
+            handled: set[Any] = set()
             for fut in as_completed(futures):
                 if should_stop is not None and should_stop():
                     # 先把已跑完的 worker 落库(结果已付 LLM 成本,不接收
                     # 等于白烧),再取消尚未起跑的;在途的随 with 退出自然结束
+                    # 范围 = 所有已 done 且**尚未消费过**的 future,含 as_completed
+                    # 刚产出的这条(旧写法用 `is not fut` 把它排除,每次停止恰好
+                    # 白丢一道已出题);前几轮已落库的必须跳过,否则重复消费
                     for done_fut in futures:
-                        if done_fut is not fut and done_fut.done():
-                            try:
-                                _consume(done_fut.result())
-                            except Exception as e:
-                                logger.warning(
-                                    "[practice] 停止时落库已到结果失败,跳过该条: %s", e,
-                                )
-                                skipped += 1
+                        if done_fut in handled or not done_fut.done():
+                            continue
+                        handled.add(done_fut)
+                        try:
+                            _consume(done_fut.result())
+                        except Exception as e:
+                            logger.warning(
+                                "[practice] 停止时落库已到结果失败,跳过该条: %s", e,
+                            )
+                            skipped += 1
+                        finished += 1
+                        if progress_callback:
+                            progress_callback(
+                                min(pre_skipped + finished, total_findings),
+                                total_findings,
+                            )
                     for other in futures:
                         other.cancel()
                     logger.info(
@@ -1827,6 +1844,7 @@ def generate_questions_for_task(
                     # 单条 worker 意外异常不拖垮整个 job(LLM 层已自有重试,
                     # 走到这里的多是本地 bug):计一条未出题,继续处理其余
                     logger.exception("[practice] 并发出题 worker 异常,跳过该条: %s", e)
+                    handled.add(fut)
                     skipped += 1
                     finished += 1
                     if progress_callback:
@@ -1834,6 +1852,7 @@ def generate_questions_for_task(
                             min(pre_skipped + finished, total_findings), total_findings,
                         )
                     continue
+                handled.add(fut)
                 _consume(work)
                 finished += 1
                 if progress_callback:
@@ -1846,7 +1865,14 @@ def generate_questions_for_task(
                         other.cancel()
                     break
 
-    stopped_early = bool(should_stop is not None and should_stop())
+    # 停止口径与 job 层的 is_cancelled 对齐:请求过停止**且确实少跑了活**才算
+    # 提前停止。只看标志会让"停止请求落在最后一条之后"的那次收尾(知识点讲解、
+    # 致命错误原因)被静默跳过,而 job 那边照样按 done 收口 —— 用户看到"已完成"
+    # 却少了讲解,两头说法不一致。
+    stopped_early = bool(
+        should_stop is not None and should_stop()
+        and pre_skipped + finished < total_findings
+    )
 
     db.commit()
     for q in created:
@@ -1876,8 +1902,9 @@ def generate_questions_for_task(
         f"(致命错误中止: {fatal_reason})" if fatal_reason else "",
     )
     if stopped_early:
-        # 用户停止:已生成的 draft 已在上面 commit,不抛致命错误;
-        # 调用方按 is_stop_requested 把 job 置 cancelled 并展示部分结果
+        # 用户停止且确实少跑了活:已生成的 draft 已在上面 commit,不抛致命错误;
+        # 调用方按 jobs.is_cancelled(同一"少跑了活"口径)把 job 置 cancelled
+        # 并展示部分结果
         logger.info(
             "[practice] task=%s 出题已停止:保留 %d 道已生成题(待确认)",
             task.id, len(created),

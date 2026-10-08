@@ -502,12 +502,15 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         task.current_stage = "任务完成,检查助手审查中"
         task.completed_at = datetime.now(timezone.utc)
         task.review_status = "running"
+        # 先登记本轮审查再 commit:终止请求可能在下面的工作区 diff 捕获(大仓库
+        # 可数秒)与审查线程真正开工之间到达。不在这里登记的话注册表是空的,
+        # 端点会误判"无审查在跑"而就地写 stopped,随后审查又跑完把终态改成 done。
+        # 登记必须排在 commit 之前:否则"库里已可见 running、登记还没落地"的窗口
+        # 里同样的误判照样发生(窗口只剩几毫秒也不能留)。登记后 commit 失败
+        # 只残留一条无害记录(任务删除时 clear_review_stop_state 会清)
+        _begin_review_state(task_id_str, 1)
         db.commit()
         _publish_status(task)
-        # 紧标当前审查轮:终止请求可能在下面的工作区 diff 捕获(大仓库可数秒)
-        # 与审查线程真正开工之间到达。不在这里登记的话注册表是空的,
-        # 端点会误判"无审查在跑"而就地写 stopped,随后审查又跑完把终态改成 done
-        _begin_review_state(task_id_str, 1)
 
         # 领域事件:任务完成(双 agent 路径,时刻=agent1 结束,不含审查时长)
         emit(
@@ -1343,6 +1346,12 @@ def _prepare_repo_context(
             repo_url, branch=branch, task_id=task_id_str, git_tokens=git_tokens or {},
             cancellable=True,
         )
+    except sandbox_tools.CloneCancelledError:
+        # 调用方取消(已停止的出题 job):必须原样冒泡。CloneCancelledError 是
+        # CloneSkippedError 的子类,若被下面的"跳过预克隆"分支接住,停止会被
+        # 静默转成"改由执行阶段自主克隆"—— 任务照跑,LLM 成本照付。
+        # 本路径当前不传 cancel_check(只有出题链传),这条是防日后接线的护栏。
+        raise
     except sandbox_tools.CloneSkippedError:
         # 用户主动跳过预克隆:与失败降级同路径,改由 react_agent 自主克隆
         # (LLM 看报错重试/自适应,历史观察成功率更高)
@@ -1948,10 +1957,11 @@ def resume_audit_with_message(
         task.current_stage = "任务完成,检查助手审查中"
         task.completed_at = datetime.now(timezone.utc)
         task.review_status = "running"
+        # 先登记再 commit(同初始运行路径):不让终止请求在 diff 捕获窗口里落空,
+        # 也不留"库里已 running 而注册表为空"的亚毫秒尾巴
+        _begin_review_state(task_id_str, start_round_idx)
         db.commit()
         _publish_status(task)
-        # 紧标当前审查轮(同初始运行路径):不让终止请求在 diff 捕获窗口里落空
-        _begin_review_state(task_id_str, start_round_idx)
 
         # 领域事件:任务完成(resume 路径,时刻=agent1 结束)
         emit(

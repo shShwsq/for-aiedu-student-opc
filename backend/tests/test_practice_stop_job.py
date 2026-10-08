@@ -6,9 +6,12 @@
    漏一处就让 SSE 客户端等不到终止事件永久挂着)
 2. services/practice/generator.py:should_stop 检查点
    - 逐条 finding 之间停止:已生成的 draft **先 commit 再返回**(不白烧已付 token)
+   - 并发路径停止:所有已跑完的 worker 照常落库(含刚触发检查点的那一条)
+   - 停止落在最后一条之后:讲解照常收尾(与 job 层 is_cancelled 同口径)
    - 出题开始前(主题分类后 / 克隆阶段)停止:抛 PracticeGenerateCancelled
    - 克隆取消检查点透传到 sandbox_tools(否则停止按钮在克隆阶段完全不生效)
 3. routers/practice.py:POST /practice/generate/{job_id}/stop 的 200/404/409
+   (explain job 不查停止标志 → 409,不给假的 200)
 """
 import json
 from types import SimpleNamespace
@@ -41,8 +44,12 @@ def _raw(**overrides):
     return q
 
 
-def _gen_db(finding_count=3):
-    """最小 mock db:Result 查询返回 N 条 finding,其余查询走空集"""
+def _gen_db(finding_count=3, settings_row=None):
+    """最小 mock db:Result 查询返回 N 条 finding,其余查询走空集
+
+    settings_row 非空时作为 PracticeSettings 查询结果返回(要跑并发路径或
+    开启收尾讲解时必须传,默认 None = 串行 + 无讲解开关)。
+    """
     findings = [
         SimpleNamespace(
             id=f"r{i}",
@@ -57,7 +64,7 @@ def _gen_db(finding_count=3):
     def _query(model):
         q = MagicMock()
         if model is gen.PracticeSettings:
-            q.filter.return_value.first.return_value = None
+            q.filter.return_value.first.return_value = settings_row
         elif model is gen.Result:
             q.filter.return_value.order_by.return_value.all.return_value = findings
         elif model is gen.KnowledgePoint:
@@ -75,6 +82,17 @@ def _gen_db(finding_count=3):
 def _gen_task():
     return SimpleNamespace(
         id="t1", params={"repo_url": "https://example.com/r.git"}, scenario=None,
+    )
+
+
+def _settings(concurrency=1, explain=False):
+    """练习设置行(字段与真模同名称;并发路径需要 generate_concurrency>1)"""
+    return SimpleNamespace(
+        restore_workspace_for_practice=False,
+        thinking_mode_for_practice="follow",
+        generate_explanation_with_questions=explain,
+        explain_llm_config_id=None,
+        generate_concurrency=concurrency,
     )
 
 
@@ -201,6 +219,81 @@ def test_stop_mid_loop_keeps_and_commits_generated_questions(monkeypatch):
     assert db.commit.called                # 而且确实落了库(不是随 session 丢掉)
 
 
+def test_concurrent_stop_keeps_future_that_triggered_checkpoint(monkeypatch):
+    """并发停止:刚被 as_completed 产出的那条 future 已经跑完,必须照常落库
+
+    旧写法用 `done_fut is not fut` 把它排除在落库之外 —— 每次停止恰好白丢
+    一道已付过 LLM 成本的题,与两行之上的注释"不接收等于白烧"自相矛盾。
+
+    两条 worker 都先睡再起(保证两条都已起跑、不会在起跑前被 cancel):
+    谁先醒谁就拿到 n=1 并拉下停止标志,因而主线程第一次检查必然命中停止
+    分支,且此时另一条要么仍在途(旧写法收到 0 条)要么刚跟上(旧写法只收到
+    它这一条)——两种情况下"第1题"都会缺失。
+    """
+    import threading as _threading
+    import time as _time
+
+    lock = _threading.Lock()
+    state = {"calls": 0, "flag": False}
+
+    def _fake_call_llm(*args, **kwargs):
+        _time.sleep(0.15)
+        with lock:
+            state["calls"] += 1
+            n = state["calls"]
+        if n == 1:
+            state["flag"] = True          # 第一条跑完就按下停止
+        return json.dumps([_raw(stem=f"第{n}题")], ensure_ascii=False)
+
+    monkeypatch.setattr(gen, "_call_llm", _fake_call_llm)
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    db = _gen_db(finding_count=2, settings_row=_settings(concurrency=2))
+
+    created, _skipped = gen.generate_questions_for_task(
+        db, _gen_task(), "u1", client=MagicMock(),
+        should_stop=lambda: state["flag"],
+    )
+
+    # 旧写法这里拿不到"第1题"(触发检查点的那条被排除)
+    assert "第1题" in {q.stem for q in created}
+    assert db.commit.called
+    # 两条都真的进了 LLM:确认走的是并发分支且未被提前 cancel
+    # (串行下第二条根本不会被调用)
+    assert state["calls"] == 2
+
+
+def test_stop_after_last_finding_keeps_explain_phase(monkeypatch):
+    """停止落在最后一条之后:题已出齐,知识点讲解不能被静默跳过
+
+    generator 的 stopped_early 与 job 层的 is_cancelled 必须同一口径(都要求
+    "确实少跑了活")。旧写法只看标志:job 那边按 done 收口,这边的讲解却因
+    stopped_early=True 被跳过 —— 用户看到"已完成"却少了知识点讲解。
+    """
+    state = {"flag": False}
+    explained = []
+
+    def _fake_call_llm(*args, **kwargs):
+        state["flag"] = True              # 唯一一条正在跑时用户点了停止
+        return json.dumps([_raw()], ensure_ascii=False)
+
+    monkeypatch.setattr(gen, "_call_llm", _fake_call_llm)
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    monkeypatch.setattr(gen, "resolve_explain_client", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(
+        gen, "explain_knowledge_points",
+        lambda db, uid, digests, **kw: explained.append(len(digests)) or len(digests),
+    )
+    db = _gen_db(finding_count=1, settings_row=_settings(explain=True))
+
+    created, _skipped = gen.generate_questions_for_task(
+        db, _gen_task(), "u1", client=MagicMock(),
+        should_stop=lambda: state["flag"],
+    )
+
+    assert len(created) == 1
+    assert explained, "全部 finding 已处理完时应照常收尾讲解"
+
+
 def test_stop_after_topic_classification_raises_cancelled(monkeypatch):
     """出题开始前停止:没有题可保留 → 冒 PracticeGenerateCancelled(不是 error)"""
     monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
@@ -317,3 +410,16 @@ def test_stop_endpoint_rejects_finished_job():
     with pytest.raises(fastapi.HTTPException) as exc:
         stop_generate_job(job_id, current_user=_user())
     assert exc.value.status_code == 409
+
+
+def test_stop_endpoint_rejects_explain_job():
+    """知识点讲解 job:执行线程不查停止标志,接了只会回一个假的 200 → 409"""
+    import fastapi
+
+    job_id = create_job("u-stop", source="explain", task_title="知识点讲解")
+    update_job(job_id, status="running")
+    with pytest.raises(fastapi.HTTPException) as exc:
+        stop_generate_job(job_id, current_user=_user())
+    assert exc.value.status_code == 409
+    # 标志不落:不能因为一次被拒的请求把后续同 id 的判定带偏
+    assert jobs.is_stop_requested(job_id) is False

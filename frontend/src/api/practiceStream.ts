@@ -103,6 +103,16 @@ export function subscribeGenerateStream(
   register('error', callbacks.onError, true)
   register('cancelled', callbacks.onCancelled, true)
 
+  // 调用方(切换 job / 组件卸载)直接 es.close() 时既不会命中上面的终止分支,
+  // 也不会触发原生 onerror(explicit close 不派发 error 事件),诊断定时器会
+  // 跟着泄漏一个 2 秒 interval。把 close 包一层:关流同时清 timer。
+  // (clearInterval 幂等,终止分支里先清过一次也不会报错)
+  const nativeClose = es.close.bind(es)
+  es.close = () => {
+    clearInterval(countTimer)
+    nativeClose()
+  }
+
   // [诊断] 原生连接错误(e.data 为 undefined)与业务 error 事件区分;
   // 同时记录连接耗时与断开原因,排查连接反复建立/中断
   es.onerror = () => {

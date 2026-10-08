@@ -1101,6 +1101,9 @@ def stop_task_review_endpoint(
 
     例外:没有审查线程在跑(后端重启后的遗留"检查中"角标)时无人会来收尾,
     就地写终态并推事件,否则前端永远卡在"检查中"。
+
+    并发:落笔前复核一次 review_status —— 终止请求若落在审查收尾之后,不覆盖
+    刚写入的 done/failed,而是把真实终态回给前端(它会据此拉快照收角标)。
     """
     task = db.get(Task, task_id)
     if not task:
@@ -1119,6 +1122,22 @@ def stop_task_review_endpoint(
         )
 
     stopped_round = request_review_stop(task.id)
+    # 写之前复核终态:上面的"仅 running 可终止"检查到这里之间存在窗口 —— 审查
+    # 线程可能刚提交 done/failed(甚至已注销登记,使 stopped_round 为 None)。
+    # 此时写 stopped 会把刚完成的审查成果标成"已终止"(知识点已落库、临时结果
+    # 标题已替换),写 current_stage 则留下永不推进的"正在终止检查..."。
+    # 直查列而不 db.refresh(task):行若已被删除只会拿到 None,不会抛异常。
+    fresh_status = db.query(Task.review_status).filter(Task.id == task.id).scalar()
+    if fresh_status != "running":
+        logger.info(
+            f"[task={task_id}] 终止请求落在审查收尾之后"
+            f"(review_status={fresh_status or '未开始'}),不覆盖终态"
+        )
+        return {
+            "review_status": fresh_status or "not_started",
+            "message": "检查已结束,无需终止",
+        }
+
     if stopped_round is None:
         # 无审查线程持有本轮:端点代它收尾(角标不能永久卡住)
         task.review_status = "stopped"

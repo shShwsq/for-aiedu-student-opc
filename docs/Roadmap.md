@@ -60,7 +60,7 @@
 - **知识点主题手动修正(知识点看板)**:看板每张卡片底部「改主题」下拉可修正自动匹配出错的主题(`PUT /practice/knowledge-points/{key}/topic`);改在知识点级并级联更新其下题目的 `learning_topic`(看板分组与「练这个主题」组卷均按知识点主题命中),目标主题须属于当前用户(含已停用),改后整板刷新让卡片流入新分区。
 - **出题模型三级解析**:task 级 > 用户级默认(`practice_settings.default_llm_config_id`)> env 默认;思考模式三态覆盖(follow/on/off)。
 - **异步 job + SSE**:出题后台线程执行,`/practice/generate/{job_id}/stream` 推送进度;出题日志落盘 `logs/practice_generate.log`。
-- **停止 / 继续出题**(出题进度侧栏):`POST /practice/generate/{job_id}/stop` 置一次性停止标志后立即返回,后台线程在检查点(逐条 finding 之间 / 并发 worker 入口 / 工作区恢复的克隆轮询)协作式收尾,job 终态新增 `cancelled`;**已生成的 draft 先 commit 再返回**(不白烧已付 token),仍可「确认入库」。「继续出题」不复活旧 job,而是用同一 `max_findings` 重发一次 `force_regenerate=false` 的请求 —— 本用户已出过题的 finding 后端会整条跳过,选题顺序确定,所以天然从断点接着跑。`stop_requested` 随 snapshot/job 列表下发,侧栏在生效前显示“正在停止…”(协作式取消可能滞后数十秒)。
+- **停止 / 继续出题**(出题进度侧栏):`POST /practice/generate/{job_id}/stop` 置一次性停止标志后立即返回,后台线程在检查点(逐条 finding 之间 / 并发 worker 入口 / 工作区恢复的克隆轮询)协作式收尾,job 终态新增 `cancelled`;**已生成的 draft 先 commit 再返回**(不白烧已付 token),仍可「确认入库」。终态口径只认「确实少跑了活」:停止请求落在最后一条之后(全部已处理)时按 `done` 收口且收尾讲解照常跑,不误报「已停止」也不静默少产出知识点讲解;并发路径下所有已跑完的 worker(含刚触发检查点的那一条)都补落库,只有仍在途的不接收。「继续出题」不复活旧 job,而是用同一 `max_findings` 重发一次 `force_regenerate=false` 的请求 —— 本用户已出过题的 finding 后端会整条跳过,选题顺序确定,所以天然从断点接着跑。`stop_requested` 随 snapshot/job 列表下发,侧栏在生效前显示“正在停止…”(协作式取消可能滞后数十秒)。停止只对出题 job(`manual`/`auto`)开放,知识点讲解 job 的执行线程不查标志 → 409。
 - **前端**:PracticeView(练习首页 / 会话答题 / 统计趋势 / 题库管理)、出题进度侧栏、生成确认弹窗、练习设置弹窗;`PRACTICE_ENABLED` 功能开关前后端联动。
 
 #### 工作区变更与智能体策略

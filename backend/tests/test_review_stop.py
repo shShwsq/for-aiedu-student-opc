@@ -11,7 +11,8 @@
 3. runtime.stream_llm + LLMClient.chat_stream:逐 chunk 的 stop_check 命中即
    关底层流并标 stopped(否则 16384-token 的调用要跑完才停,按钮像没生效)
 4. POST /tasks/{id}/review/stop:仅 review_status=running 可停;
-   无在跑审查(遗留角标)时就地写终态并推 review_done
+   无在跑审查(遗留角标)时就地写终态并推 review_done;落笔前复核一次库里的
+   终态,不把审查线程刚提交的 done/failed 覆写成 stopped
 """
 from unittest.mock import MagicMock
 
@@ -324,11 +325,17 @@ def _mk_running_task(review_status="running"):
     return task
 
 
-def _call_stop_endpoint(task, db=None):
+def _call_stop_endpoint(task, db=None, fresh_status=None):
     from app.routers.tasks import stop_task_review_endpoint
 
     db = db or MagicMock()
     db.get.return_value = task
+    # 端点落笔前会直查列复核 review_status(防覆盖刚写入的终态)。
+    # db 是 MagicMock:不指定 scalar 返回值的话它是个 Mock,永远 != "running"。
+    # 默认与内存对象一致(单线程世界里两者本就该相同)。
+    db.query.return_value.filter.return_value.scalar.return_value = (
+        task.review_status if fresh_status is None else fresh_status
+    )
     return stop_task_review_endpoint(task.id, db=db, current_user=None)
 
 
@@ -376,6 +383,29 @@ def test_stop_endpoint_rejects_when_not_running():
     with pytest.raises(fastapi.HTTPException) as exc:
         _call_stop_endpoint(task)
     assert exc.value.status_code == 409
+
+
+def test_stop_endpoint_does_not_clobber_terminal_written_mid_request(monkeypatch):
+    """审查线程在"读到 running"与"落笔"之间收口:端点不能覆写刚写入的终态。
+
+    登记尚未注销时 request_stop 仍返回轮次,旧写法会把 current_stage 写成
+    "正在终止检查..."并永不再推进(审查已结束);登记已注销时更会把 done
+    改写成 stopped —— 知识点已落库却标着"已终止",状态与数据矛盾。
+    """
+    task = _mk_running_task()
+    review_stop.begin_review(task.id, 1)
+    published = []
+    monkeypatch.setattr(
+        "app.routers.tasks._publish_task_status", lambda t: published.append(t),
+    )
+
+    resp = _call_stop_endpoint(task, fresh_status="done")
+
+    assert resp["review_status"] == "done"      # 把真实终态回给前端(它据此拉快照)
+    assert task.review_status == "running"      # 不抢先改写内存对象
+    assert task.current_stage == "检查助手审查中"  # 不留永不自愈的"正在终止..."
+    assert published == []
+    assert resp["message"] == "检查已结束,无需终止"
 
 
 def test_stop_endpoint_rejects_other_users_task():

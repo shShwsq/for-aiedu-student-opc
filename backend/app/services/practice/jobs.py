@@ -18,7 +18,9 @@ POST /practice/generate 立即返回 job_id,后台线程执行生成,
 - job 记录 user_id,读取时校验,防跨用户窥探
 - 协作式停止:每个 job 一个 stop Event,路由置标志后立即返回,后台线程在
   检查点(LLM 往返之间 / 工具循环 / 克隆轮询)命中标志自行收尾,把状态写成
-  终态 cancelled —— 已生成的 draft 照常入库 commit(不白烧已付的 token)
+  终态 cancelled —— 已生成的 draft 照常入库 commit(不白烧已付的 token)。
+  只对会查标志的来源开放(STOPPABLE_SOURCES=manual/auto);explain job 的执行
+  线程不查标志,路由层直接 409,免得回一个假的 200
 """
 import logging
 import threading
@@ -47,6 +49,12 @@ _RECENT_TEXT_CHARS = 4000
 _TERMINAL_STATUSES = ("done", "error", "cancelled")
 # 非终态(仍在跑)
 _ACTIVE_STATUSES = ("pending", "running")
+
+# 支持协作式停止的 job 来源:这两条链的执行线程会查 is_stop_requested 检查点。
+# explain(知识点讲解)线程不查标志:接受停止请求只会让前端以为"正在停止…",
+# 实际照跑到底并收口成 done,等于给了一个假的 200,所以明确拒绝。
+# (要给讲解也加上可停,需把 should_stop 透进 explain_knowledge_points 的批间边界)
+STOPPABLE_SOURCES = ("manual", "auto")
 
 _JOBS: dict[str, dict] = {}
 _LOCK = threading.Lock()
@@ -156,6 +164,19 @@ def update_job(job_id: str, **fields) -> None:
 
 def set_total(job_id: str, total: int) -> None:
     update_job(job_id, total=total, status="running")
+
+
+def job_source(job_id: str, user_id) -> str | None:
+    """job 来源(manual/auto/explain);不存在或不属于该用户返回 None
+
+    给路由做"这类 job 能不能停"的前置判定用(来源在 job 生命周期内不变,
+    与后续 request_stop 之间的读-写不会错位)。
+    """
+    with _LOCK:
+        job = _JOBS.get(job_id)
+        if job is None or job["user_id"] != user_id:
+            return None
+        return job["source"]
 
 
 def request_stop(job_id: str, user_id) -> str | None:

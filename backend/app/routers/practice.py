@@ -405,7 +405,17 @@ def stop_generate_job(
     粒度说明:在途的那一次 LLM 往返不能回收(成本已付),所以下一条边界
     可能要数十秒才到;期间列表/snapshot 的 stop_requested=true 让侧栏显示
     "正在停止…",刷新页面也不丢这个中间态。
+
+    范围:只接受出题 job(manual/auto)。知识点讲解 job 的执行线程不查停止
+    标志,接了只会回一个假的 200,因此直接 409。
     """
+    source = gen_jobs.job_source(job_id, current_user.id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="生成任务不存在或已过期")
+    if source not in gen_jobs.STOPPABLE_SOURCES:
+        raise HTTPException(
+            status_code=409, detail="知识点讲解任务不支持停止(会一次跑完全部批次)",
+        )
     current = gen_jobs.request_stop(job_id, current_user.id)
     if current is None:
         raise HTTPException(status_code=404, detail="生成任务不存在或已过期")
