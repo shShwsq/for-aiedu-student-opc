@@ -119,7 +119,7 @@ ACP(Agent Client Protocol)是一个开放协议,由 Zed 编辑器团队发起,�
 
 | 项 | 内容 |
 |----|------|
-| 源码位置 | `references/deepseek-harness-master`(DeepSeek AI 开源,MIT,https://github.com/deepseek-ai/deepseek-harness) |
+| 源码位置 | <https://github.com/deepseek-ai/deepseek-harness>(DeepSeek AI 开源,MIT,默认分支 `master`) |
 | ACP 实现 | `packages/acp/acp`(`@deepseek-ai/dsh-acp`),基于官方 `@agentclientprotocol/sdk` |
 | 启动方式 | `dsh --profile acp`(stdio JSON-RPC 服务器,随附的 ACP profile) |
 | 认证 | `authenticate` 立即成功,服务器本身不要求认证;LLM 凭证经 `DEEPSEEK_API_KEY` 环境变量注入(+ 可选 `DEEPSEEK_BASE_URL`,自部署/代理端点) |
@@ -139,7 +139,7 @@ ACP(Agent Client Protocol)是一个开放协议,由 Zed 编辑器团队发起,�
 
 | 项 | 内容 |
 |----|------|
-| 源码位置 | `references/codex-main`(OpenAI 官方开源,Apache-2.0,Rust 实现) |
+| 源码位置 | <https://github.com/openai/codex>(OpenAI 官方开源,Apache-2.0,Rust 实现,默认分支 `main`) |
 | 原生 ACP | **不支持**,但提供非交互模式:`codex exec --json` 输出 JSONL 事件流;`codex exec resume <thread_id>` 恢复会话实现多轮对话 |
 | 认证 | API Key 经环境变量注入;模型/provider 经 `~/.codex/config.toml` 配置 |
 | 通信协议 | 仅支持 OpenAI **Responses API**(wire_api 固定 `responses`),端点必须实现 `/v1/responses`;只支持 `/v1/chat/completions` 的中转/Ollama/vLLM 无法直连 |
@@ -209,10 +209,12 @@ ACP CLI 子进程(qodercli --acp --yolo / dsh --profile acp)
 
 ## 6. 参考文件索引
 
-| 内容 | 路径 |
+下表为上游开源仓库的 GitHub 地址(`references/` 目录仅为本地参考副本,不随本仓库提交)。
+
+| 内容 | 地址 |
 |------|------|
 | ACP 官方规范 | <https://agentclientprotocol.com>(协议版本 1) |
-| DeepSeek Harness ACP 包说明 | `references/deepseek-harness-master/packages/acp/acp/README.zh.md` |
-| DeepSeek Harness 仓库根文档 | `references/deepseek-harness-master/README.md` |
-| Codex JSONL 事件定义 | `references/codex-main/codex-rs/exec/src/exec_events.rs` |
-| Codex 仓库根文档 | `references/codex-main/README.md` |
+| DeepSeek Harness ACP 包说明 | <https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/acp/acp/README.zh.md> |
+| DeepSeek Harness 仓库根文档 | <https://github.com/deepseek-ai/deepseek-harness/blob/master/README.md> |
+| Codex JSONL 事件定义 | <https://github.com/openai/codex/blob/main/codex-rs/exec/src/exec_events.rs> |
+| Codex 仓库根文档 | <https://github.com/openai/codex/blob/main/README.md> |
