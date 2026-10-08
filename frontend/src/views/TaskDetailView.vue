@@ -12,7 +12,10 @@
  *
  * 流式思考显示(thinking_delta):
  * - 一次 LLM 调用对应一个 conv_id,前端按 conv_id 累积 reasoning + content
- * - 流式期间以"流式思考卡片"显示打字机效果
+ * - 流式期间以"流式思考卡片"显示打字机效果;思考链(reasoning)在流式期间
+ *   自动展开(过阈值后,见 utils/thinkingExpand),流式结束后自动折叠回一行标题
+ *   —— 与执行过程组的"运行时展开、结束收起"同一套生命周期取向:
+ *   看的是直播,留下的是干净的聊天记录
  * - 思考链同时以 type=thinking 落库,落库即推 conversation 事件
  *   (带 stream_conv_id),前端据此把实时卡片退役成只读历史卡片;
  *   刷新/中途离开页面再回来时由 GET /tasks/{id} 快照还原同一批卡片
@@ -58,6 +61,7 @@ import { parseDiffFileSegments } from '@/utils/diffFiles'
 import { triggerBlobDownload } from '@/utils/download'
 import { renderMarkdown } from '@/utils/markdown'
 import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
+import { COLLAPSE_GRACE_MS, isThinkingExpanded, shouldLatchAutoExpand } from '@/utils/thinkingExpand'
 import { findRetiredCardConvId } from '@/utils/thinkingReconcile'
 import type {
   AttachmentInfo,
@@ -221,8 +225,13 @@ interface StreamingItem {
   status: 'streaming' | 'done' | 'error'
   started_at: string
   finished_at?: string
-  /** reasoning 是否展开(默认折叠,流式期间自动展开,完成后折叠) */
-  reasoning_expanded: boolean
+  /** 思考链展开状态(判定见 utils/thinkingExpand):生命周期自动驱动 + 用户可钉住
+   * - reasoning_auto:流式中已跨过自动展开阈值的闩锁(单调,不逐字符重算)
+   * - reasoning_grace:结束后的收起宽限期,到期才折叠(不与正文出现同帧)
+   * - reasoning_pin:用户手动点过的意图,优先于以上两条规则;null=未干预 */
+  reasoning_auto?: boolean
+  reasoning_grace?: boolean
+  reasoning_pin?: boolean | null
   /** 全局递增序号(流式项到达顺序,用于调试) */
   seq: number
   /** 该流式 thinking 开始时,其所在 round 已收到的正式对话数(用于计算插入位置) */
@@ -233,14 +242,17 @@ interface StreamingItem {
 
 const streamingItems = reactive<Map<string, StreamingItem>>(new Map())
 /**
- * 历史回放思考项的展开状态
- * key: conv_id(形如 history:${c.id});value: 是否展开
+ * 历史回放思考项的展开状态(仅存用户手动意图)
+ * key: conv_id(形如 history:${c.id});value: pin
  *
  * 历史思考项在 roundGroups computed 里每次重算都会新建 streamingItem 对象,
  * 状态无法持久,且其 conv_id 未注册进 streamingItems,故 toggleReasoning 找不到。
- * 这里用独立 Map 持久化展开状态,computed 读取它,toggle 时修改它触发重算。
+ * 这里用独立 Map 持久化用户意图,computed 读取它,toggle 时修改它触发重算。
+ * 未点过的项不在 Map 里(=pin null),回放态是 done 所以按自动规则折叠。
  */
-const historyReasoningExpanded = reactive<Map<string, boolean>>(new Map())
+const historyReasoningPins = reactive<Map<string, boolean>>(new Map())
+/** 思考卡收起宽限定时器(卸载时清掉,避免跨任务残留回调) */
+const graceTimers = new Set<ReturnType<typeof setTimeout>>()
 /** 全局序号计数器:流式项到达顺序 */
 let streamingSeqCounter = 0
 /** 每 round 已收到的正式对话数(用于给 streamingItem 计算插入位置 seq) */
@@ -627,7 +639,15 @@ function connectSSE(taskId: string): void {
       // agent2 审查/动态验证拿不到该 id,按 reasoning/content 文本对账。
       if (data.type === 'thinking') {
         const retired = findRetiredCardConvId(streamingItems.values(), data)
-        if (retired) streamingItems.delete(retired)
+        if (retired) {
+          // 交接:把实时卡上用户钉住的展开意图带到只读历史卡(键形如 history:${id}),
+          // 否则"我点开想盯着看的思考"会在落库那一刻被无声收回去
+          const card = streamingItems.get(retired)
+          if (card && typeof card.reasoning_pin === 'boolean') {
+            historyReasoningPins.set(`history:${data.id}`, card.reasoning_pin)
+          }
+          streamingItems.delete(retired)
+        }
       }
       // 追加到对话列表
       // 注意:type=thinking 的落库记录也会走这里 —— 它是"中途离开页面再回来"
@@ -807,7 +827,7 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
   const { conv_id, round_idx, role, phase, delta, verify } = data
 
   if (phase === 'start') {
-    // 创建新的流式项:reasoning 默认折叠(用户可手动展开查看思考链)
+    // 创建新的流式项:思考链按生命周期自动展开(过阈值后),完成后折叠
     // 记录该 round 当前已收到的正式对话数,用于后续 seq 计算(让 thinking 排在
     // 它之后的 tool_call 之前,而非所有 thinking 都挤在最前面)
     const insertSeq = convCountPerRound.get(round_idx) ?? 0
@@ -819,7 +839,9 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
       content: '',
       status: 'streaming',
       started_at: new Date().toISOString(),
-      reasoning_expanded: false,
+      reasoning_auto: false,
+      reasoning_grace: false,
+      reasoning_pin: null,
       seq: streamingSeqCounter++,
       insertSeq,
       verify,
@@ -839,7 +861,9 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
       content: '',
       status: 'streaming',
       started_at: new Date().toISOString(),
-      reasoning_expanded: false,
+      reasoning_auto: false,
+      reasoning_grace: false,
+      reasoning_pin: null,
       seq: streamingSeqCounter++,
       insertSeq,
       verify,
@@ -849,34 +873,67 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
   const cur = streamingItems.get(conv_id)!
   if (phase === 'reasoning') {
     cur.reasoning += delta
+    // 跨过阈值才置自动展开闩锁(单调):短思考保持单行标题,
+    // 避免一次任务里几十个迭代各自"闪一下收起"
+    if (!cur.reasoning_auto && shouldLatchAutoExpand(cur)) cur.reasoning_auto = true
   } else if (phase === 'content') {
     cur.content += delta
   } else if (phase === 'error') {
-    cur.status = 'error'
+    // 错误文本仍归入思考卡(整项失败的完整提示由任务级 error_message 承担)
     cur.reasoning += `\n[错误] ${delta}`
+    finishThinking(cur, conv_id, 'error')
   } else if (phase === 'end') {
-    // 流式结束:标记完成,reasoning 自动折叠(只显示标题和字数提示)
-    // 不移除卡片:它是本次会话内唯一的实时展示载体;
-    // 落库后收到同一段的 conversation 事件时退役(见 onConversation),
-    // 中途离开页面再回来则由快照还原为只读卡片
-    cur.status = 'done'
-    cur.finished_at = new Date().toISOString()
-    cur.reasoning_expanded = false
+    finishThinking(cur, conv_id, 'done')
   }
 }
 
-/** 切换流式卡片 reasoning 的展开/折叠 */
+/**
+ * 流式收尾:标记完成,展开态进入宽限期后自动折叠
+ *
+ * 不移除卡片:它是本次会话内唯一的实时展示载体;
+ * 落库后收到同一段的 conversation 事件时退役(见 onConversation),
+ * 中途离开页面再回来则由快照还原为只读卡片。
+ *
+ * 宽限期只给"曾经自动展开过"的卡片:让收起发生在正文渲染之后一拍,
+ * 而不是与正文出现抢同一帧把用户视线拽走。用户 pin 过的不受影响
+ * (isThinkingExpanded 里 pin 优先)。
+ */
+function finishThinking(
+  cur: StreamingItem,
+  convId: string,
+  status: 'done' | 'error',
+): void {
+  cur.status = status
+  cur.finished_at = new Date().toISOString()
+  cur.reasoning_grace = cur.reasoning_auto === true
+  cur.reasoning_auto = false
+  if (!cur.reasoning_grace) return
+  const timer = setTimeout(() => {
+    graceTimers.delete(timer)
+    // 卡片可能已随落库退役(或被整页快照清空),找不到就不必再改
+    const it = streamingItems.get(convId)
+    if (it) it.reasoning_grace = false
+  }, COLLAPSE_GRACE_MS)
+  graceTimers.add(timer)
+}
+
+/** 清掉思考卡收起宽限定时器(卸载/切换任务时不留残余回调) */
+function clearGraceTimers(): void {
+  for (const t of graceTimers) clearTimeout(t)
+  graceTimers.clear()
+}
+
+/** 切换思考卡展开/折叠:写成用户意图(pin),覆盖生命周期自动规则 */
 function toggleReasoning(convId: string): void {
   // 实时流式项:状态存在 streamingItems 里
   const item = streamingItems.get(convId)
   if (item) {
-    item.reasoning_expanded = !item.reasoning_expanded
+    item.reasoning_pin = !isThinkingExpanded(item)
     return
   }
   // 历史回放项:conv_id 形如 history:xxx,未注册进 streamingItems,
-  // 用独立 Map 持久化展开状态(修改后触发 roundGroups computed 重算)
-  const cur = historyReasoningExpanded.get(convId) ?? false
-  historyReasoningExpanded.set(convId, !cur)
+  // 用独立 Map 持久化用户意图(修改后触发 roundGroups computed 重算)
+  historyReasoningPins.set(convId, !(historyReasoningPins.get(convId) ?? false))
 }
 
 // ---- plan 提取工具(与后端 _extract_plan 逻辑一致:优先 JSON 格式,回退逐行格式)----
@@ -1049,6 +1106,7 @@ onMounted(initTask)
 onUnmounted(() => {
   unmountedFlag = true
   if (eventSource) eventSource.close()
+  clearGraceTimers()
 })
 
 /**
@@ -1064,7 +1122,8 @@ function resetTaskState(): void {
   streamingItems.clear()
   planPerRound.clear()
   convCountPerRound.clear()
-  historyReasoningExpanded.clear()
+  historyReasoningPins.clear()
+  clearGraceTimers()
   // 重置 resume 窗口标志(防止跨任务误触发 onDone 校验)
   resumingRef.value = false
   // 清空待处理消息条目(旧任务的)
@@ -1103,9 +1162,10 @@ watch(
 // step 归属推断:用迭代内首个工具调用的工具名匹配 plan step 关键词
 // (复用后端 _TOOL_STEP_KEYWORDS 映射,与 plan 状态推进逻辑一致)
 //
-// 折叠策略(过程整体收起,结论直接可见;运行中流式自动展开,完成/轮结束自动收起):
+// 折叠策略(过程整体收起,结论直接可见;运行中自动展开,轮结束/任务完成自动收起):
 // - 无 plan:所有迭代进单个"执行过程"折叠组(结论已提出组外,组内是纯过程噪音);
-// - 有 plan:每个 step 一个折叠组(默认收起),无法归属的迭代进"执行过程"兜底折叠组;
+// - 有 plan:活跃轮只展开"前沿组"(最新迭代所属那个),轮闭合后各组默认收起,
+//   无法归属的迭代进"执行过程"兜底折叠组;
 // - 结论段:该轮最终回答不折叠,像正常消息一样直接可见(无特殊标签,ChatGPT 式);
 // - 工具行:默认折叠(compact 单行 / agent、toolpair 卡片,按 tool_call id 记录展开)。
 
@@ -1170,6 +1230,8 @@ interface StepGroup {
   iterations: IterationSegment[]
   /** 是否含流式中(任一迭代流式则为 true) */
   hasStreaming: boolean
+  /** 活跃轮的前沿组:该轮运行期间整段保持展开(工具执行的空档也不收起) */
+  live: boolean
   /** 该 step 内的平铺消息(如用户追问/回答,位于组内迭代边界;含此消息的组默认展开) */
   plains: PlainSegment[]
 }
@@ -1409,11 +1471,14 @@ function segmentRoundItems(
     status: 'none',
     iterations: [],
     hasStreaming: false,
+    live: false,
     plains: [],
   }
 
   /** 迭代序号 → 所属 step 组(用于把平铺消息穿插到对应组内边界) */
   const groupByIterIdx = new Map<number, StepGroup>()
+  /** 最新迭代所属组 = 活跃轮的前沿组(iterations 按迭代序递增遍历,后者覆盖前者) */
+  let leadingGroup: StepGroup | null = null
 
   for (const iter of iterations) {
     const stepId = inferStepFromIteration(iter, planSteps)
@@ -1429,6 +1494,7 @@ function segmentRoundItems(
           status: step?.status || 'pending',
           iterations: [],
           hasStreaming: false,
+          live: false,
           plains: [],
         }
         stepGroupsMap.set(stepId, group)
@@ -1436,11 +1502,13 @@ function segmentRoundItems(
       group.iterations.push(iter)
       if (iter.hasStreaming) group.hasStreaming = true
       groupByIterIdx.set(iter.iterationIdx, group)
+      leadingGroup = group
     } else {
       // 无法归属(无 plan 或工具名无匹配)→ 归入无 step 组
       noStepGroup.iterations.push(iter)
       if (iter.hasStreaming) noStepGroup.hasStreaming = true
       groupByIterIdx.set(iter.iterationIdx, noStepGroup)
+      leadingGroup = noStepGroup
     }
   }
 
@@ -1457,6 +1525,16 @@ function segmentRoundItems(
   // 追加无法归属的迭代组(如果有)
   if (noStepGroup.iterations.length > 0) {
     orderedGroups.push(noStepGroup)
+  }
+
+  // 活跃轮的"前沿组"整段保持展开。此前只看 hasStreaming:thinking 一收完就转去
+  // 跑工具(clone_repo / 子智能体可能几十秒),这段空档 hasStreaming 变 false,
+  // 组正好在"工具正在跑"的时候收起,下一次 thinking 到达再展开 —— 直播在
+  // 迭代边界上反复断流。前沿组之外的早期 step 组仍保持折叠,不形成刷屏长垄。
+  if (!roundClosed && leadingGroup) {
+    for (const g of orderedGroups) {
+      g.live = g === leadingGroup || g.hasStreaming
+    }
   }
 
   // 平铺消息按原始位置穿插到 step 组之间或组内迭代边界,不再统一追加到轮末
@@ -1574,8 +1652,9 @@ const roundGroups = computed<RoundGroup[]>(() => {
         status: 'done',
         started_at: c.created_at,
         finished_at: c.created_at,
-        // 从独立 Map 读取持久化的展开状态(实时流式项不在此处读取)
-        reasoning_expanded: historyReasoningExpanded.get(historyConvId) ?? false,
+        // 从独立 Map 读取用户手动意图(实时流式项不在此处读取);
+        // 未点过则为 null,回放态(done)按自动规则折叠
+        reasoning_pin: historyReasoningPins.get(historyConvId) ?? null,
         seq: 0,
         insertSeq: localIdx,
       }
@@ -1690,13 +1769,18 @@ const latestPlanSteps = computed<PlanStep[]>(() => {
 
 // ---- 折叠状态查询/切换 ----
 
-/** step 组是否展开:手动收起优先;否则手动展开 OR 含流式(自动展开)
- * OR 组内有用户消息(追问/回答必须可见)。最终总结已提为结论段平铺,
- * 过程组一律默认折叠 */
+/** step 组是否展开:手动收起优先;否则手动展开 OR 活跃轮前沿组(直播中)
+ * OR 含流式 OR 组内有用户消息(追问/回答必须可见)。最终总结已提为结论段平铺,
+ * 轮闭合后的过程组一律默认折叠 */
 function isStepExpanded(group: StepGroup): boolean {
   if (collapsedSteps.has(group.id)) return false
-  // 含流式或含组内平铺消息(如用户追问/回答)时自动展开,保证消息可见
-  if (expandedSteps.has(group.id) || group.hasStreaming || group.plains.length > 0) return true
+  // 前沿组/含流式/含组内平铺消息(如用户追问/回答)时自动展开,保证直播内容可见
+  if (
+    expandedSteps.has(group.id) ||
+    group.live ||
+    group.hasStreaming ||
+    group.plains.length > 0
+  ) return true
   return false
 }
 

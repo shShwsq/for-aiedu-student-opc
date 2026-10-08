@@ -191,7 +191,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     placement: 'top',
     title: '协作对话流',
     content:
-      '任务运行时,这里实时显示你和 AI助手的对话:执行过程默认折叠(运行中自动展开),每轮最终回答像聊天消息一样直接可见。',
+      '任务运行时,这里实时显示你和 AI助手的对话:正在跑的"执行过程"和 AI 思考会自动展开,结束后自动收起(点一下可以钉住你想看的状态),每轮最终回答则像聊天消息一样一直直接可见。',
   },
   {
     id: 'detail-pause',

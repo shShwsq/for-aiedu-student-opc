@@ -7,11 +7,13 @@
  *
  * 渲染规则:
  * - reasoning 和 content 是两个独立的卡片,不再是嵌套在同一个外层容器里
- * - reasoning 卡片可折叠(默认折叠),点击 header 展开/收起
+ * - reasoning 卡片由生命周期驱动展开:流式中自动展开(过阈值)、结束后折叠
+ *   (判定见 utils/thinkingExpand),点击 header 可钉住覆盖自动规则
  * - content 卡片用 role/type 对应配色
  */
-import { computed, ref } from 'vue'
-import { renderMarkdown } from '@/utils/markdown'
+import { computed, nextTick, ref, watch } from 'vue'
+import { escapePlainText, renderMarkdown } from '@/utils/markdown'
+import { isThinkingExpanded } from '@/utils/thinkingExpand'
 import type { AttachmentInfo } from '@/types/task'
 
 interface StreamingItem {
@@ -19,7 +21,10 @@ interface StreamingItem {
   reasoning: string
   content: string
   status: 'streaming' | 'done' | 'error'
-  reasoning_expanded: boolean
+  /** 展开状态三要素(见 utils/thinkingExpand),由父组件维护 */
+  reasoning_auto?: boolean
+  reasoning_grace?: boolean
+  reasoning_pin?: boolean | null
   role?: 'agent1' | 'agent2'
 }
 
@@ -73,7 +78,7 @@ const isActive = computed(
   () => !!(props.item.is_streaming && props.item.streaming?.status === 'streaming'),
 )
 
-/** 正式对话项 reasoning 的折叠状态:默认折叠,点击展开 */
+/** 正式对话项 reasoning 的折叠状态(默认折叠,点击展开) */
 const evalExpanded = ref(false)
 
 /**
@@ -85,8 +90,11 @@ const isUaEvaluation = computed(
   () => props.item.role === 'agent2' && props.item.type === 'evaluation',
 )
 
-/** 流式项 reasoning 的展开状态(由父组件通过 streamingItems 管理) */
-const streamingExpanded = computed(() => props.item.streaming?.reasoning_expanded ?? false)
+/** 流式项 reasoning 的展开状态(由父组件通过 streamingItems 维护,本处只读判定) */
+const streamingExpanded = computed(() => {
+  const s = props.item.streaming
+  return s ? isThinkingExpanded(s) : false
+})
 
 /**
  * tool_call content 拆分:后端把意图放在首行,原始调用详情放后续行。
@@ -125,11 +133,38 @@ const streamingDisplayContent = computed(() => {
   return stripPlanBlock(c)
 })
 
-/** 流式项的 reasoning 实际内容(trim 后) */
+/** 流式项 reasoning 的实际内容(trim 后) */
 const streamingReasoning = computed(() => {
   const r = props.item.streaming?.reasoning ?? ''
   return r.trim()
 })
+
+/**
+ * 思考框自动贴底:展开只是把框打开,真正在看的新内容在框的底端。
+ * 思考框高 300px 封顶(带内部滚动),不贴住底部时用户看到的是思考的
+ * 开头、最新 token 落在可视区外,自动展开就白做了。
+ * 用户在框内向上滚回看时不再打扰(与外层对话流 followBottom 同一套 proximity 判断)。
+ */
+const reasoningRef = ref<HTMLElement | null>(null)
+const innerFollow = ref(true)
+
+function onReasoningScroll(): void {
+  const el = reasoningRef.value
+  if (!el) return
+  innerFollow.value = el.scrollTop + el.clientHeight >= el.scrollHeight - 12
+}
+
+watch(
+  () => [streamingReasoning.value, streamingExpanded.value] as const,
+  () => {
+    // 只给"还在流"的卡片贴底:历史卡用户点开是为了从头读,跳到底部反而错位
+    if (!isActive.value || !streamingExpanded.value || !innerFollow.value) return
+    nextTick(() => {
+      const el = reasoningRef.value
+      if (el) el.scrollTop = el.scrollHeight
+    })
+  },
+)
 
 /**
  * 是否渲染该消息组。
@@ -162,6 +197,14 @@ const displayContent = computed(() => {
  * tool_call 的 intent 标题是单行意图,也不渲染。
  */
 const streamingReasoningHtml = computed(() => renderMarkdown(streamingReasoning.value))
+/**
+ * 思考框实际注入的 HTML:流式中只转义不排版(逐 token 重解析 markdown 会把
+ * 渲染成本扣在每个增量上,而思考链可达数千字符),结束后一次性渲染。
+ * 两个形态共用同一个元素:避免 keyed 分支交换时新旧两块短暂共存把框高撑一倍。
+ */
+const streamingReasoningHtmlOut = computed(() =>
+  isActive.value ? escapePlainText(streamingReasoning.value) : streamingReasoningHtml.value,
+)
 const streamingContentHtml = computed(() => renderMarkdown(streamingDisplayContent.value))
 const reasoningHtml = computed(() => renderMarkdown(props.item.reasoning || ''))
 const displayContentHtml = computed(() => {
@@ -209,7 +252,7 @@ function formatSize(bytes: number): string {
   <div v-if="showCard" class="msg-group">
     <!-- 流式思考项:reasoning 卡片 + content 卡片,两者独立 -->
     <template v-if="item.is_streaming && item.streaming">
-      <!-- reasoning 独立卡片(可折叠) -->
+      <!-- reasoning 独立卡片(流式中自动展开,结束后折叠) -->
       <div
         v-if="streamingReasoning"
         class="msg-reasoning-card"
@@ -232,7 +275,15 @@ function formatSize(bytes: number): string {
             </span>
           </span>
         </div>
-        <div v-if="streamingExpanded" class="msg-reasoning-content markdown-body" v-html="streamingReasoningHtml" />
+        <Transition name="thinking-box">
+          <div
+            v-if="streamingExpanded"
+            ref="reasoningRef"
+            :class="['msg-reasoning-content', isActive ? 'msg-reasoning-live' : 'markdown-body']"
+            v-html="streamingReasoningHtmlOut"
+            @scroll="onReasoningScroll"
+          />
+        </Transition>
       </div>
 
       <!-- content 独立卡片 -->
@@ -399,6 +450,30 @@ function formatSize(bytes: number): string {
 .msg-reasoning-content.markdown-body,
 .msg-content-card.markdown-body {
   white-space: normal;
+}
+
+/* 流式中的思考框:纯文本直出(pre-wrap 保留换行,不走 markdown 解析) */
+.msg-reasoning-live {
+  white-space: pre-wrap;
+}
+
+/* 思考框展开/收起过渡:宽限期到点后折叠不把下方消息"猛地拽上去" */
+.thinking-box-enter-active,
+.thinking-box-leave-active {
+  transition:
+    max-height 0.18s ease,
+    padding-top 0.18s ease,
+    margin-top 0.18s ease,
+    opacity 0.18s ease;
+  overflow: hidden;
+}
+
+.thinking-box-enter-from,
+.thinking-box-leave-to {
+  max-height: 0;
+  padding-top: 0;
+  margin-top: 0;
+  opacity: 0;
 }
 
 /* 流式思考时给 reasoning 卡片加脉冲动画 */

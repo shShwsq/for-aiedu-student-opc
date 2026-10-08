@@ -25,3 +25,15 @@ export function renderMarkdown(text: string | null | undefined): string {
   const raw = marked.parse(text, { async: false }) as string
   return DOMPurify.sanitize(raw)
 }
+
+/**
+ * 把纯文本转成可注入 v-html 的安全 HTML:只转义 & < >,不解析 markdown。
+ *
+ * 用途:流式增量期间的长文本(思考链可达数千字符)——逐 token 跑
+ * marked+DOMPurify 会把渲染成本扣在每个增量上,而这段文本本来就是连续
+ * 叙述,不需要排版。转义后注入,与 renderMarkdown 同样不接受原始 HTML。
+ */
+export function escapePlainText(text: string | null | undefined): string {
+  if (!text) return ''
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}

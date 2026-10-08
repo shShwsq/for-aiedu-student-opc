@@ -20,8 +20,9 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import type { Conversation, ReviewStatus } from '@/types/task'
 import { renderMarkdown } from '@/utils/markdown'
+import { isThinkingExpanded } from '@/utils/thinkingExpand'
 
-/** 与 TaskDetailView 内部 StreamingItem 对齐(本组件只读消费) */
+/** 与 TaskDetailView 内部 StreamingItem 对齐(本组件只读消费展开状态,写入走 toggle) */
 interface StreamingLike {
   conv_id: string
   round_idx: number
@@ -30,6 +31,10 @@ interface StreamingLike {
   content: string
   status: 'streaming' | 'done' | 'error'
   verify?: boolean
+  /** 思考展开状态三要素(见 utils/thinkingExpand),与主对话流同一张卡片实体 */
+  reasoning_auto?: boolean
+  reasoning_grace?: boolean
+  reasoning_pin?: boolean | null
 }
 
 interface ToolEntry {
@@ -239,6 +244,16 @@ function streamText(s: StreamingLike): string {
 function charCount(text: string | null | undefined): number {
   return (text || '').length
 }
+
+/**
+ * 流式思考开合:用户手动开合也写回 pin(与主对话流同一张卡片实体,两处联动)。
+ * 程序性改 open(宽限期到点折叠)也会触发 toggle,结果是幂等的:
+ * pin 取当前展开值,不会把自动规则翻过来反噬自己。
+ */
+function onStreamToggle(s: StreamingLike, ev: Event): void {
+  const open = (ev.target as HTMLDetailsElement).open
+  if (isThinkingExpanded(s) !== open) s.reasoning_pin = open
+}
 </script>
 
 <template>
@@ -278,8 +293,15 @@ function charCount(text: string | null | undefined): number {
           <div v-else class="panel-tool-pending">执行中…</div>
         </details>
 
-        <!-- 实时流式思考(SSE thinking_delta;verify 标记为动态验证):默认折叠,与工具核查同级 -->
-        <details v-for="s in g.streaming" :key="s.conv_id" class="panel-item panel-stream-item">
+        <!-- 实时流式思考(SSE thinking_delta):流式中自动展开、结束后折叠,
+             与主对话流思考卡同一套生命周期规则(审查动辄数分钟,不能只看字数跑) -->
+        <details
+          v-for="s in g.streaming"
+          :key="s.conv_id"
+          class="panel-item panel-stream-item"
+          :open="isThinkingExpanded(s)"
+          @toggle="onStreamToggle(s, $event)"
+        >
           <summary>
             <span :class="['panel-stream-label', { 'is-verify': s.verify }]">
               {{ s.verify ? '动态验证' : '思考中' }}{{ s.status === 'streaming' ? '…' : '' }}
