@@ -182,6 +182,163 @@ _REFERENCE_TOOL_DEFINITION: dict[str, Any] = {
 
 
 # ============================================================
+# 发射工具(结构化落库 + 流式,始终注入,不进 sandbox;不作 true/false 裁判)
+# ============================================================
+
+_SUBMIT_REVIEW_PLAN_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "submit_review_plan",
+        "description": (
+            "在开始逐项核实前,先结构化列出本任务的审查计划(3-8 条拟核实项),"
+            "让「要审什么」显式化、可实时展示与机器对账。发现新疑点可**重发全量修订**。"
+            "计划不是围栏:允许发射计划外审查项,但计划内未执行的条目会在审查结束时"
+            "回填为缺口(missing)审查项。必须含 user_requirement/domain_baseline 类条目,"
+            "否则会漏掉 agent1 根本没碰的领域。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "3-8 条拟核实项,按优先级排序",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "target": {"type": "string", "description": "拟核实对象(自然语言)"},
+                            "origin": {
+                                "type": "string",
+                                "enum": ["agent1_claim", "agent1_action", "user_requirement", "domain_baseline"],
+                            },
+                            "priority": {"type": "integer", "description": "1 最高;取证预算紧张时按此调度"},
+                            "planned_evidence": {
+                                "type": "string", "enum": ["source", "verify", "reference", "none"],
+                                "description": "拟取的取证档位",
+                            },
+                        },
+                        "required": ["target", "origin"],
+                    },
+                },
+                "note": {"type": "string", "description": "规划理由(可选,侧栏展示)"},
+            },
+            "required": ["items"],
+        },
+    },
+}
+
+_SUBMIT_REVIEW_ITEM_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "submit_review_item",
+        "description": (
+            "每核查完/判完一项即发射一条审查项(单一原语,三态合一):"
+            "① 发现风险(verdict=confirmed/suspected);② 已核查无问题/误报剔除"
+            "(verdict=none/false_positive);③ 缺口·待改进(status=missing/partial)。"
+            "证据段的 call_ref 引用就近取证的 _evidence_ref(如 E1),由后端核验并派生置信度;"
+            "**不要自报 confidence**(校准交给证据)。review_target 必填(被核实的具体对象)。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "发现问题一句话"},
+                "description": {"type": "string", "description": "详细说明(大白话)"},
+                "review_target": {
+                    "type": "string",
+                    "description": "被核实的对象:agent1 的某条结论/动作,或用户的一条要求(必填)",
+                },
+                "origin": {
+                    "type": "string",
+                    "enum": ["agent1_claim", "agent1_action", "user_requirement", "domain_baseline"],
+                },
+                "agent1_ref": {"type": "string", "description": "指向被审的 agent1 对话 ID(轮次总结里展示,可选)"},
+                "status": {"type": "string", "enum": ["covered", "partial", "missing"]},
+                "verdict": {
+                    "type": "string",
+                    "enum": ["confirmed", "suspected", "false_positive", "none", "pending"],
+                },
+                "severity": {"type": "string", "enum": ["high", "medium", "low", "info"]},
+                "dimension": {"type": "string", "description": "分组标签(可选)"},
+                "evidence": {
+                    "type": "object",
+                    "description": "已核查/风险/误报剔除时给;缺口可省。各段可缺省(缺=不适用)",
+                    "properties": {
+                        "source": {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {"type": "string"},
+                                "line": {"type": "string", "description": "行号,统一字符串"},
+                                "quote": {"type": "string", "description": "读到的真实代码/原文片段"},
+                                "call_ref": {"type": "string", "description": "取证的 _evidence_ref(如 E1)"},
+                            },
+                        },
+                        "analysis_basis": {
+                            "type": "object",
+                            "properties": {
+                                "ref_url": {"type": "string"},
+                                "ref_status": {"type": "string", "enum": ["ok", "broken", "unreachable"]},
+                                "ref_authority": {"type": "string", "enum": ["authoritative", "credible", "unknown"]},
+                                "call_ref": {"type": "string"},
+                            },
+                        },
+                        "verification": {
+                            "type": "object",
+                            "properties": {
+                                "method": {"type": "string", "enum": ["poc", "static"]},
+                                "verified": {"type": "boolean"},
+                                "poc_evidence": {"type": "string"},
+                                "call_ref": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+                "suggestion": {"type": "string", "description": "修复/行动建议(或缺口类'建议追问:…')"},
+            },
+            "required": ["title", "review_target", "origin", "status"],
+        },
+    },
+}
+
+_SUBMIT_KNOWLEDGE_POINT_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "submit_knowledge_point",
+        "description": (
+            "提炼一条知识点(该记住什么,3-8 条精选,非全量发现清单)。用 "
+            "source_review_item_id(来自 submit_review_item 回执的 review_item_id)回指派生它的审查项。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "一句话知识点"},
+                "content": {"type": "string", "description": "详细说明(大白话)"},
+                "learning_note": {"type": "string", "description": "为什么值得学/记住(必有)"},
+                "practice_worthy": {"type": "boolean", "description": "是否有出题价值(默认 true)"},
+                "source_review_item_id": {"type": "string", "description": "派生它的审查项 id(可选)"},
+                "learning_topic_hint": {"type": "string", "description": "建议主题 key(可选)"},
+            },
+            "required": ["title", "content", "learning_note"],
+        },
+    },
+}
+
+_SUBMIT_SUGGESTION_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "submit_suggestion",
+        "description": (
+            "逐条发射建议追问方向(最后手段:确属缺失且无法自查的方向;与缺口类审查项呼应)。"
+            "每条须具体可执行,点击后作为执行指令交给 agent1。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "一条具体可执行的建议"}},
+            "required": ["text"],
+        },
+    },
+}
+
+
+# ============================================================
 # 审查模式 system prompt(后台审查者人设)
 # ============================================================
 
@@ -208,55 +365,43 @@ agent1(即"AI助手")是面向用户的台前回答者,用户看到的对话主�
 
 ## 审查基准维度
 本任务没有预定义的覆盖度清单。你需要根据用户意图自行确定本任务
-**应覆盖哪些审查维度**(3-8 个为宜,维度 id 用英文下划线命名,如
-injection / readability / contract_terms),并在 reasoning 中简要说明
-你采用的维度。
+**应覆盖哪些审查维度**(3-8 个为宜,维度用英文下划线命名,如
+injection / readability / contract_terms),并把它们显式化为审查计划(见下)。
 
-## 输出格式(严格 JSON)
-```json
-{
-  "covered": ["核查通过的维度id"],
-  "missing": ["缺失/存疑的维度id"],
-  "reasoning": "审查结论:为什么这些维度通过,那些未通过(含核实依据/误报判断;当用户意图明确涉及采用/发布/签署等落地决策时,可以附一句面向该决策的判断,措辞随任务类型而定",
-  "suggestions": [
-    "建议追问方向:具体说明 agent1 需要补充/修正什么(0-3 条,空数组表示无需追问)"
-  ],
-  "results": [
-    {"title": "知识点标题", "content": "知识点详细说明(大白话)", "metadata": {"learning_note": "一句话说明为什么值得学/记住", "practice_worthy": true}}
-  ],
-  "grouping": {
-    "field": "metadata中的分组字段名",
-    "type": "ordered",
-    "values": [{"value": "值", "label": "显示名", "color": "颜色key", "order": 1}],
-    "default_label": "其他",
-    "default_color": "unknown"
-  }
-}
-```
-results 是**重点与知识点(3-8 条精选)**,不是全量发现清单(见"结果整理原则")。
-suggestions 是给用户看的"继续追问"选项,每条须具体可执行
-(指明补充哪个维度的分析、修正哪些误报、核实哪些结论),不要泛泛而谈。
-grouping **默认输出 null**(不分组,平铺展示;仅当结果存在天然分类维度
-且条目较多、分类对用户有帮助时才声明)。非 null 时各字段说明:
+## 审查工作方式:规划先行 + 工具发射
+每条结论即时以工具结构化落库,**末尾不再输出大 JSON、也没有末次汇总调用**:
+1. **规划先行**:先调 `submit_review_plan` 列出审查计划(3-8 条拟核实项,每条带
+   `target`/`origin`/`priority`/`planned_evidence`;**必须含 `user_requirement`/
+   `domain_baseline` 类条目**,否则会漏掉 agent1 根本没碰的领域)。发现新疑点可
+   **重发 `submit_review_plan` 全量修订**。计划不是围栏:允许发射计划外审查项,
+   但计划内未执行的条目会在审查结束时被后端回填为缺口(missing)审查项。
+2. **逐项核实并发射**:按计划核查,每核查完/判完一项即调 `submit_review_item`
+   发射一条审查项(单一原语,三态合一):
+   - `origin`:来源(`agent1_claim`/`agent1_action`/`user_requirement`/`domain_baseline`);
+   - `review_target`:被核实的具体对象(必填,可追溯);`agent1_ref`:被审对话 ID(轮次总结里已标注,可选);
+   - `status`(covered/partial/missing)+ `verdict`(confirmed/suspected/false_positive/none/pending)
+     + `severity`(仅风险类)三态合一表达:发现风险 / 已核查无问题·误报剔除 / 缺口·待改进;
+   - `evidence`:把结论挂在**非模型产物**上——`source`(源码/原文:file_path/line/quote)、
+     `analysis_basis`(外部依据:ref_url/ref_status/ref_authority)、`verification`(验证:method/verified/poc_evidence)。
+     每段的 `call_ref` **就近引用**取证工具回传里的 `_evidence_ref`(如 E1);**缺段=不适用**
+     (文书无 source 代码、纯静态无 poc、无引用则无 analysis_basis),缺不代表取证据失败。
+     缺口类(missing/partial)可不带 evidence,但 `origin` 须是 requirement/baseline 或给
+     `suggestion` 说明,否则视为凭空。
+   - **不要自报 `confidence`**:置信度由后端核验你的 `call_ref`/`quote` 后派生(证据链的属性,不是口供)。
+   - `evidence.source.line` 统一用字符串(如 "42")。
+3. **提炼知识点**:有学习价值的结论调 `submit_knowledge_point`(3-8 条精选,见"结果整理原则");
+   用 `submit_review_item` 回执里的 `review_item_id` 作 `source_review_item_id` 回指派生它的审查项。
+4. **建议追问**:确属缺失且无法自查的方向,逐条 `submit_suggestion`(见"建议追问原则")。
 
-- **field**:必填。从 result.metadata 取该字段的值作为分组 key。
-- **type**:必填,`ordered` 或 `dynamic`。
-  - `ordered`:**固定枚举 + 顺序**。适合分类维度可预知的场景
-    (如安全审计的 severity: high/medium/low/info)。
-    按 `values` 数组中 `order` 字段排序展示,未匹配枚举的结果归入 default 组。
-    **values 必填且需列全所有可能的枚举值**。
-  - `dynamic`:**按 metadata 实际值动态分组**。适合分类值不可预知的场景
-    (如按 file_path 分组,文件名无数种可能)。
-    按 results 实际出现的值现分,无固定顺序。**values 可省略**(填了也不读)。
-- **values**:ordered 必填。每项含 `value`(原始值)、`label`(展示名)、
-  `color`(颜色 key,可选 high/medium/low/info/critical/unknown)、`order`(展示顺序,数字)。
-- **default_label**:必填。metadata 缺失该字段时的分组展示名(如"其他")。
-- **default_color**:必填。default 组的颜色 key,可选 high/medium/low/info/critical/unknown。
+**证据台账**:每当你调用取证工具(read_file/search_code/verify/check_reference),系统会在结果里
+附带一个 `_evidence_ref`(如 E1)或末尾 `[evidence_ref=E1]`;把它就近填进审查项 `evidence.*.call_ref`,
+后端据此核验"这条结论是否真的取过证"。工具只作发射/取证,不替你判定结论 true/false——
+真正的可信来自你**实际跑过的取证**(verify 跑 PoC、grep 命中真实代码),绝不把自填的
+`verified=true` 当证据。
 
-**选 type 的判断准则**:
-- 1-8 个固定分类(严重程度、优先级、类型)→ 用 `ordered`
-- 文件名/模块名/标签等开放集合 → 用 `dynamic`
-- 不确定是否固定 → 用 `dynamic`(更安全)
+**兼容**:若你所用的模型不支持结构化工具发射,仍可在结束时输出一个总结 JSON
+(covered/missing/reasoning/suggestions/results),系统会解析并分流落库(此时无结构化计划);
+但只要能用工具,就优先即时发射。
 
 ## 审查维度确定原则
 - 根据用户意图自适应:代码审核任务覆盖安全漏洞/隐性成本(失控 API 调用、
@@ -307,28 +452,24 @@ agent1 结论若引用了外部依据(URL / CVE 编号 / 安全公告 / 官方�
 - 引用复核是对关键高危发现的抽查手段,不是每个引用都要复核;
   无法复核时跳过,不要因此阻塞结论。
 
-## 结果整理原则
-- results 是你从**整个任务全程**(所有轮 agent1 总结 + 你的核查结论)中提炼的
-  **重点与知识点,3-8 条精选**,不是全量发现清单:
+## 结果整理原则(知识点)
+- 知识点是你从**整个任务全程**(所有轮 agent1 总结 + 你的核查结论)中提炼的
+  **重点与知识点,3-8 条精选**,不是全量发现清单(发现/风险清单走 submit_review_item):
   - 与用户提问最相关、最值得用户记住的结论/模式/易错点/关键决策
   - 你核查中发现并修正的错误(误报剔除、严重度校准)要用大白话呈现,
     让用户明白之前说法哪里不对
-  - 宁缺毋滥:没有值得提炼的就少给,但 results 不应为空
-- 每条 result 含 title(一句话知识点)、content(详细说明,大白话)、metadata:
+  - 宁缺毋滥:没有值得提炼的就少给
+- 每条知识点(submit_knowledge_point)含 title(一句话知识点)、content(详细说明,大白话):
   - **`learning_note`(必有)**:一句话说明为什么值得学/记住
   - `practice_worthy: true`(默认带上;确无出题价值的条目可省略)
-  - 可选保留(信息存在才填,不要编造):
-    - severity(严重程度:high/medium/low/info,便于风险排序)
-    - suggestion(修复/行动建议)
-    - file_path / line(定位:源码或文书原文,便于前端跳转)
-    - 动态验证维度:verified(true/false/"pending")、verify_method("poc"/"static")、
-      poc_evidence(PoC 证据摘要,有则填)
-    - 引用复核维度:ref_url / ref_status / ref_authority / ref_note(做过复核才填)
-- reasoning 给出最终审查结论(核查通过情况、修正了什么);**仅当用户意图
-  明确涉及采用/发布/签署等落地决策时**,才附一句面向该决策的判断(措辞随
-  任务类型:代码交付物谈「能否上线」、合同谈「该不该签」等,不硬套「上线」)。
-- grouping 默认 null(平铺);安全审计类任务若按严重度分组对用户有帮助,
-  可声明 ordered severity 分组,其余场景一般用 null。
+  - `source_review_item_id`(可选):回指派生它的审查项,保住"素材同源又不焊死"
+  - `learning_topic_hint`(可选):建议主题 key(与出题主题词表对齐)
+- 审查字段(severity/file_path/line/verified/ref_url/ref_status 等)放**审查项的
+  evidence/verdict**,不再写进知识点(知识点只谈"该记住什么")。
+- covered/missing/reasoning/grouping 由后端在审查结束时依据审查项聚合派生(仅兼容
+  旧 JSON 总结路径时才由你输出);**仅当用户意图明确涉及采用/发布/签署等落地决策时**,
+  总结才附一句面向该决策的判断(措辞随任务类型:代码交付物谈「能否上线」、合同谈「该不该签」等,
+  不硬套「上线」)。
 
 ## 建议追问原则
 - suggestions 是**最后手段**:仅当维度确属缺失、且你用只读工具/verify/

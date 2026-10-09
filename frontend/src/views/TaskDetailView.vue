@@ -63,11 +63,22 @@ import { renderMarkdown } from '@/utils/markdown'
 import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
 import { COLLAPSE_GRACE_MS, isThinkingExpanded, shouldLatchAutoExpand } from '@/utils/thinkingExpand'
 import { findRetiredCardConvId } from '@/utils/thinkingReconcile'
+import {
+  bucketizeReviewItems,
+  confidenceClass,
+  confidenceLabel,
+  formatConfidenceScore,
+} from '@/utils/reviewBucket'
 import type {
   AttachmentInfo,
   CloneProgressEventData,
   Conversation,
+  KnowledgePointEventData,
   PlanStep,
+  ReviewItem,
+  ReviewItemEventData,
+  ReviewPlanUpdateEventData,
+  ReviewSummary,
   SendMessageResponse,
   TaskDetail,
   TaskResult,
@@ -458,6 +469,9 @@ function maskTokenValue(value: string): string {
 
 async function initTask(): Promise<void> {
   const taskId = route.params.id as string
+  // 切换/重载任务:清空上一任务的实时审查计划
+  reviewPlanLive.value = null
+  expandedReviewItems.value = new Set()
   try {
     // 拉任务快照(场景降级后不再需要单独拉 /scenarios:结果分组/meta
     // 从 task.params._grouping 和 results 的 metadata keys 推断)
@@ -735,9 +749,28 @@ function connectSSE(taskId: string): void {
         // 快照拉取失败:保持本地状态,onReviewDone/onDone 会再拉
       }
     },
+    onReviewPlanUpdate: (data: ReviewPlanUpdateEventData) => {
+      // 审查计划发射/修订:覆盖式整体替换(重发=全量修订,不重复累积)
+      reviewPlanLive.value = data
+    },
+    onReviewItemAdd: (data: ReviewItemEventData) => {
+      // 审查项即时落库:按 id 去重 push;review_done 拉快照权威兜底
+      if (!task.value) return
+      const arr = task.value.review_items ?? []
+      if (!arr.some((i) => i.id === data.id)) {
+        task.value.review_items = [...arr, data as unknown as ReviewItem]
+      }
+    },
+    onKnowledgePointAdd: (data: KnowledgePointEventData) => {
+      // 知识点即时落库:按 id 去重 push 进 results(知识点区)
+      if (!task.value) return
+      const arr = task.value.results ?? []
+      if (!arr.some((r) => r.id === data.id)) {
+        task.value.results = [...arr, data]
+      }
+    },
     onReviewDone: async (data) => {
       // 后台审查结束:done=重点与知识点已替换临时结果 / failed=审查失败
-      // / stopped=用户终止检查(两者都保留 agent1 执行结果)
       // 拉快照同步最终 results 与 suggestions(终止 done 事件随后到达)
       if (task.value) {
         task.value.review_status = data.review_status
@@ -2050,8 +2083,42 @@ const resultGroups = computed<ResultGroup[]>(() => {
   return dyn
 })
 
-// ---- 状态徽章 ----
+// ---- 审查结果(ReviewItem):证据驱动可信审查,按三态分桶展示 ----
 
+const reviewItems = computed<ReviewItem[]>(() => task.value?.review_items ?? [])
+const reviewBuckets = computed(() => bucketizeReviewItems(reviewItems.value))
+const hasReviewResults = computed(() => reviewItems.value.length > 0)
+/** 聚合审查结论(task.params._review,review_done 快照权威) */
+const reviewSummary = computed<ReviewSummary | null>(() => {
+  const r = task.value?.params?.['_review'] as ReviewSummary | undefined
+  return r && r.counts ? r : null
+})
+/** 实时审查计划(SSE review_plan_update;review_done 后以 _review.plan 为准) */
+const reviewPlanLive = ref<ReviewPlanUpdateEventData | null>(null)
+
+const expandedReviewItems = ref<Set<string>>(new Set())
+function toggleReviewItem(id: string): void {
+  const s = new Set(expandedReviewItems.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  expandedReviewItems.value = s
+}
+
+/** 三态分桶的展示顺序与标题(发现风险 → 已核查·剔除误报 → 缺口·待改进) */
+const REVIEW_BUCKET_ORDER = [
+  { key: 'risk', label: '发现风险' },
+  { key: 'cleared', label: '已核查·剔除误报' },
+  { key: 'gap', label: '缺口·待改进' },
+] as const
+
+/** 审查项证据里的源码/原文文件:复用工作区文件跳转 */
+async function openReviewFile(it: ReviewItem): Promise<void> {
+  const path = it.evidence?.source?.file_path
+  if (!path) return
+  await onToolFileClick(path)
+}
+
+// ---- 状态徽章 ----
 const statusConfig: Record<TaskStatus, { label: string; class: string }> = {
   pending: { label: '等待中', class: 'badge-pending' },
   running: { label: '进行中', class: 'badge-running' },
@@ -3140,9 +3207,68 @@ function toggleResult(id: string): void {
           :is-running="isAgent2Running"
           :review-status="task.review_status"
           :stopping-review="stoppingReview"
+          :review-summary="reviewSummary"
+          :review-plan-live="reviewPlanLive"
+          :review-items="reviewItems"
           @send-suggestion="handleSuggestionDig"
           @stop-review="handleStopReview"
         />
+
+        <!-- 审查结果(ReviewItem):证据驱动可信审查,按三态分桶(风险/已核查/缺口) -->
+        <section v-if="hasReviewResults" class="sidebar-review" data-onboarding="detail-review">
+          <h2>
+            审查结果 <span class="count">({{ reviewItems.length }})</span>
+            <span v-if="task.review_status === 'running'" class="review-interim-hint">检查助手核查中</span>
+          </h2>
+          <div v-for="bucket in REVIEW_BUCKET_ORDER" :key="bucket.key" class="review-bucket">
+            <template v-if="reviewBuckets[bucket.key].length">
+              <h3 class="review-bucket-head">
+                <span :class="['bucket-tag', `bucket-${bucket.key}`]">{{ bucket.label }}</span>
+                <span class="count">{{ reviewBuckets[bucket.key].length }}</span>
+              </h3>
+              <article
+                v-for="it in reviewBuckets[bucket.key]"
+                :key="it.id"
+                :class="['review-card', { 'review-card-expanded': expandedReviewItems.has(it.id) }]"
+                @click="toggleReviewItem(it.id)"
+              >
+                <div class="review-header">
+                  <span class="review-toggle">{{ expandedReviewItems.has(it.id) ? '▼' : '▶' }}</span>
+                  <h4>{{ it.title }}</h4>
+                  <span :class="['conf-badge', `conf-${confidenceClass(it.confidence?.tier)}`]">
+                    {{ confidenceLabel(it.confidence?.tier) }} · {{ formatConfidenceScore(it.confidence?.score) }}
+                  </span>
+                  <span v-if="it.evidence_mismatch" class="conf-warn" title="有引用但后端核验未通过">⚠ 证据未核验</span>
+                </div>
+                <div v-if="it.severity || it.origin" class="review-meta">
+                  <span class="origin-tag" :title="it.origin">{{ it.origin }}</span>
+                  <span v-if="it.severity" :class="['sev-tag', `sev-${it.severity}`]">{{ it.severity }}</span>
+                </div>
+                <div v-if="expandedReviewItems.has(it.id)" class="review-body">
+                  <p class="rv-line"><strong>被核实对象:</strong>{{ it.review_target || '—' }}</p>
+                  <p v-if="it.description" class="rv-line"><strong>发现问题:</strong>{{ it.description }}</p>
+                  <div v-if="it.evidence?.source?.quote || it.evidence?.source?.file_path" class="rv-section">
+                    <strong>原始证据:</strong>
+                    <code
+                      v-if="it.evidence?.source?.file_path"
+                      class="rv-file"
+                      @click.stop="openReviewFile(it)"
+                    >{{ it.evidence.source.file_path }}<span v-if="it.evidence.source.line">:{{ it.evidence.source.line }}</span></code>
+                    <pre v-if="it.evidence?.source?.quote" class="rv-quote">{{ it.evidence.source.quote }}</pre>
+                  </div>
+                  <p v-if="it.evidence?.analysis_basis?.ref_url" class="rv-line">
+                    <strong>分析依据:</strong>{{ it.evidence.analysis_basis.ref_url }}
+                  </p>
+                  <p v-if="it.evidence?.verification" class="rv-line">
+                    <strong>验证测试:</strong>{{ it.evidence.verification.method || '—' }}
+                    <span v-if="it.evidence.verification.poc_evidence"> · {{ it.evidence.verification.poc_evidence }}</span>
+                  </p>
+                  <p v-if="it.suggestion" class="rv-line"><strong>建议:</strong>{{ it.suggestion }}</p>
+                </div>
+              </article>
+            </template>
+          </div>
+        </section>
 
         <!-- 重点与知识点(原"结果清单";分组由 task.params._grouping 驱动,卡片默认折叠;置底展示) -->
         <section
@@ -4767,4 +4893,32 @@ function toggleResult(id: string): void {
 .diff-line-hunk { color: var(--color-text-muted); }
 .diff-line-meta { color: var(--color-text-secondary); font-weight: var(--fw-medium); }
 .diff-line-ctx { color: var(--color-text); }
+
+/* ---- 审查结果(ReviewItem):三态分桶 + 证据链 + 置信徽标 ---- */
+.sidebar-review { margin-top: var(--space-4); }
+.review-bucket { margin-top: var(--space-2); }
+.review-bucket-head { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-2) 0; }
+.bucket-tag { font-size: var(--fs-sm); font-weight: var(--fw-semibold); padding: 1px 8px; border-radius: var(--radius-sm); }
+.bucket-risk { background: var(--color-danger-light); color: var(--color-danger); }
+.bucket-cleared { background: rgba(22, 163, 74, 0.12); color: var(--color-success, #16a34a); }
+.bucket-gap { background: rgba(217, 119, 6, 0.14); color: var(--color-warning, #d97706); }
+.review-card { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-2) var(--space-3); margin-bottom: var(--space-2); cursor: pointer; }
+.review-card:hover { background: var(--color-bg-hover, rgba(0,0,0,0.03)); }
+.review-card-expanded { background: var(--color-bg-subtle, rgba(0,0,0,0.02)); }
+.review-header { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.review-header h4 { margin: 0; flex: 1; font-size: var(--fs-sm); }
+.review-toggle { color: var(--color-text-muted); font-size: var(--fs-xs); }
+.conf-badge { font-size: var(--fs-xs); padding: 1px 6px; border-radius: var(--radius-sm); border: 1px solid var(--color-border); white-space: nowrap; }
+.conf-verified { background: rgba(22,163,74,0.12); color: var(--color-success,#16a34a); }
+.conf-source { background: var(--color-info-light, rgba(37,99,235,0.12)); color: var(--color-info,#2563eb); }
+.conf-reference { background: rgba(124,58,237,0.12); color: #7c3aed; }
+.conf-assertion { background: rgba(120,120,120,0.14); color: var(--color-text-secondary); }
+.conf-warn { font-size: var(--fs-xs); color: var(--color-warning,#d97706); }
+.review-meta { display: flex; gap: var(--space-2); margin-top: 4px; flex-wrap: wrap; }
+.origin-tag { font-size: var(--fs-xs); color: var(--color-text-muted); border: 1px dashed var(--color-border); padding: 0 6px; border-radius: var(--radius-sm); }
+.review-body { margin-top: var(--space-2); font-size: var(--fs-sm); color: var(--color-text); }
+.rv-line { margin: 4px 0; }
+.rv-section { margin: 6px 0; }
+.rv-file { display: inline-block; margin: 2px 0; padding: 1px 6px; background: var(--color-bg-subtle, #f3f4f6); border-radius: var(--radius-sm); cursor: pointer; color: var(--color-info,#2563eb); }
+.rv-quote { margin: 4px 0; padding: 6px 8px; background: var(--color-code-bg, #0b1021); color: inherit; border-radius: var(--radius-sm); white-space: pre-wrap; word-break: break-all; font-size: var(--fs-xs); }
 </style>

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.models.practice import PracticeSettings, Question
 from app.models.task import Result, Task
+from app.models.audit import ReviewItem  # 触发门控:存在审查项即视为有结构化素材
 from app.services.practice import jobs as gen_jobs
 from app.services.practice.generator import (
     PracticeGenerateCancelled,
@@ -25,12 +26,15 @@ logger = logging.getLogger(__name__)
 
 
 def _has_structured_findings(db: Session, task_id) -> bool:
-    """任务的 Results 中是否存在带元信息的结构化发现
+    """任务是否具备"结构化素材"以触发自动出题。
 
-    判定标准:metadata 为非空 dict(安全场景含 cwe/severity,
-    代码审核等场景含 category/file_path 等,文书场景含条款定位;
-    出题主题按发现内容自动匹配,不限定只认 cwe/severity)。
+    证据驱动可信审查后的判定:① 存在 ReviewItem(审查项),或 ② Results 中存在
+    带非空元信息的知识点(兼容单 agent/老任务)。任一成立即触发。
     """
+    # ① 审查项非空
+    if db.query(ReviewItem.id).filter(ReviewItem.task_id == task_id).first():
+        return True
+    # ② 知识点带元信息(旧语义保留)
     results = db.query(Result.metadata_).filter(Result.task_id == task_id).all()
     for (meta,) in results:
         if meta and isinstance(meta, dict) and any(

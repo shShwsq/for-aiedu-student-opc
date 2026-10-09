@@ -97,7 +97,7 @@
 
 - **幕后质检定位**:agent1 是面向用户的台前回答者(其每轮 summary 即主界面用户看到的回答);agent2 的核查过程与知识点经任务详情侧栏(Agent2Panel)呈现,主对话流只显示用户与 agent1 的对话。"敢不敢上线"不再是硬性产出,仅当用户意图涉及上线/采用决策时在 reasoning 附判断
 - **职责顺序(核查优先、建议追问兜底)**:①核实发现(只读工具读真实源码核对,单轮上限 `MAX_READ_TOOL_CALLS=12`)→ ②动态 PoC 验证(经 verifier_agent,单轮上限 `MAX_VERIFY_CALLS=3`,需测试环境)→ ③引用复核(`check_reference`,单轮上限 `MAX_REFERENCE_CALLS=3`)→ ④提炼重点与知识点 → ⑤(兜底)建议追问方向;凡能自查的绝不建议
-- **重点与知识点产出(审查完成时 results)**:从全程提炼 **3-8 条精选知识点**,不是全量发现清单;每条 metadata 含 `learning_note`(必有,学习价值说明)、`practice_worthy: true`(默认)、可选 severity/file_path/line/verified/ref_* 系列。grouping 默认 null(平铺),仅安全审计类按严重度分组对用户有帮助时才声明
+- **两类产物、即时发射(证据驱动可信审查)**:核查过程不再"末尾一次性大 JSON",而是用四个发射工具即时结构化落库——`submit_review_plan`(审查计划)、`submit_review_item`(**审查项**,落 `ReviewItem` 表,三态合一:发现风险 / 已核查·剔除误报 / 缺口·待改进)、`submit_knowledge_point`(**知识点**,落 `Result` 表,含 `learning_note`/`practice_worthy`/`source_review_item_id` 回指派生审查项)、`submit_suggestion`(建议追问)。**审查项回答"代码有没有问题、多可信",知识点回答"该记住什么"**,分型但同源。审查项带证据者由后端 `app/agents/evidence.py` 核验证据引用(`evidence.*.call_ref` 指向本轮 `_evidence_ref` 台账)后**派生置信度**(verified/source_confirmed/reference_corroborated/assertion_only),**模型不自报 confidence**。不支持结构发射的模型回退旧"末尾大 JSON"路径(covered/missing/reasoning/suggestions/results/grouping),整轮无解析才判失败
 - **题目与知识点生成**:任务完成后由 orchestrator 调用 practice 服务(实现位于 `app/services/practice/`)生成练习题与知识点,选题优先覆盖 practice_worthy 标记的知识点
 - **审查维度自定**：无预定义覆盖度清单，agent2 每次评估时根据用户意图自行确定应覆盖的审查维度（3-8 个为宜），跨轮保持维度 id 稳定
 - **流式输出**：`_stream_agent2_llm`（runtime.stream_llm 薄包装）收 token，实时推送 `thinking_delta` 事件给前端（Agent2Panel 侧栏渲染）；content 为最终评估 JSON 不进流式卡片，只展示思考链。思考链**逐次流式调用即落库并推 `conversation` 事件**（`_record_agent2_thinking`）——审查动辄数分钟多次调用，攒到末尾一条会因 parse_failed/降级提前 return 整段丢失，中途刷新页面也会看不见已生成的部分
@@ -131,6 +131,8 @@ def run_agent2(
 ```
 
 > 失败降级时附 `degraded=true`(degrade_reason 见日志)→ 调用方标 `review_status=failed`,保留 agent1 临时结果。用户终止检查时附 `stopped=true` → 调用方标 `review_status=stopped`(同样保留临时结果,但不再跑审查后下游链)。
+
+> **结构化发射路径(`_emitted`)**:本轮只要用过任一 `submit_*`,返回值即附 `_emitted=true` 与 `item_count`/`kp_count`/`_review`,并在循环退出时:① 先做**规划对账**——`submit_review_plan` 计划内未匹配到发射审查项的条目,回填为 `status=missing` 的 ReviewItem(`_review.plan` 记 planned/executed/backfilled_gap);② 聚合写 `task.params["_review"]`(三态计数 + 置信分布 + verdict_summary + suggestions);③ 按 `ReviewItem.severity` 派生 `task.params["_grouping"]`(无 severity→平铺)。审查项/知识点由 `run_agent2` **即时落库**,orchestrator 见 `_emitted` 后**不再重复写 Result**(否则双写)。发射类工具另设硬上限(ReviewItem≤15、知识点≤12、建议≤5)防循环跑飞。旧"末尾大 JSON"路径(无 `_emitted`)仍由 orchestrator 用 `results` 替换本轮临时 Result。**注**:"按主题并行出题"的 `services/practice` 重写尚未落地(当前仍逐知识点出题,已支持 `Question.source_review_item_id` 溯源);PoC"已验证"档依赖靶场,缺靶场时置信优雅降级为 source_confirmed/assertion_only。
 
 ### 2.4 上下文构造
 

@@ -54,6 +54,9 @@ EventType = Literal[
     "question",  # agent2 请求用户澄清(选择题/填空题弹窗)
     "agent1_done",  # agent1 执行完成(任务标记 COMPLETED,后台审查开始;非终止事件)
     "review_done",  # 后台审查完成/失败(非终止事件,随后推 done)
+    "review_plan_update",  # agent2 审查计划发射/修订(覆盖式,侧栏计划卡)
+    "review_item_add",  # agent2 逐条审查项即时落库(侧栏审查结果区实时增长)
+    "knowledge_point_add",  # agent2 逐条知识点即时落库(侧栏知识点区实时增长)
     "done", "error",
     "clone_progress",  # 仓库克隆进度(local 模式 Popen 流式解析 git stderr)
 ]

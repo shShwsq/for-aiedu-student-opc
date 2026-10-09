@@ -108,6 +108,35 @@ class ResultResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ReviewItemResponse(BaseModel):
+    """审查项响应(agent2 证据驱动审查,三态合一)
+
+    bucket 为三态分桶(risk/cleared/gap),由模型 property 集中判读,
+    前端/导出复用同一口径不再各自分叉。
+    """
+
+    id: uuid.UUID
+    round_idx: int
+    title: str
+    description: str | None = None
+    review_target: str = ""
+    origin: str
+    agent1_ref: uuid.UUID | None = None
+    dimension: str | None = None
+    status: str
+    verdict: str | None = None
+    severity: str | None = None
+    evidence: dict[str, Any] | None = None
+    confidence: dict[str, Any] | None = None
+    evidence_validated: bool = False
+    evidence_mismatch: bool = False
+    suggestion: str | None = None
+    bucket: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class ConversationResponse(BaseModel):
     """对话记录响应"""
 
@@ -154,6 +183,8 @@ class TaskResponse(BaseModel):
     completed_at: datetime | None
     results: list[ResultResponse] = []
     conversations: list[ConversationResponse] = []
+    # 审查项(证据驱动可信审查;老任务无 ReviewItem → 空数组,前端不显示审查结果区)
+    review_items: list[ReviewItemResponse] = []
 
     model_config = {"from_attributes": True}
 

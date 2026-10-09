@@ -15,12 +15,17 @@ import pytest
 from app.prompts.agent2 import (
     AGENT2_REVIEW_PROMPT,
     AGENT2_SYSTEM_PROMPT,
+    _SUBMIT_REVIEW_PLAN_TOOL,
+    _SUBMIT_REVIEW_ITEM_TOOL,
+    _SUBMIT_KNOWLEDGE_POINT_TOOL,
+    _SUBMIT_SUGGESTION_TOOL,
 )
 
 
 def test_system_prompt_alias_points_to_review():
     """兼容别名指向审查模式 prompt(旧引用不破坏)。"""
     assert AGENT2_SYSTEM_PROMPT is AGENT2_REVIEW_PROMPT
+
 
 
 # ============================================================
@@ -38,10 +43,44 @@ def test_review_prompt_contains_knowledge_results_contract():
     assert "不是全量发现清单" in AGENT2_REVIEW_PROMPT
 
 
-def test_review_prompt_grouping_defaults_to_null():
-    """grouping 契约:默认输出 null(平铺)。"""
-    assert "默认输出 null" in AGENT2_REVIEW_PROMPT
-    assert "默认 null" in AGENT2_REVIEW_PROMPT
+def test_review_prompt_grouping_is_backend_derived():
+    """grouping/covered/missing/reasoning 由后端聚合派生(不再是模型输出契约)。"""
+    assert "由后端" in AGENT2_REVIEW_PROMPT
+    assert "聚合派生" in AGENT2_REVIEW_PROMPT
+
+
+def test_review_prompt_has_four_emit_tools_and_planning():
+    """工具发射契约:四发射工具 + 规划先行 + 不产 confidence + call_ref 证据台账。"""
+    for name in (
+        "submit_review_plan", "submit_review_item",
+        "submit_knowledge_point", "submit_suggestion",
+    ):
+        assert name in AGENT2_REVIEW_PROMPT
+    # 规划先行(必须含 requirement/baseline,否则漏审)
+    assert "规划先行" in AGENT2_REVIEW_PROMPT
+    assert "user_requirement" in AGENT2_REVIEW_PROMPT
+    assert "domain_baseline" in AGENT2_REVIEW_PROMPT
+    # 置信后端派生,模型不自报
+    assert "不要自报" in AGENT2_REVIEW_PROMPT
+    assert "confidence" in AGENT2_REVIEW_PROMPT
+    # 证据引用就近 call_ref
+    assert "_evidence_ref" in AGENT2_REVIEW_PROMPT
+    assert "call_ref" in AGENT2_REVIEW_PROMPT
+    # 单一原语三态合一 + review_target 必填可追溯
+    assert "三态合一" in AGENT2_REVIEW_PROMPT
+    assert "review_target" in AGENT2_REVIEW_PROMPT
+
+
+def test_submit_tool_definitions_shape():
+    """四个发射工具的 function.name 与关键参数就位。"""
+    assert _SUBMIT_REVIEW_PLAN_TOOL["function"]["name"] == "submit_review_plan"
+    assert _SUBMIT_REVIEW_ITEM_TOOL["function"]["name"] == "submit_review_item"
+    assert _SUBMIT_KNOWLEDGE_POINT_TOOL["function"]["name"] == "submit_knowledge_point"
+    assert _SUBMIT_SUGGESTION_TOOL["function"]["name"] == "submit_suggestion"
+    item_props = _SUBMIT_REVIEW_ITEM_TOOL["function"]["parameters"]["properties"]
+    assert {"review_target", "origin", "status", "verdict", "evidence"} <= set(item_props)
+    # submit_review_item 不含 confidence(后端派生)
+    assert "confidence" not in item_props
 
 
 def test_review_prompt_ship_conclusion_is_conditional():
@@ -58,9 +97,9 @@ def test_review_prompt_ship_conclusion_is_conditional():
 
 
 def test_review_prompt_has_suggestions_contract():
-    """建议追问契约:0-3 条、具体可执行、最后手段(能自查的不列建议)。"""
-    assert "suggestions" in AGENT2_REVIEW_PROMPT
-    assert "0-3" in AGENT2_REVIEW_PROMPT
+    """建议追问契约:具体可执行、最后手段(能自查的不列建议)。"""
+    assert "submit_suggestion" in AGENT2_REVIEW_PROMPT
+    assert "最多 3 条" in AGENT2_REVIEW_PROMPT
     assert "最后手段" in AGENT2_REVIEW_PROMPT
     assert "你能自己核查确认的,一律不列建议" in AGENT2_REVIEW_PROMPT
 

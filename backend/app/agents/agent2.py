@@ -41,7 +41,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Any, Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from json_repair import repair_json
 from sqlalchemy.orm import Session
@@ -57,8 +57,25 @@ from app.agents.runtime.llm_stream import (
 )
 from app.agents.runtime.tool_intent import build_tool_intent
 from app.domain_events import VERIFIER_COMPLETED, emit
+from app.event_bus import publish
 from app.llm.client import LLMClient
-from app.models.task import Conversation, Task
+from app.models.task import Conversation, Result, Task
+
+# 证据台账 + 置信度派生(纯函数,见 app/agents/evidence.py)
+from app.agents.evidence import EvidenceRecorder, derive_confidence_column, score_review_item
+
+# 审查项模型(三态判读口径 + 枚举白名单集中管理)
+from app.models.audit import (
+    ReviewItem,
+    VALID_ORIGINS,
+    VALID_SEVERITIES,
+    VALID_STATUSES,
+    VALID_VERDICTS,
+    BUCKET_CLEARED,
+    BUCKET_GAP,
+    BUCKET_RISK,
+    classify_status,
+)
 
 # agent2 的 LLM 文本资产(审查 system prompt + 三类工具定义)
 # 集中管理于 app/prompts/agent2.py,本模块只留执行逻辑
@@ -68,6 +85,10 @@ from app.prompts.agent2 import (
     _READ_ONLY_TOOL_DEFINITIONS,
     _REFERENCE_TOOL_DEFINITION,
     _VERIFY_TOOL_DEFINITION,
+    _SUBMIT_REVIEW_PLAN_TOOL,
+    _SUBMIT_REVIEW_ITEM_TOOL,
+    _SUBMIT_KNOWLEDGE_POINT_TOOL,
+    _SUBMIT_SUGGESTION_TOOL,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +119,19 @@ MAX_VERIFY_CALLS = 3
 # 单次评估中最多调用引用复核的次数(每次抓取最长 15s,串行阻塞,
 # 上限收敛为 3 控制单轮评估最坏时长)
 MAX_REFERENCE_CALLS = 3
+
+# 四发射工具(始终注入):结构化落库 + 流式的"发射器",不进 sandbox
+_SUBMIT_TOOLS: list[dict[str, Any]] = [
+    _SUBMIT_REVIEW_PLAN_TOOL,
+    _SUBMIT_REVIEW_ITEM_TOOL,
+    _SUBMIT_KNOWLEDGE_POINT_TOOL,
+    _SUBMIT_SUGGESTION_TOOL,
+]
+# 发射类硬上限(prompt 约定之外的最后防线):主循环靠"不再发工具"退出,
+# 取证额度有代码强制而发射原本没有,须防循环跑飞失控
+MAX_REVIEW_ITEMS = 15
+MAX_KNOWLEDGE_POINTS = 12
+MAX_SUGGESTIONS = 5
 
 # ============================================================
 # 工具调用窗口构造(完整评估注入)
@@ -283,9 +317,12 @@ def run_agent2(
         rounds_text = []
         for i, r in enumerate(agent1_summaries, 1):
             summary = (r.get("summary") or "(无 summary)")[:MAX_HISTORY_MSG_CHARS]
-            rounds_text.append(
-                f"### 第 {i} 轮 agent1 自然语言总结\n{summary}"
-            )
+            cid = r.get("conversation_id") if isinstance(r, dict) else None
+            header = f"### 第 {i} 轮 agent1 自然语言总结"
+            if cid:
+                # 暴露被审对话 ID,供 submit_review_item.agent1_ref 锚定(可追溯)
+                header += f"(对话ID: {cid},可作为 agent1_ref)"
+            rounds_text.append(f"{header}\n{summary}")
         total_chars = sum(len(s) for s in rounds_text)
         if total_chars > MAX_HISTORY_TOTAL_CHARS:
             # 超总量上限:从最早轮开始丢弃(至少保留最近一轮;轮次编号保持
@@ -366,6 +403,9 @@ def run_agent2(
         "allow_reference_check", True
     )
     tools = []
+    # 四发射工具始终注入(结构化落库 + 流式,不依赖 repo_path / 环境):
+    # submit_review_plan / submit_review_item / submit_knowledge_point / submit_suggestion
+    tools.extend(_SUBMIT_TOOLS)
     if repo_path:
         tools.extend(_READ_ONLY_TOOL_DEFINITIONS)
     if verify_enabled:
@@ -382,6 +422,30 @@ def run_agent2(
     verify_count = 0
     reference_count = 0
     degraded_error: Exception | None = None
+    # 证据台账:本轮每次取证工具调用分配 E1… 引用号,回灌前注入、正文入台账,
+    # 供 submit_review_item 的 evidence.*.call_ref 就近指名 + 后端核验(见 evidence.py)
+    evidence = EvidenceRecorder()
+
+    # 发射态:四 submit_* 工具的即时落库计数 + 幂等标志 + 聚合素材
+    emit_state: dict[str, Any] = {
+        "items": 0, "kp": 0, "sug": 0,
+        "round_cleared_items": False, "round_cleared_kp": False,
+        "emitted": False,
+        "targets": [],          # 已发射审查项的 review_target(规划对账用)
+        "item_payloads": [],    # 已发射审查项 payload(含 bucket/confidence/severity)
+        "kp_payloads": [],      # 已发射知识点 payload(供 orchestrator 计数/兼容)
+        "suggestions": [],      # submit_suggestion 累积文本
+        "plan": None,           # 最近一次 submit_review_plan(覆盖式修订)
+    }
+    # 被审 agent1 对话 id 集(校验 submit_review_item.agent1_ref 归属;空集=不校验)
+    agent1_conv_ids: set[UUID] = set()
+    for _r in agent1_summaries:
+        _cid = _r.get("conversation_id") if isinstance(_r, dict) else None
+        if _cid:
+            try:
+                agent1_conv_ids.add(UUID(str(_cid)))
+            except (ValueError, AttributeError, TypeError):
+                pass
 
     def _invoke_stream(msgs: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]], str]:
         """调 _stream_agent2_llm:仅在需要时下传 stop_check
@@ -473,6 +537,90 @@ def run_agent2(
             except json.JSONDecodeError:
                 args = {}
 
+            # ---- 发射工具(控制类,始终可用,不进 sandbox;不计取证额度) ----
+            if fn_name == "submit_review_plan":
+                items = args.get("items") if isinstance(args.get("items"), list) else []
+                emit_state["plan"] = {"items": items, "note": args.get("note")}
+                emit_state["emitted"] = True
+                publish(task_id, "review_plan_update", {
+                    "items": items, "note": args.get("note"), "planned": len(items),
+                })
+                _append_tool_receipt(messages, tc, {"ok": True, "planned": len(items)})
+                continue
+
+            if fn_name == "submit_review_item":
+                if emit_state["items"] >= MAX_REVIEW_ITEMS:
+                    _append_tool_receipt(messages, tc, {
+                        "ok": False, "reason": f"审查项已达上限({MAX_REVIEW_ITEMS}),拒收本条",
+                    })
+                    continue
+                # 本轮首条:清本轮已落 ReviewItem(重跑幂等)
+                if not emit_state["round_cleared_items"] and db is not None and task is not None:
+                    try:
+                        db.query(ReviewItem).filter(
+                            ReviewItem.task_id == task.id,
+                            ReviewItem.round_idx == round_idx,
+                        ).delete()
+                        db.commit()
+                    except Exception as e:
+                        logger.warning(f"[task={task_id}] 清理本轮 ReviewItem 失败(忽略): {e}")
+                    emit_state["round_cleared_items"] = True
+                payload = _persist_review_item(
+                    db, task, round_idx, args,
+                    evidence_ledger=evidence.ledger, has_repo=bool(repo_path),
+                    verify_available=verify_enabled, agent1_conv_ids=agent1_conv_ids,
+                )
+                publish(task_id, "review_item_add", payload)
+                emit_state["items"] += 1
+                emit_state["emitted"] = True
+                emit_state["item_payloads"].append(payload)
+                if payload["review_target"]:
+                    emit_state["targets"].append(payload["review_target"])
+                _append_tool_receipt(messages, tc, {
+                    "ok": True, "review_item_id": payload["id"],
+                    "confidence": payload["confidence"],
+                })
+                continue
+
+            if fn_name == "submit_knowledge_point":
+                if emit_state["kp"] >= MAX_KNOWLEDGE_POINTS:
+                    _append_tool_receipt(messages, tc, {
+                        "ok": False, "reason": f"知识点已达上限({MAX_KNOWLEDGE_POINTS}),拒收本条",
+                    })
+                    continue
+                # 本轮首条知识点:清本轮临时 Result(agent1 summary 占位)
+                if not emit_state["round_cleared_kp"] and db is not None and task is not None:
+                    try:
+                        db.query(Result).filter(
+                            Result.task_id == task.id,
+                            Result.round_idx == round_idx,
+                        ).delete()
+                        db.commit()
+                    except Exception as e:
+                        logger.warning(f"[task={task_id}] 清理本轮临时 Result 失败(忽略): {e}")
+                    emit_state["round_cleared_kp"] = True
+                payload = _persist_knowledge_point(db, task, round_idx, args)
+                publish(task_id, "knowledge_point_add", payload)
+                emit_state["kp"] += 1
+                emit_state["emitted"] = True
+                emit_state["kp_payloads"].append(payload)
+                _append_tool_receipt(messages, tc, {"ok": True, "result_id": payload["id"]})
+                continue
+
+            if fn_name == "submit_suggestion":
+                if emit_state["sug"] >= MAX_SUGGESTIONS:
+                    _append_tool_receipt(messages, tc, {
+                        "ok": False, "reason": f"建议已达上限({MAX_SUGGESTIONS}),拒收本条",
+                    })
+                    continue
+                text = (args.get("text") or "").strip()
+                if text:
+                    emit_state["suggestions"].append(text)
+                emit_state["sug"] += 1
+                emit_state["emitted"] = True
+                _append_tool_receipt(messages, tc, {"ok": True, "count": len(emit_state["suggestions"])})
+                continue
+
             # ---- 只读核查工具 ----
             if fn_name in ("read_file", "list_files", "find_files", "search_code"):
                 if not repo_path:
@@ -496,6 +644,11 @@ def run_agent2(
                 tool_result_str = _execute_read_tool(
                     fn_name, args, repo_path, str(task_id),
                     db=db, task=task, round_idx=round_idx,
+                )
+                # 分配证据引用号并注入回灌内容(JSON 结果加 _evidence_ref 字段)
+                tool_result_str = evidence.record_read(
+                    tool_result_str,
+                    args_brief=f"{fn_name}:{json.dumps(args, ensure_ascii=False)[:120]}",
                 )
                 messages.append({
                     "role": "tool",
@@ -531,6 +684,11 @@ def run_agent2(
                 tool_result_str = _execute_reference_tool(
                     args, str(task_id),
                     db=db, task=task, round_idx=round_idx,
+                )
+                # 分配证据引用号并注入回灌内容
+                tool_result_str = evidence.record_reference(
+                    tool_result_str,
+                    args_brief=f"check_reference:{str(args.get('url', ''))[:120]}",
                 )
                 messages.append({
                     "role": "tool",
@@ -608,7 +766,12 @@ def run_agent2(
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc["id"] or f"call_{tc['index']}",
-                "content": verify_result,
+                "content": evidence.record_verify(
+                    verify_result,
+                    # verify 成功判据:非"验证失败"前缀(verifier 总结为自然语言文本)
+                    verify_ok=not str(verify_result).startswith("[验证失败"),
+                    args_brief=f"verify:{verification_request[:120]}",
+                ),
             })
 
         # 工具批次内被终止:不再回到 LLM(已 append 的 assistant 工具调用消息
@@ -659,6 +822,15 @@ def run_agent2(
             "degrade_reason": degrade_reason,
         }
 
+    # 结构化发射路径(四 submit_* 已即时落库):规划对账 + 聚合 _review + 派生 grouping,
+    # 不再解析末尾大 JSON(此路径无末次汇总调用)。
+    if emit_state["emitted"]:
+        return _finalize_emitted(
+            db, task, task_id, round_idx, emit_state, evidence.ledger,
+            has_repo=bool(repo_path), verify_available=verify_enabled,
+            agent1_conv_ids=agent1_conv_ids,
+        )
+
     # 解析 JSON(LLM 可能输出带 ```json ``` 包裹的)
     try:
         result = _parse_json_response(content)
@@ -702,6 +874,9 @@ def run_agent2(
         result["results"] = []
     if "grouping" not in result:
         result["grouping"] = None
+
+    # 证据台账旁路附带(内部用,不落前端):供调用方/测试按 ref 复核取证是否真发生
+    result["_evidence_ledger"] = evidence.ledger
 
     return result
 
@@ -1007,6 +1182,296 @@ def _build_agent2_history(
         total -= len(dropped)
 
     return "[你之前各轮的评估记录(保持质检判断连续性)]\n" + "\n\n".join(segments)
+
+
+# ============================================================
+# 发射工具处理(即时结构化落库 + 流式;见实施计划 Part C)
+# ============================================================
+
+
+def _append_tool_receipt(
+    messages: list[dict[str, Any]], tc: dict[str, Any], receipt: dict[str, Any],
+) -> None:
+    """把发射工具回执以 JSON 文本回灌(契约固定:source_review_item_id 只能从回执拿 id)"""
+    messages.append({
+        "role": "tool",
+        "tool_call_id": tc["id"] or f"call_{tc['index']}",
+        "content": json.dumps(receipt, ensure_ascii=False),
+    })
+
+
+def _clamp_str(val: Any, allowed: frozenset[str]) -> str | None:
+    return val if isinstance(val, str) and val in allowed else None
+
+
+def _sanitize_evidence(evidence: Any) -> dict[str, Any] | None:
+    """只保留三段合法 dict;evidence.source.line 归一为字符串(缺段=不适用)"""
+    if not isinstance(evidence, dict):
+        return None
+    out: dict[str, Any] = {}
+    for seg_key in ("source", "analysis_basis", "verification"):
+        seg = evidence.get(seg_key)
+        if isinstance(seg, dict):
+            seg = dict(seg)
+            if "line" in seg and seg["line"] is not None:
+                seg["line"] = str(seg["line"])
+            out[seg_key] = seg
+    return out or None
+
+
+def _persist_review_item(
+    db: Session | None, task: Task | None, round_idx: int, args: dict[str, Any],
+    *, evidence_ledger: dict, has_repo: bool, verify_available: bool,
+    agent1_conv_ids: set[UUID] | None,
+) -> dict[str, Any]:
+    """核验证据 + 派生置信 → 落 ReviewItem → 返回 payload(含 bucket)。
+
+    db/task 为空(单测降级路径)时仍算出 payload(不落库),保证回执形状一致。
+    """
+    title = (args.get("title") or "").strip() or "(未命名审查项)"
+    review_target = (args.get("review_target") or "").strip()
+    origin = args.get("origin") if args.get("origin") in VALID_ORIGINS else "agent1_claim"
+    status = args.get("status") if args.get("status") in VALID_STATUSES else "covered"
+    verdict = _clamp_str(args.get("verdict"), VALID_VERDICTS)
+    severity = _clamp_str(args.get("severity"), VALID_SEVERITIES)
+    evidence = _sanitize_evidence(args.get("evidence"))
+
+    # agent1_ref:校验确属本任务 agent1 对话,无效置空(不拒收)
+    agent1_ref: UUID | None = None
+    raw_ref = args.get("agent1_ref")
+    if isinstance(raw_ref, str) and raw_ref.strip():
+        try:
+            cand = UUID(raw_ref.strip())
+            if not agent1_conv_ids or cand in agent1_conv_ids:
+                agent1_ref = cand
+        except (ValueError, AttributeError, TypeError):
+            agent1_ref = None
+
+    score = score_review_item(
+        evidence, verdict, evidence_ledger,
+        has_repo=has_repo, verify_available=verify_available,
+    )
+    confidence = derive_confidence_column(score)
+    validated = bool(score and score.get("evidence_validated"))
+    mismatch = bool(score and score.get("evidence_mismatch"))
+    item_id = uuid4()
+    bucket = classify_status(status, verdict)
+
+    payload: dict[str, Any] = {
+        "id": str(item_id), "round_idx": round_idx, "title": title[:512],
+        "description": args.get("description"), "review_target": review_target,
+        "origin": origin, "agent1_ref": str(agent1_ref) if agent1_ref else None,
+        "dimension": args.get("dimension"), "status": status, "verdict": verdict,
+        "severity": severity, "evidence": evidence, "confidence": confidence,
+        "evidence_validated": validated, "evidence_mismatch": mismatch,
+        "suggestion": args.get("suggestion"), "bucket": bucket,
+    }
+
+    if db is not None and task is not None:
+        try:
+            db.add(ReviewItem(
+                id=item_id, task_id=task.id, round_idx=round_idx,
+                title=title[:512], description=args.get("description"),
+                review_target=review_target, origin=origin, agent1_ref=agent1_ref,
+                dimension=args.get("dimension"), status=status, verdict=verdict,
+                severity=severity, evidence=evidence, confidence=confidence,
+                evidence_validated=validated, evidence_mismatch=mismatch,
+                suggestion=args.get("suggestion"),
+            ))
+            db.commit()
+        except Exception as e:
+            logger.warning(f"[task={task.id}] 落库 ReviewItem 失败(忽略): {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    return payload
+
+
+def _persist_knowledge_point(
+    db: Session | None, task: Task | None, round_idx: int, args: dict[str, Any],
+) -> dict[str, Any]:
+    """落 Result(知识点)→ 返回 payload。db/task 为空时只算 payload 不落库。"""
+    title = (args.get("title") or "").strip() or "(未命名知识点)"
+    content = args.get("content") or ""
+    meta: dict[str, Any] = {
+        "learning_note": args.get("learning_note") or "",
+        "practice_worthy": bool(args.get("practice_worthy", True)),
+    }
+    if args.get("source_review_item_id"):
+        meta["source_review_item_id"] = str(args["source_review_item_id"])
+    if args.get("learning_topic_hint"):
+        meta["learning_topic_hint"] = str(args["learning_topic_hint"])
+    rid = uuid4()
+    payload = {
+        "id": str(rid), "round_idx": round_idx, "title": title[:512],
+        "content": content, "metadata_": meta,
+    }
+    if db is not None and task is not None:
+        try:
+            db.add(Result(
+                id=rid, task_id=task.id, round_idx=round_idx,
+                title=title[:512], content=content, metadata_=meta,
+            ))
+            db.commit()
+        except Exception as e:
+            logger.warning(f"[task={task.id}] 落库知识点(Result)失败(忽略): {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    return payload
+
+
+_SEVERITY_CANON = ["high", "medium", "low", "info", "critical"]
+_SEVERITY_ORDER = {s: i + 1 for i, s in enumerate(_SEVERITY_CANON)}
+
+
+def _derive_grouping_from_items(item_payloads: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """按 ReviewItem.severity 派生 ordered grouping;无任何 severity → None(平铺)。"""
+    present = {
+        p.get("severity") for p in item_payloads
+        if p.get("severity") in VALID_SEVERITIES
+    }
+    if not present:
+        return None
+    values = [
+        {"value": s, "label": s, "color": s, "order": _SEVERITY_ORDER[s]}
+        for s in _SEVERITY_CANON if s in present
+    ]
+    return {
+        "field": "severity", "type": "ordered", "values": values,
+        "default_label": "其他", "default_color": "unknown",
+    }
+
+
+def _targets_match(plan_target: str, emitted_targets: list[str]) -> bool:
+    """规划对账的宽松语义匹配:归一化后互为子串即算命中(不做 embedding)。"""
+    pt = (plan_target or "").strip().casefold()
+    if not pt:
+        return False
+    for t in emitted_targets:
+        et = (t or "").strip().casefold()
+        if et and (pt in et or et in pt):
+            return True
+    return False
+
+
+def _finalize_emitted(
+    db: Session | None, task: Task | None, task_id: UUID | str, round_idx: int,
+    state: dict[str, Any], evidence_ledger: dict,
+    *, has_repo: bool, verify_available: bool,
+    agent1_conv_ids: set[UUID] | None,
+) -> dict[str, Any]:
+    """循环退出(已用发射工具)后收尾:规划对账回填 → 聚合 _review → 派生 grouping →
+    写 task.params → 返回覆盖旧契约的紧凑汇总(covered/missing/reasoning 供 review 卡与记忆)。
+    """
+    # 1) 规划对账:计划内未发射的条目回填为 missing ReviewItem
+    plan = state.get("plan") or {}
+    backfilled = 0
+    planned = len(plan.get("items") or [])
+    for pitem in (plan.get("items") or []):
+        target = pitem.get("target") if isinstance(pitem, dict) else None
+        if not target or _targets_match(target, state["targets"]):
+            continue
+        args = {
+            "title": f"[计划回填] {target}",
+            "description": "计划内未执行,由规划对账回填",
+            "review_target": target,
+            "origin": pitem.get("origin") if isinstance(pitem, dict) else None,
+            "status": "missing", "verdict": "pending",
+        }
+        payload = _persist_review_item(
+            db, task, round_idx, args,
+            evidence_ledger=evidence_ledger, has_repo=has_repo,
+            verify_available=verify_available, agent1_conv_ids=agent1_conv_ids,
+        )
+        publish(task_id, "review_item_add", payload)
+        state["item_payloads"].append(payload)
+        backfilled += 1
+
+    executed = planned - backfilled
+
+    # 2) 聚合标量(三态计数 + status + confidence_tally)
+    items = state["item_payloads"]
+    counts = {"total": len(items), "risk": 0, "cleared": 0, "gap": 0}
+    status_tally = {"covered": 0, "partial": 0, "missing": 0}
+    conf_tally = {
+        "verified": 0, "source_confirmed": 0,
+        "reference_corroborated": 0, "assertion_only": 0,
+    }
+    covered_ids: list[str] = []
+    missing_ids: list[str] = []
+    for it in items:
+        b = it.get("bucket")
+        if b in counts:
+            counts[b] += 1
+        st = it.get("status")
+        if st in status_tally:
+            status_tally[st] += 1
+        if st == "covered":
+            covered_ids.append(str(it.get("dimension") or it.get("id")))
+        elif st in ("partial", "missing"):
+            missing_ids.append(str(it.get("dimension") or it.get("id")))
+        tier = (it.get("confidence") or {}).get("tier")
+        if tier in conf_tally:
+            conf_tally[tier] += 1
+
+    verdict_summary = (
+        f"{counts['total']} 项:发现风险 {counts['risk']}、"
+        f"已核查·剔除误报 {counts['cleared']}、缺口 {counts['gap']}"
+        f"(源码取证 {conf_tally['source_confirmed']}、已验证 {conf_tally['verified']}、"
+        f"外部佐证 {conf_tally['reference_corroborated']}、"
+        f"仅断言 {conf_tally['assertion_only']});"
+        f"规划 {planned} / 核实 {max(executed, 0)} / 回填缺口 {backfilled}"
+    )
+
+    review = {
+        "counts": counts,
+        "status": status_tally,
+        "confidence_tally": conf_tally,
+        "knowledge_point_count": state["kp"],
+        "verdict_summary": verdict_summary,
+        "suggestions": list(state["suggestions"]),
+        "plan": {
+            "items": plan.get("items") or [],
+            "note": plan.get("note"),
+            "planned": planned,
+            "executed": max(executed, 0),
+            "backfilled_gap": backfilled,
+        } if plan else None,
+    }
+
+    grouping = _derive_grouping_from_items(items)
+
+    # 3) 写 task.params._review + _grouping(结构化落库,补现状缺口)
+    if db is not None and task is not None:
+        try:
+            task.params = {
+                **(task.params or {}), "_review": review, "_grouping": grouping,
+            }
+            db.commit()
+        except Exception as e:
+            logger.warning(f"[task={task.id}] 写 task.params._review 失败(忽略): {e}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    return {
+        "covered": covered_ids,
+        "missing": missing_ids,
+        "reasoning": verdict_summary,
+        "suggestions": list(state["suggestions"]),
+        "results": state["kp_payloads"],   # 知识点(已由 run_agent2 落库,不再由 orchestrator 重复写)
+        "grouping": grouping,
+        "_emitted": True,
+        "item_count": counts["total"],
+        "kp_count": state["kp"],
+        "_review": review,
+        "_evidence_ledger": evidence_ledger,
+    }
 
 
 def _parse_json_response(content: str) -> dict[str, Any]:

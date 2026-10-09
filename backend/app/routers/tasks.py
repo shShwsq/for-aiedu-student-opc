@@ -46,6 +46,9 @@ from app.event_bus import (
 )
 from app.models.task import Conversation, Result, Task, TaskStatus
 from app.models.task_artifact import TaskArtifact
+# 注册审查项模型:TaskResponse.review_items 读取 Task.review_items backref,
+# 须在 mapper 配置前导入 audit(与 main.py lifespan 的注册一致,单跑本路由测试也成立)
+from app.models import audit  # noqa: F401
 from app.clone_skip import clear_skip_state, request_skip_clone
 from app.prompts.executor import build_first_round_question
 from app.models.user import User
@@ -1371,12 +1374,17 @@ def _build_markdown_report(
         lines.append(f"- 错误信息: {task.error_message}")
     lines.append("")
 
+    # 审查结果(ReviewItem):证据驱动可信审查,按三态分桶(风险/已核查/缺口)+ 证据链 + 置信
+    review_items = list(getattr(task, "review_items", None) or [])
+    _append_review_items_md(lines, review_items)
+
     # 重点与知识点(场景降级后:grouping 从 task.params._grouping 读取,
     # meta_fields 从 results 的 metadata keys 动态推断)
     results = list(task.results)
     if results:
         grouping, meta_fields = _get_result_display_config(task, results)
-        lines.append("## 重点与知识点")
+        # 有审查结果区时,results 语义收敛为"知识点"(与审查项分型)
+        lines.append("## 知识点" if review_items else "## 重点与知识点")
         lines.append("")
         if grouping:
             _append_grouped_results_md(lines, results, grouping, meta_fields)
@@ -1457,6 +1465,72 @@ def _append_result_md(
     lines.append("")
 
 
+_REVIEW_BUCKET_ORDER = [
+    ("risk", "发现风险"), ("cleared", "已核查·剔除误报"), ("gap", "缺口·待改进"),
+]
+
+
+def _review_confidence_str(it) -> str:
+    conf = it.confidence or {}
+    if not conf:
+        return "未分级"
+    label = conf.get("label", "未分级")
+    score = conf.get("score")
+    return f"{label}({score:.0%})" if isinstance(score, (int, float)) else label
+
+
+def _append_review_items_md(lines: list[str], items: list) -> None:
+    """追加"审查结果"节:按三态分桶 + 被核实对象/证据链/置信(后端派生)"""
+    if not items:
+        return
+    buckets: dict[str, list] = {}
+    for it in items:
+        buckets.setdefault(it.bucket, []).append(it)
+    lines.append("## 审查结果")
+    lines.append("")
+    for key, label in _REVIEW_BUCKET_ORDER:
+        rs = buckets.get(key) or []
+        if not rs:
+            continue
+        lines.append(f"### {label} ({len(rs)})")
+        lines.append("")
+        for it in rs:
+            lines.append(f"#### {it.title}")
+            lines.append("")
+            sev = f" · 严重度:{it.severity}" if it.severity else ""
+            lines.append(
+                f"- 被核实对象:{it.review_target or '—'}"
+            )
+            lines.append(
+                f"- 来源:{it.origin} · 状态:{it.status} · 判定:{it.verdict or '—'}{sev}"
+            )
+            warn = " · ⚠ 证据未核验" if it.evidence_mismatch else ""
+            lines.append(f"- 置信度:{_review_confidence_str(it)}{warn}")
+            if it.description:
+                lines.append(f"- 说明:{it.description}")
+            ev = it.evidence or {}
+            src = ev.get("source") or {}
+            if src.get("file_path") or src.get("quote"):
+                loc = src.get("file_path", "") or ""
+                if src.get("line"):
+                    loc += f":{src['line']}"
+                if loc:
+                    lines.append(f"- 原始证据({loc}):")
+                if src.get("quote"):
+                    lines.append("```")
+                    lines.append(str(src["quote"]))
+                    lines.append("```")
+            ab = ev.get("analysis_basis") or {}
+            if ab.get("ref_url"):
+                lines.append(f"- 分析依据:{ab['ref_url']}")
+            ver = ev.get("verification") or {}
+            if ver:
+                lines.append(f"- 验证测试:{ver.get('method', '—')}")
+            if it.suggestion:
+                lines.append(f"- 建议:{it.suggestion}")
+            lines.append("")
+
+
 def _build_html_report(
     task: Task, db: Session,
 ) -> str:
@@ -1518,11 +1592,15 @@ def _build_html_report(
         parts.append(f"<div>错误信息:{html.escape(task.error_message)}</div>")
     parts.append("</div>")
 
+    # 审查结果(ReviewItem):按三态分桶 + 证据链 + 置信
+    review_items = list(getattr(task, "review_items", None) or [])
+    _append_review_items_html(parts, review_items)
+
     # 重点与知识点
     results = list(task.results)
     if results:
         grouping, meta_fields = _get_result_display_config(task, results)
-        parts.append("<h2>重点与知识点</h2>")
+        parts.append("<h2>知识点</h2>" if review_items else "<h2>重点与知识点</h2>")
         if grouping:
             _append_grouped_results_html(parts, results, grouping, meta_fields)
         else:
@@ -1595,9 +1673,53 @@ def _append_result_html(
     parts.append("</div>")
 
 
+def _append_review_items_html(parts: list[str], items: list) -> None:
+    """追加"审查结果"节(HTML):按三态分桶 + 被核实对象/证据链/置信"""
+    if not items:
+        return
+    buckets: dict[str, list] = {}
+    for it in items:
+        buckets.setdefault(it.bucket, []).append(it)
+    parts.append("<h2>审查结果</h2>")
+    for key, label in _REVIEW_BUCKET_ORDER:
+        rs = buckets.get(key) or []
+        if not rs:
+            continue
+        parts.append(f"<h3>{html.escape(label)} ({len(rs)})</h3>")
+        for it in rs:
+            conf = it.confidence or {}
+            parts.append('<div class="result">')
+            warn = " <span style='color:#d97706'>⚠ 证据未核验</span>" if it.evidence_mismatch else ""
+            parts.append(f"<h4>{html.escape(it.title or '(无标题)')}</h4>")
+            parts.append(
+                f"<div>被核实对象:{html.escape(it.review_target or '—')}</div>"
+            )
+            sev = f" · 严重度:{html.escape(it.severity)}" if it.severity else ""
+            parts.append(
+                f"<div>来源:{html.escape(it.origin)} · 状态:{html.escape(it.status)}"
+                f" · 判定:{html.escape(it.verdict or '—')}{sev}</div>"
+            )
+            parts.append(f"<div>置信度:{html.escape(_review_confidence_str(it))}{warn}</div>")
+            if it.description:
+                parts.append(f"<div>{html.escape(it.description)}</div>")
+            ev = it.evidence or {}
+            src = ev.get("source") or {}
+            if src.get("file_path"):
+                loc = str(src["file_path"]) + (f":{src['line']}" if src.get("line") else "")
+                parts.append(f"<div>原始证据:{html.escape(loc)}</div>")
+            if src.get("quote"):
+                parts.append(f"<pre>{html.escape(str(src['quote']))}</pre>")
+            ab = ev.get("analysis_basis") or {}
+            if ab.get("ref_url"):
+                parts.append(f"<div>分析依据:{html.escape(str(ab['ref_url']))}</div>")
+            if it.suggestion:
+                parts.append(f"<div>建议:{html.escape(it.suggestion)}</div>")
+            parts.append(f'<div class="round">第 {it.round_idx} 轮产出</div>')
+            parts.append("</div>")
+
+
 # ============================================================
 # 详细对话(报告导出用:按轮组织的结论类对话)
-# ============================================================
 #
 # 与前端任务详情主对话流对齐:只摘「结论类」对话,跳过思考 / 工具调用 /
 # history_compress 等过程性内容。

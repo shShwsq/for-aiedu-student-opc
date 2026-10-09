@@ -255,6 +255,11 @@ class Question(Base):
     source_result_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("results.id", ondelete="SET NULL"), nullable=True
     )
+    # 题目源自哪条真实审查项(证据驱动可信审查:出题素材同源,可空回指)
+    # 存量老列为 NULL(升级见 migrate_practice_add_source_review_item_id)
+    source_review_item_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("review_items.id", ondelete="SET NULL"), nullable=True
+    )
     knowledge_point_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("knowledge_points.id", ondelete="CASCADE"),
         nullable=False, index=True
@@ -587,7 +592,8 @@ def migrate_practice_learning_columns() -> None:
       与讲解四列 explanation / explanation_source / explanation_model /
       explanation_updated_at(存量知识点讲解为空,由看板「生成讲解」按需回填)
     - practice_questions 加 learning_topic(可空,老题不补)与
-      source_file / source_lines(源码定位,可空)
+      source_file / source_lines(源码定位,可空)、
+      source_review_item_id(回指审查项,可空;须晚于 review_items 建表)
     全新库(create_all 已建好新列)或已迁过 → 直接返回。
     """
     import logging
@@ -705,6 +711,12 @@ def migrate_practice_learning_columns() -> None:
                     "VARCHAR(16) DEFAULT 'repo'"
                 ))
                 log.info("practice_questions.origin 列迁移完成")
+            if "source_review_item_id" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE practice_questions ADD COLUMN source_review_item_id "
+                    "UUID REFERENCES review_items(id) ON DELETE SET NULL"
+                ))
+                log.info("practice_questions.source_review_item_id 列迁移完成")
         # KP 主题回填:仅在本轮刚加列时执行一次(幂等)。
         # 必须放在 practice_questions 分支之后(回填依赖题表 learning_topic 列已存在),
         # 取该 KP 题目中最常见的非空 learning_topic(并列按主题名排序保证确定性),

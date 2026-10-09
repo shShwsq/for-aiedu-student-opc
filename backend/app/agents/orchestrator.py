@@ -1032,11 +1032,14 @@ def _run_background_review(
         )
         _record_agent2_review(db, task, round_idx, ua_result)
 
+        # 结构化发射路径:run_agent2 已即时落库 ReviewItem/知识点并写 _review/_grouping,
+        # 审查产物是 ReviewItem(不只是知识点),空 results 不再判失败
+        _emitted = bool(ua_result.get("_emitted"))
         review_stopped = bool(ua_result.get("stopped"))
         review_failed = (
             bool(ua_result.get("degraded"))
             or bool(ua_result.get("parse_failed"))
-            or not ua_result.get("results")
+            or (not _emitted and not ua_result.get("results"))
         )
 
         if review_stopped:
@@ -1063,41 +1066,58 @@ def _run_background_review(
                 f"results={len(ua_result.get('results') or [])}),保留临时结果"
             )
         else:
-            # 审查完成:本轮临时 Result 替换为重点与知识点(按轮追加:
-            # 仅删本轮 round_idx 的临时结果,跨轮知识点保留不覆盖;
-            # 知识点落库不受世代门控影响 —— 按轮产出,历史完整)
-            structured_results = ua_result.get("results") or []
-            grouping = ua_result.get("grouping")
-            db.query(Result).filter(
-                Result.task_id == task.id,
-                Result.round_idx == round_idx,
-            ).delete()
-            for r in structured_results:
-                db.add(Result(
-                    task_id=task.id,
-                    round_idx=round_idx,
-                    title=r.get("title", "(无标题)"),
-                    content=r.get("content", ""),
-                    metadata_=r.get("metadata"),
-                ))
-            db.commit()
-            # 把 grouping 存到 task.params 供前端读取(结果分组声明)
-            if grouping:
-                if task.params is not None:
-                    task.params = {**(task.params or {}), "_grouping": grouping}
-                else:
-                    task.params = {"_grouping": grouping}
-                db.commit()
-            if not _superseded():
-                task.review_status = "done"
-                task.current_stage = (
-                    f"任务完成,检查助手整理出 {len(structured_results)} 个重点与知识点"
+            if _emitted:
+                # 结构化发射路径:ReviewItem / 知识点(Result)已由 run_agent2 即时落库,
+                # _review/_grouping 已写进 task.params —— 此处不重复写 Result,只标状态。
+                item_count = int(ua_result.get("item_count") or 0)
+                kp_count = int(ua_result.get("kp_count") or 0)
+                if not _superseded():
+                    task.review_status = "done"
+                    task.current_stage = (
+                        f"任务完成,检查助手发射 {item_count} 条审查项、"
+                        f"{kp_count} 个知识点"
+                    )
+                logger.info(
+                    f"[task={task.id}] 后台审查完成(结构化发射),"
+                    f"{item_count} 条审查项、{kp_count} 个知识点、"
+                    f"{len(ua_result.get('suggestions') or [])} 条建议"
                 )
-            logger.info(
-                f"[task={task.id}] 后台审查完成,"
-                f"整理 {len(structured_results)} 个结构化结果,"
-                f"{len(ua_result.get('suggestions') or [])} 条建议"
-            )
+            else:
+                # 旧"末尾大 JSON"路径:本轮临时 Result 替换为重点与知识点(按轮追加:
+                # 仅删本轮 round_idx 的临时结果,跨轮知识点保留不覆盖;
+                # 知识点落库不受世代门控影响 —— 按轮产出,历史完整)
+                structured_results = ua_result.get("results") or []
+                grouping = ua_result.get("grouping")
+                db.query(Result).filter(
+                    Result.task_id == task.id,
+                    Result.round_idx == round_idx,
+                ).delete()
+                for r in structured_results:
+                    db.add(Result(
+                        task_id=task.id,
+                        round_idx=round_idx,
+                        title=r.get("title", "(无标题)"),
+                        content=r.get("content", ""),
+                        metadata_=r.get("metadata"),
+                    ))
+                db.commit()
+                # 把 grouping 存到 task.params 供前端读取(结果分组声明)
+                if grouping:
+                    if task.params is not None:
+                        task.params = {**(task.params or {}), "_grouping": grouping}
+                    else:
+                        task.params = {"_grouping": grouping}
+                    db.commit()
+                if not _superseded():
+                    task.review_status = "done"
+                    task.current_stage = (
+                        f"任务完成,检查助手整理出 {len(structured_results)} 个重点与知识点"
+                    )
+                logger.info(
+                    f"[task={task.id}] 后台审查完成,"
+                    f"整理 {len(structured_results)} 个结构化结果,"
+                    f"{len(ua_result.get('suggestions') or [])} 条建议"
+                )
 
         # 世代门控:被新流取代时跳过 badge 更新与 review_done 事件
         # (review_status/current_stage 归新流所有,防老审查收尾值覆盖
@@ -2255,13 +2275,14 @@ def _load_react_summaries(db: Session, task_id) -> list[dict]:
         .order_by(Conversation.round_idx.asc(), Conversation.created_at.asc())
         .all()
     )
-    summaries_by_round: dict[int, str] = {}
+    summaries_by_round: dict[int, tuple[str, str]] = {}
     for c in convs:
         if c.content:
-            summaries_by_round[c.round_idx] = c.content
+            # 保留该轮最后一条 thinking 的正文 + 对话 ID(agent2 可据此填 agent1_ref)
+            summaries_by_round[c.round_idx] = (c.content, str(c.id))
     return [
-        {"round": r, "summary": s}
-        for r, s in sorted(summaries_by_round.items())
+        {"round": r, "summary": s, "conversation_id": cid}
+        for r, (s, cid) in sorted(summaries_by_round.items())
     ]
 
 

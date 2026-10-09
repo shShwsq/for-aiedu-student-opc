@@ -116,6 +116,92 @@ export interface TaskResult {
   metadata_?: Record<string, unknown> | null
 }
 
+// ============================================================
+// 证据驱动可信审查:审查项(ReviewItem)与审查结论聚合(_review)
+// ============================================================
+
+/** 审查项三态分桶(与后端 audit.classify_status 一致) */
+export type ReviewBucket = 'risk' | 'cleared' | 'gap'
+export type ReviewOrigin = 'agent1_claim' | 'agent1_action' | 'user_requirement' | 'domain_baseline'
+export type ReviewStatusState = 'covered' | 'partial' | 'missing'
+export type ReviewVerdict = 'confirmed' | 'suspected' | 'false_positive' | 'none' | 'pending'
+export type ReviewSeverity = 'high' | 'medium' | 'low' | 'info'
+export type ConfidenceTier =
+  | 'verified' | 'source_confirmed' | 'reference_corroborated' | 'assertion_only'
+
+/** 后端派生的置信度(仅带证据者有;模型不自报) */
+export interface ReviewConfidence {
+  tier: ConfidenceTier
+  label: string
+  score: number
+}
+
+/** 证据链三段(缺段=不适用),各段可带 call_ref 指向取证台账 */
+export interface ReviewEvidence {
+  source?: { file_path?: string; line?: string; quote?: string; call_ref?: string }
+  analysis_basis?: {
+    ref_url?: string
+    ref_status?: 'ok' | 'broken' | 'unreachable'
+    ref_authority?: 'authoritative' | 'credible' | 'unknown'
+    call_ref?: string
+  }
+  verification?: {
+    method?: 'poc' | 'static'
+    verified?: boolean
+    poc_evidence?: string
+    call_ref?: string
+  }
+}
+
+/** 审查项(后端 ReviewItemResponse,三态合一) */
+export interface ReviewItem {
+  id: string
+  round_idx: number
+  title: string
+  description?: string | null
+  review_target: string
+  origin: ReviewOrigin
+  agent1_ref?: string | null
+  dimension?: string | null
+  status: ReviewStatusState
+  verdict?: ReviewVerdict | null
+  severity?: ReviewSeverity | null
+  evidence?: ReviewEvidence | null
+  confidence?: ReviewConfidence | null
+  evidence_validated: boolean
+  evidence_mismatch: boolean
+  suggestion?: string | null
+  /** 三态分桶(后端集中判读,前端直接复用) */
+  bucket: ReviewBucket
+  created_at: string
+}
+
+/** 审查计划条目(submit_review_plan.items) */
+export interface ReviewPlanItem {
+  target: string
+  origin: ReviewOrigin
+  priority?: number
+  planned_evidence?: 'source' | 'verify' | 'reference' | 'none'
+}
+
+/** task.params._review 聚合审查结论(结构化落库) */
+export interface ReviewSummary {
+  counts: { total: number; risk: number; cleared: number; gap: number }
+  status: { covered: number; partial: number; missing: number }
+  confidence_tally: Record<ConfidenceTier, number>
+  knowledge_point_count: number
+  verdict_summary: string
+  suggestions: string[]
+  plan?: {
+    items: ReviewPlanItem[]
+    note?: string | null
+    planned: number
+    executed: number
+    backfilled_gap: number
+  } | null
+}
+
+
 /** 追问/创建消息附带的上传文件展示信息(后端 Conversation.attachments 项) */
 export interface AttachmentInfo {
   upload_id: string
@@ -189,6 +275,8 @@ export interface TaskDetail {
   completed_at: string | null
   results: TaskResult[]
   conversations: Conversation[]
+  /** 审查项(证据驱动可信审查;老任务为空数组,前端不显示审查结果区) */
+  review_items?: ReviewItem[]
   /** 用户选择的 skill 列表(null/未定义 = 全部可用) */
   allowed_skills?: string[] | null
   /** 测试环境 URL(启用验证时,agent2 在此环境动态验证安全发现) */
@@ -236,6 +324,9 @@ export type SSEEventType =
   | 'command_confirm'
   | 'agent1_done'
   | 'review_done'
+  | 'review_plan_update'
+  | 'review_item_add'
+  | 'knowledge_point_add'
   | 'done'
   | 'error'
 
@@ -366,6 +457,30 @@ export interface ReviewDoneEventData {
    */
   review_status: 'done' | 'failed' | 'stopped'
 }
+
+/**
+ * review_plan_update 事件 data(submit_review_plan 发射/修订,覆盖式)
+ *
+ * 重发=全量替换(后端按轮覆盖),前端计划卡整体更新,不重复累积。
+ */
+export interface ReviewPlanUpdateEventData {
+  items: ReviewPlanItem[]
+  note?: string | null
+  planned: number
+}
+
+/**
+ * review_item_add 事件 data(submit_review_item 即时落库)
+ *
+ * payload 与后端 _persist_review_item 返回形状一致(无 created_at)。
+ * 前端按 id 去重 push 进 reviewItems;review_done 拉快照兜底补齐。
+ */
+export type ReviewItemEventData = Omit<ReviewItem, 'created_at'> & {
+  created_at?: string
+}
+
+/** knowledge_point_add 事件 data(submit_knowledge_point 即时落库) */
+export type KnowledgePointEventData = TaskResult
 
 /**
  * plan 事件 data

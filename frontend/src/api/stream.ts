@@ -23,8 +23,11 @@ import type {
   ConversationEventData,
   ConversationUpdateEventData,
   DoneEventData,
+  KnowledgePointEventData,
   PlanEventData,
   ReviewDoneEventData,
+  ReviewItemEventData,
+  ReviewPlanUpdateEventData,
   SSEEvent,
   SSEEventType,
   StatusEventData,
@@ -65,6 +68,12 @@ export interface StreamCallbacks {
   onAgent1Done?: (data: Agent1DoneEventData) => void
   /** 后台审查结束(拉快照:done=重点与知识点替换临时结果 / failed=保留执行结果) */
   onReviewDone?: (data: ReviewDoneEventData) => void
+  /** 审查计划发射/修订(覆盖式,侧栏计划卡) */
+  onReviewPlanUpdate?: (data: ReviewPlanUpdateEventData) => void
+  /** 审查项即时落库(侧栏审查结果区实时增长,按 id 去重 append) */
+  onReviewItemAdd?: (data: ReviewItemEventData) => void
+  /** 知识点即时落库(侧栏知识点区实时增长,按 id 去重 append) */
+  onKnowledgePointAdd?: (data: KnowledgePointEventData) => void
   onDone?: (data: DoneEventData) => void
   onError?: (data: DoneEventData) => void
 }
@@ -100,6 +109,9 @@ export function subscribeTaskStream(
     'command_confirm',
     'agent1_done',
     'review_done',
+    'review_plan_update',
+    'review_item_add',
+    'knowledge_point_add',
     'done',
     'error',
   ]
@@ -165,6 +177,15 @@ export function subscribeTaskStream(
               review_status: data.review_status,
             })
             callbacks.onReviewDone?.(data as unknown as ReviewDoneEventData)
+            break
+          case 'review_plan_update':
+            callbacks.onReviewPlanUpdate?.(data as unknown as ReviewPlanUpdateEventData)
+            break
+          case 'review_item_add':
+            callbacks.onReviewItemAdd?.(data as unknown as ReviewItemEventData)
+            break
+          case 'knowledge_point_add':
+            callbacks.onKnowledgePointAdd?.(data as unknown as KnowledgePointEventData)
             break
           case 'done':
             // [诊断] done 事件:任务结束,记录触发时前端是否在 resume 窗口

@@ -18,7 +18,15 @@
  *   共用同一 reactive Map,本组件只读消费)
  */
 import { computed, nextTick, ref, watch } from 'vue'
-import type { Conversation, ReviewStatus } from '@/types/task'
+import type {
+  Conversation,
+  ReviewItem,
+  ReviewPlanItem,
+  ReviewPlanUpdateEventData,
+  ReviewStatus,
+  ReviewSummary,
+} from '@/types/task'
+import { planItemStatus } from '@/utils/reviewBucket'
 import { renderMarkdown } from '@/utils/markdown'
 import { isThinkingExpanded } from '@/utils/thinkingExpand'
 
@@ -61,6 +69,12 @@ const props = defineProps<{
   reviewStatus?: ReviewStatus | null
   /** 终止请求已提交但尚未生效(审查线程还在收尾):按钮置灰防重复点 */
   stoppingReview?: boolean
+  /** 聚合审查结论(task.params._review;review_done 快照权威) */
+  reviewSummary?: ReviewSummary | null
+  /** 实时审查计划(SSE review_plan_update,_review 未到位前展示) */
+  reviewPlanLive?: ReviewPlanUpdateEventData | null
+  /** 审查项清单(计划对账逐条状态用) */
+  reviewItems?: ReviewItem[]
 }>()
 
 /**
@@ -137,9 +151,33 @@ const suggestions = computed<string[]>(() => {
   }
 })
 
+/** 审查计划条目(优先聚合 _review.plan,回退实时 review_plan_update) */
+const reviewPlanItems = computed<ReviewPlanItem[] | null>(() => {
+  const fromSummary = props.reviewSummary?.plan?.items
+  if (fromSummary && fromSummary.length) return fromSummary
+  if (props.reviewPlanLive?.items?.length) return props.reviewPlanLive.items
+  return null
+})
+
+/** 计划对账汇总(展示"规划 N / 核实 M / 回填缺口 K") */
+const reviewPlanTally = computed(() => {
+  const plan = props.reviewSummary?.plan
+  if (plan) {
+    return { planned: plan.planned, executed: plan.executed, backfilled: plan.backfilled_gap }
+  }
+  const live = props.reviewPlanLive
+  if (live?.items?.length) {
+    const planned = live.items.length
+    const executed = live.items.filter(
+      (i) => planItemStatus(i.target, props.reviewItems) === 'done',
+    ).length
+    return { planned, executed, backfilled: planned - executed }
+  }
+  return null
+})
+
 /** 追问按钮防重复(点击后由父组件发消息,审查重新开始) */
 const diggingSuggestion = ref<string | null>(null)
-
 /** 点击"追问":把建议文本作为用户消息发出(emit 给父组件走 resume 链路) */
 function handleDig(text: string): void {
   if (diggingSuggestion.value) return
@@ -278,6 +316,46 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
         @click="emit('stop-review')"
       >{{ stoppingReview ? '终止中...' : '终止检查' }}</button>
     </h2>
+
+    <!-- 审查结论面板(task.params._review 聚合:三态计数 + 置信分布 + 总体判定) -->
+    <div v-if="reviewSummary" class="panel-review-summary">
+      <div class="prs-counts">
+        <span class="prs-risk">风险 {{ reviewSummary.counts.risk }}</span>
+        <span class="prs-cleared">已核查 {{ reviewSummary.counts.cleared }}</span>
+        <span class="prs-gap">缺口 {{ reviewSummary.counts.gap }}</span>
+        <span class="prs-total">共 {{ reviewSummary.counts.total }} 项</span>
+      </div>
+      <div v-if="reviewSummary.confidence_tally" class="prs-conf">
+        <span class="conf-badge conf-verified">已验证 {{ reviewSummary.confidence_tally.verified }}</span>
+        <span class="conf-badge conf-source">源码 {{ reviewSummary.confidence_tally.source_confirmed }}</span>
+        <span class="conf-badge conf-reference">佐证 {{ reviewSummary.confidence_tally.reference_corroborated }}</span>
+        <span class="conf-badge conf-assertion">断言 {{ reviewSummary.confidence_tally.assertion_only }}</span>
+      </div>
+      <p v-if="reviewSummary.verdict_summary" class="prs-verdict">{{ reviewSummary.verdict_summary }}</p>
+    </div>
+
+    <!-- 审查计划卡(submit_review_plan + 规划对账:逐条 target/origin/优先级 + ✓/⚠) -->
+    <details v-if="reviewPlanItems" class="panel-review-plan" open>
+      <summary>
+        审查计划
+        <span v-if="reviewPlanTally" class="prp-tally">
+          规划 {{ reviewPlanTally.planned }} / 核实 {{ reviewPlanTally.executed }}
+          / 回填缺口 {{ reviewPlanTally.backfilled }}
+        </span>
+      </summary>
+      <p v-if="reviewSummary?.plan?.note || reviewPlanLive?.note" class="prp-note">
+        {{ reviewSummary?.plan?.note || reviewPlanLive?.note }}
+      </p>
+      <ol class="prp-list">
+        <li v-for="(pi, idx) in reviewPlanItems" :key="idx" class="prp-item">
+          <span :class="['prp-state', planItemStatus(pi.target, reviewItems) === 'done' ? 'is-done' : 'is-gap']">
+            {{ planItemStatus(pi.target, reviewItems) === 'done' ? '✓' : '⚠' }}
+          </span>
+          <span class="prp-target">{{ pi.target }}</span>
+          <span class="prp-origin" :title="pi.origin">{{ pi.origin }}</span>
+        </li>
+      </ol>
+    </details>
 
     <div v-for="g in rounds" :key="g.round_idx" class="panel-round">
       <button type="button" class="panel-round-head" @click="toggleRound(g.round_idx)">
@@ -699,4 +777,31 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
   border: none;
   padding: 0;
 }
+
+/* ---- 审查结论面板 + 审查计划卡(证据驱动可信审查) ---- */
+.panel-review-summary { margin: var(--space-2) 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-bg-subtle, rgba(0,0,0,0.02)); }
+.prs-counts { display: flex; flex-wrap: wrap; gap: var(--space-2); font-size: var(--fs-sm); }
+.prs-risk { color: var(--color-danger); }
+.prs-cleared { color: var(--color-success, #16a34a); }
+.prs-gap { color: var(--color-warning, #d97706); }
+.prs-total { color: var(--color-text-muted); margin-left: auto; }
+.prs-conf { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.conf-badge { font-size: var(--fs-xs); padding: 1px 6px; border-radius: var(--radius-sm); border: 1px solid var(--color-border); }
+.conf-verified { background: rgba(22,163,74,0.12); color: var(--color-success,#16a34a); }
+.conf-source { background: rgba(37,99,235,0.12); color: var(--color-info,#2563eb); }
+.conf-reference { background: rgba(124,58,237,0.12); color: #7c3aed; }
+.conf-assertion { background: rgba(120,120,120,0.14); color: var(--color-text-secondary); }
+.prs-verdict { margin: 6px 0 0; font-size: var(--fs-sm); color: var(--color-text); }
+
+.panel-review-plan { margin: var(--space-2) 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); }
+.panel-review-plan > summary { cursor: pointer; font-weight: var(--fw-semibold); font-size: var(--fs-sm); }
+.prp-tally { color: var(--color-text-muted); font-weight: normal; margin-left: 6px; font-size: var(--fs-xs); }
+.prp-note { margin: 4px 0; font-size: var(--fs-xs); color: var(--color-text-secondary); }
+.prp-list { margin: 6px 0 0; padding-left: 4px; list-style: none; }
+.prp-item { display: flex; align-items: center; gap: var(--space-2); padding: 2px 0; font-size: var(--fs-sm); }
+.prp-state { width: 16px; text-align: center; }
+.prp-state.is-done { color: var(--color-success,#16a34a); }
+.prp-state.is-gap { color: var(--color-warning,#d97706); }
+.prp-target { flex: 1; }
+.prp-origin { font-size: var(--fs-xs); color: var(--color-text-muted); border: 1px dashed var(--color-border); padding: 0 6px; border-radius: var(--radius-sm); }
 </style>

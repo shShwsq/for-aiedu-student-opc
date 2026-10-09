@@ -93,6 +93,9 @@ async def lifespan(app: FastAPI):
     from app.models import practice  # noqa: F401  # 练习模块全新表,随 create_all 建表
     from app.models import domain_event_log  # noqa: F401  # 领域事件审计日志,随 create_all 建表
     from app.models import memory_settings  # noqa: F401  # 记忆生成设置 1:1 表,随 create_all 建表
+    # 审查项(证据驱动可信审查):review_items 表须晚于 practice_questions 的
+    # source_review_item_id 外键迁移(create_all 建缺失表,须先注册 audit)
+    from app.models import audit  # noqa: F401
 
     if settings.DB_REBUILD_ON_START:
         Base.metadata.drop_all(bind=engine)

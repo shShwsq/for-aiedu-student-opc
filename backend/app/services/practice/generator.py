@@ -45,6 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import UUID
 
 from json_repair import repair_json
 from sqlalchemy.orm import Session
@@ -71,6 +72,7 @@ from app.models.practice import (
     ensure_user_topics,
 )
 from app.models.task import Result, Task
+from app.models.audit import ReviewItem  # 溯源:题目可回指审查项(证据驱动可信审查)
 from app.models.user_llm_config import UserLLMConfig
 from app.services.practice.difficulty import clamp_difficulty
 from app.services.practice.explainer import (
@@ -1103,6 +1105,28 @@ def _is_practice_worthy(finding: Result) -> bool:
     return isinstance(meta, dict) and meta.get("practice_worthy") is True
 
 
+def _resolve_source_review_item_id(db: Session, metadata: Any) -> UUID | None:
+    """从知识点 Result.metadata_.source_review_item_id 解析出真实存在的审查项 id。
+
+    证据驱动可信审查的出题溯源:题目源自哪条真实审查项。无效/悬空(审查项已不在)
+    返回 None,避免因外键约束破坏整批入库。
+    """
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("source_review_item_id")
+    if not raw:
+        return None
+    try:
+        cand = UUID(str(raw))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    try:
+        exists = db.query(ReviewItem.id).filter(ReviewItem.id == cand).first()
+    except Exception:
+        return None
+    return cand if exists else None
+
+
 # ============================================================
 # 质量关卡 1:退化题检测(叙述式判断题 / 答案泄露措辞)
 # ============================================================
@@ -1710,6 +1734,9 @@ def generate_questions_for_task(
         dup_skipped = 0
         kp_questions: dict[str, list[dict]] = {}   # 本条 finding 在各知识点下产出的题
         kp_meta: dict[str, tuple[str, str]] = {}    # key → (展示名, 主题)
+        # 溯源:知识点 Result.metadata_.source_review_item_id → Question.source_review_item_id
+        # 校验该审查项真实存在再写入(避免悬空外键破坏入库)
+        review_item_uuid = _resolve_source_review_item_id(db, finding.metadata_)
         for q in work.questions:
             dedup_hash = compute_dedup_hash(q["stem"], q["code_snippet"])
             if dedup_hash in existing_hashes:
@@ -1731,6 +1758,7 @@ def generate_questions_for_task(
                 user_id=user_id,
                 source_task_id=task.id,
                 source_result_id=finding.id,
+                source_review_item_id=review_item_uuid,
                 knowledge_point_id=kp.id,
                 qtype=QuestionType(q["qtype"]),
                 stem=q["stem"],

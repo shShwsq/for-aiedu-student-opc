@@ -13,7 +13,7 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 工具分**取证**与**发射**两族:
 
 - **取证工具(当前已实现)**:三类共 6 个可调用函数(其中 `verify` 内部再委派 2 个子工具),见 §1–§3;
-- **发射/输出工具(规划中)**:`submit_review_plan`(审查规划,先行且可修订)/ `submit_review_item`(审查项,三态合一)/ `submit_knowledge_point`(知识点)/ `submit_suggestion`,属"证据驱动的可信审查"改造拟新增的**四个发射原语**,见 §4。
+- **发射/输出工具(后端已落地,UI/出题接入中)**:`submit_review_plan`(审查规划,先行且可修订)/ `submit_review_item`(审查项,三态合一)/ `submit_knowledge_point`(知识点)/ `submit_suggestion`,是"证据驱动的可信审查"改造的**四个即时发射原语**,见 §4。
 
 下表为**取证工具**(§1–§3):
 
@@ -138,9 +138,11 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 
 ---
 
-## 4. 输出/发射工具(证据驱动改造 · 规划中)
+## 4. 输出/发射工具(证据驱动改造 · 后端已落地)
 
-> ⚠️ **状态:规划中,尚未落地。** 当前代码里 agent2 仍是"跑完取证循环 → 末尾输出一个大 JSON"(`covered`/`missing`/`reasoning`/`suggestions`/`results`/`grouping`);审查规划也只隐式存在于提示词("自行确定 3-8 个审查维度并在 reasoning 中说明"),不可实时展示、不可机器核对。本节四个工具是"证据驱动的可信审查"改造(`.trae/documents/证据驱动可信审查实施计划.md` Part C)拟新增的**即时发射原语**——把"末尾一次性大 JSON"拆成"规划先行 + 核查到哪、发射到哪",并**把"审查项"与"知识点"分成两类产物**。设计要点:用工具调用作**发射器**(结构化落库 + 流式),而**不是**把"结论 true/false"做成工具返回值(后者只是模型自证,不增准确性,反而更"看起来权威")。
+> ✅ **状态:后端发射链路已落地**(`backend/app/agents/agent2.py` 主循环 + `app/agents/evidence.py` 置信派生 + `app/models/audit.py` `ReviewItem` 表 + `app/prompts/agent2.py` 四发射工具与规划先行提示词;回归测试见 `tests/test_agent2_emit_split.py` / `test_agent2_evidence_ledger.py` / `test_evidence_score_review_item.py`)。**尚未完成**:侧栏分区渲染(前端 `TaskDetailView`/`Agent2Panel`)与按主题并行出题(`services/practice`)仍在实施中,故前端事件类型/SSE 契约(`review_plan_update`/`review_item_add`/`knowledge_point_add`)已就位但 UI 呈现后续接入。
+>
+> 设计要点:用工具调用作**发射器**(结构化落库 + 流式),而**不是**把"结论 true/false"做成工具返回值(后者只是模型自证,不增准确性,反而更"看起来权威")。不支持结构化发射的模型仍回退旧"末尾大 JSON"路径(见下"兜底")。
 
 四类发射工具**始终注入**(`run_agent2` 的 `tools`,不依赖 `repo_path`),**不进 sandbox**:主循环识别到即执行落库/记事件,回一句短 `tool_result` 回执,模型据此继续或收尾。**审查完成 = 模型不再发工具**(循环自然退出),不再有末次汇总调用;`submit_review_plan` 在循环开头发出(过程中可全量重发修订),不改变这一退出语义。
 
