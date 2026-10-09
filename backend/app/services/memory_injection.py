@@ -236,3 +236,19 @@ def resolve_agent_memory_file_path(mode: str, local_dir, filename: str) -> str:
     if str(mode) == "local" and local_dir:
         return os.path.join(str(local_dir), ".agent_memory", filename)
     return f"{sandbox_tools._MEMORY_DIR_SANDBOX}/{filename}"
+
+
+def resolve_agent_skills_dir_path(mode: str, local_dir) -> str:
+    """计算外部 CLI 可直达的 skill 物化目录绝对路径(按运行模式)。
+
+    与 resolve_agent_memory_file_path 同口径(仅外部 CLI 需要,内置 react_agent 走
+    skill 工具不碰文件系统):
+    - sandbox 模式:/home/user/.agent_skills —— 容器内真实路径
+    - local 模式:<local_dir>/.agent_skills —— 宿主机无 /home/user,write_skill_files
+      即写此处,CLI 用各自 Read 工具按真实绝对路径访问
+    """
+    from app.tools import sandbox_tools
+
+    if str(mode) == "local" and local_dir:
+        return os.path.join(str(local_dir), ".agent_skills")
+    return sandbox_tools._SKILLS_DIR_SANDBOX

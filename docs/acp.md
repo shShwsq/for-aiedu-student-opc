@@ -205,6 +205,22 @@ ACP CLI 子进程(qodercli --acp --yolo / dsh --profile acp)
 5. **挂死/崩溃兜底**:prompt 期间长时间无数据事件时分级 idle 超时(工具执行中放宽、等模型输出收紧),超时发 `session/cancel` 并用已累积输出收尾,不直接 fail 任务;CLI 崩溃/连接中断(SSE 流结束但未收到 JSON-RPC 最终响应)时,bridge 关流前推 `event: stream_error` 携带原因(进程退出/EOF/读失败),后端抛 `ACPStreamAborted` 并走同款截断善后,summary 标注"本轮输出不完整"让 agent2 知情,不把崩溃当作正常完成
 6. **新增 agent 成本**:在 registry 注册(bin、acp_args、credential_env、bridge_script)+ 写一个薄 wrapper,其余全复用
 
+### 5.3 上下文注入(仓库 / 记忆 / 技能)
+
+CLI 在容器内运行,拿不到后端进程内的数据,故"该让 CLI 知道什么"统一走**注入**而非工具:
+
+| 注入段 | 数据如何进入容器 | prompt 注入方式 |
+|--------|------------------|-----------------|
+| 仓库/上传上下文 | orchestrator 预 clone / 传输上传文件 | `build_cli_repo_context_section`(首轮后不再重发) |
+| 记忆(全局 + 项目) | `sandbox_tools.write_*_memory_file` 写 `/home/user/.agent_memory/`(local 模式落 `<local_dir>`) | `build_cli_memory_section`(内容 + 按运行模式算的"查全量"路径指针) |
+| **技能(Skill)** | `orchestrator._write_skill_files_for_task` → `sandbox_tools.write_skill_files` 物化到 `/home/user/.agent_skills/<skill>/`(先清后写;含 SKILL.md + 文本资源,二进制跳过) | `build_cli_skills_section`(清单:名称 + 描述 + SKILL.md 绝对路径指针) |
+
+要点:
+- **与内置 react_agent 的分工**:react_agent 有进程内 SkillRegistry,走 `list_skills` / `skill` 工具直接取 body,不碰文件系统;外部 CLI 无此注册表,只能靠"物化进容器 + prompt 指针"这条与记忆同构的通道。因此 skill 物化只对 `task.executor != builtin` 生效。
+- **用户隔离与 allowed_skills**:物化/注入的集合由 `loader.resolve_visible_skills(user_id, allowed_skills)` 解析(内置共享 + 仅本人上传,再按任务 `allowed_skills` 过滤,同名去重),与内置侧同口径 —— 不做"全量挂载所有 skill"的全局卷(那会跨用户泄露私有 skill)。
+- **路径按运行模式**:sandbox 用 `/home/user/...`,local 用真实 `<local_dir>` 绝对路径(CLI 用各自 Read 工具,访问不到后端对 `/home/user` 虚拟路径的映射,见 `resolve_agent_skills_dir_path`)。
+- **去重**:skill 段并入记忆注入桶一起参与 `_resolve_injection_plan` 的指纹去重(skill 集在任务内恒定),同一 session 内未变化不重发,省 token。
+
 ---
 
 ## 6. 参考文件索引

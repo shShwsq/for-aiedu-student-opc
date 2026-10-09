@@ -108,6 +108,11 @@ _MEMORY_FILE = "project_memory.md"
 # 全局长期记忆文件(跨项目通用经验,每任务启动时覆盖为当前用户的全局记忆)
 _GLOBAL_MEMORY_FILE = "global_memory.md"
 
+# skill 物化目录(沙箱内绝对路径)。外部 CLI 执行器无进程内 skill 注册表,只能像
+# 记忆文件那样把"当前任务可见且允许"的 skill 落进容器,再由 prompt 注入路径指针引导
+# 其用自身 Read 工具查阅。内置 react_agent 走 skill 工具(读进程内 REGISTRY),不用此目录。
+_SKILLS_DIR_SANDBOX = "/home/user/.agent_skills"
+
 # local 会话元信息文件名(临时目录根,进程重启后孤儿恢复按它定位 task)
 _LOCAL_SESSION_META_FILE = ".secondlook_meta.json"
 
@@ -1795,6 +1800,72 @@ def write_global_memory_file(task_id: str, content: str) -> None:
         session: SandboxSession = ctx["session"]
         session.run_command(f"mkdir -p {shlex.quote(_MEMORY_DIR_SANDBOX)}")
         session.write_file(f"{_MEMORY_DIR_SANDBOX}/{_GLOBAL_MEMORY_FILE}", content)
+
+
+def _skill_dir_name(name: str) -> str:
+    """skill 名 → 容器内安全目录名(委托 loader,与 prompt 指针共用同一实现)"""
+    from app.skills.loader import skill_subdir_name
+
+    return skill_subdir_name(name)
+
+
+def write_skill_files(task_id: str, skills: list) -> None:
+    """把"当前任务可见且允许"的 skill 物化进容器固定目录,供外部 CLI 执行器 Read 查阅。
+
+    目录 /home/user/.agent_skills/<skill_name>/(local 模式映射到 <local_dir>/.agent_skills/)。
+    每个 skill 落 SKILL.md 全文(frontmatter + 正文)及其文本类附加资源文件;二进制文件跳过
+    (write_file 只处理文本)。先清空目录再写,避免上一集合的残留(与记忆"写空串清残留"同理)。
+
+    skills 为空 → 只清空目录(该任务无可用 skill,不留旧文件)。
+    与 write_global_memory_file 同构:local 用 Python 直接写,sandbox 用 mkdir + write_file。
+    """
+    ctx = _get_or_create_session(task_id)
+    mode = ctx["mode"]
+
+    if mode == "local":
+        skills_root = Path(ctx["local_dir"]) / ".agent_skills"
+        shutil.rmtree(skills_root, ignore_errors=True)
+        skills_root.mkdir(parents=True, exist_ok=True)
+        for skill in skills or []:
+            src_dir = getattr(skill, "skill_dir", None)
+            if not src_dir:
+                continue
+            src_dir = Path(src_dir)
+            dest_dir = skills_root / _skill_dir_name(getattr(skill, "name", ""))
+            for f in sorted(src_dir.rglob("*")):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(src_dir)
+                try:
+                    content = f.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    continue  # 二进制/不可读资源跳过,CLI 只依赖 SKILL.md
+                out = dest_dir / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(content, encoding="utf-8")
+    else:
+        session: SandboxSession = ctx["session"]
+        # 先清空再重建(skills 为空也要清掉残留)
+        session.run_command(f"rm -rf {shlex.quote(_SKILLS_DIR_SANDBOX)}")
+        session.run_command(f"mkdir -p {shlex.quote(_SKILLS_DIR_SANDBOX)}")
+        for skill in skills or []:
+            src_dir = getattr(skill, "skill_dir", None)
+            if not src_dir:
+                continue
+            src_dir = Path(src_dir)
+            name_dir = _skill_dir_name(getattr(skill, "name", ""))
+            for f in sorted(src_dir.rglob("*")):
+                if not f.is_file():
+                    continue
+                rel = f.relative_to(src_dir).as_posix()
+                try:
+                    content = f.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    continue
+                abs_path = f"{_SKILLS_DIR_SANDBOX}/{name_dir}/{rel}"
+                parent = abs_path.rsplit("/", 1)[0]
+                session.run_command(f"mkdir -p {shlex.quote(parent)}")
+                session.write_file(abs_path, content)
 
 
 def _is_memory_file_path(file_path: str) -> bool:

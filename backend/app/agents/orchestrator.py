@@ -1325,6 +1325,9 @@ def _prepare_repo_context(
     # - 项目记忆文件:选了仓库且能匹配到 Project 时写,否则写空串清残留
     _write_memory_files_for_task(task, db, task_id_str, repo_url)
 
+    # CLI 执行器:把可见且允许的 skill 物化进容器(内置 react_agent 跳过)
+    _write_skill_files_for_task(task, task_id_str)
+
     # 上传交付物分支(优先于 clone;创建时已保证与 repo_url 互斥):
     # 把上传内容传输进沙箱工作区。上传文件 agent 无法自行重新获取,
     # 服务端文件缺失/传输失败都直接失败,不降级
@@ -1682,6 +1685,34 @@ def _write_memory_files_for_task(
         logger.warning(f"[task={task.id}] 写入项目记忆文件失败(忽略): {e}")
 
 
+def _write_skill_files_for_task(task: Task, task_id_str: str) -> None:
+    """把"当前任务可见且允许"的 skill 物化进容器,供外部 CLI 执行器 Read 查阅。
+
+    仅对 CLI 执行器(task.executor != builtin)生效:内置 react_agent 走进程内
+    skill 工具(list_skills/skill),不碰文件系统,物化对它无意义。CLI 无进程内
+    注册表,只能像记忆文件那样落进容器 + prompt 注入路径指针(见 acp_base)。
+
+    可见集与内置侧同口径(loader.resolve_visible_skills:用户隔离 ∩ allowed_skills)。
+    任何异常 catch + log,不阻塞任务启动。
+    """
+    from app.agents.executor_agent import EXECUTOR_BUILTIN
+
+    if (task.executor or EXECUTOR_BUILTIN).strip().lower() == EXECUTOR_BUILTIN:
+        return
+    try:
+        from app.skills import loader as skill_loader
+        from app.tools import sandbox_tools
+
+        skills = skill_loader.resolve_visible_skills(task.user_id, task.allowed_skills)
+        sandbox_tools.write_skill_files(task_id_str, skills)
+        logger.info(
+            f"[task={task.id}] 已为 {task.executor} 物化 {len(skills)} 个 skill "
+            f"(allowed={task.allowed_skills})"
+        )
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 物化 skill 文件失败(忽略): {e}")
+
+
 def _restore_workspace_if_needed(
     task: Task, db: Session, task_id_str: str, git_tokens: dict | None = None,
     round_idx: int | None = None, followup_replay: dict | None = None,
@@ -1861,6 +1892,8 @@ def resume_audit_with_message(
     )
     if not restored:
         _write_memory_files_for_task(task, db, task_id_str, repo_url)
+    # CLI 执行器:每轮追问/重试都刷新 skill 物化(会话重建后容器里可能已无旧文件)
+    _write_skill_files_for_task(task, task_id_str)
     perf_log(
         task.id,
         "restore_workspace" if restored else "write_memory_files",

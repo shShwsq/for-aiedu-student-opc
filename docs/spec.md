@@ -527,6 +527,7 @@ Result(任务结果项,通用)
   - 系统内置:`GET /skills`(列出全部,含内置 + 各用户自己的)+ `POST /skills/reload`(管理员重新扫描)
   - 用户上传:`POST /skills/upload`(zip,含 `SKILL.md`)+ `DELETE /skills/{scenario_id}/{skill_name}`(只能删自己的)+ `PUT /skills/{scenario_id}/{skill_name}/SKILL.md`(在线编辑自己的 SKILL.md,热保存)
 - **react_agent 调用**:通过 `list_skills` 工具查看可用 skill(内置 + 当前用户上传的),通过 `skill` 工具加载指定 skill 的 body 到上下文,LLM 按其指引执行
+- **CLI 执行器调用**(Qoder/DeepSeek/Codex,经 ACP):外部 CLI 无进程内 SkillRegistry 与 skill 工具,故与记忆文件同构——任务启动时 `orchestrator._write_skill_files_for_task` 把"当前用户可见 ∩ `allowed_skills`"的 skill 物化进容器固定目录(sandbox 模式 `/home/user/.agent_skills/<skill>/`,local 模式 `<local_dir>/.agent_skills/<skill>/`,含 SKILL.md 全文 + 文本类附加资源,二进制跳过;先清后写避免残留),再在 prompt 末尾(并入记忆注入桶参与去重)追加"可用技能"清单与路径指针,引导 CLI 用自身文件读取工具按需查阅 SKILL.md 并执行。`build_cli_skills_section` 保持零 `app.*` 依赖,可见集解析与路径计算在调用侧(`loader.resolve_visible_skills` / `memory_injection.resolve_agent_skills_dir_path`)
 - **首版技能清单**(场景降级后按 scenario 组织,用户创建任务时可选 `allowed_skills` 过滤;均挂在 `code_review` 场景下):
   - `code_review/check_sql_injection`(注入类)
   - `code_review/check_hardcoded_secrets`(硬编码密钥)

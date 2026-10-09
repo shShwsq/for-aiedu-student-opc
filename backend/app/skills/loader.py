@@ -222,6 +222,47 @@ def list_visible_skills(user_id: uuid.UUID | None) -> list[ParsedSkill]:
     return result
 
 
+def skill_subdir_name(name: str) -> str:
+    """skill 名 → 容器内物化子目录名(物化写入与 prompt 指针共用,保证两侧一致)
+
+    skill.name 正常是标识符;兜一层防路径穿越/非法字符:去掉路径分隔符与空段/ ".",
+    把 ".." 换成 "_",空/异常回退为 "skill"。
+    """
+    cleaned = "".join(
+        p for p in (name or "").strip().replace("\\", "/").split("/")
+        if p not in ("", ".")
+    )
+    cleaned = cleaned.replace("..", "_")
+    return cleaned or "skill"
+
+
+def resolve_visible_skills(
+    user_id: uuid.UUID | None, allowed_skills: list[str] | None,
+) -> list[ParsedSkill]:
+    """解析某任务实际可用的 skill(可见集 ∩ 允许集),供 CLI 执行侧物化/注入用。
+
+    与内置 react_agent 的 skill 工具口径一致(skill_tool._get_all_skills + allowed
+    过滤),只是这里显式接收参数而非读 ContextVar,便于 orchestrator/acp_base 调用:
+    - 可见:user_id 的内置 skill(全局共享)+ 自己上传的 skill(用户隔离)
+    - 允许:allowed_skills 非空时按名称过滤;None/空表示全部可用(默认)
+    - 同名跨场景去重(保留首个,与 react 侧一致)
+
+    返回平铺列表;无匹配时返回空列表。
+    """
+    seen_names: set[str] = set()
+    deduped: list[ParsedSkill] = []
+    for skill in list_visible_skills(user_id):
+        if skill.name in seen_names:
+            continue
+        seen_names.add(skill.name)
+        deduped.append(skill)
+
+    if allowed_skills:
+        allowed_set = set(allowed_skills)
+        return [s for s in deduped if s.name in allowed_set]
+    return deduped
+
+
 def get_skill(scenario_id: str, skill_name: str) -> ParsedSkill | None:
     """按 (scenario, name) 查找 skill"""
     return REGISTRY.get(scenario_id, skill_name)

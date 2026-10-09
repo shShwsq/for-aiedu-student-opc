@@ -94,6 +94,7 @@ from app.prompts.executor import (
     build_cli_history_replay_section,
     build_cli_memory_section,
     build_cli_repo_context_section,
+    build_cli_skills_section,
     build_first_round_question,
     format_plan_reminder,
 )
@@ -2238,11 +2239,15 @@ def _build_prompt_message(
     memory_summary: str = "",
     global_memory: str = "",
     history_replay: str = "",
+    skills_section: str = "",
 ) -> str:
     """构造发给 CLI 的完整 prompt 消息(历史回放 + 预 clone 上下文 + 记忆注入段 + 纯指令)
 
     落库展示用 _build_base_prompt(纯指令);预 clone 上下文段、记忆段与
     跨轮历史回放都只进发送内容,不落库不展示。
+
+    skills_section:CLI 可用技能注入段,与 run 链路一致并入记忆桶末尾(默认空,
+    保持既有调用/单测行为不变)。
 
     run_acp_agent 不直接调本函数(它需要在同一 session 内跳过未变化的注入段),
     但两者均走 _compose_send_text,段落顺序因此一致。
@@ -2256,7 +2261,7 @@ def _build_prompt_message(
             repo_context if followup_query is None else None,
             variant,
         ),
-        _build_memory_section(memory_summary, global_memory),
+        _build_memory_section(memory_summary, global_memory) + skills_section,
         history_replay,
     )
 
@@ -2346,6 +2351,36 @@ def _build_memory_section(
         memory_summary, global_memory,
         project_file_path=project_file_path, global_file_path=global_file_path,
     )
+
+
+def _build_cli_skills_section(task: Task, mode: str, local_dir) -> str:
+    """构造"可用技能"注入段(外部 CLI 执行器专用,拼进 prompt,不落库不展示)。
+
+    orchestrator 已在任务启动时把可见且允许的 skill 物化进容器
+    (_write_skill_files_for_task);这里按同一可见集算出每个 SKILL.md 的容器绝对
+    路径(子目录名用 loader.skill_subdir_name,与物化写入同源)并拼清单+指针。
+    无可用 skill / 异常 → 返回空串(不注入,不拖垮执行轮)。
+    """
+    try:
+        from app.services.memory_injection import resolve_agent_skills_dir_path
+        from app.skills import loader as skill_loader
+
+        skills = skill_loader.resolve_visible_skills(task.user_id, task.allowed_skills)
+        if not skills:
+            return ""
+        skills_dir = resolve_agent_skills_dir_path(mode, local_dir)
+        items = [
+            {
+                "name": s.name,
+                "description": s.description,
+                "file": f"{skills_dir}/{skill_loader.skill_subdir_name(s.name)}/SKILL.md",
+            }
+            for s in skills
+        ]
+        return build_cli_skills_section(items)
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 构造 CLI skill 注入段失败(忽略): {e}")
+        return ""
 
 
 # ============================================================
@@ -2913,6 +2948,12 @@ def run_acp_agent(
                 memory_summary, global_memory,
                 project_file_path=_project_mem_path, global_file_path=_global_mem_path,
             )
+            # skill 注入段并入记忆桶一起参与去重(skill 集在任务内恒定,合并无害);
+            # 独立成第三桶需改 _resolve_injection_plan/_context_sections_hash 及其单测,
+            # 收益(仅"skill 单独变化时不重发记忆")不足以覆盖改动面,故复用记忆桶。
+            raw_skills = _build_cli_skills_section(task, _mem_mode, _mem_local_dir)
+            if raw_skills:
+                raw_memory = raw_memory + raw_skills
             # 判定用的 session 状态:
             # - 复用进程内 session → 直接用缓存条目
             # - 恢复成功的 session → CLI 已从磁盘复原上下文(含既往注入段),

@@ -457,6 +457,46 @@ def build_cli_memory_section(
 
 
 # ============================================================
+# CLI 侧可用技能(Skill)注入段(acp_base 消费;数据加载在调用侧)
+# ============================================================
+
+
+def build_cli_skills_section(skills: list[dict[str, Any]]) -> str:
+    """构造"可用技能"段(拼在发送给 CLI 的 prompt 中,不落库不展示)。
+
+    背景:外部 CLI 执行器没有后端进程内的 skill 注册表,拿不到内置 react_agent 的
+    list_skills/skill 工具;故 orchestrator 在任务启动时把"当前任务可见且允许"的
+    skill 物化进容器(见 sandbox_tools.write_skill_files),这里只注入一段清单 +
+    路径指针,引导 CLI 用自身 Read 工具按需查阅 SKILL.md 并按其指令执行。
+
+    skills:调用侧预解析的列表,每项为
+        {"name": str, "description": str, "file": str}
+    其中 file 是 CLI 可直达的 SKILL.md 绝对路径(按运行模式算好,含物化子目录名);
+    本函数零 app.* 依赖,不做任何路径/DB 计算(见 tests/test_prompts_purity.py)。
+
+    空列表返回空串(无可用 skill 时不产生多余段落)。措辞工具中立(不写 read_file)。
+    """
+    items = [s for s in (skills or []) if (s.get("name") or "").strip()]
+    if not items:
+        return ""
+
+    lines = [
+        "- {}: {}(完整指令见文件 {},需要时先用你的文件读取工具查看再按其指引执行)".format(
+            (s.get("name") or "").strip(),
+            (s.get("description") or "").strip(),
+            (s.get("file") or "").strip(),
+        )
+        for s in items
+    ]
+    return (
+        "\n\n[可用技能(Skills)]\n"
+        "以下是本任务可用的技能(预封装的审计/执行操作指引)。当某项与当前任务相关时,"
+        "读取对应 SKILL.md 并按其指令调用你的工具执行:\n"
+        + "\n".join(lines)
+    )
+
+
+# ============================================================
 # CLI 侧跨轮历史回放段(acp_base 消费;结构化历史的加载与压缩在执行器侧)
 # ============================================================
 
