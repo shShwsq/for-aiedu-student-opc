@@ -195,7 +195,11 @@ function toggleRound(r: number): void {
 // 每张都要各自跟住自己最新的 token。
 const streamRefs = new Map<string, HTMLElement | null>()
 function setStreamRef(key: string, el: unknown): void {
-  streamRefs.set(key, (el as HTMLElement | null) || null)
+  const node = (el as HTMLElement | null) || null
+  // 键是 conv_id(逐张卡片唯一):卸载时 Vue 以 null 回调,必须删键而非置 null,
+  // 否则长任务里失效条目会按 conv_id 无限累积,watch 每次都白遍历一遍 null。
+  if (node) streamRefs.set(key, node)
+  else streamRefs.delete(key)
 }
 watch(
   () => rounds.value,

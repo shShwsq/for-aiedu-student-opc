@@ -121,19 +121,25 @@ describe('buildAgent2Rounds', () => {
     ])
   })
 
-  it('seq 下标基准含 agent1 与 user 消息(与 convCountPerRound 同基准)', () => {
+  it('seq 下标基准含 agent1 消息、不含 user question(与 convCountPerRound 同基准)', () => {
     const rounds = buildAgent2Rounds(
       [
         mkConv({ id: 'a1', role: 'agent1', type: 'tool_call' }),
-        mkConv({ id: 'a2', role: 'agent1', type: 'tool_result', tool_call_id: 'a1' }),
-        mkConv({ id: 'th1', type: 'thinking' }),
         mkConv({ id: 'u1', role: 'user', type: 'question' }),
+        mkConv({ id: 'th1', type: 'thinking' }),
+        mkConv({ id: 'th2', type: 'thinking' }),
       ],
-      [mkStream({ conv_id: 'live', insertSeq: 3 })],
+      [mkStream({ conv_id: 'live', insertSeq: 2 })],
     )
-    // user question 不进下标:live 的 insertSeq=3 → 排在 th1(下标 2)之后
-    expect(kinds(rounds[0])).toEqual(['thinking:th1', 'stream:live'])
-    expect(rounds[0].entries.every((e) => e.key !== 'u1')).toBe(true)
+    // 下标基准:a1 计入(占 0 号位)、u1 不计,故 th1 落在下标 1、th2 落在下标 2。
+    // 直接钉死 seq,才能同时抓住两种回归:误排 agent1 → th1.seq=0;误计 user
+    // question → th1.seq=2000。此前只断言"th1 排在 live 之前"的相对顺序,th1
+    // 无论算成下标 0 还是 1 都 < live,两种实现都成立,等于没守住这个回归点。
+    const seqOf = (key: string) => rounds[0].entries.find((e) => e.key === key)?.seq
+    expect(seqOf('th1')).toBe(1000)
+    expect(seqOf('th2')).toBe(2000)
+    // live 插在下标 2 的槽(2*1000-500=1500)→ 夹在 th1 与 th2 之间
+    expect(kinds(rounds[0])).toEqual(['thinking:th1', 'stream:live', 'thinking:th2'])
   })
 
   it('insertSeq 缺失时退化为本轮末尾(流式卡片就是最新一段)', () => {
