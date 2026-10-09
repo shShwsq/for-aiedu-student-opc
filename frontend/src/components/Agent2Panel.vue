@@ -6,6 +6,11 @@
  * roundGroups 过滤);检查助手的思考流/审查结论/工具核查(读码/PoC/引用复核)/
  * 最终总结全部在本面板按轮折叠展示。
  *
+ * 轮内呈现顺序 = **真实时序穿插**(思考 → 它触发的工具 → 下一段思考 …),
+ * 由 utils/agent2Timeline 统一算定,不再按 type 分桶。分桶会让整轮思考全部堆到
+ * 工具之后、实时卡片又压在历史思考之上,既看不出"为什么做这步核查",
+ * 读起来还像倒叙。
+ *
  * 后台审查流程(agent1 结束即任务完成):
  * - reviewStatus=running:头部"检查中"badge,审查流式实时可见,可点"终止检查"
  * - reviewStatus=done:头部"检查完成"badge;建议追问卡(suggestions)可点"追问"
@@ -13,7 +18,8 @@
  * - reviewStatus=stopped:头部"检查已终止"badge(用户主动停,同样保留执行结果)
  *
  * 数据来源:
- * - conversations:任务 Conversation 列表(role=agent2 的历史消息)
+ * - conversations:任务**全量** Conversation 列表(本组件只渲染 role=agent2,
+ *   但下标基准要含所有角色才能与主对话流的 convCountPerRound 对齐)
  * - streamingItems:SSE thinking_delta 累积的流式思考(与 TaskDetailView
  *   共用同一 reactive Map,本组件只读消费)
  */
@@ -29,6 +35,11 @@ import type {
 import { planItemStatus } from '@/utils/reviewBucket'
 import { renderMarkdown } from '@/utils/markdown'
 import { isThinkingExpanded } from '@/utils/thinkingExpand'
+import {
+  agent2RoundStats,
+  buildAgent2Rounds,
+  type Agent2RoundTimeline,
+} from '@/utils/agent2Timeline'
 
 /** 与 TaskDetailView 内部 StreamingItem 对齐(本组件只读消费展开状态,写入走 toggle) */
 interface StreamingLike {
@@ -43,22 +54,8 @@ interface StreamingLike {
   reasoning_auto?: boolean
   reasoning_grace?: boolean
   reasoning_pin?: boolean | null
-}
-
-interface ToolEntry {
-  call: Conversation
-  result: Conversation | null
-}
-
-interface RoundGroup {
-  round_idx: number
-  thinking: Conversation[]
-  streaming: StreamingLike[]
-  tools: ToolEntry[]
-  evaluations: Conversation[]
-  reviews: Conversation[]
-  summaries: Conversation[]
-  others: Conversation[]
+  /** 卡片开始时该 round 已收到的正式对话数(时序插槽定位用,见 utils/agent2Timeline) */
+  insertSeq?: number
 }
 
 const props = defineProps<{
@@ -93,45 +90,21 @@ const TOOL_INTENT_PREFIX = /^\[agent2 质检\]\s*/
 // _UA_EVAL_NON_FOLLOWUP_MARKERS 对齐)
 const NON_FOLLOWUP_MARKERS = ['评估完成,无需追问', '(未给出追问)', '请求用户澄清']
 
-/** agent2 全部消息按轮分组(tool_call 与 tool_result 按 id 配对) */
-const rounds = computed<RoundGroup[]>(() => {
-  const byRound = new Map<number, RoundGroup>()
-  const ensure = (r: number): RoundGroup => {
-    let g = byRound.get(r)
-    if (!g) {
-      g = {
-        round_idx: r, thinking: [], streaming: [], tools: [],
-        evaluations: [], reviews: [], summaries: [], others: [],
-      }
-      byRound.set(r, g)
-    }
-    return g
-  }
-  for (const c of props.conversations) {
-    if (c.role !== 'agent2') continue
-    const g = ensure(c.round_idx)
-    if (c.type === 'thinking') g.thinking.push(c)
-    else if (c.type === 'tool_call') g.tools.push({ call: c, result: null })
-    else if (c.type === 'tool_result') {
-      const hit = c.tool_call_id
-        ? g.tools.find((t) => t.call.id === c.tool_call_id)
-        : undefined
-      if (hit) hit.result = c
-      else g.others.push(c) // 孤立结果(调用记录缺失)兜底展示
-    } else if (c.type === 'evaluation') g.evaluations.push(c)
-    else if (c.type === 'review') g.reviews.push(c)
-    else if (c.type === 'summary') g.summaries.push(c)
-    else if (c.type === 'suggestions') {
-      // suggestions 不进轮组:由下方独立区块渲染(追问卡片)
-      continue
-    } else if (c.type) g.others.push(c) // 未知 type 容错(老数据形态)
-  }
-  for (const s of props.streamingItems.values()) {
-    if (s.role !== 'agent2') continue
-    ensure(s.round_idx).streaming.push(s)
-  }
-  return [...byRound.values()].sort((a, b) => a.round_idx - b.round_idx)
-})
+/**
+ * 按轮的时间轴(轮升序;轮内条目按真实时序穿插)
+ *
+ * 一条有序条目流由 buildAgent2Rounds 算出,tool_call/tool_result 的配对也在
+ * 其中完成(按 tool_call_id 精确配对)。思考与工具必须共用同一条序列:分桶
+ * (工具一桶、思考一桶)会切断"这段思考引发了哪一步核查"的因果链。
+ * 注意 conversations 传**全量**(不按 role 预筛):seq 的下标基准要与
+ * TaskDetailView 的 convCountPerRound 一致,实时卡片才能插对槽位。
+ */
+const rounds = computed<Agent2RoundTimeline<Conversation, StreamingLike>[]>(() =>
+  buildAgent2Rounds<Conversation, StreamingLike>(
+    props.conversations,
+    [...props.streamingItems.values()].filter((s) => s.role === 'agent2'),
+  ),
+)
 
 /** 建议追问方向(取最新一条 type=suggestions 的 JSON,旧版整块覆盖) */
 const suggestions = computed<string[]>(() => {
@@ -217,10 +190,12 @@ function toggleRound(r: number): void {
   expanded.value.has(r) ? expanded.value.delete(r) : expanded.value.add(r)
 }
 
-// ---- 流式思考文本自动贴底(仅当用户未向上滚动时) ----
-const streamRefs = new Map<number, HTMLElement | null>()
-function setStreamRef(r: number, el: unknown): void {
-  streamRefs.set(r, (el as HTMLElement | null) || null)
+// ---- 流式思考文本自动贴底(每次时间轴变化后把各张活卡片拉到自己底部) ----
+// 按条目 key 存:一轮可能同时挂着审查思考与动态验证两张活卡片,
+// 每张都要各自跟住自己最新的 token。
+const streamRefs = new Map<string, HTMLElement | null>()
+function setStreamRef(key: string, el: unknown): void {
+  streamRefs.set(key, (el as HTMLElement | null) || null)
 }
 watch(
   () => rounds.value,
@@ -259,17 +234,13 @@ function evalDigest(e: Conversation): string {
 
 /** 轮组标题文案(轮组唯一标题,不显示轮次数字):
  *  流式中 → "核查中…",否则如 "3 次核查 · 1 条修正指令 · 已完成" */
-function roundDigest(g: RoundGroup): string {
-  if (g.streaming.length) return '核查中…'
+function roundDigest(g: Agent2RoundTimeline<Conversation, StreamingLike>): string {
+  const stats = agent2RoundStats(g.entries, NON_FOLLOWUP_MARKERS)
+  if (stats.live) return '核查中…'
   const parts: string[] = []
-  const toolCount = g.tools.length
-  if (toolCount) parts.push(`${toolCount} 次核查`)
-  const followups = g.evaluations.filter((e) => {
-    const c = (e.content || '').trim()
-    return !!c && !NON_FOLLOWUP_MARKERS.some((m) => c.startsWith(m))
-  }).length
-  if (followups) parts.push(`${followups} 条修正指令`)
-  if (g.summaries.length) parts.push('已完成')
+  if (stats.tools) parts.push(`${stats.tools} 次核查`)
+  if (stats.followups) parts.push(`${stats.followups} 条修正指令`)
+  if (stats.summaries) parts.push('已完成')
   return parts.join(' · ') || '核查完成'
 }
 
@@ -364,64 +335,68 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
       </button>
 
       <div v-if="expanded.has(g.round_idx)" class="panel-round-body">
-        <!-- 工具核查(读码核对 / PoC / 引用复核):执行步骤,提到思考之前、与思考同级 -->
-        <details v-for="tool in g.tools" :key="tool.call.id" class="panel-item panel-tool">
-          <summary>{{ toolIntent(tool.call) }}</summary>
-          <div v-if="tool.result" class="panel-tool-result">{{ truncate(tool.result.content, 1500) }}</div>
-          <div v-else class="panel-tool-pending">执行中…</div>
-        </details>
+        <!-- 单条时间轴:一次 v-for 遍历全部条目,按 kind 分支渲染。
+             绝不能拆成多个 v-for(那等于回到分桶),否则思考又会整体脱离工具。 -->
+        <template v-for="e in g.entries" :key="e.key">
+          <!-- 工具核查(读码核对 / PoC / 引用复核):紧跟触发它的那段思考 -->
+          <details v-if="e.kind === 'tool'" class="panel-item panel-tool">
+            <summary>{{ toolIntent(e.call) }}</summary>
+            <div v-if="e.result" class="panel-tool-result">{{ truncate(e.result.content, 1500) }}</div>
+            <div v-else class="panel-tool-pending">执行中…</div>
+          </details>
 
-        <!-- 实时流式思考(SSE thinking_delta):流式中自动展开、结束后折叠,
-             与主对话流思考卡同一套生命周期规则(审查动辄数分钟,不能只看字数跑) -->
-        <details
-          v-for="s in g.streaming"
-          :key="s.conv_id"
-          class="panel-item panel-stream-item"
-          :open="isThinkingExpanded(s)"
-          @toggle="onStreamToggle(s, $event)"
-        >
-          <summary>
-            <span :class="['panel-stream-label', { 'is-verify': s.verify }]">
-              {{ s.verify ? '动态验证' : '思考中' }}{{ s.status === 'streaming' ? '…' : '' }}
-            </span>
-            <span class="panel-row-count">· {{ charCount(s.reasoning || s.content) }} 字</span>
-          </summary>
-          <div
-            class="panel-stream-text"
-            :ref="(el) => setStreamRef(g.round_idx, el)"
-            v-text="streamText(s)"
-          />
-        </details>
+          <!-- 实时流式思考(SSE thinking_delta):流式中自动展开、结束后折叠,
+               与主对话流思考卡同一套生命周期规则(审查动辄数分钟,不能只看字数跑)。
+               插在"它开始时刻已有多少条落库记录"的槽位上,即它自己那批工具之前 -->
+          <details
+            v-else-if="e.kind === 'stream'"
+            class="panel-item panel-stream-item"
+            :open="isThinkingExpanded(e.stream)"
+            @toggle="onStreamToggle(e.stream, $event)"
+          >
+            <summary>
+              <span :class="['panel-stream-label', { 'is-verify': e.stream.verify }]">
+                {{ e.stream.verify ? '动态验证' : '思考中' }}{{ e.stream.status === 'streaming' ? '…' : '' }}
+              </span>
+              <span class="panel-row-count">· {{ charCount(e.stream.reasoning || e.stream.content) }} 字</span>
+            </summary>
+            <div
+              class="panel-stream-text"
+              :ref="(el) => setStreamRef(e.key, el)"
+              v-text="streamText(e.stream)"
+            />
+          </details>
 
-        <!-- 历史思考链(刷新页面后由落库记录接管) -->
-        <details v-for="t in g.thinking" :key="t.id" class="panel-item">
-          <summary>思考链 · {{ charCount(t.reasoning || t.content) }} 字</summary>
-          <div class="markdown-body panel-md" v-html="renderMarkdown(t.reasoning || t.content)" />
-        </details>
+          <!-- 历史思考链(刷新页面后由落库记录接管) -->
+          <details v-else-if="e.kind === 'thinking'" class="panel-item">
+            <summary>思考链 · {{ charCount(e.conv.reasoning || e.conv.content) }} 字</summary>
+            <div class="markdown-body panel-md" v-html="renderMarkdown(e.conv.reasoning || e.conv.content)" />
+          </details>
 
-        <!-- 审查结论(后台审查模式):结论行 + 展开完整审查 -->
-        <details v-for="rv in g.reviews" :key="rv.id" class="panel-item panel-review">
-          <summary>{{ firstLine(rv.content) || '审查结论' }}</summary>
-          <pre class="panel-full-text">{{ rv.reasoning || rv.content }}</pre>
-        </details>
+          <!-- 审查结论(后台审查模式):结论行 + 展开完整审查 -->
+          <details v-else-if="e.kind === 'review'" class="panel-item panel-review">
+            <summary>{{ firstLine(e.conv.content) || '审查结论' }}</summary>
+            <pre class="panel-full-text">{{ e.conv.reasoning || e.conv.content }}</pre>
+          </details>
 
-        <!-- 评估(resume 消息分析):结论行 + 展开完整评估 -->
-        <details v-for="e in g.evaluations" :key="e.id" class="panel-item panel-eval">
-          <summary>{{ evalDigest(e) }}</summary>
-          <pre class="panel-full-text">{{ e.reasoning || e.content }}</pre>
-        </details>
+          <!-- 评估(resume 消息分析):结论行 + 展开完整评估 -->
+          <details v-else-if="e.kind === 'evaluation'" class="panel-item panel-eval">
+            <summary>{{ evalDigest(e.conv) }}</summary>
+            <pre class="panel-full-text">{{ e.conv.reasoning || e.conv.content }}</pre>
+          </details>
 
-        <!-- 最终总结(高亮) -->
-        <div v-for="s in g.summaries" :key="s.id" class="panel-summary">
-          <span class="panel-summary-label">最终结论</span>
-          <div class="markdown-body panel-md" v-html="renderMarkdown(s.content)" />
-        </div>
+          <!-- 最终总结(高亮) -->
+          <div v-else-if="e.kind === 'summary'" class="panel-summary">
+            <span class="panel-summary-label">最终结论</span>
+            <div class="markdown-body panel-md" v-html="renderMarkdown(e.conv.content)" />
+          </div>
 
-        <!-- 未知类型容错(老数据形态) -->
-        <details v-for="o in g.others" :key="o.id" class="panel-item">
-          <summary>{{ o.type }} · {{ truncate(firstLine(o.content), 50) }}</summary>
-          <pre class="panel-full-text">{{ o.content }}</pre>
-        </details>
+          <!-- 未知类型 / 孤儿 tool_result 容错(老数据形态) -->
+          <details v-else class="panel-item">
+            <summary>{{ e.conv.type }} · {{ truncate(firstLine(e.conv.content), 50) }}</summary>
+            <pre class="panel-full-text">{{ e.conv.content }}</pre>
+          </details>
+        </template>
       </div>
     </div>
 

@@ -227,11 +227,17 @@ RoundGroup { roundIdx, segments, planSteps }
 3. **动态验证**(配置了测试环境 URL 时):开关、授权模式切换、登录凭证(脱敏);不出现 verifier_agent 字样。
 4. **检查助手核查**(Agent2Panel,有 agent2 活动时):agent2 的全部过程输出——
    按轮折叠组(进行中轮自动展开),轮组标题为核查摘要文案(如"3 次核查 · 1 条
-   修正指令",不显示轮次数字),轮内含流式思考(SSE thinking_delta,
-   verify 标记显示"动态验证";展开规则与主对话流思考卡同一套生命周期,见 §3.2
-   ——审查动辄数分钟且正文全在 reasoning,折叠着就等于只看得到字数跑)、
-   历史思考链、工具核查(读码/PoC/引用复核,tool_call 与 tool_result 配对为单行摘要+展开)、
-   评估结论、最终总结卡。
+   修正指令",不显示轮次数字),**轮内是一条时序穿插的条目流**(思考 → 它触发的
+   工具 → 下一段思考 …),由 `utils/agent2Timeline.buildAgent2Rounds` 算定:
+   含流式思考(SSE thinking_delta,verify 标记显示"动态验证";展开规则与主对话流
+   思考卡同一套生命周期,见 §3.2 ——审查动辄数分钟且正文全在 reasoning,折叠着就
+   等于只看得到字数跑)、历史思考链、工具核查(读码/PoC/引用复核,tool_call 与
+   tool_result 配对为单行摘要+展开)、评估结论、最终总结卡。
+   条目顺序与主对话流同一口径(落库项 seq=轮内下标×1000,实时卡片
+   seq=insertSeq×1000-500),**不按 type 分桶**——分桶会把整轮思考堆到工具之后、
+   并把实时卡片压在历史思考之上(读起来像倒叙),切断"这段思考引发了哪步核查"的
+   因果链;tool_call/tool_result 配对复用 `buildToolSegments`(按 tool_call_id
+   精确配对,并行调用错开落库也不散位,孤儿 result 走兜底行)。
    标题行右侧状态 badge 取 review_status(检查中 / 检查完成 / 检查失败 /
    检查已终止);**审查中额外提供一个「终止检查」按钮**(POST /tasks/{id}/review/stop,
    `stoppingReview` 置灰防重复点):后端是协作式取消(LLM 流 chunk 边界 / 工具
