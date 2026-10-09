@@ -13,7 +13,7 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 工具分**取证**与**发射**两族:
 
 - **取证工具(当前已实现)**:三类共 6 个可调用函数(其中 `verify` 内部再委派 2 个子工具),见 §1–§3;
-- **发射/输出工具(规划中)**:`submit_finding`(审查结果)/ `submit_knowledge_point`(知识点)/ `submit_dimension` / `submit_suggestion`,属"证据驱动的可信审查"改造拟新增,见 §4。
+- **发射/输出工具(规划中)**:`submit_review_plan`(审查规划,先行且可修订)/ `submit_review_item`(审查项,三态合一)/ `submit_knowledge_point`(知识点)/ `submit_suggestion`,属"证据驱动的可信审查"改造拟新增的**四个发射原语**,见 §4。
 
 下表为**取证工具**(§1–§3):
 
@@ -38,7 +38,7 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 
 **底层实现**:`backend/app/tools/sandbox_tools.py`。同一函数有 `local` / `sandbox` 两条执行路径(本地模式直读文件系统;沙箱模式经 OpenSandbox 容器),对 agent2 透明。
 
-**结果硬兜底**:回灌 LLM 的单个工具结果截断至 `_MAX_TOOL_RESULT_CHARS=3000` 字符(见 [agent2.py L807](../backend/app/agents/agent2.py#L806-L803))。
+**结果硬兜底**:回灌 LLM 的单个工具结果截断至 `_MAX_TOOL_RESULT_CHARS=3000` 字符(定义见 [agent2.py L807](../backend/app/agents/agent2.py#L807),应用见 [L798-802](../backend/app/agents/agent2.py#L798-L802))。
 
 ### 1.1 `read_file`
 - 作用:读取工作区内文件内容,返回带行号(`cat -n` 格式)正文,支持分页——用于逐行核对 agent1 声称的漏洞代码、行号、上下文是否属实。
@@ -140,25 +140,26 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 
 ## 4. 输出/发射工具(证据驱动改造 · 规划中)
 
-> ⚠️ **状态:规划中,尚未落地。** 当前代码里 agent2 仍是"跑完取证循环 → 末尾输出一个大 JSON"(`covered`/`missing`/`reasoning`/`suggestions`/`results`/`grouping`)。本节四个工具是"证据驱动的可信审查"改造(`.trae/documents/证据驱动可信审查实施计划.md` Part C)拟新增的**即时发射原语**——把"末尾一次性大 JSON"拆成"核查到哪、发射到哪",并**把"审查结果"与"知识点"分成两类产物**。设计要点:用工具调用作**发射器**(结构化落库 + 流式),而**不是**把"结论 true/false"做成工具返回值(后者只是模型自证,不增准确性,反而更"看起来权威")。
+> ⚠️ **状态:规划中,尚未落地。** 当前代码里 agent2 仍是"跑完取证循环 → 末尾输出一个大 JSON"(`covered`/`missing`/`reasoning`/`suggestions`/`results`/`grouping`);审查规划也只隐式存在于提示词("自行确定 3-8 个审查维度并在 reasoning 中说明"),不可实时展示、不可机器核对。本节四个工具是"证据驱动的可信审查"改造(`.trae/documents/证据驱动可信审查实施计划.md` Part C)拟新增的**即时发射原语**——把"末尾一次性大 JSON"拆成"规划先行 + 核查到哪、发射到哪",并**把"审查项"与"知识点"分成两类产物**。设计要点:用工具调用作**发射器**(结构化落库 + 流式),而**不是**把"结论 true/false"做成工具返回值(后者只是模型自证,不增准确性,反而更"看起来权威")。
 
-四类发射工具**始终注入**(`run_agent2` 的 `tools`,不依赖 `repo_path`),**不进 sandbox**:主循环识别到即执行落库/记事件,回一句短 `tool_result` 回执,模型据此继续或收尾。**审查完成 = 模型不再发工具**(循环自然退出),不再有末次汇总调用。
+四类发射工具**始终注入**(`run_agent2` 的 `tools`,不依赖 `repo_path`),**不进 sandbox**:主循环识别到即执行落库/记事件,回一句短 `tool_result` 回执,模型据此继续或收尾。**审查完成 = 模型不再发工具**(循环自然退出),不再有末次汇总调用;`submit_review_plan` 在循环开头发出(过程中可全量重发修订),不改变这一退出语义。
 
 | 工具 | 落点实体 | 用途 | 参数(要点) | 次数 |
 |---|---|---|---|---|
-| `submit_finding` | **`AuditFinding`(新表)——审查结果** | 发射一条已核查的风险/质量发现(五段证据链) | `title`/`description` + `evidence{source, analysis_basis, verification}`(各带 `call_ref`)+ `conclusion{verdict, severity, suggestion}` + `dimension_id`;**不含 confidence 数字**(后端派生) | 0..N |
-| `submit_knowledge_point` | **`Result`——知识点** | 发射一条学习提炼(重点/知识点) | `title`/`content` + `learning_note`/`practice_worthy` + `source_finding_id?`(回指派生它的审查结果)/`learning_topic_hint?` | 0..N |
-| `submit_dimension` | 累积进 `task.params._review` | 逐条标注审查维度覆盖情况 | `dim_id` + `status`(covered/missing/partial)+ `note` | 每维度一次(约 3–8) |
+| `submit_review_plan` | **`task.params._review.plan`**(审查计划,不落表) | 规划先行:声明本轮拟核实的审查清单与取证调度;发现新疑点可**全量重发修订** | `items[]`(每条 `target` 拟核实对象 + `origin` 四类来源 + `priority` + `planned_evidence`:`source/verify/reference/none`)+ `note?`(规划理由) | 1 次起,可重发(覆盖式) |
+| `submit_review_item` | **`ReviewItem`(新表)——审查项(三态合一)** | 声明并落定一个审查项:发现风险 / 已核查·剔除误报 / 缺口·待改进 | `review_target`(被核实的 agent1 具体结论/动作)+ `origin`(agent1_claim/agent1_action/user_requirement/domain_baseline)+ `status`(covered/partial/missing)+ `verdict`(confirmed/suspected/false_positive/none/pending)+ `severity?` + `evidence{source,analysis_basis,verification}`(各带 `call_ref`,缺口可省)+ `suggestion?` + `agent1_ref?` + `dimension?`(分组标签);**不含 confidence**(后端派生) | 每项一次(约 3–8) |
+| `submit_knowledge_point` | **`Result`——知识点** | 发射一条学习提炼(重点/知识点) | `title`/`content` + `learning_note`/`practice_worthy` + `source_review_item_id?`(回指派生它的审查项)/`learning_topic_hint?` | 0..N |
 | `submit_suggestion` | 累积进 `task.params._review` | 发射一条"建议追问方向" | `text`(具体可执行,用户点击后作为指令交回 agent1) | 0..3 |
 
-> **审查结果 ≠ 知识点**:`AuditFinding` 回答"代码有没有问题、多可信"(证据链 + 置信度 + 判定),`Result`(知识点)回答"该记住什么"(学习提炼,喂知识点看板/出题);二者用 `source_finding_id` 显式连边,**分型但不割裂,保住"素材同源"**。
+> **审查项 ≠ 知识点**:`ReviewItem` 回答"代码有没有问题、多可信"(三态:风险/已核查/缺口,带证据者附证据链 + 置信度),`Result`(知识点)回答"该记住什么"(学习提炼,喂知识点看板/出题);二者用 `source_review_item_id` 显式连边,**分型但不割裂,保住"素材同源"**。三态由 `status`+`verdict`+是否带 `evidence` 组合判读(风险=verdict∈{confirmed,suspected};已核查/误报=verdict∈{none,false_positive}+covered;缺口=status∈{missing,partial})。
 
 **关键约定**:
-- `submit_finding.evidence.*.call_ref` **必须引用本轮取证工具结果里见过的 `_evidence_ref`**(取证到哪、发射到哪,引用就近);后端核验引用是否真取过证据,取不到自动降置信并标 `evidence_mismatch`。
-- 模型**不产出置信度数字**;`conclusion.verdict`(confirmed/suspected/false_positive/pending)才是它的定性判断,置信度由后端 `app/agents/evidence.py` 从"证据完整度 + 校验结果"派生(verified / source_confirmed / reference_corroborated / assertion_only)。
-- **即时落库 + 实时事件**:每条 `submit_finding` 落 `AuditFinding` 并推 `audit_finding_add`;每条 `submit_knowledge_point` 落 `Result` 并推 `knowledge_point_add`(侧栏两区各自逐条增长,不再等 `review_done` 一次性出现);本轮首条各自按"同轮重跑幂等"清理本轮旧数据。
-- `covered`/`missing` 由逐条 `submit_dimension` 累积;聚合审查结论(维度 + 置信分布 + 总体判定)在循环退出时写 `task.params._review`;`grouping` 由后端按 `AuditFinding.severity` 派生(无 severity → 平铺)。
-- **兜底**:不支持结构化工具发射的模型,沿用 `extract_text_tool_calls` 文本兜底解析四个 `submit_*`;整轮一个都没解析出来时回退旧"末尾大 JSON"解析(仍分流落 `AuditFinding`/`Result` + 逐条派生置信)。
+- **审查规划先行**:agent2 先调 `submit_review_plan` 结构化发出审查清单(据 **agent1 执行过程 + 结果 + 用户输入 + 领域基线**,`priority`/`planned_evidence` 显式调度取证预算——四个只读工具共享的 12 次额度不够"每项深查"时,按优先级取舍而非默默跳过),再**逐项核实并发射**;计划**不是围栏**,允许发射计划外审查项,过程中发现新疑点可全量重发修订计划。`origin` **必须含 `user_requirement`/`domain_baseline` 类条目**,否则会漏掉 agent1 没碰的领域;维度退化为分组标签,清单不再有"发现/覆盖"两套归属的分叉。
+- `evidence.*.call_ref` **必须引用本轮取证工具结果里见过的 `_evidence_ref`**(核查到哪、发射到哪,引用就近);后端核验引用是否真取过证据,取不到自动降置信并标 `evidence_mismatch`。
+- 模型**不产出置信度数字**;`verdict` 才是它的定性判断,置信度由后端 `app/agents/evidence.py` 从"证据完整度 + 校验结果"派生(verified / source_confirmed / reference_corroborated / assertion_only);缺口项无证据则不写置信。
+- **即时落库 + 实时事件**:每次 `submit_review_plan` 覆盖计划并推 `review_plan_update`(侧栏计划卡逐条打勾);每条 `submit_review_item` 落 `ReviewItem` 并推 `review_item_add`;每条 `submit_knowledge_point` 落 `Result` 并推 `knowledge_point_add`(侧栏两区各自逐条增长,不再等 `review_done` 一次性出现);本轮首条各自按"同轮重跑幂等"清理本轮旧数据。
+- 循环退出时后端先做**规划对账**(计划内未匹配到发射审查项的条目,回填为 `status=missing` 的 ReviewItem——对"确认偏误"的机器级兜底),再聚合写 `task.params._review`(三态计数 + 置信分布 + `plan` 对账计数 planned/executed/backfilled_gap + 总体判定,清单本身即 `review_items` 行);`grouping` 由后端按 `ReviewItem.severity` 派生(无 severity → 平铺)。
+- **兜底**:不支持结构化工具发射的模型,沿用 `extract_text_tool_calls` 文本兜底解析四个 `submit_*`;整轮一个都没解析出来时回退旧"末尾大 JSON"解析(仍分流落 `ReviewItem`/`Result` + 逐条派生置信;旧路径无结构化计划,前端不显示计划卡)。
 
 > 与 §1–§3 取证工具的配合关系:§1–§3 产生**证据**,§4 把证据**绑定到审查结论并即时输出**——这正是"证据驱动的可信审查"对"谁来审查审查者"的回答:每条审查结论挂可复核的证据指针,置信度由证据派生而非模型自评。
 
@@ -166,7 +167,7 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 
 ## 5. 工具调用循环与协作式终止
 
-- agent2 采用**自定义内联推理循环**(非内置 ReAct 引擎):同一 `while` 里处理只读 / verify / check_reference 三类工具调用,结果回灌后再调 LLM,直到无工具调用 → 输出结构化 JSON 评估。**改造后**(§4):取证工具与 `submit_*` 发射工具交错,核查到哪、发射到哪;循环自然退出即审查完成,不再输出末尾大 JSON。
+- agent2 采用**自定义内联推理循环**(非内置 ReAct 引擎):同一 `while` 里处理只读 / verify / check_reference 三类工具调用,结果回灌后再调 LLM,直到无工具调用 → 输出结构化 JSON 评估。**改造后**(§4):规划先行(`submit_review_plan`)后取证工具与 `submit_*` 发射工具交错,核查到哪、发射到哪;循环自然退出即审查完成,不再输出末尾大 JSON。
 - **Hermes 文本 tool_call 兜底**:部分模型(GLM/Qwen 思考模式)把工具调用写进正文而非结构化通道;循环用 `extract_text_tool_calls()` 兜底解析,再 `strip_tool_call_blocks()` 剥离,避免被误当最终 JSON 解析。
 - **协作式终止("终止检查")**:在检查点(LLM 流 chunk 边界 / 工具循环边界 / 每次工具执行之间)命中 `stop_check()` 即退出,返回 `stopped=true`,orchestrator 标 `review_status=stopped`、保留 agent1 临时结果。
 - 思考链逐次落库(`_record_agent2_thinking`),工具调用/结果按 `tool_call_id` 配对落库,侧栏据 `role=agent2` 分流展示。
@@ -181,4 +182,4 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 - 面向用户的直接对话(其产出经侧栏 `Agent2Panel` 呈现,不进主对话流);
 - 任意出网抓取(仅 `check_reference` 复核 agent1 明确引用的链接,且受 SSRF 约束)。
 
-> 与"证据驱动的可信审查"改造的关系见 `.trae/documents/证据驱动可信审查实施计划.md`:§1–§3 取证工具是**证据来源**;改造新增的 §4 发射工具(`submit_finding`/`submit_dimension`/`submit_suggestion`)把每条审查结论与产生它的**具体工具调用**绑定,并据此派生置信度、即时落库推流。
+> 与"证据驱动的可信审查"改造的关系见 `.trae/documents/证据驱动可信审查实施计划.md`:§1–§3 取证工具是**证据来源**;改造新增的 §4 发射工具(`submit_review_plan`/`submit_review_item`/`submit_knowledge_point`/`submit_suggestion`)先规划、再绑定证据即时输出,退出时做规划对账并派生置信度、落库推流。
