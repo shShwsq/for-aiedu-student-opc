@@ -3096,7 +3096,7 @@ function toggleResult(id: string): void {
       :class="{ 'detail-sidebar-resizing': detailSidebarResizing }"
       :style="detailSidebarStyle"
     >
-      <!-- 桌面态左缘调宽手柄(窄屏覆盖抽屉态隐藏):悬停染主色提示可拖;
+      <!-- 桌面态左缘调宽手柄(窄屏覆盖抽屉态隐藏):悬停染主色提示可拖,同时把侧栏左缘淡线拉回实心作为瞄准参考;
            可聚焦 separator 按 WAI-ARIA Window Splitter 暴露取值范围,双击复位由
            useResizableSidebar 在 pointerup 里自行判定(不依赖原生 dblclick) -->
       <div
@@ -3520,16 +3520,32 @@ function toggleResult(id: string): void {
   /* 宽度由 useResizableSidebar 内联下发(拖拽 + localStorage 记忆);
      窄屏走下面的 @media 覆盖抽屉态 */
   min-width: 320px;
-  /* 与左侧历史任务栏对称的分隔线:主区与侧栏同底色,不画线看不出边界 */
-  border-left: 1px solid var(--color-border);
+  /* 分隔线常态压到 20% 透明度:主区与侧栏同底色,静置时保持极简;
+     悬浮左缘手柄 / 键盘聚焦 / 拖拽中才回落到 --color-border 实心,
+     作为"这里是可拖边界"的瞄准提示(抽屉态在下面的 @media 里彻底抹掉) */
+  border-left: 1px solid color-mix(in srgb, var(--color-border) 20%, transparent);
+  transition: border-left-color var(--transition-fast);
   height: 100%;
   display: flex;
   flex-direction: column;
   background: var(--color-bg);
 }
 
-/* 左缘调宽手柄:常态只占位透明(分隔线已交代边界),悬停/聚焦染主色提示"这里可拖"。
-   left:-3px 让热区压住分隔线两侧,不必像素级对准 */
+/* 手柄 hover / focus-visible / active 或整栏拖宽态,把边界线还原成实心。
+   :has() 与本仓已广泛使用的 color-mix 同属现代 CSS 基线,不需回退;
+   detail-sidebar-resizing 是 JS 侧标记,保证 pointerdown 起手瞬间线就在,
+   避免拖拽过程中"参考线消失"这种比常态更糟的观感 */
+.detail-sidebar:has(.detail-resize-handle:hover),
+.detail-sidebar:has(.detail-resize-handle:focus-visible),
+.detail-sidebar:has(.detail-resize-handle:active),
+.detail-sidebar.detail-sidebar-resizing {
+  border-left-color: var(--color-border);
+}
+
+/* 左缘调宽手柄:常态透明占位(边界线只在旁边淡淡交代),悬停/聚焦时同时干两件事——
+   1) 自身染 --color-primary-light 提示"这里可拖";
+   2) 通过上面的 .detail-sidebar:has(.detail-resize-handle:hover) 把左缘淡线拉回实心,
+   形成瞄准用的参考线。left:-3px 让热区压住分隔线两侧,不必像素级对准 */
 .detail-resize-handle {
   position: absolute;
   top: 0;
@@ -3642,6 +3658,9 @@ function toggleResult(id: string): void {
     z-index: 20;
     width: min(420px, 85vw);
     box-shadow: var(--shadow-xl);
+    /* 抽屉盖在主区上,shadow-xl 已交代层级,左缘分隔线在窄屏是多余装饰,
+       连同常态 20% 淡线一起抹掉,让抽屉边缘更干净 */
+    border-left-color: transparent;
   }
 
   /* 抽屉态宽度归 CSS,拖宽没有意义(断点须与 useResizableSidebar 的 narrowMax 一致) */
