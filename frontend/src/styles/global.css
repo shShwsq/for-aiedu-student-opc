@@ -31,6 +31,25 @@ body {
   min-height: 100dvh;
 }
 
+/* ---- 侧栏拖拽调宽期间的全局态(useResizableSidebar 挂载 / 摘除) ----
+   右栏往左拖时指针会移进主区:body 类禁掉全页选中,遮罩接管指针 + 锁住光标,
+   顺带防住正文被选蓝、CodeMirror / iframe 抢走 pointermove。 */
+body.is-resizing-sidebar {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.sidebar-resize-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  cursor: col-resize;
+  user-select: none;
+  touch-action: none;
+  background: transparent;
+}
+
+
 /* ---- 链接 ---- */
 a {
   color: var(--color-primary);

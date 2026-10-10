@@ -262,14 +262,25 @@ RoundGroup { roundIdx, segments, planSteps }
 - **常显边界**:`.detail-sidebar` 补 `border-left`(与左侧历史任务栏对称);
 - **悬停可拖暗示**:左缘 6px 透明热区(`left:-3px`,压住分隔线两侧),
   hover / focus-visible 染 `--color-primary-light`,`cursor: col-resize`;
-- **交互**:按住拖手柄往左 = 变宽(栏停靠右缘,方向取反);双击复位 420px;
-  键盘 ← / → 微调 24px,Home 复位(`role="separator"` 无障碍语义);
+- **交互**:按住拖手柄往左 = 变宽(栏停靠右缘,方向取反);双击复位 420px ——
+  **不靠原生 `dblclick`**(手柄 `pointerdown` 里 `preventDefault` 后,部分浏览器不再补发
+  click/dblclick),改由 composable 在 `pointerup` 用「按下没移动 + 距上次点击 < 300ms」判定;
+  键盘 ← / → 微调 24px,Home 复位;
+- **无障碍**:手柄是可聚焦 `role="separator"`(WAI-ARIA Window Splitter),暴露
+  `aria-valuenow / aria-valuemin / aria-valuemax`(valuemax 用当前视口下的**实际上限**,
+  不是静态 max,免得把读屏用户引去拖到钳位外);
+- **拖拽期间的全局态**:composable 给 `document.body` 挂 `is-resizing-sidebar` 类
+  (`user-select:none`)+ 追加一层全屏透明遮罩 `.sidebar-resize-overlay`(`cursor:col-resize`)
+  —— 右栏往左拖时指针会移进主对话流,只禁侧栏会在主区把正文选蓝、光标也会断,遮罩顺带
+  挡掉源码查阅栏里 CodeMirror 抢指针;松手 / 卸载即撤;
 - **约束**:`min 320 / max 640`,并再按 `50vw` 收一道上限 —— 右栏每变宽 1px
-  都是从主对话流身上扣的;视口变窄时按新上限重钳,不保留顶破上限的宽度;
+  都是从主对话流身上扣的;视口变窄时按新上限重钳,不保留顶破上限的宽度(不写盘,
+  刷新从存档还原,故只丢本次会话的手感);
 - **窄屏**:≤1024px 侧栏改为覆盖式抽屉(§5 顶部那条 @media),宽度归 CSS,
   手柄隐藏不响应拖拽 —— 断点取值必须与 `useResizableSidebar({ narrowMax: 1024 })` 一致;
 - **记忆**:松手时写 `localStorage` 键 `secondlook:sidebar-width:task-detail:{email}`
-  (拖拽过程中不写);用户未就位时读写都跳过。
+  (拖拽过程中不写);用户未就位时读写都跳过(路由守卫已 `await fetchMe`,进入本受保护页时
+  `auth.user` 必已就位,故挂载即生效)。
 
 实现集中在 `frontend/src/composables/useResizableSidebar.ts`(指针跟手 / 钳位 /
 窄屏判定 / 可选持久化),`PracticeCodeSidebar`(做题页源码查阅栏,默认 760px、

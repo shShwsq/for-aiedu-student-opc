@@ -127,6 +127,7 @@ function dispatchPointer(type: string, clientX = 0): void {
 }
 
 beforeEach(() => {
+  vi.useRealTimers()
   localStorage.clear()
   vi.restoreAllMocks()
   setViewport(1440)
@@ -216,6 +217,115 @@ describe('useResizableSidebar 拖拽', () => {
     unmount()
     dispatchPointer('pointermove', 500)
     expect(result.width.value).toBe(420)
+  })
+})
+
+describe('useResizableSidebar 双击复位(不靠原生 dblclick)', () => {
+  it('两次"按下没移动"的点击间隔够近 → 复位默认宽度', () => {
+    vi.useFakeTimers()
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({ min: 320, max: 640, defaultWidth: 420, narrowMax: 1024 }),
+    )
+    // 先拖宽
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointermove', 900)
+    dispatchPointer('pointerup')
+    expect(result.width.value).toBe(520)
+
+    // 第一次点击(按下即抬,不移动)
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointerup')
+    expect(result.width.value).toBe(520) // 单击不复位
+
+    // 100ms 内第二次点击 → 判定双击,复位
+    vi.advanceTimersByTime(100)
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointerup')
+    expect(result.width.value).toBe(420)
+    unmount()
+  })
+
+  it('间隔过久的两次点击不复位', () => {
+    vi.useFakeTimers()
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({ min: 320, max: 640, defaultWidth: 420, narrowMax: 1024 }),
+    )
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointermove', 900)
+    dispatchPointer('pointerup')
+    expect(result.width.value).toBe(520)
+
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointerup')
+    vi.advanceTimersByTime(1000) // 超过 300ms 间隔
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointerup')
+    expect(result.width.value).toBe(520) // 不算双击
+    unmount()
+  })
+
+  it('真拖拽(移动超容差)不计为点击,不会误触发复位', () => {
+    vi.useFakeTimers()
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({ min: 320, max: 640, defaultWidth: 420, narrowMax: 1024 }),
+    )
+    // 连来两次快速"拖拽"(非点击):第二次不得复位
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointermove', 900)
+    dispatchPointer('pointerup')
+    vi.advanceTimersByTime(50)
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointermove', 950)
+    dispatchPointer('pointerup')
+    // 起点宽 520,dx=50 → 570(而非复位到默认 420)
+    expect(result.width.value).toBe(570)
+    unmount()
+  })
+})
+
+describe('useResizableSidebar 拖拽期间的全局态', () => {
+  it('startResize 挂 body 类 + 全屏遮罩,pointerup 撤干净', () => {
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({ min: 320, max: 640, defaultWidth: 420, narrowMax: 1024 }),
+    )
+    result.startResize(pointer('pointerdown', 1000))
+    expect(document.body.classList.contains('is-resizing-sidebar')).toBe(true)
+    expect(document.querySelector('.sidebar-resize-overlay')).not.toBeNull()
+
+    dispatchPointer('pointerup')
+    expect(document.body.classList.contains('is-resizing-sidebar')).toBe(false)
+    expect(document.querySelector('.sidebar-resize-overlay')).toBeNull()
+    unmount()
+  })
+
+  it('拖拽中途卸载也要撤掉全局态(不留悬空遮罩)', () => {
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({ min: 320, max: 640, defaultWidth: 420, narrowMax: 1024 }),
+    )
+    result.startResize(pointer('pointerdown', 1000))
+    unmount()
+    expect(document.body.classList.contains('is-resizing-sidebar')).toBe(false)
+    expect(document.querySelector('.sidebar-resize-overlay')).toBeNull()
+  })
+})
+
+describe('useResizableSidebar 无障碍取值', () => {
+  it('ariaValueNow 跟随宽度,min 固定,max 按视口比例上限收', () => {
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({
+        min: 320, max: 640, defaultWidth: 420, narrowMax: 1024, maxViewportRatio: 0.5,
+      }),
+    )
+    expect(result.ariaValueNow.value).toBe(420)
+    expect(result.ariaValueMin.value).toBe(320)
+    // 1440 视口 × 0.5 = 720 > max → 取静态 max 640
+    expect(result.ariaValueMax.value).toBe(640)
+
+    // 视口缩到 1000(>1024? 否,仍宽屏外)→ 用 1100:上限 550
+    setViewport(1100)
+    window.dispatchEvent(new Event('resize'))
+    expect(result.ariaValueMax.value).toBe(550)
+    unmount()
   })
 })
 

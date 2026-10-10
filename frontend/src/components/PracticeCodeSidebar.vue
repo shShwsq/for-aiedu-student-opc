@@ -64,8 +64,10 @@ const {
   /** 窄屏(<=640px):栏内回退为纵向堆叠,宽度交给 CSS,不应用内联宽度 */
   isNarrow,
   inlineWidth: sidebarStyle,
+  ariaValueNow: sidebarWidthNow,
+  ariaValueMin: sidebarWidthMin,
+  ariaValueMax: sidebarWidthMax,
   startResize: onResizeStart,
-  resetWidth: resetSidebarWidth,
   onResizeKeydown,
 } = useResizableSidebar({
   min: MIN_WIDTH,
@@ -494,17 +496,19 @@ watch(
     :style="sidebarStyle"
     aria-label="源码查阅"
   >
-    <!-- 桌面态左缘拖拽调宽手柄(窄屏隐藏) -->
+    <!-- 桌面态左缘拖拽调宽手柄(窄屏隐藏);双击复位由 composable 在 pointerup 判定 -->
     <div
       v-if="!isNarrow"
       class="cs-resize-handle"
       role="separator"
       aria-orientation="vertical"
+      :aria-valuenow="sidebarWidthNow"
+      :aria-valuemin="sidebarWidthMin"
+      :aria-valuemax="sidebarWidthMax"
       aria-label="调整源码查阅栏宽度"
       tabindex="0"
       title="拖动调整宽度,双击复位"
       @pointerdown="onResizeStart"
-      @dblclick="resetSidebarWidth"
       @keydown="onResizeKeydown"
     />
 

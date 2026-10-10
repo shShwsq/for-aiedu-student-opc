@@ -133,8 +133,10 @@ const {
   inlineWidth: detailSidebarStyle,
   resizing: detailSidebarResizing,
   isNarrow: detailSidebarNarrow,
+  ariaValueNow: detailSidebarWidth,
+  ariaValueMin: detailSidebarMin,
+  ariaValueMax: detailSidebarMax,
   startResize: onDetailResizeStart,
-  resetWidth: resetDetailSidebarWidth,
   onResizeKeydown: onDetailResizeKeydown,
 } = useResizableSidebar({
   min: 320,
@@ -3094,17 +3096,21 @@ function toggleResult(id: string): void {
       :class="{ 'detail-sidebar-resizing': detailSidebarResizing }"
       :style="detailSidebarStyle"
     >
-      <!-- 桌面态左缘调宽手柄(窄屏覆盖抽屉态隐藏):悬停染主色提示可拖 -->
+      <!-- 桌面态左缘调宽手柄(窄屏覆盖抽屉态隐藏):悬停染主色提示可拖;
+           可聚焦 separator 按 WAI-ARIA Window Splitter 暴露取值范围,双击复位由
+           useResizableSidebar 在 pointerup 里自行判定(不依赖原生 dblclick) -->
       <div
         v-if="!detailSidebarNarrow"
         class="detail-resize-handle"
         role="separator"
         aria-orientation="vertical"
+        :aria-valuenow="detailSidebarWidth"
+        :aria-valuemin="detailSidebarMin"
+        :aria-valuemax="detailSidebarMax"
         aria-label="调整核查与结果侧栏宽度"
         tabindex="0"
         title="拖动调整宽度,双击复位"
         @pointerdown="onDetailResizeStart"
-        @dblclick="resetDetailSidebarWidth"
         @keydown="onDetailResizeKeydown"
       />
       <div class="detail-sidebar-header">
