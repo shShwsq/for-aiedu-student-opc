@@ -117,7 +117,7 @@ const followBottom = ref(true)
 /** 工作区侧栏是否折叠(默认折叠,完全隐藏) */
 const workspaceCollapsed = ref(true)
 
-/** 任务详情侧栏是否折叠(右侧栏,默认展开;折叠时完全隐藏,主区聚焦对话) */
+/** 核查与结果侧栏是否折叠(右侧栏,默认展开;折叠时完全隐藏,主区聚焦对话) */
 const detailCollapsed = ref(false)
 
 function toggleWorkspace(): void {
@@ -3061,10 +3061,10 @@ function toggleResult(id: string): void {
       </div>
     </main>
 
-    <!-- 右侧:任务详情侧栏(抽屉把手式;展开时顶部条带标题+折叠按钮,折叠时悬浮把手在 page-body 右上角) -->
+    <!-- 右侧:核查与结果侧栏(抽屉把手式;展开时顶部条带标题+折叠按钮,折叠时悬浮把手在 page-body 右上角) -->
     <aside v-if="task && !detailCollapsed" class="detail-sidebar">
       <div class="detail-sidebar-header">
-        <span class="detail-sidebar-title">任务详情</span>
+        <span class="detail-sidebar-title">核查与结果</span>
         <!-- 状态徽标 + 下载/打印:自任务概览区块顶部迁入,排在折叠按钮左侧
              完成时间不再单列,改为悬浮徽标时以 title 展示 -->
         <span
@@ -3105,13 +3105,13 @@ function toggleResult(id: string): void {
         <WorkspaceToggleButton
           side="right"
           :collapsed="false"
-          expand-title="展开任务详情"
-          collapse-title="折叠任务详情"
+          expand-title="展开核查与结果"
+          collapse-title="折叠核查与结果"
           @toggle="toggleDetail"
         />
       </div>
       <div class="detail-sidebar-body">
-        <!-- 任务详情概览(精简后仅保留运行期实时阶段与错误提示):
+        <!-- 侧栏概览(精简后仅保留运行期实时阶段与错误提示):
              场景/创建时间/完成时间已移除——场景降级为模板无展示价值,
              创建时间主区标题行已有,完成时间改悬浮"已完成"徽章查看。
              当前阶段是运行/暂停态唯一的实时进度文案,故仅活跃期保留;
@@ -3375,8 +3375,8 @@ function toggleResult(id: string): void {
       <WorkspaceToggleButton
         side="right"
         :collapsed="true"
-        expand-title="展开任务详情"
-        collapse-title="折叠任务详情"
+        expand-title="展开核查与结果"
+        collapse-title="折叠核查与结果"
         @toggle="toggleDetail"
       />
       <span v-if="task.results.length > 0" class="detail-handle-badge">
@@ -3463,7 +3463,7 @@ function toggleResult(id: string): void {
   max-width: 80%;
 }
 
-/* ---- 右侧任务详情栏(抽屉把手式;展开时顶部条+滚动内容区,折叠时不渲染) ---- */
+/* ---- 右侧核查与结果栏(抽屉把手式;展开时顶部条+滚动内容区,折叠时不渲染) ---- */
 .detail-sidebar {
   flex-shrink: 0;
   width: clamp(320px, 28vw, 420px);
@@ -3595,7 +3595,7 @@ function toggleResult(id: string): void {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ---- 任务详情概览(扁平化) ---- */
+/* ---- 侧栏概览(扁平化) ---- */
 .overview-section {
   padding: var(--space-2) 0;
 }

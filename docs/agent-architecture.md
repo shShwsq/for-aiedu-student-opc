@@ -55,7 +55,7 @@
 
 | 角色 | 职责 | 是否调工具 | 模型来源 |
 |------|------|-----------|---------|
-| **agent2(检查助手)** | **幕后质检 + 学习点提炼**:核查 agent1 的产出(读真实源码核实/PoC/引用复核),审查完成时提炼重点与知识点(results,3-8 条精选,含 learning_note),确属缺失且无法自查的方向给建议追问(suggestions,用户点击后触发 resume);核查过程与知识点经任务详情侧栏呈现,不进主对话流 | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=12`);可选经 verifier_agent 生成 PoC 验证(单轮上限 `MAX_VERIFY_CALLS=3`);引用复核 `check_reference`(后端安全抓取,单轮上限 `MAX_REFERENCE_CALLS=3`,`allow_reference_check` 默认开) | `task.llm_config_id` |
+| **agent2(检查助手)** | **幕后质检 + 学习点提炼**:核查 agent1 的产出(读真实源码核实/PoC/引用复核),审查完成时提炼重点与知识点(results,3-8 条精选,含 learning_note),确属缺失且无法自查的方向给建议追问(suggestions,用户点击后触发 resume);核查过程与知识点经核查与结果侧栏呈现,不进主对话流 | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=12`);可选经 verifier_agent 生成 PoC 验证(单轮上限 `MAX_VERIFY_CALLS=3`);引用复核 `check_reference`(后端安全抓取,单轮上限 `MAX_REFERENCE_CALLS=3`,`allow_reference_check` 默认开) | `task.llm_config_id` |
 | **内置 react_agent(agent1)** | ReAct 循环执行代码分析(clone / search / read / semgrep 等) | 是,调用沙箱工具 | `task.react_llm_config_id`(空时回退 `llm_config_id`) |
 | **ExternalCLIAgent(agent1)** | 沙箱内启动外部 CLI,通过 ACP 协议通信 | 是,由 CLI 自主调工具 | CLI 自管(凭证经环境变量注入) |
 | **verifier_agent**(实验性) | 在沙箱里跑 PoC / HTTP 请求动态验证 agent1 的发现 | 是,独立工具集(`http_request` + `run_python_code`) | `task.llm_config_id`(复用 agent2 的 LLMClient) |
@@ -95,7 +95,7 @@
 
 ### 2.1 核心特征
 
-- **幕后质检定位**:agent1 是面向用户的台前回答者(其每轮 summary 即主界面用户看到的回答);agent2 的核查过程与知识点经任务详情侧栏(Agent2Panel)呈现,主对话流只显示用户与 agent1 的对话。"敢不敢上线"不再是硬性产出,仅当用户意图涉及上线/采用决策时在 reasoning 附判断
+- **幕后质检定位**:agent1 是面向用户的台前回答者(其每轮 summary 即主界面用户看到的回答);agent2 的核查过程与知识点经核查与结果侧栏(Agent2Panel)呈现,主对话流只显示用户与 agent1 的对话。"敢不敢上线"不再是硬性产出,仅当用户意图涉及上线/采用决策时在 reasoning 附判断
 - **职责顺序(核查优先、建议追问兜底)**:①核实发现(只读工具读真实源码核对,单轮上限 `MAX_READ_TOOL_CALLS=12`)→ ②动态 PoC 验证(经 verifier_agent,单轮上限 `MAX_VERIFY_CALLS=3`,需测试环境)→ ③引用复核(`check_reference`,单轮上限 `MAX_REFERENCE_CALLS=3`)→ ④提炼重点与知识点 → ⑤(兜底)建议追问方向;凡能自查的绝不建议
 - **两类产物、即时发射(证据驱动可信审查)**:核查过程不再"末尾一次性大 JSON",而是用四个发射工具即时结构化落库——`submit_review_plan`(审查计划)、`submit_review_item`(**审查项**,落 `ReviewItem` 表,三态合一:发现风险 / 已核查·剔除误报 / 缺口·待改进)、`submit_knowledge_point`(**知识点**,落 `Result` 表,含 `learning_note`/`practice_worthy`/`source_review_item_id` 回指派生审查项)、`submit_suggestion`(建议追问)。**审查项回答"代码有没有问题、多可信",知识点回答"该记住什么"**,分型但同源。审查项带证据者由后端 `app/agents/evidence.py` 核验证据引用(`evidence.*.call_ref` 指向本轮 `_evidence_ref` 台账)后**派生置信度**(verified/source_confirmed/reference_corroborated/assertion_only),**模型不自报 confidence**。不支持结构发射的模型回退旧"末尾大 JSON"路径(covered/missing/reasoning/suggestions/results/grouping),整轮无解析才判失败
 - **题目与知识点生成**:任务完成后由 orchestrator 调用 practice 服务(实现位于 `app/services/practice/`)生成练习题与知识点,选题优先覆盖 practice_worthy 标记的知识点
