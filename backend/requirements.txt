@@ -6,7 +6,11 @@ sqlalchemy>=2.0.35
 alembic>=1.13.3
 # 用 psycopg3 替代 psycopg2-binary,纯 Python 无需 pg_config,Python 3.14 兼容
 psycopg[binary]>=3.2.0
-pydantic>=2.9.2
+# pydantic 锁死到本地/测试实测的 2.13.5(对应 pydantic-core 2.46.5):
+# 用 >= 时 pip 层缓存一失效就解析到当天最新版,部署依赖集会跟本地跑测试的不一致
+# (镜像站缺 .whl.metadata 导致的 404 不归这里管,由 deploy/Dockerfile.backend 的备源重试兜底)
+pydantic==2.13.5
+pydantic-core==2.46.5
 pydantic-settings>=2.5.2
 python-dotenv>=1.0.1
 # 阶段 6:认证授权

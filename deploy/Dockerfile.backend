@@ -13,9 +13,18 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
 WORKDIR /app/backend
 
 # 先装依赖,利用 Docker 层缓存(requirements.txt 不变时不会重装)
-# 同样走阿里云 PyPI 镜像,避免 pypi.org 直连超时
+# 依赖下载走国内镜像源(下方 PIP_INDEX_URL),直连 pypi.org 易超时
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+# 镜像源开成构建参数:ARG 声明在 COPY 之后,覆盖它只失效 pip 这一层。
+# 主源失败自动用备用源重试:阿里云会把 PyPI 的 simple 页原样同步(含 data-core-metadata
+# 声明),但 pydantic-core 等包的 .whl.metadata 侧车文件(PEP 658)没同步下来 —— pip 23.1+
+# 先取 metadata 面,404 直接报错且不回落整包(见 pip/_internal/operations/prepare.py,
+# 该下载无 try/except)。清华源不把该属性写进 HTML,pip 就会下整包,因此做备源。
+# 临时手工覆盖:docker compose build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple backend
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_INDEX_FALLBACK=https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip install --no-cache-dir --retries 3 --timeout 60 -r requirements.txt -i ${PIP_INDEX_URL} \
+    || pip install --no-cache-dir --retries 3 --timeout 60 -r requirements.txt -i ${PIP_INDEX_FALLBACK}
 
 COPY backend/ .
 

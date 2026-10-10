@@ -11,6 +11,11 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+      args:
+        # PyPI 镜像源,默认阿里云;主源某个包没同步全时自动挑备源重试
+        # (.env.production 里写 PIP_INDEX_URL / PIP_INDEX_FALLBACK=...,或 compose build --build-arg)
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_INDEX_FALLBACK: ${PIP_INDEX_FALLBACK:-https://pypi.tuna.tsinghua.edu.cn/simple}
     image: secondlook-backend:latest
     env_file:
       - .env.production
