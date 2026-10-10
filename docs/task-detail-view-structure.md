@@ -19,7 +19,9 @@
 ```
 
 - **左侧 WorkspaceSidebar**:历史任务列表,支持删除/重命名;折叠时完全隐藏,由顶栏按钮切换。
-- **右侧 detail-sidebar**:宽度 `clamp(320px, 28vw, 420px)`,默认展开,折叠后退化为右上角悬浮把手(有结果时显示数量角标)。详见 §5。
+- **右侧 detail-sidebar**:默认宽度 420px,可经左缘手柄拖拽调整(320px ~ min(640px, 50vw)),
+  按「用户 email + 栏位」记忆到 localStorage;默认展开,折叠后退化为右上角悬浮把手
+  (有结果时显示数量角标)。详见 §5。
 
 ## 2. 主区 main 纵向结构
 
@@ -252,6 +254,26 @@ RoundGroup { roundIdx, segments, planSteps }
    就是最终结果,不再等知识点替换;failed 不在这里另开提示,标题行 badge「检查失败」已说明)。
 
 > 历史说明:覆盖度看板(task.checklist 驱动的维度卡片网格)已随覆盖度清单功能移除。
+
+### 5.3 左缘调宽手柄(detail-resize-handle)
+
+侧栏与主区同底色,原先没有分隔线也看不出边界,故:
+
+- **常显边界**:`.detail-sidebar` 补 `border-left`(与左侧历史任务栏对称);
+- **悬停可拖暗示**:左缘 6px 透明热区(`left:-3px`,压住分隔线两侧),
+  hover / focus-visible 染 `--color-primary-light`,`cursor: col-resize`;
+- **交互**:按住拖手柄往左 = 变宽(栏停靠右缘,方向取反);双击复位 420px;
+  键盘 ← / → 微调 24px,Home 复位(`role="separator"` 无障碍语义);
+- **约束**:`min 320 / max 640`,并再按 `50vw` 收一道上限 —— 右栏每变宽 1px
+  都是从主对话流身上扣的;视口变窄时按新上限重钳,不保留顶破上限的宽度;
+- **窄屏**:≤1024px 侧栏改为覆盖式抽屉(§5 顶部那条 @media),宽度归 CSS,
+  手柄隐藏不响应拖拽 —— 断点取值必须与 `useResizableSidebar({ narrowMax: 1024 })` 一致;
+- **记忆**:松手时写 `localStorage` 键 `secondlook:sidebar-width:task-detail:{email}`
+  (拖拽过程中不写);用户未就位时读写都跳过。
+
+实现集中在 `frontend/src/composables/useResizableSidebar.ts`(指针跟手 / 钳位 /
+窄屏判定 / 可选持久化),`PracticeCodeSidebar`(做题页源码查阅栏,默认 760px、
+断点 640px、**不持久化**)复用同一套,两处不再各写一份拖拽代码。
 
 ## 6. 全局弹窗
 

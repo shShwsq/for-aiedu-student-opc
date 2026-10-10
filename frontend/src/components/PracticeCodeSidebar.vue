@@ -17,7 +17,7 @@
  * 定位:父组件传入 locateFile/locateLine(来自当前题的 source_file/source_lines),
  * 变化时自动展开对应目录、打开文件并滚动高亮。
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 
 import FileBinaryCard from './FileBinaryCard.vue'
 import FileContentViewer from './FileContentViewer.vue'
@@ -29,6 +29,7 @@ import {
   readWorkspaceFile,
 } from '@/api/workspace'
 import { useFileDownload } from '@/composables/useFileDownload'
+import { useResizableSidebar } from '@/composables/useResizableSidebar'
 import { useWorkspaceRestore } from '@/composables/useWorkspaceRestore'
 import { extractErrorMessage } from '@/utils/error'
 import { isLikelyBinaryPath } from '@/utils/fileKind'
@@ -52,54 +53,26 @@ const emit = defineEmits<{
 
 // ============================================================
 // 栏宽:横向分栏需足够宽度,左缘拖拽调宽(窄屏改为覆盖抽屉,不启用)
+// 指针跟手 / 钳位 / 窄屏判定交给 useResizableSidebar(与任务详情右侧栏共用一套);
+// 这里不持久化 —— 每次进入按默认宽度起算
 // ============================================================
 const MIN_WIDTH = 480
 const MAX_WIDTH = 1200
 const DEFAULT_WIDTH = 760
-const sidebarWidth = ref(DEFAULT_WIDTH)
-const resizing = ref(false)
-/** 窄屏(<=640px):栏内回退为纵向堆叠,宽度交给 CSS,不应用内联宽度 */
-const isNarrow = ref(false)
-let resizeStartX = 0
-let resizeStartW = 0
-let mql: MediaQueryList | null = null
-
-function onResizeStart(e: PointerEvent): void {
-  resizing.value = true
-  resizeStartX = e.clientX
-  resizeStartW = sidebarWidth.value
-  window.addEventListener('pointermove', onResizeMove)
-  window.addEventListener('pointerup', onResizeEnd)
-  e.preventDefault()
-}
-
-function onResizeMove(e: PointerEvent): void {
-  if (!resizing.value) return
-  // 栏靠右,左缘往左拖(=x 变小)应变宽
-  const w = resizeStartW + (resizeStartX - e.clientX)
-  sidebarWidth.value = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, w))
-}
-
-function onResizeEnd(): void {
-  resizing.value = false
-  window.removeEventListener('pointermove', onResizeMove)
-  window.removeEventListener('pointerup', onResizeEnd)
-}
-
-function onNarrowChange(): void {
-  isNarrow.value = mql?.matches ?? false
-}
-
-onMounted(() => {
-  mql = window.matchMedia('(max-width: 640px)')
-  isNarrow.value = mql.matches
-  mql.addEventListener('change', onNarrowChange)
-})
-
-onBeforeUnmount(() => {
-  onResizeEnd()
-  mql?.removeEventListener('change', onNarrowChange)
-  mql = null
+const {
+  resizing,
+  /** 窄屏(<=640px):栏内回退为纵向堆叠,宽度交给 CSS,不应用内联宽度 */
+  isNarrow,
+  inlineWidth: sidebarStyle,
+  startResize: onResizeStart,
+  resetWidth: resetSidebarWidth,
+  onResizeKeydown,
+} = useResizableSidebar({
+  min: MIN_WIDTH,
+  max: MAX_WIDTH,
+  defaultWidth: DEFAULT_WIDTH,
+  // 与下面 @media (max-width: 640px) 的覆盖抽屉态一致
+  narrowMax: 640,
 })
 
 // ============================================================
@@ -518,15 +491,21 @@ watch(
   <aside
     class="code-sidebar"
     :class="{ 'cs-resizing': resizing }"
-    :style="isNarrow ? undefined : { width: `${sidebarWidth}px` }"
+    :style="sidebarStyle"
     aria-label="源码查阅"
   >
     <!-- 桌面态左缘拖拽调宽手柄(窄屏隐藏) -->
     <div
       v-if="!isNarrow"
       class="cs-resize-handle"
-      title="拖动调整宽度"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="调整源码查阅栏宽度"
+      tabindex="0"
+      title="拖动调整宽度,双击复位"
       @pointerdown="onResizeStart"
+      @dblclick="resetSidebarWidth"
+      @keydown="onResizeKeydown"
     />
 
     <div class="cs-head">
@@ -764,7 +743,8 @@ watch(
   transition: background var(--transition-fast);
 }
 
-.cs-resize-handle:hover {
+.cs-resize-handle:hover,
+.cs-resize-handle:focus-visible {
   background: var(--color-primary-light);
 }
 

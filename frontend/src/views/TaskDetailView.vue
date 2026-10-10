@@ -54,6 +54,8 @@ import {
 import { subscribeTaskStream } from '@/api/stream'
 import { listDrafts, listGenerateJobs, getTaskGenerateModel } from '@/api/practice'
 import { ensureFeaturesLoaded, practiceEnabled } from '@/composables/useFeatures'
+import { buildStorageKey, useResizableSidebar } from '@/composables/useResizableSidebar'
+import { useAuthStore } from '@/stores/auth'
 import { listArtifacts } from '@/api/taskArtifacts'
 import { clientLog } from '@/utils/clientLog'
 import { extractErrorMessage } from '@/utils/error'
@@ -119,6 +121,29 @@ const workspaceCollapsed = ref(true)
 
 /** 核查与结果侧栏是否折叠(右侧栏,默认展开;折叠时完全隐藏,主区聚焦对话) */
 const detailCollapsed = ref(false)
+
+/**
+ * 核查与结果侧栏宽度:左缘手柄拖拽调宽,松手按「用户 email + 栏位」存 localStorage。
+ * narrowMax / maxViewportRatio 两个约束都对应下面的 CSS 与主区体验:
+ * - 1024px 以下侧栏改成覆盖式抽屉(见 @media),那档宽度归 CSS,手柄隐藏;
+ * - 上限收一半视口:右栏每变宽 1px 都是从主对话流身上扣的,别让它顶掉阅读宽度。
+ */
+const auth = useAuthStore()
+const {
+  inlineWidth: detailSidebarStyle,
+  resizing: detailSidebarResizing,
+  isNarrow: detailSidebarNarrow,
+  startResize: onDetailResizeStart,
+  resetWidth: resetDetailSidebarWidth,
+  onResizeKeydown: onDetailResizeKeydown,
+} = useResizableSidebar({
+  min: 320,
+  max: 640,
+  defaultWidth: 420,
+  narrowMax: 1024,
+  maxViewportRatio: 0.5,
+  storageKey: () => (auth.user ? buildStorageKey('task-detail', auth.user.email) : null),
+})
 
 function toggleWorkspace(): void {
   workspaceCollapsed.value = !workspaceCollapsed.value
@@ -3061,8 +3086,27 @@ function toggleResult(id: string): void {
       </div>
     </main>
 
-    <!-- 右侧:核查与结果侧栏(抽屉把手式;展开时顶部条带标题+折叠按钮,折叠时悬浮把手在 page-body 右上角) -->
-    <aside v-if="task && !detailCollapsed" class="detail-sidebar">
+    <!-- 右侧:核查与结果侧栏(抽屉把手式;展开时顶部条带标题+折叠按钮,折叠时悬浮把手在 page-body 右上角;
+         宽度可经左缘手柄拖拽调整,双击复位) -->
+    <aside
+      v-if="task && !detailCollapsed"
+      class="detail-sidebar"
+      :class="{ 'detail-sidebar-resizing': detailSidebarResizing }"
+      :style="detailSidebarStyle"
+    >
+      <!-- 桌面态左缘调宽手柄(窄屏覆盖抽屉态隐藏):悬停染主色提示可拖 -->
+      <div
+        v-if="!detailSidebarNarrow"
+        class="detail-resize-handle"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整核查与结果侧栏宽度"
+        tabindex="0"
+        title="拖动调整宽度,双击复位"
+        @pointerdown="onDetailResizeStart"
+        @dblclick="resetDetailSidebarWidth"
+        @keydown="onDetailResizeKeydown"
+      />
       <div class="detail-sidebar-header">
         <span class="detail-sidebar-title">核查与结果</span>
         <!-- 状态徽标 + 下载/打印:自任务概览区块顶部迁入,排在折叠按钮左侧
@@ -3465,13 +3509,44 @@ function toggleResult(id: string): void {
 
 /* ---- 右侧核查与结果栏(抽屉把手式;展开时顶部条+滚动内容区,折叠时不渲染) ---- */
 .detail-sidebar {
+  position: relative; /* 供左缘调宽手柄绝对定位 */
   flex-shrink: 0;
-  width: clamp(320px, 28vw, 420px);
+  /* 宽度由 useResizableSidebar 内联下发(拖拽 + localStorage 记忆);
+     窄屏走下面的 @media 覆盖抽屉态 */
   min-width: 320px;
+  /* 与左侧历史任务栏对称的分隔线:主区与侧栏同底色,不画线看不出边界 */
+  border-left: 1px solid var(--color-border);
   height: 100%;
   display: flex;
   flex-direction: column;
   background: var(--color-bg);
+}
+
+/* 左缘调宽手柄:常态只占位透明(分隔线已交代边界),悬停/聚焦染主色提示"这里可拖"。
+   left:-3px 让热区压住分隔线两侧,不必像素级对准 */
+.detail-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  width: 6px;
+  z-index: 6;
+  cursor: col-resize;
+  /* 触屏:阻止浏览器把 pointermove 当滚动手势接管 */
+  touch-action: none;
+  background: transparent;
+  transition: background var(--transition-fast);
+}
+
+.detail-resize-handle:hover,
+.detail-resize-handle:focus-visible {
+  background: var(--color-primary-light);
+}
+
+/* 拖拽中:整栏禁选中(栏内全是报告正文,否则一路选蓝)+ 光标保持左右箭头 */
+.detail-sidebar.detail-sidebar-resizing {
+  user-select: none;
+  cursor: col-resize;
 }
 
 /* 顶部条:标题 + 折叠按钮(header 下方,固定不滚) */
@@ -3561,6 +3636,11 @@ function toggleResult(id: string): void {
     z-index: 20;
     width: min(420px, 85vw);
     box-shadow: var(--shadow-xl);
+  }
+
+  /* 抽屉态宽度归 CSS,拖宽没有意义(断点须与 useResizableSidebar 的 narrowMax 一致) */
+  .detail-resize-handle {
+    display: none;
   }
 }
 
