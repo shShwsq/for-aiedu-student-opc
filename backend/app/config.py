@@ -305,6 +305,21 @@ class Settings(BaseSettings):
     ACP_IDLE_TIMEOUT_OUTPUT_SECONDS: int = 300
     ACP_IDLE_TIMEOUT_TOOL_SECONDS: int = 1800
 
+    # ACP 异步子 Agent(后台派生)提前收尾的结果回收:
+    # 部分 CLI(Qoder 的 Agent 工具)以 fire-and-forget 方式派生子 Agent,工具调用
+    # 立刻回 "Async agent launched…background" 回执并被标 completed;模型常在子 Agent
+    # 尚未回报时就结束本轮(end_turn),平台据此显示"已完成"但业务其实未完成。
+    # 检测到该签名后,在同一活跃 ACP session 上带退避地补发续轮 prompt,让 CLI 把已
+    # 完成的后台子 Agent 结果注入下一轮并产出完整报告(实测 qwen3.8-flash 可回收)。
+    ACP_ASYNC_AGENT_AUTOCONTINUE: bool = True
+    # 生效的 agent 类型(逗号分隔);仅这些 executor 走异步 Agent 续轮回收
+    ACP_ASYNC_AGENT_TYPES: str = "qoder_cli"
+    # 单轮最多补发几次续轮 prompt(防子 Agent 迟迟不回报时无限循环)
+    ACP_ASYNC_AGENT_MAX_CONTINUE: int = 3
+    # 每次补发前等待秒数(给后台子 Agent 完成时间),按 factor 递增
+    ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS: int = 20
+    ACP_ASYNC_AGENT_CONTINUE_BACKOFF_FACTOR: float = 1.5
+
     # Qoder CLI 配置(qoder_cli executor 用,国际版)
     # qodercli 可执行文件名/路径(沙箱内 PATH 查找或绝对路径)
     QODER_CLI_BIN: str = "qodercli"
