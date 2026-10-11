@@ -1,5 +1,5 @@
 """预克隆跳过控制:user 在克隆阶段按下"跳过预克隆",克隆轮询循环在下一个
-检查点终止当前 clone,orchestrator 降级为 react_agent 自主克隆
+检查点终止当前 clone,orchestrator 改由执行阶段自主克隆(executor 不变)
 
 设计:
 - 一次性标志:task_id → True;consume_skip_clone() 读取并弹出(只触发一次),

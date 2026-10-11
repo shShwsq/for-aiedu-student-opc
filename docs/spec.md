@@ -829,7 +829,8 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 
 - **Gitee refresh token 机制**:Gitee 的 access_token 带有效期,`GitProvider.refresh_access_token(refresh_token)` 在 token 过期时用 refresh_token 换新(返回新的 OAuthTokenSet,refresh_token 可能被轮转);GitHub 不支持刷新(refresh_token=None)。绑定数据存 `user_git_bindings` 时加密保存 refresh_token,克隆前自动判断并刷新
 - **克隆深度与超时**:`REPO_CLONE_DEPTH`(0=完整克隆默认,保留 git 历史供 log/blame 追溯;>0=浅克隆 `--depth N`)+ `REPO_CLONE_TIMEOUT`(默认 600s)
-- **克隆跳过**(`clone_skip.py`):用户可在克隆阶段点击跳过预克隆,一次性标志让 orchestrator 终止当前 clone 并降级为 react_agent 自主克隆
+- **克隆跳过**(`clone_skip.py`):用户可在克隆阶段点击跳过预克隆,一次性标志让 orchestrator 终止当前 clone 并改由执行阶段自主克隆(executor 不因降级而切换:内置走 `clone_repo` 工具,外部 CLI 自己在会话内 clone)
+- **credential 注入不能合批**(`_inject_git_tokens_to_cache`):`git credential approve` 每次调用只消费 stdin 里的**第一条** credential record(到空行即止,余下静默丢弃;git 2.53 实测)。多 provider 拼一个临时文件只跑一次 approve,第二个 provider 的 token 会悄悄丢在 credential cache 外(该平台私有仓库在 CLI 侧鉴权失败),而旧日志还照报“注入成功”。必须逐 provider 一个文件 + 一次 approve(靠 `;` 串在一条命令里以保往返收益),且只在输出里没有 `fatal:` 时才报注入成功(命令串用 `{ … } 2>&1` 把 stderr 收回 stdout —— 沙箱 SDK 只返回 stdout,而 git 报错走 stderr,不收就永远看不到失败)
 - **幂等复用必须验内容**(`_reuse_existing_clone`):按"归一化 URL + 分支 + 落盘路径"判定已 clone 过。完好性探测按模式分岔 —— local 直接探盘;sandbox 记的是容器内路径(宿主机上必然不存在),因此**进容器跑一次 `test -d <repo_path>/.git`** 再复用。以前 sandbox 分支"只信记录",恢复流程会命中一条"容器里根本没这个目录"的记录而秒回 done、根本不克隆(前端就是一个空目录)。拿不到真 `SandboxSession` 时宁可信记录 —— 不能让探测把复用变成死代码(当年已踩:探测无条件跑在 mode 判断之前)。探测本身报错(网络/超时)仍算可复用,只有明确 ABSENT 才重下
 - **空克隆不算成功**(`_reject_empty_clone`):`git clone` 对"无任何 ref 的 bare 缓存"和真空仓库都是 **exit 0 + 一句 warning**,所以除退出码外还必须统计非 `.git` 文件数;为 0 则报错(缓存快路径自动降级远程克隆,远程也为空则把原因带进回退链聚合错误),local 同时清掉空壳避免下一次尝试被"带 .git 的目录"避让成 bar-2。不拦就是"恢复完成、日志写成功、文件树空荡"的无解现场
 - **克隆改写工作区后失效整树快照**:`_set_repo_path` 顺手 pop `_tree_cache[task_id]`,两个侧栏恢复完成后的首屏拉树也带 `refresh=true` —— 否则 30s TTL 内仍会命中"刚 mkdir -p、还没检出"的空态快照

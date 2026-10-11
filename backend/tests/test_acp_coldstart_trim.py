@@ -3,10 +3,13 @@
 覆盖:
 - `_ensure_cli_env`:建目录 + 检查 CLI 合成一条命令(2 次往返);同一会话内容未变
   则整体短路(0 次);ctx 换新(容器重建)后必须重来 —— 否则新容器里没有 bridge 脚本
-- `_inject_git_tokens_to_cache`:多 provider 合并为 write_file + 1 条命令;
+- `_inject_git_tokens_to_cache`:每 provider 各一个输入文件 + 各一次 approve
+  (`git credential approve` 一次只消费 stdin 里的**第一条** record,多条拼一个
+  文件会静默丢掉后面的 provider),双 provider 降到 N 次 write_file + 1 条命令;
   **token 绝不出现在命令串里**(只能经临时文件);`rm -f` 用 `;` 收尾,approve 失败也删
 - `_wait_for_bridge_ready`:成功路径不取后台日志(省一次沙箱往返);health 不通才查
-  日志,并保留 "ACP CLI 启动失败" 的快速失败口径
+  日志,并保留 "ACP CLI 启动失败" 的快速失败口径;`/health` 报 cli_not_running
+  则立即判死(终结态,不能空等 30s),而“还没就绪”的 503 仍继续轮询
 - `write_project_memory_file` / `write_skill_files`:同会话同内容跳过重写;
   skill 的父目录一次建齐(不再每文件一次 mkdir)
 
@@ -129,30 +132,68 @@ def two_providers(monkeypatch):
     return providers
 
 
-def test_inject_git_tokens_uses_two_roundtrips(two_providers):
+def test_inject_git_tokens_one_approve_per_provider(two_providers):
+    """每 provider 各一个输入文件 + 各一次 approve(不能合批)
+
+    回归点:实测(git 2.53)`git credential approve` 每次调用只读 stdin 里的
+    第一条 credential record(到空行即止,余下静默丢弃)。把两条 record 拼进
+    同一个文件只跑一次 approve,第二个 provider 的 token 就摸不到 cache,
+    而旧日志还照报“注入成功”。往返仍省:N 次 write_file + 1 条命令。
+    """
     session = _FakeSession()
     tokens = {"github": "ghp_SECRET_1", "gitee": "gitee_SECRET_2"}
 
     acp_base._inject_git_tokens_to_cache(session, str(uuid.uuid4()), tokens)
 
-    assert len(session.written) == 1 and len(session.commands) == 1
-    cred_file = next(iter(session.written))
-    assert cred_file.startswith("/tmp/.git_cred_") and cred_file.endswith(".tmp")
-    # 两条 credential record 都以"空行结尾"写进同一个输入文件
-    body = session.written[cred_file]
-    assert "host=github.com" in body and "password=ghp_SECRET_1" in body
-    assert "host=gitee.com" in body and "password=gitee_SECRET_2" in body
+    cred_files = list(session.written)
+    assert len(cred_files) == 2 and len(session.commands) == 1
+    for f in cred_files:
+        assert f.startswith("/tmp/.git_cred_") and f.endswith(".tmp")
+    # 每个文件恰好**一条** record(以空行结束),不能把多条塞进去
+    for body in session.written.values():
+        assert body.count("protocol=https\n") == 1, body
+        assert body.endswith("\n\n"), body
+    assert "github.com" in session.written[cred_files[0]]
+    assert "gitee.com" in session.written[cred_files[1]]
 
     cmd = session.commands[0]
-    # 顺序:config → chmod 600 → approve → rm(rm 用 `;` 收尾)
+    # 逐文件喂一个 approve(每个文件恰好一次 approve 输入),chmod 只做一次
+    assert cmd.count("git credential approve <") == 2, cmd
+    for f in cred_files:
+        assert cmd.count(f"git credential approve < {f}") == 1, (f, cmd)
+    assert cmd.count("chmod 600") == 1, cmd
+    # 顺序:config → chmod 600 → approve… → rm(rm 用 `;` 收尾,且覆盖全部文件)
     assert (
         cmd.index("git config --global credential.helper")
         < cmd.index("chmod 600")
         < cmd.index("git credential approve")
-        < cmd.index("rm -f")
     )
-    assert f"; rm -f" in cmd, cmd
+    rm_part = cmd.split("; rm -f ", 1)[-1]
+    for f in cred_files:
+        assert f in rm_part, (f, cmd)
+    # approve 之间用 `;` 而不是 `&&`:一个平台失败不拖累其他 provider
+    assert " && git credential approve" not in cmd, cmd
+    # stderr 必须收回 stdout:沙箱 SDK 只返回 stdout,而 git 报错走 stderr
+    # —— 不收就没有失败信号,日志会永远报“已注入”
+    assert "} 2>&1" in cmd, cmd
     assert "'cache --timeout=%d'" % acp_base._GIT_CRED_CACHE_TIMEOUT in cmd
+
+
+def test_inject_git_tokens_no_false_success_log(two_providers, caplog):
+    """命令输出里有 fatal: 时不能报注入完成(旧实现无条件 info 报两个都成功)
+
+    多 provider 合批那个 bug 之所以难发现,就是因为这个假成功日志。
+    """
+    import logging
+
+    # 空前缀匹配任何命令:模拟 git 把报错写到了(被 2>&1 收回的)输出里
+    session = _FakeSession(outputs={"": "fatal: unable to access credential cache"})
+    with caplog.at_level(logging.INFO, logger="app.agents.acp_base"):
+        acp_base._inject_git_tokens_to_cache(
+            session, "t", {"github": "ghp_SECRET_1", "gitee": "gitee_SECRET_2"}
+        )
+    assert "注入有失败" in caplog.text, caplog.text
+    assert "已注入" not in caplog.text, caplog.text
 
 
 def test_inject_git_tokens_never_puts_token_on_commandline(two_providers):
@@ -207,11 +248,23 @@ class _HealthOK:
 
 
 class _HealthFail:
+    """端口转发/服务未就绪这类“还没起来”的失败(应继续轮询,不能判死)"""
+
     status_code = 503
-    text = "cli_not_running"
+    text = "upstream not ready"
 
     def json(self):
         raise ValueError("no body")
+
+
+class _HealthCliDead:
+    """bridge 已在服务但 CLI 进程已退出(终结态,应立刻判死)"""
+
+    status_code = 200
+    text = ""
+
+    def json(self):
+        return {"status": "cli_not_running", "bridge_protocol": 2}
 
 
 def _patch_httpx(monkeypatch, responses):
@@ -268,6 +321,31 @@ def test_wait_bridge_ready_keeps_fast_fail_on_cli_startup_error(monkeypatch):
         acp_base._wait_for_bridge_ready(
             session, "exec-1", "http://ep:8088", {}, "qoder_cli"
         )
+
+
+def test_wait_bridge_ready_fails_fast_when_cli_dies_after_bind(monkeypatch):
+    """CLI spawn 成功后立刻退出:按 /health 的 cli_not_running 马上判死
+
+    回归点:bridge 侧那句 sleep(1) 去掉后,这种“起来又马上死”如果继续轮询
+    就要等满 BRIDGE_STARTUP_TIMEOUT(30s)。bridge 先确认 CLI 存活才开 HTTP 且
+    不会重拉 CLI,所以 cli_not_running 是终结态;而“还没就绪”的 503 必须继续轮询。
+    """
+    session = _FakeSession()
+    logs_calls: list[str] = []
+
+    def _logs(execution_id, cursor=None):
+        logs_calls.append(execution_id)
+        return "[cli stderr] boom", None
+
+    session.get_background_logs = _logs
+    calls = _patch_httpx(monkeypatch, [_HealthCliDead()])
+
+    with pytest.raises(RuntimeError, match="CLI 进程已退出"):
+        acp_base._wait_for_bridge_ready(
+            session, "exec-1", "http://ep:8088", {}, "qoder_cli"
+        )
+    assert len(calls) == 1        # 一次判定即收,不空等到超时
+    assert logs_calls == ["exec-1"]   # 报错时带上日志供排查
 
 
 # ============================================================

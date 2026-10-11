@@ -18,6 +18,11 @@ CLI 自己落盘的会话能否被恢复(见 acp_base 的 cwd 一致性注释)�
    (如 git token 解密)由主线程先做完,把结果 dict 递进来。
 3. **预热失败必须静默回落**:任何异常都只丢 handle + 停 bridge,绝不把任务 fail 掉。
 
+还有一条与“丢弃”相关的硬约束:handle 被摘走(克隆失败/跳过/取消、consume 超预算、
+会话关闭)时线程可能正跑在半路,**它必须自己发现并收工**(`PrewarmHandle.cancelled`)
+—— 否则会在没人接手的情况下把第二个 bridge 起在固定端口上,与执行阶段的串行
+bridge 抢同一个 8088(沙箱内端口空间每容器独立,不像 local 模式那样动态分端口)。
+
 跨线程并发打同一个沙箱会话的前提由 `backend/scripts/smoke_sandbox_concurrency.py`
 实测(sandbox 模式:命令层可并发、输出不串话、单次往返单价不劣化),因此这里
 连 `_ensure_cli_env` 也放进了预热线程;`should_prewarm` 仍只在 sandbox 模式放行。
@@ -61,6 +66,8 @@ class PrewarmHandle:
     error: str | None = None
     started_at: float = field(default_factory=time.monotonic)
     done: threading.Event = field(default_factory=threading.Event)
+    # 被丢弃标记:discard/超时回收时置位,预热线程逐步自检(见模块 docstring 第 4 段)
+    cancelled: threading.Event = field(default_factory=threading.Event)
 
     @property
     def elapsed(self) -> float:
@@ -92,6 +99,34 @@ def should_prewarm(agent_type: str) -> bool:
     return agent_type in allowed
 
 
+class _PrewarmCancelled(Exception):
+    """预热线程发现 handle 已被丢弃 → 就地收工(内部流转,绝不冒泡到任务层)"""
+
+
+def _check_cancelled(handle: PrewarmHandle, step: str) -> None:
+    """步与步之间自检已被丢弃
+
+    单独一个异常类型是为了和“预热失败”分开:被丢弃属正常回收,不该进
+    warning 日志把排查带偏到“CLI 环境准备失败了”。
+    """
+    if handle.cancelled.is_set():
+        raise _PrewarmCancelled(step)
+
+
+def _clear_artifacts(handle: PrewarmHandle) -> None:
+    """清掉半成品产物:交接面必须是“要么完整可用,要么什么都没有”
+
+    只能在 `_stop_bridge_quietly` **之后**调(停 bridge 要靠 exec_id)。
+    """
+    handle.bridge_exec_id = ""
+    handle.bridge_port = 0
+    handle.endpoint_url = ""
+    handle.endpoint_headers = {}
+    handle.init_result = {}
+    handle.cli_env_ready = False
+    handle.git_cred_done = False
+
+
 def _stop_bridge_quietly(handle: PrewarmHandle, reason: str) -> None:
     """停掉预热起来的 bridge(尽力而为):没被认领 / 出错 / 指纹不符时都不能留进程"""
     if not handle.bridge_exec_id:
@@ -114,26 +149,38 @@ def _run_prewarm(
     acp_args: list[str],
     ctx: dict[str, Any],
 ) -> None:
-    """预热线程主体:环境准备 → (git 凭证) → 起 bridge → 等就绪 → initialize"""
+    """预热线程主体:环境准备 → (git 凭证) → 起 bridge → 等就绪 → initialize
+
+    每步前后都自检 `handle.cancelled`:discard 只停得住“exec_id 已写回”的 bridge,
+    线程不自查就会在已无人认领的情况下把整条链路跑完(端口冲突 + 孤儿进程)。
+    起 bridge 后的那一次复核不可省:起完才发现有没有被丢弃,那个窗口里只能自摆。
+    """
     t0 = time.perf_counter()
     try:
         # 1) CLI 运行环境(建脚本目录 + 检查 CLI + 写 bridge 脚本);
         #    ctx 用任务真正的那份,记下的就绪标记能让后续链路也跳过
+        _check_cancelled(handle, "ensure_cli_env")
         acp_base._ensure_cli_env(handle.session, handle.agent_type, ctx)
         handle.cli_env_ready = True
 
         # 2) git token 注入 credential cache(token 已在主线程解密好,这里不碰 db)
+        _check_cancelled(handle, "git_cred")
         if git_tokens:
             acp_base._inject_git_tokens_to_cache(handle.session, handle.task_id, git_tokens)
             handle.git_cred_done = True
 
         # 3) 起 bridge(后台命令,几乎不耗时);启动参数由主线程算好传入
+        _check_cancelled(handle, "start_bridge")
         handle.bridge_exec_id, handle.bridge_port = acp_base._start_acp_bridge(
             handle.session, credential_envs, task=None, agent_type=handle.agent_type,
             acp_args=acp_args,
         )
+        # 起完立刻复核:discard 若正好落在“exec_id 尚未写回”的窗口里,它那边
+        # 停不到 bridge(无 id 可中断),只能由我们把刚起的这个停掉
+        _check_cancelled(handle, "start_bridge")
 
         # 4) 端口转发 + 等 HTTP 就绪
+        _check_cancelled(handle, "wait_ready")
         handle.endpoint_url, handle.endpoint_headers = handle.session.get_endpoint(
             handle.bridge_port
         )
@@ -147,6 +194,7 @@ def _run_prewarm(
             handle.bridge_protocol = 1
 
         # 5) ACP 握手(能力协商);session/new 留给消费方(要等仓库就位)
+        _check_cancelled(handle, "initialize")
         client = acp_base.ACPClient(
             handle.endpoint_url, handle.endpoint_headers,
         )
@@ -160,6 +208,18 @@ def _run_prewarm(
             agent_type=handle.agent_type, ok=True,
             protocol=handle.bridge_protocol, git_cred=handle.git_cred_done,
         )
+    except _PrewarmCancelled as e:
+        # 被丢弃后的自我收工:只记 debug(回收是预期行为),不报 warning
+        handle.error = f"cancelled at {e}"
+        perf_log(
+            handle.task_id, "acp_prewarm_ready", time.perf_counter() - t0,
+            agent_type=handle.agent_type, ok=False, reason="cancelled",
+        )
+        _stop_bridge_quietly(handle, f"cancelled@{e}")
+        _clear_artifacts(handle)
+        logger.debug(
+            f"[task={handle.task_id}] 预热线程在 {e} 步后发现已被丢弃,就地收工"
+        )
     except Exception as e:
         handle.error = f"{type(e).__name__}: {e}"
         perf_log(
@@ -172,12 +232,7 @@ def _run_prewarm(
         )
         _stop_bridge_quietly(handle, "prewarm_error")
         # 半截状态不能半途交出:清掉所有产物,消费方按"没有预热"处理
-        handle.bridge_exec_id = ""
-        handle.endpoint_url = ""
-        handle.endpoint_headers = {}
-        handle.init_result = {}
-        handle.cli_env_ready = False
-        handle.git_cred_done = False
+        _clear_artifacts(handle)
     finally:
         handle.done.set()
 
@@ -223,7 +278,7 @@ def prewarm_agent_runtime(
 
 
 def consume_prewarm(
-    task_id: str, agent_type: str, fingerprint: str, task: Any = None,
+    task_id: str, agent_type: str, fingerprint: str,
 ) -> PrewarmHandle | None:
     """认领预热成果(一次性);不可用则丢弃并返回 None,调用方走全串行
 
@@ -263,9 +318,15 @@ def consume_prewarm(
 
 
 def _discard(handle: PrewarmHandle, reason: str) -> None:
-    """丢弃 handle:停 bridge + 清注册表(任务被停/克隆失败/指纹不符都走这里)"""
+    """丢弃 handle:置取消标记 + 停 bridge + 清注册表
+
+    标记必须先置、bridge 后停:否则线程可能在我们停完之后又起一个新的。
+    线程还没起 bridge 时(还在 ensure/注入阶段)本函数停不到任何东西,
+    靠 `_run_prewarm` 的逐步自检自己收工。
+    """
     with _handles_lock:
         _handles.pop(handle.task_id, None)
+    handle.cancelled.set()
     _stop_bridge_quietly(handle, reason)
     perf_log(handle.task_id, "acp_prewarm_discard", agent_type=handle.agent_type,
              reason=reason)
@@ -274,13 +335,20 @@ def _discard(handle: PrewarmHandle, reason: str) -> None:
 def discard_task_prewarm(task_id: str, reason: str = "abandoned") -> None:
     """丢弃某任务的预热(克隆失败/跳过/取消、任务删除等路径调用)
 
-    幂等:没有 handle 时静默返回。预热线程仍在跑也会被停掉 —— handle 被摘出注册表后
-    线程收尾时找不到归属,bridge 由这里一并中断,不会留下空转进程。
+    幂等:没有 handle 时静默返回。
+
+    预热线程还在跑时的回收是**两段**的,不是一段:
+    - bridge 已起(exec_id 已写回)→ 本函数直接中断它;
+    - bridge 未起(线程还在 ensure_cli_env / 凭证注入阶段)→ 本函数无东西可停,
+      靠置 `cancelled` 标记让线程下一步自检时自己收工(不起新的、起了就自摆)。
+      不记这个标记的话,线程会在无人接手的情况下把 bridge 起在固定 8088 上,
+      与紧跟着跑串行链路的 `run_acp_agent` 抢端口(一个 bind 失败退掉)。
     """
     task_id = str(task_id)
     with _handles_lock:
         handle = _handles.pop(task_id, None)
     if handle is None:
         return
+    handle.cancelled.set()
     _stop_bridge_quietly(handle, reason)
     perf_log(task_id, "acp_prewarm_discard", agent_type=handle.agent_type, reason=reason)

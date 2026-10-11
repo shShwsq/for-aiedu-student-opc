@@ -691,8 +691,9 @@ def browse_download(task_id: str, file_path: str, chunk_size: int = 65536) -> tu
 class CloneSkippedError(RuntimeError):
     """用户主动跳过预克隆(克隆轮询检查点抛出)
 
-    由 clone_repo_with_fallback 向上传播,orchestrator 单独捕获并降级为
-    react_agent 自主克隆;回退链内部不得吞掉(否则跳过后会默默再试
+    由 clone_repo_with_fallback 向上传播,orchestrator 单独捕获并改由执行阶段
+    自主克隆(executor 不变:内置 react_agent / 外部 CLI 各自在会话内 clone);
+    回退链内部不得吞掉(否则跳过后会默默再试
     下一种协议)。
     """
 

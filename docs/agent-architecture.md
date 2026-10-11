@@ -522,9 +522,13 @@ ExecutorAgent (ABC)
       指纹记在 ctx 上 → 容器重建换新 ctx 后自然重来)
 9.  [全新链路] _inject_git_credentials_to_cache(session, db, task)
     → git token 注入沙箱内 credential helper cache(不进环境变量/磁盘文件/命令行),
-      让 CLI 能克隆/拉取私有仓库;多 provider 合并为 write_file + 1 条命令
-      (`git config && chmod 600 && git credential approve < f; rm -f f`,双 provider 9 次 → 2 次;
-      rm 用 `;` 收尾保证 approve 失败也删掉含 token 的临时文件)
+      让 CLI 能克隆/拉取私有仓库。**每 provider 各一个输入文件 + 各一次 approve**
+      (`git credential approve` 一次只消费 stdin 里的第一条 record,多条拼一个文件
+      会静默丢掉后面的 provider;git 2.53 实测),双 provider 合计
+      N 次 write_file + 1 条命令:
+      `git config && chmod 600 f1 f2; git credential approve < f1; git credential approve < f2; rm -f f1 f2`
+      (approve 之间与收尾 rm 都用 `;`:单平台失败不拖累其他 provider,含 token
+      的临时文件也必删;输出里出现 `fatal:` 则只报 warning,不报“注入成功”)
 10. [全新链路] pre_bridge_hook(session, credentials, agent_type, task)  [wrapper 钩子]
     → Codex 用此写 ~/.codex/config.toml;钩子可返回额外 envs 合并进 bridge 环境
       (如 codex local 模式的 CODEX_HOME)
@@ -539,7 +543,10 @@ ExecutorAgent (ABC)
     → 健康轮询(默认 0.2s 间隔、30s 超时,可由 ACP_BRIDGE_HEALTH_INTERVAL_SECONDS 覆盖);
       成功路径**不取**后台日志(省一次沙箱往返),只有 health 未通过才读 bridge 日志
       以保留 "ACP CLI 启动失败" 的快速失败口径
-    → bridge 侧 main() 也不再无条件 sleep(1s) 才起 HTTP 服务(旧链路白付 1s)
+    → `/health` 报 `cli_not_running` 直接判死:bridge 先确认 CLI 存活才开 HTTP 且不会
+      重拉 CLI,这是终结态(继续轮询只能等满 30s);而端口转发未就绪的 503 仍继续轮询
+    → bridge 侧 main() 也不再无条件 sleep(1s) 才起 HTTP 服务(旧链路白付 1s);bind 失败
+      (端口被占)也纳入 try/finally,不让已 spawn 的 CLI 子进程脱管
 14. recorder = _ACPRecorder(task.id, round_idx)
     client = ACPClient(endpoint_url, endpoint_headers, recorder=..., permission_handler=...)
     → _permission_handler:CLI 关闭 yolo 时发来 request_permission(危险命令)
@@ -666,8 +673,14 @@ ExecutorAgent (ABC)
   与 `run_acp_agent` 同源于 `_get_acp_args` + `_bridge_fingerprint`(两边算出不一致时自动作废)
 - **失败不升级**:预热线程内任一步异常 → 记 `handle.error`、停可能已起的 bridge、
   产物字段清零;消费方按"没有预热"走全串行,任务绝不因预热失败而 failed
-- **回收路径**:预热线程不持有 db,清理全靠三处兼管——克隆失败/跳过时
-  `discard_task_prewarm(...)`;`stop_task_bridge(task_id)`(会话关闭/任务删除)顶部先丢弃未认领 handle
+- **回收路径(两段)**:handle 被摘走时线程可能正跑在半路,`PrewarmHandle.cancelled`
+  就是为这个窗口设的——
+  ① bridge 已起(exec_id 已写回)→ `discard_task_prewarm(...)`(克隆失败/跳过/取消)
+  或 `stop_task_bridge(task_id)`(会话关闭/任务删除)顶部直接中断它;
+  ② bridge 未起(还在 ensure/注入阶段)→ 外部无东西可停,靠置 `cancelled` 标记让
+  `_run_prewarm` 逐步自检时自己收工(不起新的;起了才发现被丢弃则自摆)。**不能只靠
+  手段 ①**:沙箱内 bridge 走固定 8088,而克隆降级不改变 executor(`get_executor` 只按
+  task.executor 选人),串行链路紧跟着就会再起一个 bridge 与孤儿 bridge 抢端口
 - **适用边界**:仅 sandbox 模式(命令层跨线程并发仅在真实沙箱实测过,
   见 `backend/scripts/smoke_sandbox_concurrency.py`),且默认只含无 wrapper 钩子的
   `qoder_cli`(`ACP_PREWARM_AGENTS`);`ACP_PREWARM_ENABLED=false` 一键回到旧行为

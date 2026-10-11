@@ -7,6 +7,8 @@
 - single-flight:同一任务重复触发只起一个线程
 - consume 的三种拒绝:指纹不符 / 预算超时 / 预热失败 → 都返回 None 且停掉 bridge
 - discard / stop_task_bridge 的回收:不留无人认领的 bridge 进程
+- 取消契约:discard 落在"bridge 还没起"的窗口里时,线程必须自己收工
+  (沙箱内固定 8088,不能让它在无人接手时再起一个与串行链路抢端口)
 - 预热失败绝不冒泡到任务层
 """
 import threading
@@ -325,3 +327,77 @@ def test_stop_bridge_failure_is_swallowed(sandbox_cli, primitives, monkeypatch):
     # 停 bridge 失败只记日志,不能把异常抛回任务删除/会话关闭路径
     acp_prewarm.discard_task_prewarm(handle.task_id, reason="x")
     assert handle.task_id not in acp_prewarm._handles
+
+
+# ============================================================
+# 取消契约:discard 与预热线程的早期竞态
+# ============================================================
+
+
+def _parked_prewarm(monkeypatch, primitives, *, git_tokens):
+    """起一个卡在 `_ensure_cli_env` 里的预热线程(此时 handle 还没有 exec_id)
+
+    返回 (handle, go):线程已停在 ensure 里、主线程拿到 handle 后由调用方
+    `go.set()` 放行,既能稳定复现"discard 早于 bridge 启动"的窗口,
+    也避开测试侧的未定义时序。
+    """
+    entered = threading.Event()
+    go = threading.Event()
+
+    def _park(session, agent_type, ctx=None):
+        primitives["ensure"] += 1
+        entered.set()
+        assert go.wait(5), "测试未在预算内放行"
+
+    monkeypatch.setattr(acp_base, "_ensure_cli_env", _park)
+    handle = acp_prewarm.prewarm_agent_runtime(
+        task_id=str(uuid.uuid4()), session=_FakeSession(), ctx={"mode": "sandbox"},
+        agent_type=AGENT, fingerprint=FP, acp_args=["--acp", "--yolo"],
+        credential_envs={"QODER_PERSONAL_ACCESS_TOKEN": "pat"},
+        git_tokens=git_tokens,
+    )
+    assert entered.wait(5)
+    return handle, go
+
+
+def test_discard_before_bridge_start_aborts_thread(sandbox_cli, primitives, monkeypatch):
+    """克隆头几秒就失败/跳过 → discard 无 bridge 可停,线程必须自己收工不起新的
+
+    不修这条的话,主线程随后走全串行链路会在同一个 8088 上起第二个 bridge,
+    两个 bind 抢端口(一个退掉),还多养一个孤儿 CLI 进程。
+    """
+    handle, go = _parked_prewarm(monkeypatch, primitives, git_tokens={"github": "ghp_x"})
+
+    acp_prewarm.discard_task_prewarm(handle.task_id, reason="clone_failed")
+    go.set()
+    assert handle.wait(5)
+
+    assert handle.cancelled.is_set()
+    # 关键断言:凭证注入与 bridge 启动都不再往下走(端口没被抢)
+    assert primitives["inject"] == 0
+    assert primitives["start"] == 0
+    assert handle.bridge_exec_id == "" and handle.endpoint_url == ""
+    assert handle.task_id not in acp_prewarm._handles
+
+
+def test_discard_racing_with_bridge_start_stops_the_new_bridge(
+    sandbox_cli, primitives, monkeypatch,
+):
+    """discard 正好落在“exec_id 尚未写回”的窗口:它那边停不到,只能由线程自摆"""
+    def _start(session, credential_envs, task=None, agent_type="",
+               extra_acp_args=None, acp_args=None):
+        primitives["start"] += 1
+        # 此刻 handle 已被摘出注册表且无 exec_id → discard 停不到任何东西
+        acp_prewarm.discard_task_prewarm(handle.task_id, reason="clone_skipped")
+        return "exec-1", 8088
+
+    monkeypatch.setattr(acp_base, "_start_acp_bridge", _start)
+    handle, go = _parked_prewarm(monkeypatch, primitives, git_tokens=None)
+    go.set()
+    assert handle.wait(5)
+
+    # 刚起的 bridge 被线程自己停掉,且不再等就绪 / initialize(不白烧 TTL)
+    assert primitives["stopped"] == ["exec-1"]
+    assert primitives["wait"] == 0
+    assert handle.bridge_exec_id == "" and handle.init_result == {}
+    assert handle.error and "cancelled" in handle.error

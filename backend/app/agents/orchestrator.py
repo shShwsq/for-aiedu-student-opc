@@ -340,8 +340,8 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         # ---------- 预处理:若用户选了仓库,主动 clone + list_files ----------
         # 把仓库结构和 repo_path 提前准备好:
         #   - 注入 react_agent 第 1 轮:跳过自主 clone,直接开始审计
-        # clone 失败不再让整个任务 failed:降级返回 (None, ""),回到
-        #   react_agent 自主 clone 路径(有 LLM 重试/自适应,成功率更高)
+        # clone 失败不再让整个任务 failed:降级返回 (None, ""),改由执行阶段
+        #   自主 clone(有 LLM 重试/自适应,成功率更高)
         _t0 = time.perf_counter()
         repo_path, repo_context = _prepare_repo_context(task, db, task_id_str, git_tokens)
         perf_log(
@@ -1366,10 +1366,12 @@ def _prepare_repo_context(
 ) -> tuple[str | None, str]:
     """若用户选了仓库,主动 clone + list_files,返回 (repo_path, repo_context 文本)
 
-    - 无 repo_url:返回 (None, ""),走原流程(react_agent 自主 clone)
+    - 无 repo_url:返回 (None, ""),走原流程(执行阶段自主 clone)
     - 有 repo_url:clone(HTTPS+token → SSH → HTTPS 匿名,含分支回退);
-      失败不抛异常,降级返回 (None, "") → 回到 react_agent 自主 clone 路径
+      失败不抛异常,降级返回 (None, "") → 改由**执行阶段**自己 clone
       (工具失败可被 LLM 重试/自适应,成功率高于预 clone 一次定生死);
+      注意 executor 不因降级而切换(`get_executor` 只按 task.executor 选人):
+      内置 react_agent 走 clone_repo 工具,外部 CLI 则由 CLI 自己在会话内 clone
       成功且仓库非空时 list_files 根目录,格式化成 repo_context 文本;
       仓库为空(或 list_files 失败无法确认非空)则降级返回 (repo_path, ""),
       不注入"已预先 clone"提示,避免误导 agent 在空仓库上直接开始审计
@@ -1439,10 +1441,10 @@ def _prepare_repo_context(
         discard_task_prewarm(task_id_str, reason="clone_cancelled")
         raise
     except sandbox_tools.CloneSkippedError:
-        # 用户主动跳过预克隆:与失败降级同路径,改由 react_agent 自主克隆
-        # (LLM 看报错重试/自适应,历史观察成功率更高)
+        # 用户主动跳过预克隆:与失败降级同路径,改由执行阶段自主克隆
+        # (executor 保持不变:内置走 clone_repo 工具,CLI 自己在会话内 clone)
         logger.info(
-            f"[task={task.id}] 用户跳过预克隆,降级为 react_agent 自主克隆"
+            f"[task={task.id}] 用户跳过预克隆,改由执行阶段自主克隆"
         )
         # 预热起的 bridge 不能无人认领地空转(它占本任务沙箱的 TTL 与端口),丢掉
         from app.agents.acp_prewarm import discard_task_prewarm
@@ -1459,16 +1461,16 @@ def _prepare_repo_context(
         return None, ""
     except Exception as e:
         # 降级而非失败:预 clone 一次定生死太脆(网络抖动/分支不符/私有仓库
-        # token 问题都会直接挂任务),改为回到 react_agent 自主 clone 路径,
-        # 由 LLM 看报错重试/自适应(历史观察该路径成功率明显更高)
+        # token 问题都会直接挂任务),改为让执行阶段自己 clone,由 LLM 看报错
+        # 重试/自适应(历史观察该路径成功率明显更高);executor 不变
         logger.warning(
-            f"[task={task.id}] 主动 clone 失败,降级为 react_agent 自主 clone: {e}"
+            f"[task={task.id}] 主动 clone 失败,降级为执行阶段自主 clone: {e}"
         )
         # 同 clone_skipped:无人认领的预热 bridge 先停掉(执行阶段会自己重建)
         from app.agents.acp_prewarm import discard_task_prewarm
 
         discard_task_prewarm(task_id_str, reason="clone_failed")
-        task.current_stage = "预克隆失败,改由 react_agent 自主克隆..."
+        task.current_stage = "预克隆失败,改由执行阶段自主克隆..."
         db.commit()
         _publish_status(task)
         _add_conversation(
@@ -1639,7 +1641,7 @@ def _prepare_upload_context(
     """上传交付物:把上传内容传输进任务沙箱工作区
 
     与 clone 分支的差异:
-    - 上传文件 agent 无法自主重新获取(clone 失败可降级为 react_agent 自主
+    - 上传文件 agent 无法自主重新获取(clone 失败可改由执行阶段自主
       clone 重试,上传没有对应手段),故服务端文件缺失 / 传输失败都直接
       抛异常让任务失败,不降级——降级只会让 agent 对着不存在的仓库盲跑
     - repo_context 的 header 明确"文件已就绪",提示 agent1 跳过 clone

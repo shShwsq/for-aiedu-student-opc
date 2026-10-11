@@ -644,18 +644,31 @@ def main():
         if sys.platform == "win32":
             allow_reuse_address = False
 
-    server = _BridgeServer((args.host, args.port), BridgeHandler)
-    print(f"[bridge] HTTP 服务监听 {args.host}:{args.port}", flush=True)
-
+    # bind 也纳入 try:此时 CLI 子进程已 spawn,若绑定失败(固定端口被占,
+    # 如同一容器里多起了一个 bridge)就让异常穿出 main(),会跳过下面 finally
+    # 里的 _cli.stop(),把一个没人管的 CLI 留在容器里直到容器销毁。
+    server = None
     try:
+        server = _BridgeServer((args.host, args.port), BridgeHandler)
+        print(f"[bridge] HTTP 服务监听 {args.host}:{args.port}", flush=True)
         server.serve_forever()
+    except OSError as e:
+        # 不写 "ACP CLI 启动失败" 字样:那是 CLI spawn 失败的约定快速失败标记
+        # (后端按该串判死),端口被占是另一回事,混用会误导排查
+        print(
+            f"[bridge] HTTP 端口绑定失败(port={args.port}):"
+            f"{type(e).__name__}: {e},退出",
+            file=sys.stderr, flush=True,
+        )
+        sys.exit(1)  # SystemExit 仍走下面 finally 回收 CLI
     except KeyboardInterrupt:
         pass
     finally:
         print("[bridge] 正在关闭...", file=sys.stderr, flush=True)
         if _cli:
             _cli.stop()
-        server.server_close()
+        if server:
+            server.server_close()
 
 
 if __name__ == "__main__":

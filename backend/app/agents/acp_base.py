@@ -1234,14 +1234,19 @@ def _inject_git_credentials_to_cache(session, db: Session, task: Task | None) ->
     token 只存在于 git credential-cache 守护进程的内存中,
     仅 git 命令在 HTTPS 鉴权时自动取用。沙箱容器销毁时 cache 随进程退出清理。
 
-    工作流程(已合并往返:双 provider 从 9 次降到 2 次):
-    1. write_file 写**一个**临时输入文件,内含全部 provider 的 credential record
-       (每条 protocol/host/username/password 四行 + 空行分隔;
-        git credential approve 支持从 stdin 连续读多条)
+    工作流程(双 provider 从 9 次往返降到 2 次 write_file + 1 次命令):
+    1. **每个 provider 各写一个**临时输入文件
+       (protocol/host/username/password 四行 + 空行结束这条 record)
+       —— 必须一个一个来:`git credential approve` 每次调用只消费 stdin 里的
+       **第一条** record(读到空行即止,其余静默丢弃;git 2.53 实测),
+       把多条 record 拼进同一个文件只跑一次 approve,第二个 provider 的
+       token 会悄悄丢掉(日志还报成功),该平台私有仓库在 CLI 侧就鉴权失败
     2. 一条命令串完:
        git config --global credential.helper 'cache --timeout=86400'
-       && chmod 600 文件 && git credential approve < 文件; rm -f 文件
-       —— rm 用 `;` 收尾而不是 `&&`:approve 失败也必须删掉含 token 的临时文件
+       && chmod 600 文件… ; git credential approve < f1; git credential approve < f2
+       ; rm -f 文件…
+       —— approve 之间以及收尾 rm 都用 `;` 而不是 `&&`:单个平台失败既不拖累
+       其他 provider,含 token 的临时文件也必定被删掉
 
     失败不阻断流程(降级为无 token,CLI 走 SSH / 匿名 HTTPS 回退)。
     task=None(测试连接场景)时跳过。
@@ -1284,53 +1289,81 @@ def _inject_git_tokens_to_cache(session, task_id, tokens: dict[str, str]) -> Non
     从 _inject_git_credentials_to_cache 拆出:预热线程不能复用主线程的 ORM
     Session(非线程安全),但 token 可以在主线程先加载好再递进来。
     失败只 warning 降级(不阻断任务),安全约束见上层 docstring。
+
+    逐 provider 一个输入文件 + 一次 approve(不能合批,见上层 docstring 第 1 条);
+    往返仍省:write_file × N + 1 条命令。
     """
     from app.git_provider import PROVIDERS
 
-    # 多条 credential record 拼一个输入文件(每条以空行结束)
-    blocks: list[str] = []
+    attempted: list[str] = []   # 已尝试落盘的文件(含写失败的那半个)
+    files: list[str] = []       # 写成功的文件
     injected: list[str] = []
-    for provider_id, token in tokens.items():
-        provider = PROVIDERS.get(provider_id)
-        if not provider or not token:
-            continue
-        blocks.append(
-            f"protocol=https\n"
-            f"host={provider.host}\n"
-            f"username={provider.token_username}\n"
-            f"password={token}\n"
-            f"\n"  # 空行结束一条 record(也是多条之间的分隔)
-        )
-        injected.append(provider_id)
-    if not blocks:
-        return
-
-    cred_file = f"/tmp/.git_cred_{int(time.time() * 1000)}.tmp"
+    command_ran = False
     try:
-        # token 只经 write_file 落临时文件,不进命令行/env/ps(避免 ps 与 /proc 泄露)
-        session.write_file(cred_file, "".join(blocks))
-        # chmod 在 approve 之前;rm 用 `;` 衔接 —— 即使前面任一步失败也要执行,
-        # 含 token 的临时文件不能留在磁盘上
-        session.run_command(
-            f"git config --global credential.helper"
+        # 1) token 只经 write_file 落临时文件,不进命令行/env/ps(避免 ps 与 /proc 泄露)
+        for provider_id, token in tokens.items():
+            provider = PROVIDERS.get(provider_id)
+            if not provider or not token:
+                continue
+            # provider_id 只取自 PROVIDERS 的键(封闭集合),作路径片段安全
+            cred_file = (
+                f"/tmp/.git_cred_{provider_id}_{int(time.time() * 1000)}.tmp"
+            )
+            attempted.append(cred_file)
+            session.write_file(
+                cred_file,
+                f"protocol=https\n"
+                f"host={provider.host}\n"
+                f"username={provider.token_username}\n"
+                f"password={token}\n"
+                f"\n"  # 空行 = 这条 record 结束(approve 只读到这一条)
+            )
+            files.append(cred_file)
+            injected.append(provider_id)
+        if not files:
+            return
+
+        quoted = [shlex.quote(f) for f in files]
+        # 2) 一条命令串完;approve 逐文件、用 `;` 分隔(一个平台失败不拖累其他)
+        approves = "; ".join(f"git credential approve < {q}" for q in quoted)
+        # 用 `{ … } 2>&1` 把 config/chmod/approve 的 stderr 收回 stdout:
+        # SDK 的 Execution.text 只含 stdout,而 git 的报错走 stderr
+        # (`credential approve` 失败还是静默的,退出码也不看),
+        # 不收 stderr 就根本没有失败信号 —— 日志会永远报“注入成功”
+        result = session.run_command(
+            f"{{ git config --global credential.helper"
             f" 'cache --timeout={_GIT_CRED_CACHE_TIMEOUT}'"
-            f" && chmod 600 {shlex.quote(cred_file)}"
-            f" && git credential approve < {shlex.quote(cred_file)}"
-            f"; rm -f {shlex.quote(cred_file)}",
+            f" && chmod 600 {' '.join(quoted)}"
+            f"; {approves}; }} 2>&1"
+            f"; rm -f {' '.join(quoted)}",
             timeout=30, check=False,
         )
-        logger.info(
-            f"[task={task_id}] git credential cache 注入成功: "
-            f"{injected}(沙箱内 git 可访问私有仓库)"
-        )
+        command_ran = True
+        # 报成功要有依据:只把没见 `fatal:` 的输出当成注入完成
+        if "fatal:" in (result or "").lower():
+            logger.warning(
+                f"[task={task_id}] git credential cache 注入有失败"
+                f"(providers={injected}): {(result or '')[:300]}"
+            )
+        else:
+            logger.info(
+                f"[task={task_id}] git credential cache 已注入: "
+                f"{injected}(逐 provider 一次 approve,沙箱内 git 可访问私有仓库)"
+            )
     except Exception as e:
         # 降级:不阻断流程,CLI 走 SSH / 匿名 HTTPS 回退
         logger.warning(f"[task={task_id}] git credential cache 注入失败(降级为无 token): {e}")
-        # 尽力善后:异常可能发生在 write_file 之后,临时文件已落盘
-        try:
-            session.run_command(f"rm -f {shlex.quote(cred_file)}", timeout=5, check=False)
-        except Exception:
-            pass
+    finally:
+        # 尽力善后:写失败/命令根本没跑起来时,那条命令里的 rm 也就没执行,
+        # 含 token 的临时文件不能靠运气清理(已跑成命令则 rm 已随 `;` 执行过)
+        if not command_ran and attempted:
+            try:
+                session.run_command(
+                    "rm -f " + " ".join(shlex.quote(f) for f in attempted),
+                    timeout=5, check=False,
+                )
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -1407,6 +1440,14 @@ def _start_acp_bridge(
     return execution_id, ACP_BRIDGE_PORT
 
 
+class _BridgeCliDead(RuntimeError):
+    """bridge 已在服务但 CLI 进程已退出(终结态,等下去不会自己变好)
+
+    单独一个类型(仍是 RuntimeError 子类,上层与测试口径不变):这样
+    `_wait_for_bridge_ready` 里那些“任意请求异常 = 还没就绪”的容错不会把它误吸掉。
+    """
+
+
 def _wait_for_bridge_ready(
     session, execution_id: str, endpoint_url: str, endpoint_headers: dict[str, str],
     agent_type: str = "",
@@ -1430,6 +1471,21 @@ def _wait_for_bridge_ready(
     )
 
     last_logs_len = 0
+
+    def _cli_dead_error(detail: str) -> _BridgeCliDead:
+        """组装“CLI 已死”错误(带日志供排查)
+
+        判定安全的依据:bridge 先确认 CLI 存活才开 HTTP 服务,且 bridge 不会
+        重拉 CLI —— 所以 /health 报 cli_not_running 就是**终结态**,不会“等一下又好了”。
+        旧版靠 bridge 侧 sleep(1) 后判 alive 快速失败,那 1s 已去掉,改在这里按
+        /health 状态判,否则“spawn 成功后瞬间退出”(坏 PAT/损坏安装)要等满 30s。
+        """
+        logs, _ = session.get_background_logs(execution_id)
+        return _BridgeCliDead(
+            f"ACP bridge 启动失败:CLI 进程已退出({detail})。"
+            f"日志:\n{(logs or '')[-1000:]}"
+        )
+
     try:
         while time.time() < deadline:
             # 健康检查优先:就绪成功就返回,整轮不必取一次后台日志
@@ -1441,11 +1497,16 @@ def _wait_for_bridge_ready(
                     if data.get("status") == "ok":
                         logger.info(f"[{agent_type}] ACP bridge 就绪")
                         return data
-                    else:
-                        logger.debug(f"[{agent_type}] health 200 但状态非 ok: {data}")
+                    if data.get("status") == "cli_not_running":
+                        raise _cli_dead_error("health 200 但 status=cli_not_running")
+                    logger.debug(f"[{agent_type}] health 200 但状态非 ok: {data}")
                 else:
                     body = resp.text[:300]
+                    if "cli_not_running" in body:
+                        raise _cli_dead_error(f"health HTTP {resp.status_code}")
                     logger.debug(f"[{agent_type}] health 返回 HTTP {resp.status_code}: {body}")
+            except _BridgeCliDead:
+                raise  # “CLI 已死”不能当成“还没就绪”继续轮询
             except Exception as e:
                 logger.debug(f"[{agent_type}] health 请求失败: {type(e).__name__}: {e}")
 
