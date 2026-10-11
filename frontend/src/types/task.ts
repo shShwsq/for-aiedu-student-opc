@@ -414,6 +414,8 @@ export interface CloneProgressEventData {
  *   2. phase='reasoning' → 累积到思考链区域
  *   3. phase='content' → 累积到正式回答区域
  *   4. phase='end' → 标记完成
+ *   5. phase='notice' → 系统提示(收尾后的过程性说明),追加并收卡但不标错误
+ *   6. phase='error' → 系统提示(降级/失败),追加并收卡,渲染成 "[错误] …"
  *
  * 流结束后,完整内容会通过 conversation 事件再推一次(用于落库 + 迟到订阅者补播)
  */
@@ -424,8 +426,8 @@ export interface ThinkingDeltaEventData {
   round_idx: number
   /** 角色:agent1 / agent2 */
   role: 'agent1' | 'agent2'
-  /** 阶段:start / reasoning / content / end / error */
-  phase: 'start' | 'reasoning' | 'content' | 'end' | 'error'
+  /** 阶段:start / reasoning / content / end / notice / error */
+  phase: 'start' | 'reasoning' | 'content' | 'end' | 'notice' | 'error'
   /** 增量文本(start/end 时为空字符串) */
   delta: string
   /** 迭代序号(仅 agent1 有,标识 ReAct 循环的第几次 LLM 调用) */

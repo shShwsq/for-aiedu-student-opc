@@ -311,6 +311,8 @@ class Settings(BaseSettings):
     # 尚未回报时就结束本轮(end_turn),平台据此显示"已完成"但业务其实未完成。
     # 检测到该签名后,在同一活跃 ACP session 上带退避地补发续轮 prompt,让 CLI 把已
     # 完成的后台子 Agent 结果注入下一轮并产出完整报告(实测 qwen3.8-flash 可回收)。
+    # 触发以"本轮派生过后台子 Agent"为主判据(其结果只能从下一轮回流),收尾文本的
+    # 口吻/篇幅只用于排除"结果其实已给全"的情形,避免重复补发把同一份报告堆两遍。
     ACP_ASYNC_AGENT_AUTOCONTINUE: bool = True
     # 生效的 agent 类型(逗号分隔);仅这些 executor 走异步 Agent 续轮回收
     ACP_ASYNC_AGENT_TYPES: str = "qoder_cli"
@@ -319,6 +321,13 @@ class Settings(BaseSettings):
     # 每次补发前等待秒数(给后台子 Agent 完成时间),按 factor 递增
     ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS: int = 20
     ACP_ASYNC_AGENT_CONTINUE_BACKOFF_FACTOR: float = 1.5
+    # 判定"续轮已产出实质报告"的字符阈值:补发拿到不少于该长度的文本就收手
+    # (即便末尾还带"等待"字样)。再补发只会让模型把同一份报告重复输出堆进
+    # summary,因此停止补发并保留"结果可能不完整"的标注。设为 0 = 该判据关闭
+    ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS: int = 1500
+    # 耗时上界提醒:每次补发除 sleep 外还受上面的 idle 兜底约束(无活动工具 300s,
+    # 有工具在跑 1800s),MAX_CONTINUE=3 时单轮回收最坏可占用数十分钟 —— 远大于
+    # 三档退避的 20+30+45=95s。子 Agent 长期不回报请调小 MAX_CONTINUE 或关掉开关。
 
     # Qoder CLI 配置(qoder_cli executor 用,国际版)
     # qodercli 可执行文件名/路径(沙箱内 PATH 查找或绝对路径)

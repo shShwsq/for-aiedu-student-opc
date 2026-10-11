@@ -269,6 +269,19 @@ Each CLI executor has two config values: binary name/path + install command (aut
 | `ACP_IDLE_TIMEOUT_OUTPUT_SECONDS` | Idle timeout with no active tool (waiting for model output); on expiry the session is cancelled and the round wraps up with accumulated output (`0` = off) | `300` |
 | `ACP_IDLE_TIMEOUT_TOOL_SECONDS` | Last-resort idle timeout while a tool is running (git clone / long builds produce no output) — guards against CLI crashes without a `completed` event (`0` = off) | `1800` |
 
+**Async sub-agent recovery** (signature comes from Qoder CLI):
+
+Qoder's `Agent` tool is fire-and-forget: the tool call immediately returns an "Async agent launched…background" ack and the model often ends the turn (`end_turn`) before the sub-agents report back — the platform then shows "completed" while the work isn't done. When a round launched background sub-agents and its closing text hasn't delivered substantive results yet, the backend re-sends a follow-up prompt on the same live ACP session with backoff so the CLI injects the finished sub-agent results into the next turn. If a follow-up is truncated by hang protection, ends with a `stopReason` other than `end_turn`, or exhausts its attempts, the summary and the UI are annotated "results may be incomplete" instead of falsely claiming completion.
+
+| Variable | Description | Default |
+|---|---|---|
+| `ACP_ASYNC_AGENT_AUTOCONTINUE` | Master switch (`false` = never continue) | `true` |
+| `ACP_ASYNC_AGENT_TYPES` | Executors this applies to (comma-separated) | `qoder_cli` |
+| `ACP_ASYNC_AGENT_MAX_CONTINUE` | Max follow-up prompts per round (`0` = none). Each follow-up is additionally bounded by the idle timeouts above, so the worst case is tens of minutes | `3` |
+| `ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS` | Wait before each follow-up (gives sub-agents time to finish) | `20` |
+| `ACP_ASYNC_AGENT_CONTINUE_BACKOFF_FACTOR` | Growth factor for that wait | `1.5` |
+| `ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS` | Threshold for "a substantive report arrived": stop re-asking once the follow-up output is at least this long (asking again only stacks duplicate reports into the summary); `0` = disable this criterion | `1500` |
+
 **Qoder CLI** — `task.executor=qoder_cli`
 
 | Variable | Default |

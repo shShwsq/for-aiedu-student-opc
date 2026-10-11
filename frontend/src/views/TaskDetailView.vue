@@ -938,6 +938,12 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
     if (!cur.reasoning_auto && shouldLatchAutoExpand(cur)) cur.reasoning_auto = true
   } else if (phase === 'content') {
     cur.content += delta
+  } else if (phase === 'notice') {
+    // 系统提示(如"已回收后台子任务结果"):归入思考卡并收尾,但不标错误态。
+    // 后端在整轮 flush 之后才发这个相位,卡片可能已被 conversation 事件退役,
+    // 所以必须自带结束态,否则会留下一张永远"正在生成"的孤儿卡
+    cur.reasoning += `\n${delta}`
+    finishThinking(cur, conv_id, 'done')
   } else if (phase === 'error') {
     // 错误文本仍归入思考卡(整项失败的完整提示由任务级 error_message 承担)
     cur.reasoning += `\n[错误] ${delta}`

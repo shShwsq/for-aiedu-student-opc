@@ -662,7 +662,7 @@ react_agent 维护跨轮 plan 状态:
 | `conversation` | 对话消息(agent2 / agent1 的每一步) |
 | `conversation_update` | 更新已有 conversation 的 content(节流推送,如部分 CLI 的工具调用参数增量) |
 | `status` | 任务状态变更(进入新阶段) |
-| `thinking_delta` | LLM 流式 token 增量(打字机效果;phase: start / reasoning / content / error / end) |
+| `thinking_delta` | LLM 流式 token 增量(打字机效果;phase: start / reasoning / content / notice / error / end) |
 | `plan` | 计划清单状态更新(跨轮续接) |
 | `verify_action` | 验证动作授权请求(verifier_agent 的 `per_action` 模式,前端 VerifyActionDialog) |
 | `command_confirm` | 危险命令确认(local 模式,前端 CommandConfirmDialog) |
@@ -826,6 +826,7 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - **沙箱续期与探活**:`SANDBOX_RENEW_INTERVAL_MINUTES`(默认 5)现仅用于 CLI(ACP)prompt 等长阻塞段的 `auto_renew` 后台线程(那段时间命令由 CLI 自己在沙箱里跑,不触发后端会话访问);普通访问路径的续期已并入探活(节流见 `sandbox_tools._SANDBOX_PROBE_INTERVAL`),回收后的处置见 §9.6
 - **CLI 挂死兜底**:`ACP_IDLE_TIMEOUT_OUTPUT_SECONDS`(默认 300,无活动工具时)/ `ACP_IDLE_TIMEOUT_TOOL_SECONDS`(默认 1800,有工具在跑时),超时 cancel + 用已累积输出收尾,防 CLI 静默挂死
 - **CLI 崩溃/流中断兜底**:SSE 流在收到 JSON-RPC 最终响应前结束(如 Node OOM 崩溃)时,bridge 关流前推 `event: stream_error`(含原因:cli_exit / stdout_eof / read_error),后端 `ACPClient._rpc` 抛 `ACPStreamAborted`;`prompt()` 捕获后与挂死超时同款善后——cancel + 置 `last_prompt_truncated` + 用已累积输出收尾,summary 标注"本轮输出不完整"让 agent2 知情,不再把崩溃当作正常完成
+- **异步子 Agent 提前收尾的结果回收**:Qoder 的 `Agent` 工具是 fire-and-forget —— 工具调用立刻回 "Async agent launched…background" 回执并被标 completed,子 Agent 的结果只能从**下一轮**回流,而模型常在它们未回报时就 `end_turn`,平台据此显示"已完成"(平台行为没错,是 CLI/模型提前收尾)。`run_acp_agent` 收尾时以"本轮派生过后台子 Agent"为主判据(executor 白名单 `ACP_ASYNC_AGENT_TYPES` + 首轮未被兜底截断 + **最后一次派生回执之后**的收尾文本还没交付实质结果 —— 派生之前写的正文与是否提前收尾无关,不参与判定),在同一活跃 ACP session 上带退避补发续轮 prompt(`ACP_ASYNC_AGENT_MAX_CONTINUE` 次),让 CLI 把已完成结果注入下一轮产出报告。判定"回收完成"不只看文本口吻:续轮被 idle/流中断兜底截断(`prompt()` 吞异常返回 `{}`,残留可能只是半份报告)、`stopReason` 非 `end_turn`、达次数上限都算"仍不完整";拿到实质内容(≥ `ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS`)或连续两次输出重复则**停止补发**(再问只会让同一份报告重复堆进 summary)但仍标可能不完整 —— 既不谎报回收成功,也不把结果堆叠。仍不完整时 summary 追加"可稍后追问"注记让 agent2 知情。会话记录(`build_session_record` 的 truncated 口径)排在回收之后写,续轮被截断的轮次不推进记录,否则下一轮恢复不回放缺失尾巴
 - **LLM 限流退避**:`LLM_RATE_LIMIT_MAX_RETRIES`(默认 3),429 时指数退避 + 抖动重试,厂商返回 Retry-After 时优先采用
 
 

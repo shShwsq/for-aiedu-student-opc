@@ -157,8 +157,23 @@ _ASYNC_AGENT_LAUNCH_RE = re.compile(
     r"Async agent launched|working in the background", re.IGNORECASE
 )
 
-# 本轮 final 文本"业务未完成、仍在等后台结果"的口吻(中英文)。命中且本轮有
-# 异步派生 → 判为提前 end_turn,触发同 session 续轮回收。
+# 派生子 Agent 的工具名(小写宽松匹配:各 CLI 把子智能体工具叫 Agent / Task /
+# subagent 不一)。工具名放宽,但回执文本必须同时命中异步标记,免得把同步
+# 子任务的回执算成异步派生。
+_ASYNC_AGENT_TOOL_NAMES = {"agent", "task", "subagent", "sub_agent"}
+
+# 判定"仍在等结果"口吻时只看末尾窗口(字符):整段正文里的技术用词
+# ("等待锁""waiting for 队列")不该被当成"还在等子 Agent 回报"
+_ASYNC_REPORT_TAIL_WINDOW = 1200
+
+# 续轮 prompt 的正常结束原因(ACP PromptResponse.stopReason)。其余值
+# (max_tokens 被截 / refusal / cancelled)说明这一轮根本没写完,
+# 拿到的残留文本不能当"已回收完整报告"
+_ASYNC_CLEAN_STOP_REASONS = {"end_turn"}
+
+# final 文本"业务未完成、仍在等后台结果"的口吻(中英文)。仅在"本轮派生过后台
+# 子 Agent"的前提下作为判据之一,且只看末尾窗口(_ASYNC_REPORT_TAIL_WINDOW),
+# 单独命中不触发续轮回收。
 _PENDING_ASYNC_REPORT_RE = re.compile(
     r"(等待|稍后|尚未|未收到|还没|之后.{0,8}(报告|结果|返回|给)"
     r"|will (deliver|report|give|provide|share)"
@@ -195,6 +210,71 @@ def _looks_like_pending_async_report(text: str) -> bool:
     return bool(_PENDING_ASYNC_REPORT_RE.search(text))
 
 
+def _is_async_agent_launch(tool_name: str, raw_output: str) -> bool:
+    """一次工具完成回执是否为"后台派生子 Agent"(结果要到下一轮才回流)。
+
+    工具名宽松匹配,回执文本必须命中异步标记 —— 两者缺一都不算,
+    避免把同步跑完的子任务计入异步派生而白补发一轮。
+    """
+    if (tool_name or "").strip().lower() not in _ASYNC_AGENT_TOOL_NAMES:
+        return False
+    return bool(_ASYNC_AGENT_LAUNCH_RE.search(raw_output or ""))
+
+
+def _async_delivered_min_chars() -> int:
+    """判定"已产出实质报告"的字符阈值(配置非法时返回 0=该判据不启用)。"""
+    try:
+        return max(0, int(getattr(settings, "ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS", 1500) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _needs_async_agent_recovery(text: str) -> bool:
+    """收尾文本是否"还没交付子 Agent 的结果"(续轮回收的次要判据)。
+
+    主判据是本轮派生过后台子 Agent(子 Agent 结果只能从下一轮回流),这里只
+    负责排除"结果其实已经给全"的情形:
+    - 末尾呈"在等结果"口吻 → 需要回收(主要信号)
+    - 收尾文本没实质内容(为空或短于阈值)→ 需要回收(防漏报:模型提前
+      end_turn 时常常只留一句"子任务已启动",不含任何等待字样)
+    长完整报告且末尾无等待口吻 → 不回收,避免重复补发把同一份报告堆两遍。
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if _looks_like_pending_async_report(stripped[-_ASYNC_REPORT_TAIL_WINDOW:]):
+        return True
+    min_chars = _async_delivered_min_chars()
+    return min_chars > 0 and len(stripped) < min_chars
+
+
+def _should_recover_async_agent(
+    collector: "_ACPCollector", client: "ACPClient", agent_type: str
+) -> bool:
+    """收尾判定:是否需要在同一活跃 session 上补发续轮回收后台子 Agent 结果。
+
+    文本判据只看"最后一次派生回执之后"的那段收尾文本(结果只能从下一轮回流,
+    派生之前写的正文与"是否提前收尾"无关,把它们混进来正是误判/漏判的来源)。
+    """
+    content_full = collector.content_full or ""
+    tail_start = getattr(collector, "async_agent_launch_tail_start", 0) or 0
+    return (
+        collector.async_agent_launch_count > 0
+        and _async_agent_autoccontinue_enabled(agent_type)
+        and not getattr(client, "last_prompt_truncated", None)
+        and _needs_async_agent_recovery(content_full[tail_start:])
+    )
+
+
+def _text_fingerprint(text: str) -> str:
+    """续轮输出的近似指纹(压掉空白后取首尾片段哈希),用于识别重复报告。"""
+    normalized = re.sub(r"\s+", "", text or "").lower()
+    if not normalized:
+        return ""
+    sample = normalized[:400] + normalized[-200:]
+    return hashlib.sha1(sample.encode("utf-8", "ignore")).hexdigest()
+
+
 def _async_agent_collect_results(
     client: "ACPClient",
     acp_session_id: str,
@@ -209,57 +289,103 @@ def _async_agent_collect_results(
 
     - 复用同一 client + session_id + collector:续轮内容继续累积进 content_full
       并流式推前端,收尾时并入本轮 summary(不另起 conv/round)。
-    - 停止条件:补发轮不再呈"在等结果"口吻(视为已回收)/ 达最大次数 /
-      连接或 idle 兜底异常。
-    - ctx["still_pending"]:循环结束时是否仍呈未完成口吻(供上层标注结果可能不全)。
+    - 停止条件(任一命中即停):拿到不再呈"在等结果"口吻的新输出(回收完成)/
+      被兜底截断或 stopReason 非 end_turn(结果不可信)/ 已产出实质内容却仍带
+      等待口吻或连续两次输出重复(再补发只会把同一份报告堆进 summary)/
+      连接层异常 / 达最大次数。
+    - ctx["still_pending"]:是否仍可能没拿全结果。调用方一进续轮就该置 True,
+      本函数只在确认拿到完整报告时置 False —— 其余所有退出路径都保持 True,
+      免得把失败情形标成"已回收完整报告"。
+
+    注:idle 挂死(PromptIdleTimeout)与流中断(ACPStreamAborted)都在
+    `ACPClient.prompt()` 内部兜底(置 last_prompt_truncated 后返回 {}),
+    不会抛到这儿,因此 except 只列会真正抛出的连接层异常。
     """
     max_continue = int(getattr(settings, "ACP_ASYNC_AGENT_MAX_CONTINUE", 3) or 0)
     cur_wait = float(getattr(settings, "ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS", 20) or 0)
     factor = float(getattr(settings, "ACP_ASYNC_AGENT_CONTINUE_BACKOFF_FACTOR", 1.5) or 1.5)
+    min_delivered = _async_delivered_min_chars()
 
-    last_new_text = ""
+    last_fp = ""
     for attempt in range(1, max_continue + 1):
         # 给后台子 Agent 完成时间(auto_renew 后台线程期间持续续期沙箱 TTL)
         if cur_wait > 0:
             time.sleep(cur_wait)
         prev_len = len(collector.content_full)
         try:
-            client.prompt(
+            result = client.prompt(
                 acp_session_id,
                 [{"type": "text", "text": _ASYNC_AGENT_CONTINUE_PROMPT}],
                 on_event=collector,
                 idle_probe=lambda: collector.has_active_tools,
             )
-        except (httpx.HTTPError, ConnectionError, PromptIdleTimeout, ACPStreamAborted) as e:
+        except (httpx.HTTPError, ConnectionError) as e:
             logger.warning(
-                f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次失败(停止续轮): {e}"
+                f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次连接异常(停止续轮): {e}"
+            )
+            ctx["still_pending"] = True
+            return
+
+        # 被兜底截断:prompt() 已 cancel 并返回空结果,collector 里的残留文本
+        # 可能只是半份报告,绝不能按"口吻"判成回收完成
+        trunc_reason = getattr(client, "last_prompt_truncated", None)
+        if trunc_reason:
+            logger.warning(
+                f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次被兜底提前终止"
+                f"({trunc_reason}),停止续轮并标注结果可能不完整"
+            )
+            ctx["still_pending"] = True
+            return
+        # 结束原因非 end_turn(max_tokens 被截 / refusal / cancelled):
+        # 这一轮没写完,拿到的内容不能当完整报告
+        stop_reason = str((result or {}).get("stopReason") or "")
+        if stop_reason and stop_reason not in _ASYNC_CLEAN_STOP_REASONS:
+            logger.warning(
+                f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次结束原因为 {stop_reason}"
+                f"(非正常收尾),停止续轮并标注结果可能不完整"
             )
             ctx["still_pending"] = True
             return
 
         new_text = collector.content_full[prev_len:]
-        last_new_text = new_text
-        # 本轮补发已产出实质内容且不再呈"在等结果"口吻 → 结果已回收完整
-        if new_text.strip() and not _looks_like_pending_async_report(new_text):
+        stripped = new_text.strip()
+        if not stripped:
+            # 没吐新内容:子 Agent 可能还没回报,再等一轮
+            logger.info(
+                f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次无新增输出,继续等待"
+            )
+            cur_wait = cur_wait * factor
+            continue
+        if not _looks_like_pending_async_report(new_text):
             logger.info(
                 f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次完成,"
                 f"新增 {len(new_text)} 字符"
             )
             ctx["still_pending"] = False
             return
+        # 有实质内容但末尾仍带等待口吻:再补发只会让模型把同一份报告再说一遍
+        # (连续两次指纹相同同理),就此收手并保留"可能不完整"的诚实标注
+        fp = _text_fingerprint(new_text)
+        repeated = bool(fp) and fp == last_fp
+        if repeated or (min_delivered > 0 and len(stripped) >= min_delivered):
+            ctx["still_pending"] = True
+            logger.warning(
+                f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次已产出实质内容"
+                f"({len(stripped)} 字符)但{'输出与上次重复' if repeated else '仍呈等待口吻'},"
+                f"停止补发以免报告堆叠,结果按可能不完整标注"
+            )
+            return
+        last_fp = fp
         logger.info(
             f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次后仍似未完成"
             f"(新增 {len(new_text)} 字符),继续等待"
         )
         cur_wait = cur_wait * factor
 
-    # 耗尽最大补发次数
-    ctx["still_pending"] = (
-        _looks_like_pending_async_report(last_new_text) if last_new_text else True
-    )
+    # 耗尽最大补发次数(或被配置关掉):能走到这里说明没有任何一次确认拿到完整报告
+    ctx["still_pending"] = True
     logger.warning(
-        f"[task={task.id}] {agent_type} 续轮回收已达上限 {max_continue} 次,"
-        f"结果仍可能不完整: still_pending={ctx['still_pending']}"
+        f"[task={task.id}] {agent_type} 续轮回收已达上限 {max_continue} 次,结果仍可能不完整"
     )
 
 
@@ -1654,6 +1780,9 @@ class _ACPCollector:
         # 本轮检测到的"异步后台子 Agent 派生"次数(Qoder Agent 工具回
         # "Async agent launched…background" 回执时 +1),供收尾判定是否续轮回收
         self.async_agent_launch_count = 0
+        # 最后一次派生回执时刻 content_full 的长度:收尾只看这之后的文本,
+        # 派生之前写的正文与"是否提前 end_turn"无关
+        self.async_agent_launch_tail_start = 0
         # 当前迭代状态
         self.iteration = 0
         self.current_conv_id = str(uuid.uuid4())
@@ -1740,6 +1869,37 @@ class _ACPCollector:
     def close(self) -> None:
         """prompt 调用结束:flush 最后一段迭代"""
         self._flush_iteration()
+
+    def publish_note(
+        self, text: str, *, terminal: bool = False, level: str = "info"
+    ) -> None:
+        """往侧栏思考卡追加一条系统提示(过程性说明,不落库)
+
+        level="error" 走 error 相位(前端渲染成 "[错误] …" 并收卡);
+        level="info" 时按 terminal 分流:
+        - terminal=False:本轮仍有活跃迭代,提示续写进当前思考卡的 reasoning,
+          卡片随迭代结束自然收尾 —— 不能用 error 相位,否则一条进度提示会被
+          显示成错误,还会提前把正在流式的卡片标成结束。
+        - terminal=True:整轮已 close(卡片随 conversation 事件退役),此时必须
+          自带结束态,否则前端为这个 conv_id 新建的卡片会永远停在流式中;
+          走 notice 相位 —— 与 error 一样收尾,但不标错误。
+        """
+        if terminal:
+            phase = "error" if level == "error" else "notice"
+        else:
+            phase = "error" if level == "error" else "reasoning"
+            if level != "error":
+                # 懒启动:整轮没有活跃文本卡时先开一张,否则提示挂在一个
+                # 从未收到 start 的 conv_id 上
+                self._ensure_iter_started()
+        publish(self.task.id, "thinking_delta", {
+            "conv_id": self.current_conv_id,
+            "round_idx": self.round_idx,
+            "role": "agent1",
+            "phase": phase,
+            "delta": text,
+            "iteration": self.iteration,
+        })
 
     @property
     def has_active_tools(self) -> bool:
@@ -2019,8 +2179,10 @@ class _ACPCollector:
         # 异步后台子 Agent 派生检测:Qoder 的 Agent 工具完成时回的是
         # "Async agent launched successfully…working in the background" 回执
         # (子 Agent 真正结果要到下一轮才回流),据此在收尾判定是否续轮回收。
-        if tool_name == "Agent" and _ASYNC_AGENT_LAUNCH_RE.search(raw_output or ""):
+        if _is_async_agent_launch(tool_name, raw_output or ""):
             self.async_agent_launch_count += 1
+            # 记住派生点:收尾判定只比对这之后新写出的文本
+            self.async_agent_launch_tail_start = len(self.content_full)
 
         # 该 tool_call 已完成,清理 pending(避免累积 + 防止重复 completed 重复触发)
         self._pending_tool_calls.pop(tool_call_id, None)
@@ -3151,11 +3313,43 @@ def run_acp_agent(
                     # 供同 session 下一轮去重与回放判定(业务错误异常不会走到这里,
                     # 下一轮因此仍会全量注入 + 回放,不会复用空 session 而丢历史)
                     _record_prompt_accepted(task_id_str, ctx_hash, round_idx)
+
+                    # ---- 异步子 Agent 提前收尾:同一活跃 session 续轮回收 ----
+                    # 主判据:本轮派生过后台子 Agent(其结果只能从下一轮回流)+ 首轮
+                    # 未被兜底截断 + 收尾文本还没交付实质结果(末尾呈"在等结果"口吻,
+                    # 或短到不像一份报告 —— 提前 end_turn 常只留一句"子任务已启动",
+                    # 不含任何等待字样,只靠口吻正则会漏)。
+                    # 实测(qwen3.8-flash):同 session 补发一条 session/prompt,
+                    # CLI 会把已完成的后台子 Agent 结果注入下一轮并产出完整报告。
+                    if _should_recover_async_agent(collector, client, agent_type):
+                        # 进了续轮就先按"尚未回收成功"标注:截断 / stopReason 非正常 /
+                        # 异常 / 耗尽都保持 True,只有确认拿到完整报告才由回收函数置 False
+                        _async_ctx["continued"] = True
+                        _async_ctx["still_pending"] = True
+                        logger.warning(
+                            f"[task={task.id}] {agent_type} 第 {round_idx} 轮检测到异步子 Agent "
+                            f"提前 end_turn(派生 {collector.async_agent_launch_count} 个),"
+                            f"启动同 session 续轮回收"
+                        )
+                        # 进度提示续写进当前思考卡(不标错误):此刻卡片仍在流式中
+                        collector.publish_note("[检测到后台子任务未回报,正在续轮回收结果…]")
+                        try:
+                            _async_agent_collect_results(
+                                client, acp_session_id, collector, _async_ctx,
+                                task=task, round_idx=round_idx, agent_type=agent_type,
+                            )
+                        except Exception as e:  # 续轮回收失败不拖垮本轮,保留已累积输出收尾
+                            logger.warning(
+                                f"[task={task.id}] {agent_type} 异步子 Agent 续轮回收异常(忽略,用已累积输出收尾): {e}"
+                            )
+
                     # 会话记录持久化:后端重启 / bridge 重建后仍可凭 sessionId 让
                     # CLI 恢复上下文(指纹一并存,恢复后才知道哪些注入段已给过)。
                     # 截断兜底轮(idle 挂死/流中断降级收尾)不推进记录:该轮内容
                     # 可能没被 CLI 写进磁盘 transcript,记录留在上一次干净轮,
-                    # 恢复后的增量回放才能把它补上
+                    # 恢复后的增量回放才能把它补上。
+                    # 必须排在续轮回收之后:续轮同样可能被兜底截断,提前记录会把这一轮
+                    # 当干净轮推进,下一轮恢复时就不回放这段缺失的尾巴了
                     _session_record = build_session_record(
                         agent_type=agent_type,
                         session_id=acp_session_id,
@@ -3167,41 +3361,6 @@ def run_acp_agent(
                     )
                     if _session_record is not None:
                         save_session_record(db, task, _session_record)
-
-                    # ---- 异步子 Agent 提前收尾:同一活跃 session 续轮回收 ----
-                    # 签名:本轮派生过后台子 Agent + 未被 idle/流中断截断 +
-                    # final 文本仍呈"在等结果"口吻 → 判为提前 end_turn。
-                    # 实测(qwen3.8-flash):同 session 补发一条 session/prompt,
-                    # CLI 会把已完成的后台子 Agent 结果注入下一轮并产出完整报告。
-                    if (
-                        collector.async_agent_launch_count > 0
-                        and _async_agent_autoccontinue_enabled(agent_type)
-                        and not client.last_prompt_truncated
-                        and _looks_like_pending_async_report(collector.content_full)
-                    ):
-                        _async_ctx["continued"] = True
-                        logger.warning(
-                            f"[task={task.id}] {agent_type} 第 {round_idx} 轮检测到异步子 Agent "
-                            f"提前 end_turn(派生 {collector.async_agent_launch_count} 个),"
-                            f"启动同 session 续轮回收"
-                        )
-                        publish(task.id, "thinking_delta", {
-                            "conv_id": collector.current_conv_id,
-                            "round_idx": round_idx,
-                            "role": "agent1",
-                            "phase": "error",
-                            "delta": "[检测到后台子任务未回报,正在续轮回收结果…]",
-                            "iteration": collector.iteration,
-                        })
-                        try:
-                            _async_agent_collect_results(
-                                client, acp_session_id, collector, _async_ctx,
-                                task=task, round_idx=round_idx, agent_type=agent_type,
-                            )
-                        except Exception as e:  # 续轮回收失败不拖垮本轮,保留已累积输出收尾
-                            logger.warning(
-                                f"[task={task.id}] {agent_type} 异步子 Agent 续轮回收异常(忽略,用已累积输出收尾): {e}"
-                            )
 
             except Exception as e:
                 logger.exception(f"[task={task.id}] ACP prompt 失败 ({agent_type})")
@@ -3277,27 +3436,20 @@ def run_acp_agent(
             logger.warning(
                 f"[task={task.id}] {agent_type} 第 {round_idx} 轮后台子任务续轮后仍未全部回报"
             )
-            publish(task.id, "thinking_delta", {
-                "conv_id": collector.current_conv_id,
-                "round_idx": round_idx,
-                "role": "agent1",
-                "phase": "error",
-                "delta": "[后台子任务未全部回报,已尝试续轮回收但结果可能仍不完整]",
-                "iteration": collector.iteration,
-            })
+            collector.publish_note(
+                "[后台子任务未全部回报,已尝试续轮回收但结果可能仍不完整]",
+                terminal=True, level="error",
+            )
             summary += (
                 "\n\n[系统注记:本轮派生的后台子任务在续轮回收后仍未全部回报,"
                 "以上结果可能不完整,可稍后追问以获取完整报告]"
             )
         else:
-            publish(task.id, "thinking_delta", {
-                "conv_id": collector.current_conv_id,
-                "round_idx": round_idx,
-                "role": "agent1",
-                "phase": "error",
-                "delta": "[已回收后台子任务结果并合并为完整报告]",
-                "iteration": collector.iteration,
-            })
+            # 回收成功是正常结局,走 notice 相位:此刻迭代已 flush,卡片须自带
+            # 结束态,但绝不能借 error 相位渲染成"[错误] …"
+            collector.publish_note(
+                "[已回收后台子任务结果并合并为完整报告]", terminal=True, level="info",
+            )
 
     current_plan: list[dict] = [dict(s) for s in (previous_plan or [])]
     extracted = _extract_plan(collector.content_full)

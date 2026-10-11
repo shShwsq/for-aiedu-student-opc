@@ -269,6 +269,19 @@ GitHub 和 Gitee 二者均支持,按需配置。留空的平台对应路由会�
 | `ACP_IDLE_TIMEOUT_OUTPUT_SECONDS` | 无活动工具(等模型输出)时的 idle 超时,超时则 cancel + 用已累积输出收尾本轮(`0`=关闭) | `300` |
 | `ACP_IDLE_TIMEOUT_TOOL_SECONDS` | 有工具在跑(克隆/构建等长命令本就无输出)时的最后防线超时,防 CLI 中途崩溃没发 completed(`0`=关闭) | `1800` |
 
+**异步子 Agent 提前收尾的结果回收**(签名源自 Qoder CLI):
+
+Qoder 的 `Agent` 工具是后台派生(fire-and-forget),工具调用立刻回 "Async agent launched…background" 回执,模型常在子 Agent 未回报时就 `end_turn` —— 平台据此显示"已完成",业务其实没做完。检测到"本轮派生过后台子 Agent 且收尾文本还没交付实质结果"时,后端在同一活跃 ACP session 上带退避补发续轮 prompt,让 CLI 把已完成的子 Agent 结果注入下一轮产出完整报告;补发被兜底截断 / 结束原因非 `end_turn` / 达次数上限时,summary 与前端都标注"结果可能不完整",不谎报完成。
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `ACP_ASYNC_AGENT_AUTOCONTINUE` | 总开关(`false`=完全不补发) | `true` |
+| `ACP_ASYNC_AGENT_TYPES` | 生效的 executor(逗号分隔) | `qoder_cli` |
+| `ACP_ASYNC_AGENT_MAX_CONTINUE` | 单轮最多补发几次续轮 prompt(`0`=不补发)。注意每次补发除等待外还受 idle 兜底约束,最坏可占用数十分钟 | `3` |
+| `ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS` | 每次补发前等待秒数(给子 Agent 完成时间) | `20` |
+| `ACP_ASYNC_AGENT_CONTINUE_BACKOFF_FACTOR` | 等待时长的递增系数 | `1.5` |
+| `ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS` | 判定"已产出实质报告"的字符阈值:补发拿到不少于该长度的文本就收手(再问只会让同一份报告重复堆进 summary),`0`=关闭该判据 | `1500` |
+
 **Qoder CLI** —— `task.executor=qoder_cli`
 
 | 变量 | 默认值 |

@@ -587,6 +587,18 @@ ExecutorAgent (ABC)
       但持久化记录不推进(见上)
     → 挂死兜底:按活动工具状态分级 idle 超时 → session/cancel + 置 last_prompt_truncated → 返回空结果
     → 流异常兜底:CLI 崩溃/连接中断(ACPStreamAborted)走同款善后,不把崩溃当正常完成、不 fail 任务
+    → **异步子 Agent 续轮回收**(Qoder 的 Agent 工具 fire-and-forget,结果只能从下一轮回流):
+      本轮派生过后台子 Agent(工具名宽松匹配 Agent/Task/subagent + 回执含 "Async agent
+      launched…background")且**最后一次派生回执之后**的收尾文本还没交付实质结果(呈"在等
+      结果"口吻,或短于 ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS;派生之前写的正文与是否提前
+      end_turn 无关,故完全不参与判定)→ 在同一活跃 session 上带退避补发续轮 prompt
+      (_async_agent_collect_results),让 CLI 把已完成的子 Agent 结果注入下一轮产出报告。
+      停止补发的判据不止文本口吻 —— 续轮被兜底截断(prompt() 把 idle/流中断吞成"置
+      last_prompt_truncated + 返回 {}")、stopReason 非 end_turn、已产出实质内容、连续两次
+      输出指纹相同(再问只会把同一份报告堆进 summary)、连接层异常;除"确认拿到完整报告"
+      外一律保持 still_pending=True,不谎报回收成功。
+      会话记录(build_session_record 的 truncated 口径)排在回收之后写:续轮被截断时该轮
+      同样不推进记录,否则下一轮恢复就不回放这段缺失尾巴
 21. finally: recorder.close() + collector.close() → client.close()
 22. 外层 finally: **bridge 保持运行**(已在 _bridge_cache),不再每轮停止,供后续轮次/resume 复用;
     仅当未入缓存(初始化阶段失败)时 _stop_acp_bridge,避免残留坏进程
@@ -597,6 +609,9 @@ ExecutorAgent (ABC)
 23. summary = collector.content_full or "执行完成({agent_type},{n} 次工具调用)"
     若 client.last_prompt_truncated:推 phase=error 事件「[本轮提前终止: ...]」
     并在 summary 追加截断标注(让 agent2 审查时知道输出不完整)
+    若进入过续轮回收(collector.publish_note,terminal=True):仍不完整 → phase=error +
+    summary 追加「后台子任务…可能不完整,可稍后追问」;确认回收完成 → phase=notice
+    (成功提示借 error 相位会被前端渲染成「[错误] ...」,故新增不标错的收尾相位)
 24. current_plan = _extract_plan(collector.content_full) or previous_plan
 25. return [], summary, current_plan
 ```
@@ -886,7 +901,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | `user_message_pending` | tasks API 端点 | 运行中/暂停中发送的用户补充消息（已落库入队、未被消费）：前端以"待处理"条目展示在输入框上方（TRAE 式），消费时经同 id 的 `conversation` 事件转入对话流；事件入总线历史，刷新后经 SSE 补播重建待处理状态 |
 | `user_message_withdrawn` | tasks API 端点 | 待处理消息被用户撤回（`DELETE /tasks/{id}/messages/{message_id}`：队列移除 + 删 Conversation）：前端移除待处理条目（多端同步）；已被消费的消息拒绝撤回 |
 | `conversation_update` | CLI agent | 更新已有 conversation 的 content（节流推送，如工具调用参数增量） |
-| `thinking_delta` | agent2 / react_agent / CLI agent / verifier_agent | 流式思考增量（phase: start / reasoning / content / error / end；verifier 带 `role=agent2, verify=true`） |
+| `thinking_delta` | agent2 / react_agent / CLI agent / verifier_agent | 流式思考增量（phase: start / reasoning / content / notice / error / end；verifier 带 `role=agent2, verify=true`） |
 | `plan` | react_agent / CLI agent | plan 状态更新（round_idx + steps） |
 | `verify_action` | verifier_agent | 验证动作授权请求(`per_action` 模式,前端 VerifyActionDialog) |
 | `command_confirm` | sandbox_tools (local 模式) | 危险命令确认(前端 CommandConfirmDialog) |
