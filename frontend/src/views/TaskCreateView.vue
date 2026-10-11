@@ -2698,76 +2698,7 @@ onUnmounted(() => {
   color: var(--color-text);
 }
 
-/* 字段头部:标签 + 帮助按钮(问号) */
-.field-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-1);
-}
-
-/* 字段级帮助按钮(问号)+ 说明气泡 */
-.field-help-wrap {
-  position: relative;
-  flex-shrink: 0;
-  display: inline-flex;
-}
-
-.field-help-btn {
-  width: 18px;
-  height: 18px;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--color-text-muted);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  transition: color var(--transition-fast);
-}
-
-.field-help-btn:hover {
-  color: var(--color-primary);
-}
-
-.field-help-btn svg {
-  width: 16px;
-  height: 16px;
-  display: block;
-}
-
-.field-help-popover {
-  position: absolute;
-  top: calc(100% + var(--space-1));
-  left: 0;
-  z-index: 20;
-  width: max-content;
-  min-width: 2em;
-  max-width: min(300px, 80vw);
-  max-height: 240px;
-  overflow-y: auto;
-  padding: var(--space-3);
-  font-size: var(--fs-sm);
-  line-height: var(--lh-relaxed);
-  color: var(--color-text-secondary);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
-  word-break: break-word;
-}
-
-/* 帮助气泡出现/消失动画 */
-.help-fade-enter-active,
-.help-fade-leave-active {
-  transition: opacity var(--transition-fast), transform var(--transition-fast);
-}
-
-.help-fade-enter-from,
-.help-fade-leave-to {
-  opacity: 0;
-  transform: translateY(-4px);
-}
+/* 字段级帮助气泡(圆圈问号 + 说明)统一由共享组件 HelpPopover 提供样式 */
 
 .policy-input {
   width: 100%;

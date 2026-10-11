@@ -8,9 +8,10 @@
  * - 验证授权模式:验证动作的默认授权模式(直接执行 / 逐动作授权)
  * - AI助手确认策略
  */
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import BaseSelect from '@/components/BaseSelect.vue'
+import HelpPopover from '@/components/HelpPopover.vue'
 import { getPreferences, saveAgentPolicy } from '@/api/memory'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 import { extractErrorMessage } from '@/utils/error'
@@ -198,34 +199,9 @@ const FIELD_HELP: Record<string, string> = {
     '控制 AI助手(内置执行器 / Qoder / DeepSeek / Codex)执行危险命令时是否弹窗确认。自动批准:所有命令直接执行不弹窗(速度快,适合可信任务);逐命令确认:每个危险命令执行前弹窗让用户批准(更安全,防容器破坏/资源耗尽)。此为用户级默认,任务创建时可单独覆盖。注意:Codex CLI 受非交互模式限制,仅支持自动批准,选择「逐命令确认」时会降级并警告。',
 }
 
-/** 当前展开帮助气泡的字段 key(null=无展开) */
-const openHelpKey = ref<string | null>(null)
-/** 字段帮助气泡容器 DOM(按 key 索引,用于点击外部判断) */
-const fieldHelpRefs = new Map<string, HTMLElement>()
-
-/** 切换某字段帮助气泡:已展开则收起,未展开则展开(同时收起其他字段) */
-function toggleFieldHelp(key: string): void {
-  openHelpKey.value = openHelpKey.value === key ? null : key
-}
-
-/** 点击帮助容器外部时关闭气泡 */
-function onDocClick(e: MouseEvent): void {
-  if (openHelpKey.value) {
-    const el = fieldHelpRefs.get(openHelpKey.value)
-    if (!el || !el.contains(e.target as Node)) {
-      openHelpKey.value = null
-    }
-  }
-}
-
-onMounted(() => {
-  loadPolicy()
-  document.addEventListener('click', onDocClick)
-})
-
-onUnmounted(() => {
-  document.removeEventListener('click', onDocClick)
-})
+// 字段帮助气泡:统一走共享组件 HelpPopover(正文由下方各字段的插槽供给)
+// 全局互斥与「点外部 / Esc 收起」都在组件内,这里不再维护 openKey / DOM 索引
+onMounted(loadPolicy)
 </script>
 
 <template>
@@ -262,17 +238,7 @@ onUnmounted(() => {
       <label class="policy-toggle-row policy-toggle-primary">
         <input v-model="policyAgent2Enabled" class="switch" type="checkbox" :disabled="saving" />
         <span>启用检查助手</span>
-        <div
-          :ref="(el) => { if (el) fieldHelpRefs.set('agent2_enabled', el as HTMLElement); else fieldHelpRefs.delete('agent2_enabled') }"
-          class="field-help-wrap"
-        >
-          <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('agent2_enabled')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-          </button>
-          <Transition name="help-fade">
-            <div v-if="openHelpKey === 'agent2_enabled'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.agent2_enabled }}</div>
-          </Transition>
-        </div>
+        <HelpPopover>{{ FIELD_HELP.agent2_enabled }}</HelpPopover>
       </label>
 
       <!-- 单 agent 模式提示:agent2 关闭时说明下方依赖字段为何隐藏 -->
@@ -286,33 +252,13 @@ onUnmounted(() => {
       <label class="policy-toggle-row">
         <input v-model="policyAllowVerify" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
         <span>允许检查助手自行验证 <span class="policy-experimental">(实验性)</span></span>
-        <div
-          :ref="(el) => { if (el) fieldHelpRefs.set('allow_verify', el as HTMLElement); else fieldHelpRefs.delete('allow_verify') }"
-          class="field-help-wrap"
-        >
-          <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('allow_verify')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-          </button>
-          <Transition name="help-fade">
-            <div v-if="openHelpKey === 'allow_verify'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.allow_verify }}</div>
-          </Transition>
-        </div>
+        <HelpPopover>{{ FIELD_HELP.allow_verify }}</HelpPopover>
       </label>
 
       <label class="policy-toggle-row">
         <input v-model="policyAllowReference" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
         <span>复核 AI助手引用的网址</span>
-        <div
-          :ref="(el) => { if (el) fieldHelpRefs.set('allow_reference_check', el as HTMLElement); else fieldHelpRefs.delete('allow_reference_check') }"
-          class="field-help-wrap"
-        >
-          <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('allow_reference_check')">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-          </button>
-          <Transition name="help-fade">
-            <div v-if="openHelpKey === 'allow_reference_check'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.allow_reference_check }}</div>
-          </Transition>
-        </div>
+        <HelpPopover>{{ FIELD_HELP.allow_reference_check }}</HelpPopover>
       </label>
 
       <Transition name="collapse">
@@ -320,17 +266,7 @@ onUnmounted(() => {
           <label class="policy-field">
             <div class="field-head">
               <span class="policy-label">验证授权模式</span>
-              <div
-                :ref="(el) => { if (el) fieldHelpRefs.set('verifier_auth_mode', el as HTMLElement); else fieldHelpRefs.delete('verifier_auth_mode') }"
-                class="field-help-wrap"
-              >
-                <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('verifier_auth_mode')">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                </button>
-                <Transition name="help-fade">
-                  <div v-if="openHelpKey === 'verifier_auth_mode'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.verifier_auth_mode }}</div>
-                </Transition>
-              </div>
+              <HelpPopover>{{ FIELD_HELP.verifier_auth_mode }}</HelpPopover>
             </div>
             <BaseSelect
               v-model="policyVerifierAuthMode"
@@ -349,17 +285,7 @@ onUnmounted(() => {
       <label class="policy-field policy-field-command-confirm">
         <div class="field-head">
           <span class="policy-label">AI助手确认策略</span>
-          <div
-            :ref="(el) => { if (el) fieldHelpRefs.set('executor_command_confirm', el as HTMLElement); else fieldHelpRefs.delete('executor_command_confirm') }"
-            class="field-help-wrap"
-          >
-            <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('executor_command_confirm')">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-            </button>
-            <Transition name="help-fade">
-              <div v-if="openHelpKey === 'executor_command_confirm'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.executor_command_confirm }}</div>
-            </Transition>
-          </div>
+          <HelpPopover>{{ FIELD_HELP.executor_command_confirm }}</HelpPopover>
         </div>
         <BaseSelect
           v-model="policyExecutorCommandConfirm"
@@ -559,68 +485,7 @@ onUnmounted(() => {
   gap: var(--space-1);
 }
 
-/* ---- 字段级帮助按钮(问号)+ 说明气泡 ---- */
-.field-help-wrap {
-  position: relative;
-  flex-shrink: 0;
-  display: inline-flex;
-}
-
-.field-help-btn {
-  width: 18px;
-  height: 18px;
-  padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--color-text-muted);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  transition: color var(--transition-fast);
-}
-
-.field-help-btn:hover {
-  color: var(--color-primary);
-}
-
-.field-help-btn svg {
-  width: 16px;
-  height: 16px;
-  display: block;
-}
-
-.field-help-popover {
-  position: absolute;
-  top: calc(100% + var(--space-1));
-  left: 0;
-  z-index: 20;
-  width: max-content;
-  min-width: 2em;
-  max-width: min(300px, 80vw);
-  max-height: 240px;
-  overflow-y: auto;
-  padding: var(--space-3);
-  font-size: var(--fs-sm);
-  line-height: var(--lh-relaxed);
-  color: var(--color-text-secondary);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
-  word-break: break-word;
-}
-
-.help-fade-enter-active,
-.help-fade-leave-active {
-  transition: opacity var(--transition-fast), transform var(--transition-fast);
-}
-
-.help-fade-enter-from,
-.help-fade-leave-to {
-  opacity: 0;
-  transform: translateY(-4px);
-}
+/* 字段级帮助气泡的按钮与正文样式均由共享组件 HelpPopover 提供 */
 
 .policy-toggle-row {
   display: flex;

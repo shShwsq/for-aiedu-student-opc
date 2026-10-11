@@ -14,6 +14,7 @@
  */
 import { computed, onMounted, ref } from 'vue'
 
+import HelpPopover from '@/components/HelpPopover.vue'
 import { getPreferences, getStructureDefaults, saveMemorySettings } from '@/api/memory'
 import { getMyModels } from '@/api/model_configs'
 import { extractErrorMessage } from '@/utils/error'
@@ -295,11 +296,13 @@ onMounted(load)
       <!-- 自动归纳开关 -->
       <div class="setting-row">
         <div class="setting-info">
-          <span class="setting-title">任务完成后自动归纳记忆</span>
-          <span class="setting-desc">
-            审计任务成功完成后,自动把可复用的经验归纳写入项目/全局长期记忆;
-            关闭后仅停止自动写入,已保存记忆与手动编辑不受影响
-          </span>
+          <div class="setting-title-row">
+            <span class="setting-title">任务完成后自动归纳记忆</span>
+            <HelpPopover>
+              审计任务成功完成后,自动把可复用的经验归纳写入项目/全局长期记忆。
+              关闭后仅停止自动写入,已保存记忆与手动编辑不受影响。
+            </HelpPopover>
+          </div>
         </div>
         <button
           type="button"
@@ -315,10 +318,12 @@ onMounted(load)
 
       <!-- 结构化模式 -->
       <div class="setting-block">
-        <span class="setting-title">记忆结构化模式</span>
-        <span class="setting-desc">
-          决定归纳结果的形态。切换模式不会丢失历史记忆(旧内容原样保留)
-        </span>
+        <div class="setting-title-row">
+          <span class="setting-title">记忆结构化模式</span>
+          <HelpPopover>
+            决定归纳结果的形态。切换模式不会丢失历史记忆(旧内容原样保留)。
+          </HelpPopover>
+        </div>
         <div class="option-list" role="radiogroup" aria-label="记忆结构化模式">
           <button
             v-for="opt in STRUCTURE_OPTIONS"
@@ -343,11 +348,15 @@ onMounted(load)
 
       <!-- 结构化类别编辑(仅结构化模式;表格展示标题/描述) -->
       <div v-if="structureMode === 'structured'" class="setting-block">
-        <span class="setting-title">结构化类别</span>
-        <span class="setting-desc">
-          自定义分类标题与描述(描述用于指导归纳模型归类)。类别按表格行序即优先级，
-          最后一行作为无法归类条目的杂项桶。修改后需点「保存类别」生效。
-        </span>
+        <div class="setting-title-row">
+          <span class="setting-title">结构化类别</span>
+          <HelpPopover :max-height="300" max-width="min(360px, 86vw)">
+            <p>自定义分类标题与描述(描述用于指导归纳模型归类)。</p>
+            <p>类别按表格行序即优先级,最后一行作为无法归类条目的杂项桶。</p>
+          </HelpPopover>
+        </div>
+        <!-- 不点保存不生效是操作路径上的硬要求,留在明面:收进气泡会让「改了没反应」变成无解迷题 -->
+        <span class="setting-desc">修改后需点「保存类别」生效</span>
 
         <div class="cat-groups">
           <div class="cat-group">
@@ -430,11 +439,13 @@ onMounted(load)
 
       <!-- 归纳模型 -->
       <div class="setting-block">
-        <span class="setting-title">记忆归纳模型</span>
-        <span class="setting-desc">
-          归纳与精简记忆时使用的专用模型,独立于任务自带模型(归纳是轻量任务,可选便宜快速的模型);
-          选「跟随系统默认」则用环境配置的模型
-        </span>
+        <div class="setting-title-row">
+          <span class="setting-title">记忆归纳模型</span>
+          <HelpPopover>
+            归纳与精简记忆时使用的专用模型,独立于任务自带模型(归纳是轻量任务,可选便宜快速的模型);
+            选「跟随系统默认」则用环境配置的模型。
+          </HelpPopover>
+        </div>
         <select
           class="model-select"
           aria-label="记忆归纳模型"
@@ -454,10 +465,12 @@ onMounted(load)
 
       <!-- 思考模式 -->
       <div class="setting-block">
-        <span class="setting-title">归纳思考模式</span>
-        <span class="setting-desc">
-          是否让归纳模型开启思考(慢想)模式;关闭更快,开启质量可能更高
-        </span>
+        <div class="setting-title-row">
+          <span class="setting-title">归纳思考模式</span>
+          <HelpPopover>
+            是否让归纳模型开启思考(慢想)模式;关闭更快,开启质量可能更高。
+          </HelpPopover>
+        </div>
         <div class="option-list" role="radiogroup" aria-label="归纳思考模式">
           <button
             v-for="opt in THINKING_OPTIONS"
@@ -483,10 +496,12 @@ onMounted(load)
       <!-- 注入精简上限 -->
       <div class="setting-row">
         <div class="setting-info">
-          <span class="setting-title">注入精简上限(字符)</span>
-          <span class="setting-desc">
-            精简版项目记忆注入 system prompt 的字符上限,超出则调用模型精简(200–8000)
-          </span>
+          <div class="setting-title-row">
+            <span class="setting-title">注入精简上限(字符)</span>
+            <HelpPopover>
+              精简版项目记忆注入 system prompt 的字符上限,超出则调用模型精简(200–8000)。
+            </HelpPopover>
+          </div>
         </div>
         <input
           class="number-input"
@@ -621,6 +636,13 @@ onMounted(load)
   flex-direction: column;
   gap: var(--space-1);
   min-width: 0;
+}
+
+/* 标题 + 问号气泡(说明正文见共享组件 HelpPopover) */
+.setting-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
 }
 
 .setting-title {

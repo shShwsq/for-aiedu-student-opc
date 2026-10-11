@@ -7,6 +7,8 @@
  * 布局:
  * - 中栏宽度与 CLI 设置页对齐(max-width 680px 居中):上传区 + 技能列表
  * - 上传区为常规文件上传样式:左侧选择框点击弹出文件对话框并回显文件名,右侧上传按钮
+ * - zip 结构 / 命名规则等长说明不常驻铺在页面上,统一收进标题旁的问号气泡
+ *   (共享组件 HelpPopover,与 CLI 设置、智能体策略同款)
  * - 点击列表项打开右侧栏:左边技能文件列表,右边文件编辑器(与记忆管理同款)
  *   · .md 文件支持「编辑 / 预览」切换,预览用 marked 渲染 + DOMPurify 净化
  *   · 自己的 skill 的 SKILL.md 可编辑保存(后端先验后写 + 热刷新);改 frontmatter
@@ -21,6 +23,7 @@ import DOMPurify from 'dompurify'
 
 import AppHeader from '@/components/AppHeader.vue'
 import CodeMirrorEditor from '@/components/CodeMirrorEditor.vue'
+import HelpPopover from '@/components/HelpPopover.vue'
 import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
 import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import {
@@ -479,19 +482,35 @@ onMounted(loadSkills)
         <main class="main-col">
           <!-- ============ 上传区 ============ -->
           <section class="upload-card">
-            <div class="upload-header">
+            <div class="section-title-row">
               <h2 class="section-title">上传技能</h2>
-              <p class="section-desc">
-                上传 zip 格式的 skill(内含 SKILL.md,支持
-                <code>&lt;skill_name&gt;/SKILL.md</code> 或根目录直接放
-                <code>SKILL.md</code>),上传后 AI助手的 list_skills / skill
-                工具立即可用。技能仅自己可见,他人无法查看或使用。zip 最大 50MB。
-                <br />
-                SKILL.md 的 <code>name</code> 会作为存储目录名,需以字母或数字开头,
-                仅含字母、数字与 <code>.</code> <code>_</code> <code>-</code>,
-                不含 <code>..</code>,长度不超过 64(如
-                <code>my_api_checker</code>)。
-              </p>
+              <!-- 完整约束收进气泡:首次打包前需看到的要点靠上传失败的报错文案回传
+                   (后端校验失败会原样回吐命名规则) -->
+              <HelpPopover
+                label="查看技能上传说明"
+                size="md"
+                max-width="min(420px, calc(100vw - 48px))"
+                :max-height="420"
+              >
+                <ul>
+                  <li>
+                    zip 内须含 <code>SKILL.md</code>:支持
+                    <code>&lt;skill_name&gt;/SKILL.md</code> 或根目录直接放
+                    <code>SKILL.md</code>
+                  </li>
+                  <li>zip 最大 50MB</li>
+                  <li>上传后 AI助手的 <code>list_skills</code> / <code>skill</code> 工具立即可用</li>
+                  <li>技能仅自己可见,他人无法查看或使用</li>
+                  <li>
+                    <code>SKILL.md</code> 的 <code>name</code> 会作为存储目录名:需以字母或数字开头,
+                    仅含字母、数字与 <code>.</code> <code>_</code> <code>-</code>,不含
+                    <code>..</code>,不以 <code>.</code> 收尾,长度不超过 64,且避开 Windows 保留名
+                    (<code>CON</code>、<code>PRN</code>、<code>NUL</code> 等);如
+                    <code>my_api_checker</code>
+                  </li>
+                  <li>与自己的同名技能冲突时会询问是否覆盖;与系统内置技能同名会被拒绝</li>
+                </ul>
+              </HelpPopover>
             </div>
             <div class="upload-row">
               <!-- 左侧选择框:点击弹出文件对话框,选中后回显文件名 -->
@@ -683,6 +702,25 @@ onMounted(loadSkills)
                   <span v-else-if="isDirty" class="dirty-tag">未保存</span>
                 </div>
                 <div class="toolbar-right">
+                  <!-- 命名规则/改名提示:编辑器才是 name 非法或与 URL 不一致的实际触发点。
+                       align=right 让气泡向左展开:侧栏面板 overflow: hidden,向右会裁掉 -->
+                  <HelpPopover
+                    v-if="canEdit"
+                    label="查看 SKILL.md 命名与保存规则"
+                    align="right"
+                    max-width="min(340px, 78vw)"
+                    :max-height="320"
+                  >
+                    <p>
+                      改 frontmatter 的 <code>name</code> 即重命名该技能(资源文件随行,撞
+                      内置或已有同名会被拒绝)。
+                    </p>
+                    <p>
+                      名称需以字母或数字开头,仅含字母、数字与 <code>.</code> <code>_</code>
+                      <code>-</code>,不含 <code>..</code>,不以 <code>.</code> 收尾,长度不超过 64。
+                    </p>
+                    <p>内容校验不过时后端不会动磁盘上的旧版本。</p>
+                  </HelpPopover>
                   <!-- md 文件:编辑/预览切换 -->
                   <div v-if="isMd(activePath)" class="mode-switch" role="group" aria-label="编辑/预览">
                     <button
@@ -708,13 +746,6 @@ onMounted(loadSkills)
                 </div>
               </header>
 
-              <!-- 命名规则/改名提示:编辑器才是 name 非法或与 URL 不一致的实际触发点 -->
-              <p v-if="canEdit" class="editor-hint">
-                改 frontmatter 的 <code>name</code> 即重命名该技能(资源文件随行,撞
-                内置或已有同名会被拒绝);名称需以字母或数字开头,仅含字母、数字与
-                <code>.</code> <code>_</code> <code>-</code>,不含 <code>..</code>,
-                长度不超过 64。内容校验不过时后端不会动磁盘上的旧版本。
-              </p>
               <div class="editor-content">
                 <div v-if="fileLoading" class="content-placeholder">
                   <span class="status-spinner" /> 加载中...
@@ -839,22 +870,13 @@ onMounted(loadSkills)
   color: var(--color-text);
 }
 
-.section-desc {
-  margin-top: var(--space-1);
-  font-size: var(--fs-sm);
-  color: var(--color-text-secondary);
-  line-height: 1.6;
-}
-
-.section-desc code {
-  font-family: var(--font-mono, monospace);
-  font-size: 0.9em;
-  background: var(--color-surface-alt);
-  padding: 1px 5px;
-  border-radius: var(--radius-sm);
-}
-
 /* ============ 上传区 ============ */
+.section-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
 .upload-row {
   margin-top: var(--space-4);
   display: flex;
@@ -1360,23 +1382,6 @@ onMounted(loadSkills)
   border-bottom: 1px solid var(--color-border);
   background: var(--color-surface);
   flex-shrink: 0;
-}
-
-/* 命名/改名提示(只在可编辑的 SKILL.md 下出现) */
-.editor-hint {
-  margin: 0;
-  padding: var(--space-1) var(--space-3);
-  font-size: var(--fs-xs);
-  line-height: 1.5;
-  color: var(--color-text-muted);
-  background: var(--color-surface-alt);
-  border-bottom: 1px solid var(--color-border);
-  flex-shrink: 0;
-}
-
-.editor-hint code {
-  font-family: var(--font-mono, monospace);
-  font-size: 0.9em;
 }
 
 .toolbar-left {

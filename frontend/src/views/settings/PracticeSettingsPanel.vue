@@ -21,6 +21,7 @@
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import HelpPopover from '@/components/HelpPopover.vue'
 import { getPreferences, savePracticeSettings } from '@/api/memory'
 import { getMyModels } from '@/api/model_configs'
 import {
@@ -499,10 +500,12 @@ onBeforeUnmount(() => {
       <!-- 自动生成练习题 -->
       <div class="setting-row">
         <div class="setting-info">
-          <span class="setting-title">自动生成练习题</span>
-          <span class="setting-desc">
-            审计任务完成后自动生成练习题候选题(全局生效,仍需预览确认才入库)
-          </span>
+          <div class="setting-title-row">
+            <span class="setting-title">自动生成练习题</span>
+            <HelpPopover>
+              审计任务完成后自动生成练习题候选题(全局生效,仍需预览确认才入库)。
+            </HelpPopover>
+          </div>
         </div>
         <button
           type="button"
@@ -519,11 +522,13 @@ onBeforeUnmount(() => {
       <!-- 出题前恢复工作区 -->
       <div class="setting-row">
         <div class="setting-info">
-          <span class="setting-title">出题前恢复工作区</span>
-          <span class="setting-desc">
-            出题时沙箱已清理(任务完成超过 1 小时)则重新克隆仓库,
-            让出题过程能查阅真实源码提高题目质量(会消耗克隆时间)
-          </span>
+          <div class="setting-title-row">
+            <span class="setting-title">出题前恢复工作区</span>
+            <HelpPopover>
+              出题时沙箱已清理(任务完成超过 1 小时)则重新克隆仓库,
+              让出题过程能查阅真实源码提高题目质量(会消耗克隆时间)。
+            </HelpPopover>
+          </div>
         </div>
         <button
           type="button"
@@ -539,11 +544,13 @@ onBeforeUnmount(() => {
 
       <!-- 出题思考模式 -->
       <div class="setting-block">
-        <span class="setting-title">出题思考模式</span>
-        <span class="setting-desc">
-          是否让出题模型开启思考(慢想)模式;开启后出题更慢但题目质量可能更高,
-          关闭则生成更快——若某模型思考模式下反复读代码却出不出题,可强制关闭
-        </span>
+        <div class="setting-title-row">
+          <span class="setting-title">出题思考模式</span>
+          <HelpPopover max-width="min(360px, 86vw)">
+            是否让出题模型开启思考(慢想)模式;开启后出题更慢但题目质量可能更高,
+            关闭则生成更快——若某模型思考模式下反复读代码却出不出题,可强制关闭。
+          </HelpPopover>
+        </div>
         <div class="topic-list" role="radiogroup" aria-label="出题思考模式">
           <button
             v-for="opt in THINKING_OPTIONS"
@@ -568,11 +575,13 @@ onBeforeUnmount(() => {
 
       <!-- 默认出题模型 -->
       <div class="setting-block">
-        <span class="setting-title">默认出题模型</span>
-        <span class="setting-desc">
-          生成练习题时默认使用的模型(手动出题与自动出题均生效);
-          任务自带模型配置时优先用任务配置,选「跟随系统默认」则用环境配置
-        </span>
+        <div class="setting-title-row">
+          <span class="setting-title">默认出题模型</span>
+          <HelpPopover max-width="min(360px, 86vw)">
+            生成练习题时默认使用的模型(手动出题与自动出题均生效);
+            任务自带模型配置时优先用任务配置,选「跟随系统默认」则用环境配置。
+          </HelpPopover>
+        </div>
         <select
           class="model-select"
           aria-label="默认出题模型"
@@ -592,10 +601,12 @@ onBeforeUnmount(() => {
         <!-- 始终用默认出题模型 -->
         <div class="force-default-row">
           <div class="setting-info">
-            <span class="setting-title force-title">始终用默认出题模型</span>
-            <span class="setting-desc">
-              忽略任务自带的模型配置,所有任务出题统一用上面的默认模型
-            </span>
+            <div class="setting-title-row">
+              <span class="setting-title force-title">始终用默认出题模型</span>
+              <HelpPopover>
+                忽略任务自带的模型配置,所有任务出题统一用上面的默认模型。
+              </HelpPopover>
+            </div>
           </div>
           <button
             type="button"
@@ -612,16 +623,20 @@ onBeforeUnmount(() => {
 
       <!-- ===== 知识点讲解与出题并发 ===== -->
       <div class="setting-block">
-        <span class="setting-title">知识点讲解</span>
-        <span class="setting-desc">
-          开启后,出题完成会顺带把本次涉及的知识点写成一段讲解(看板上可折叠展开阅读);
-          一次 job 只多几次轻任务调用(≤8 个知识点一批),不是每个知识点跑一次。
-          自己编辑过的讲解(标「已编辑」)永远不会被自动覆盖
-        </span>
+        <div class="setting-title-row">
+          <span class="setting-title">知识点讲解</span>
+          <HelpPopover :max-height="300" max-width="min(380px, 86vw)">
+            开启后,出题完成会顺带把本次涉及的知识点写成一段讲解(看板上可折叠展开阅读)。
+            一次 job 只多几次轻任务调用(≤8 个知识点一批),不是每个知识点跑一次;
+            自己编辑过的讲解(标「已编辑」)永远不会被自动覆盖。
+          </HelpPopover>
+        </div>
         <div class="force-default-row">
           <div class="setting-info">
-            <span class="setting-title">出题后自动更新讲解</span>
-            <span class="setting-desc">默认关闭;关闭后仍可在知识点看板上逐点生成</span>
+            <div class="setting-title-row">
+              <span class="setting-title">出题后自动更新讲解</span>
+              <HelpPopover>默认关闭;关闭后仍可在知识点看板上逐点生成。</HelpPopover>
+            </div>
           </div>
           <button
             type="button"
@@ -634,10 +649,12 @@ onBeforeUnmount(() => {
             <span class="switch-thumb" />
           </button>
         </div>
-        <span class="setting-title sub-title">讲解专用模型</span>
-        <span class="setting-desc">
-          讲解不需要出题那个代价(思考类模型出题要上百秒一条),可以单独挂个快模型
-        </span>
+        <div class="setting-title-row">
+          <span class="setting-title sub-title">讲解专用模型</span>
+          <HelpPopover>
+            讲解不需要出题那个代价(思考类模型出题要上百秒一条),可以单独挂个快模型。
+          </HelpPopover>
+        </div>
         <select
           class="model-select"
           aria-label="讲解专用模型"
@@ -656,12 +673,14 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="setting-block">
-        <span class="setting-title">出题并发度</span>
-        <span class="setting-desc">
-          串行时出题耗时≈各条 finding 耗时之和(实测 kimi 约 30s/条、思考类模型 160s/条)。
-          提高并发能近似线性缩短总时长,但受厂商「组内并发/RPM」上限约束:
-          超限会触发 429,反而多等退避。建议与厂商配额一致(厂商只允许 1 并发时保持串行)
-        </span>
+        <div class="setting-title-row">
+          <span class="setting-title">出题并发度</span>
+          <HelpPopover :max-height="300" max-width="min(380px, 86vw)">
+            串行时出题耗时≈各条 finding 耗时之和(实测 kimi 约 30s/条、思考类模型 160s/条)。
+            提高并发能近似线性缩短总时长,但受厂商「组内并发/RPM」上限约束:
+            超限会触发 429,反而多等退避。建议与厂商配额一致(厂商只允许 1 并发时保持串行)。
+          </HelpPopover>
+        </div>
         <div class="topic-list" role="radiogroup" aria-label="出题并发度">
           <button
             v-for="opt in CONCURRENCY_OPTIONS"
@@ -685,13 +704,15 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- ===== 学习主题:内置 4 个(可停用)+ 自定义增删改 ===== -->
-      <h2 id="learning-topics" class="section-title">学习主题</h2>
-      <div class="setting-block">
-        <span class="setting-desc">
+      <!-- 帮助按钮直接放在 h2 内:套 flex 行会把 .section-title 的整行分隔线拉成只包住文字 -->
+      <h2 id="learning-topics" class="section-title">
+        学习主题
+        <HelpPopover class="section-help" max-width="min(360px, 86vw)">
           出题视角与自动分类的主题词表。停用的主题不再出新题,已有题目不受影响;
-          自定义主题的出题质量取决于描述的具体程度
-        </span>
-
+          自定义主题的出题质量取决于描述的具体程度。
+        </HelpPopover>
+      </h2>
+      <div class="setting-block">
         <div v-if="topicBusy" class="loading-box"><span class="btn-spinner" /> 加载中…</div>
         <div v-else class="topic-manage-list">
           <div
@@ -1012,16 +1033,22 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
+/* 标题 + 问号气泡(说明正文见共享组件 HelpPopover) */
+.setting-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* 分区标题里的帮助按钮:随文字行内排布,垂直居中于字面 */
+.section-help {
+  vertical-align: middle;
+}
+
 .setting-title {
   font-size: var(--fs-base);
   font-weight: var(--fw-medium);
   color: var(--color-text);
-}
-
-.setting-desc {
-  font-size: var(--fs-xs);
-  color: var(--color-text-secondary);
-  line-height: var(--lh-relaxed);
 }
 
 .setting-block {
