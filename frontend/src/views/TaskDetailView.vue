@@ -213,12 +213,23 @@ function selectSection(key: SidebarSectionKey): void {
   persistSection()
 }
 
-/** 标题行折叠按钮:收起为 rail(展开入口在 rail,故只需处理收起) */
+/**
+ * 收起为 rail 的唯一鼠标入口 = 再点一次当前段按钮(selectSection 的 toggle 分支),
+ * 标题行不再有独立的收起按钮。键盘的 Escape 走这里。
+ */
 function collapseDetail(): void {
   activeSection.value = null
   attentionSection.value = null
   sectionTouched = true
   persistSection()
+}
+
+/**
+ * rail 按钮的悬浮/无障碍名称。展开态补一句「再次点击收起」:收起动作没有别的
+ * 显式控件了,只靠「点图标=展开、再点=收起」这个隐式 toggle 没人能发现。
+ */
+function railBtnLabel(sec: (typeof SIDEBAR_SECTIONS)[number]): string {
+  return activeSection.value === sec.key ? `${sec.label}（再次点击收起）` : sec.label
 }
 
 /** rail 按钮元素(键盘上下键在段间移动焦点用) */
@@ -3315,16 +3326,11 @@ function openPracticeGenerate(): void {
         @keydown="onDetailResizeKeydown"
       />
       <div class="detail-sidebar-header">
-        <span class="detail-sidebar-title">核查与结果</span>
-        <!-- rail 只有图标,展开后在这里交代当前看的是哪一段。
-             状态徽标与下载/打印不在这里(它们随 rail 常驻,收起态也要能用) -->
-        <span class="detail-sidebar-section">{{ activeSectionLabel }}</span>
-        <WorkspaceToggleButton
-          side="right"
-          :collapsed="false"
-          collapse-title="收起为分段栏"
-          @toggle="collapseDetail"
-        />
+        <!-- 标题就是当前段名:栏级总名「核查与结果」钉在这里对「正在看哪一段」零信息量,
+             而段名原本以一个小标签跟在后面——两处交代合并成一处,标题行不留控件
+             (收起在 rail:再点当前段即收起,按钮 tooltip 已写明)。
+             状态徽标与下载/打印也不在这里(它们随 rail 常驻,收起态也要能用) -->
+        <span class="detail-sidebar-title">{{ activeSectionLabel }}</span>
       </div>
       <div
         id="detail-panel"
@@ -3590,8 +3596,8 @@ function openPracticeGenerate(): void {
           'is-active': activeSection === sec.key,
           'has-attention': attentionSection === sec.key,
         }"
-        :title="sec.label"
-        :aria-label="sec.label"
+        :title="railBtnLabel(sec)"
+        :aria-label="railBtnLabel(sec)"
         :aria-expanded="activeSection === sec.key"
         aria-controls="detail-panel"
         @click="selectSection(sec.key)"
@@ -3824,7 +3830,7 @@ function openPracticeGenerate(): void {
   cursor: col-resize;
 }
 
-/* 顶部条:标题 + 当前段名 + 收起按钮(固定不滚)。
+/* 顶部条:当前段名(固定不滚,无控件)。
    状态徽标与导出按钮不在这条里——它们随 rail 常驻,收起态也要能点 */
 .detail-sidebar-header {
   display: flex;
@@ -3844,13 +3850,6 @@ function openPracticeGenerate(): void {
   font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--color-text);
-}
-
-/* 当前段名(如「审查结果」):rail 只有图标,展开后靠它交代在看哪一段 */
-.detail-sidebar-section {
-  flex-shrink: 0;
-  font-size: var(--fs-xs);
-  color: var(--color-text-tertiary);
 }
 
 /* 内容区:独立滚动,卡片间距用 gap 统一 */

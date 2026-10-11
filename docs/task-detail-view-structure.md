@@ -20,8 +20,9 @@
 ```
 
 - **左侧 WorkspaceSidebar**:历史任务列表,支持删除/重命名;折叠时完全隐藏,由顶栏按钮切换。
-- **右侧 rail + 展开面板**:rail 常驻页面右缘(56px),是**唯一的展开入口**——收起态
-  没有独立把手,也没有折叠态悬浮角标(原有两套展开入口与 tab 行一并收敛成 rail)。
+- **右侧 rail + 展开面板**:rail 常驻页面右缘(56px),是**唯一的展开与收起入口**——收起态
+  没有独立把手,展开面板标题行也没有收起按钮,也没有折叠态悬浮角标(原有两套展开入口与
+  tab 行一并收敛成 rail)。
   展开面板默认宽度 420px,可经其左缘手柄拖拽调整(320px ~ min(640px, 50vw)),
   按「用户 email + 栏位」记忆到 localStorage;当前展开段按「用户 email」记忆到
   `secondlook:sidebar-section:task-detail:{email}`。详见 §5。
@@ -222,8 +223,9 @@ RoundGroup { roundIdx, segments, planSteps }
 └─────┘
 ```
 
-- 只有图标(段名放 `title`/`aria-label`),56px 宽摆不下「重点与知识点」这类长标签;
-  展开后由面板标题行交代在看哪一段(见 §5.2);
+- 只有图标,`title`/`aria-label` 载段名(56px 宽摆不下「重点与知识点」这类长标签),
+  展开态额外带「（再次点击收起）」——收起没有别的显式控件了,隐式 toggle 不写出来就没人发现;
+  展开后由面板标题行的段名交代在看哪一段(见 §5.2);
 - 角标超 99 显示 `99+`;点当前已展开段的按钮 = 收起;
 - **审查状态变化不自动弹栏**,只点亮对应按钮的提示环(`has-attention`)+ 角标:
   running → 核查过程,done/failed/stopped → 审查结果,单 agent 模式完成且有结果 →
@@ -240,13 +242,15 @@ RoundGroup { roundIdx, segments, planSteps }
 
 ```
 ┌───────────────────────────────────┐
-│ 核查与结果     审查结果   [⟩⟩]            │
+│ 审查结果                          │
 └───────────────────────────────────┘
 ```
 
-- 左:总标题"核查与结果"(栏级名,勿改成段名);
-- 右:**当前段名**(如"审查结果",rail 无文字标签,展开后靠它定位)+
-  **收起按钮**(WorkspaceToggleButton,收起为 rail)。
+- 标题 = **当前段名**(概览 / 核查过程 / 审查结果 / 重点与知识点),取 `activeSectionLabel`;
+  标题行**不放任何控件**——收起在 rail(再点当前段),状态徽标与导出在 rail 底部;
+- 栏级总名「核查与结果」不再钉在标题行:它对「正在看哪一段」零信息量,而原先跟在后面的
+  那个小段名标签才是有信息量的,两者合并成一个(总名仍保留在 rail 的 `aria-label`
+  「核查与结果分段」与新手引导措辞里,不作为面板标题)。
 
 ### 5.3 四段内容(sidebar-panel,按 activeSection 展示)
 
@@ -452,3 +456,27 @@ step 组折叠策略、工具行四种渲染类型。
    `emit('send-suggestion')`。
 4. 引导事件名 `sidebar-activate-section`(旧 `sidebar-activate-tab` 已废弃);
    未知 key 仍由 `SIDEBAR_SECTIONS.some()` 守卫静默丢弃——改段名时记得同步引导步骤。
+
+## 11. 标题行去控件化:收起按钮回归 rail + 标题改段名(本次改动)
+
+| 旧结构 | 新结构 |
+|---|---|
+| 标题行 = 总标题「核查与结果」+ 小段名标签 + `WorkspaceToggleButton`(收起为分段栏) | 标题行 = **当前段名**一个纯文本,无控件 |
+| 收起有两条鼠标路径(标题行按钮 / 再点当前段按钮),是 §10「三套展开入口收敛为 rail 四个 disclosure」之后漏网的第四个入口 | 收起只剩 rail 当前段按钮一条鼠标路径(`title`/`aria-label` 带「再次点击收起」补足可发现性) |
+| 栏级总名占着标题行主位,段名退为附属小标签 | 段名上位成标题(`activeSectionLabel`);栏级总名退到 rail `aria-label` 与引导/帮助文案 |
+
+保留不变:栏级名「核查与结果」作为这一栏的概念称呼(导航 `aria-label`、help.md、
+agent2 提示词里的指称不变),左侧历史任务栏在 `AppHeader` 里的 `WorkspaceToggleButton`
+(它没有 rail 等价物,不冗余),`collapseDetail()`(仍由 Escape 使用)。
+
+实现要点(供代码改动参考):
+
+1. 删 `WorkspaceToggleButton` 与 `.detail-sidebar-section` 两个节点及其 CSS;
+   `WorkspaceToggleButton` 的 import 仍被 `AppHeader` 插槽使用,不要一并删掉。
+2. 新增 `railBtnLabel(sec)`:展开态 `${sec.label}（再次点击收起）`,收起态回 `sec.label`,
+   同时接 `title` 与 `aria-label`(无障碍名也跟着说清动作)。
+3. 已知缺口:Escape 处只在 rail `<nav>` 的 `keydown` 上,焦点在面板正文里时按 Escape
+   不会收起。标题行原先那个按钮是此场景唯一的鼠标退路,现已移除——若要补,
+   把同一处理器挂到 `<aside class="detail-sidebar">` 上即可。
+4. 引导步骤 `detail-rail` 早已写明「再点一下当前段就收起」,本次改动后它成了唯一路径,
+   文案无需改。
