@@ -3487,14 +3487,16 @@ const showKnowledgeToolbar = computed<boolean>(() => {
             <p v-if="task.review_status === 'running'" class="sidebar-section-status">
               <span class="review-interim-hint">检查助手核查中</span>
             </p>
-            <!-- 建议卡在「概览」段:从这里给一条跳转,别让用户找不到追问入口 -->
+            <!-- 建议卡在「概览」段:从这里给一条跳转,别让用户找不到追问入口。
+                 文案不带「· 去概览」(按钮上不重复说目标段),去向放到 title 里 -->
             <button
               v-if="suggestions.length > 0"
               type="button"
               class="sidebar-jump"
+              title="到「概览」段查看建议追问方向"
               @click="selectSection('overview')"
             >
-              {{ suggestions.length }} 条建议追问 · 去概览
+              {{ suggestions.length }} 条建议追问
             </button>
             <div v-for="bucket in REVIEW_BUCKET_ORDER" :key="bucket.key" class="review-bucket">
               <template v-if="reviewBuckets[bucket.key].length">
@@ -4018,9 +4020,10 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   border-radius: var(--radius-full);
 }
 
-/* 段间跳转(如「审查结果 → 去概览看建议追问」) */
+/* 段间跳转(如「审查结果 → 概览」看建议追问)。
+   它是 .sidebar-review(display: block)的inline-block 子元素,天然靠左上角——
+   原先那行 align-self: flex-start 是父层还是 flex 面板时的残留,在块流里不起作用,已清 */
 .sidebar-jump {
-  align-self: flex-start;
   padding: var(--space-1) var(--space-2);
   margin-bottom: var(--space-2);
   font-size: var(--fs-xs);
@@ -4133,7 +4136,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   padding: var(--space-2) 0;
 }
 
-/* 临时结果提示(后台审查进行中,结果清单标题行;呼吸点提示将自动更新) */
+/* 临时结果提示(后台审查进行中,知识点段首行;呼吸点提示将自动更新) */
 .review-interim-hint {
   display: inline-flex;
   align-items: center;
@@ -4159,13 +4162,13 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   animation: none;
 }
 
-/* 出题进度跳转入口(位于结果清单标题行,与「生成练习题」按钮互斥;呼吸红点提示运行中) */
+/* 出题进度跳转入口(知识点段首行,与「生成练习题」按钮互斥;呼吸红点提示运行中)。
+   不靠右:两个入口共用一个位置,哪个生效就落在最左,切换状态时不会左右跳 */
 .gen-progress-entry {
   position: relative;
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  margin-left: auto;
   padding: var(--space-1) var(--space-3);
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
@@ -4463,9 +4466,9 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   margin-left: 0;
 }
 
-/* 结果清单标题旁的「生成练习题」入口(仅任务完成后可用) */
+/* 知识点段首行的「生成练习题」入口(仅任务完成后可用)。与出题进度入口同一档口径:
+   靠最左跟提示语成一组,不再钉到行尾(单独一个按钮孤在右缘,看不出它管的是下方卡片) */
 .practice-generate-btn {
-  margin-left: auto;
   padding: var(--space-1) var(--space-3);
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
@@ -4482,7 +4485,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   background: var(--color-primary);
 }
 
-/* 出题入口旁的「本次出题将使用」提示(位于结果清单标题行下方) */
+/* 出题入口旁的「本次出题将使用」提示(知识点段首行下方) */
 .generate-model-hint {
   display: flex;
   align-items: baseline;
