@@ -11,8 +11,18 @@
  * size:
  * - 'md'(默认,36px):对齐表单主下拉
  * - 'sm'(34px):对齐紧凑面板(如 Qoder 配置行)
+ *
+ * 命名坑:floating-ui 的 size 中间件与 size prop 同名时,<script setup> 的顶层
+ * import 绑定会遮蔽同名 prop,模板里读到的 `size` 是那个中间件函数(类名拼成
+ * is-function(...) ,sm 变体失效)。故 import 起别名,模板里读 prop 写 props.size。
  */
-import { autoUpdate, computePosition, flip, offset, size } from '@floating-ui/dom'
+import {
+  autoUpdate,
+  computePosition,
+  flip,
+  offset,
+  size as sizeMiddleware,
+} from '@floating-ui/dom'
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 
 export interface SelectOption {
@@ -156,10 +166,13 @@ function setupFloating(): void {
 function updatePosition(anchor: HTMLElement, floating: HTMLElement): void {
   computePosition(anchor, floating, {
     placement: 'bottom-start',
+    // 下拉列表是 position: fixed(相对视口),默认 absolute 策略给的是文档坐标,
+    // 窗口滚动后会整体下移一个 scrollY
+    strategy: 'fixed',
     middleware: [
       offset(4),
       flip({ padding: 8 }),
-      size({
+      sizeMiddleware({
         apply({ rects, elements }) {
           Object.assign(elements.floating.style, {
             minWidth: `${rects.reference.width}px`,
@@ -198,7 +211,7 @@ onBeforeUnmount(() => {
   <div
     ref="rootRef"
     class="base-select"
-    :class="[`is-${size}`, { 'is-disabled': disabled }]"
+    :class="[`is-${props.size}`, { 'is-disabled': disabled }]"
   >
     <button
       ref="triggerRef"

@@ -16,8 +16,21 @@
  * - 定位走 @floating-ui/dom + Teleport 到 body(与 BaseSelect / ModelCombobox 同款):
  *   设置页与技能页都包在 overflow: hidden / auto 的滚动容器里,绝对定位的气泡会被
  *   裁掉(靠底的字段尤其明显),交给 floating-ui 就能自动翻到上方并贴合视口
+ *
+ * 命名坑(务必保留别名):floating-ui 的 size 中间件与 size prop 同名。<script setup>
+ * 的顶层绑定(含 import)会暴露给模板并盖掉同名 prop —— 直接写 `size` 的话,
+ * 模板里的 `help-btn-${size}` 会拼成 `help-btn-function(options){…}`,尺寸类失效、
+ * 按钮塌成 0x0,全站问号按钮集体看不见。故:import 起别名 sizeMiddleware,
+ * 模板里读 prop 也统一写 props.size,不给同名绑定留可乘之机。
  */
-import { autoUpdate, computePosition, flip, offset, shift, size } from '@floating-ui/dom'
+import {
+  autoUpdate,
+  computePosition,
+  flip,
+  offset,
+  shift,
+  size as sizeMiddleware,
+} from '@floating-ui/dom'
 import { computed, nextTick, onUnmounted, ref } from 'vue'
 
 const props = withDefaults(
@@ -136,12 +149,15 @@ function updatePosition(anchor: HTMLElement, floating: HTMLElement): void {
   computePosition(anchor, floating, {
     // 下方放不下时 flip 自动翻到上方
     placement: props.align === 'right' ? 'bottom-end' : 'bottom-start',
+    // 气泡是 position: fixed(相对视口),默认 absolute 策略给的是文档坐标,
+    // 窗口一滚动就会把气泡整体推下去一个 scrollY(严重时推出视口=看不到)
+    strategy: 'fixed',
     middleware: [
       offset(4),
       flip({ padding: 8 }),
       // flip 只管主轴;靠右边缘的按钮(分区标题、工具栏)还需沿交叉轴推回视口内
       shift({ padding: 8 }),
-      size({
+      sizeMiddleware({
         padding: 8,
         apply({ availableHeight, elements }) {
           Object.assign(elements.floating.style, {
@@ -177,10 +193,11 @@ defineExpose({
 
 <template>
   <div ref="wrapRef" class="help-wrap" @click.stop>
+    <!-- 尺寸类读 props.size:模板里的裸 `size` 会被同名顶层绑定(import)遮住 -->
     <button
       type="button"
       class="help-btn"
-      :class="`help-btn-${size}`"
+      :class="`help-btn-${props.size}`"
       :aria-label="label"
       :aria-expanded="open"
       @click="setOpen(!open)"
