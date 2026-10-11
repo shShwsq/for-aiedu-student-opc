@@ -37,6 +37,8 @@ export interface OnboardingStep {
   requiresPractice?: boolean
   /** 练习功能启用时覆盖 content(同一锚点在两种部署下的不同文案) */
   contentWhenPractice?: string
+  /** 引导定位前需要激活的侧栏标签页 key(如 'results');用于 tab 布局下目标元素隐藏时自动切换 */
+  activateTab?: string
 }
 
 /**
@@ -47,8 +49,10 @@ export interface OnboardingStep {
  *       home-nav 文案补全该导航项;关闭部署步骤与文案保持 v2 不变。
  * - v4: 首页改为工作台布局(操作行 + 最近任务列表,欢迎卡/特性介绍区移除):
  *       欢迎步骤锚点从欢迎卡改到操作行,新增「最近任务」步骤。
+ * - v5: 核查与结果侧栏改为分段标签页布局(概览/核查/结果),
+ *       新增 activateTab 机制保证引导定位前自动切换 tab。
  */
-export const ONBOARDING_VERSION = 4
+export const ONBOARDING_VERSION = 5
 
 /**
  * 全部引导步骤(按路由分组,组内按顺序播放)。
@@ -180,6 +184,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     target: 'detail-results',
     route: 'task-detail',
     placement: 'right',
+    activateTab: 'results',
     title: '结果清单',
     content:
       '任务执行完成后,产出的结果会按维度分组显示在这里(安全审计场景按严重程度,代码审查场景按类别)。当前任务还没结果,等你提交第一个任务后回到这里就能看到。',

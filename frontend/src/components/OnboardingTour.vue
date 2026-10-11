@@ -58,9 +58,16 @@ async function updatePosition(): Promise<void> {
   // 等待 DOM 更新(路由切换 / 数据加载后目标元素可能还没渲染)
   await nextTick()
 
-  const target = findTarget()
   const step = currentStep.value
   if (!step) return
+
+  // 若该步骤指定了 activateTab,先通知侧栏切换标签页(目标元素可能在隐藏 panel 内)
+  if (step.activateTab) {
+    window.dispatchEvent(new CustomEvent('sidebar-activate-tab', { detail: step.activateTab }))
+    await nextTick()
+  }
+
+  const target = findTarget()
 
   if (!target) {
     // 目标不在 DOM:居中显示气泡,不绘制高亮

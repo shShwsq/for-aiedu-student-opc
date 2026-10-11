@@ -26,6 +26,7 @@ import { jsonrepair } from 'jsonrepair'
 
 import AppHeader from '@/components/AppHeader.vue'
 import Agent2Panel from '@/components/Agent2Panel.vue'
+import DetailCardDrawer from '@/components/DetailCardDrawer.vue'
 import ConversationMessage from '@/components/ConversationMessage.vue'
 import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
 import UserMessageInput from '@/components/UserMessageInput.vue'
@@ -121,6 +122,49 @@ const workspaceCollapsed = ref(true)
 
 /** 核查与结果侧栏是否折叠(右侧栏,默认展开;折叠时完全隐藏,主区聚焦对话) */
 const detailCollapsed = ref(false)
+
+// ---- 侧栏分段标签页 ----
+const SIDEBAR_TABS = [
+  { key: 'overview', label: '概览' },
+  { key: 'review', label: '核查' },
+  { key: 'results', label: '结果' },
+] as const
+
+type SidebarTabKey = (typeof SIDEBAR_TABS)[number]['key']
+const activeSidebarTab = ref<SidebarTabKey>('overview')
+/** 用户是否手动选过 tab:选过后不再自动抢切(避免把正在浏览其它 tab 的用户拽走) */
+const userPickedTab = ref(false)
+
+/** 用户点击 tab:记录手动选择 + 切换 */
+function selectSidebarTab(key: SidebarTabKey): void {
+  userPickedTab.value = true
+  activeSidebarTab.value = key
+}
+
+/** 接收 onboarding tour 切换标签指令(程序性切换,不算用户手动选择) */
+function onOnboardingActivateTab(e: Event): void {
+  const tab = (e as CustomEvent).detail as SidebarTabKey
+  if (SIDEBAR_TABS.some((t) => t.key === tab)) activeSidebarTab.value = tab
+}
+onMounted(() => window.addEventListener('sidebar-activate-tab', onOnboardingActivateTab))
+onUnmounted(() => window.removeEventListener('sidebar-activate-tab', onOnboardingActivateTab))
+
+// ---- 卡片详情 Drawer ----
+const drawerItem = ref<ReviewItem | TaskResult | null>(null)
+const drawerType = ref<'review' | 'result'>('review')
+const drawerOpen = ref(false)
+
+function openCardDrawer(item: ReviewItem | TaskResult, type: 'review' | 'result'): void {
+  drawerItem.value = item
+  drawerType.value = type
+  drawerOpen.value = true
+}
+
+/** Drawer 内点击证据文件跳转工作区 */
+async function handleDrawerOpenFile(item: ReviewItem): Promise<void> {
+  drawerOpen.value = false
+  await openReviewFile(item)
+}
 
 /**
  * 核查与结果侧栏宽度:左缘手柄拖拽调宽,松手按「用户 email + 栏位」存 localStorage。
@@ -496,9 +540,12 @@ function maskTokenValue(value: string): string {
 
 async function initTask(): Promise<void> {
   const taskId = route.params.id as string
-  // 切换/重载任务:清空上一任务的实时审查计划
+  // 切换/重载任务:清空上一任务的实时审查计划与 drawer
   reviewPlanLive.value = null
-  expandedReviewItems.value = new Set()
+  drawerOpen.value = false
+  drawerItem.value = null
+  // 新任务重新允许自动切换 tab(清除上一任务残留的手动选择闸门)
+  userPickedTab.value = false
   try {
     // 拉任务快照(场景降级后不再需要单独拉 /scenarios:结果分组/meta
     // 从 task.params._grouping 和 results 的 metadata keys 推断)
@@ -2129,14 +2176,6 @@ const reviewSummary = computed<ReviewSummary | null>(() => {
 /** 实时审查计划(SSE review_plan_update;review_done 后以 _review.plan 为准) */
 const reviewPlanLive = ref<ReviewPlanUpdateEventData | null>(null)
 
-const expandedReviewItems = ref<Set<string>>(new Set())
-function toggleReviewItem(id: string): void {
-  const s = new Set(expandedReviewItems.value)
-  if (s.has(id)) s.delete(id)
-  else s.add(id)
-  expandedReviewItems.value = s
-}
-
 /** 三态分桶的展示顺序与标题(发现风险 → 已核查·剔除误报 → 缺口·待改进) */
 const REVIEW_BUCKET_ORDER = [
   { key: 'risk', label: '发现风险' },
@@ -2185,6 +2224,29 @@ const isAgent2Running = computed(
   () =>
     task.value?.status === 'running' &&
     (task.value?.current_stage || '').includes('检查助手'),
+)
+
+// ---- 标签自动切换 ----
+// 实时后台审查的权威信号是 review_status:agent1 一结束 status 就置 COMPLETED,
+// 审查全程 status 不再变化,故不能用要求 status==='running' 的 isAgent2Running。
+// 用户手动选过 tab(userPickedTab)后不再抢占;呼吸点/计数 badge 仍是常态提示。
+watch(
+  [() => task.value?.review_status, () => task.value?.status],
+  ([reviewStatus, status]) => {
+    if (userPickedTab.value) return
+    if (reviewStatus === 'running') {
+      activeSidebarTab.value = 'review'
+    } else if (
+      reviewStatus === 'done' || reviewStatus === 'failed' || reviewStatus === 'stopped'
+    ) {
+      activeSidebarTab.value = 'results'
+    } else if (
+      status === 'completed' && !reviewStatus && (task.value?.results.length ?? 0) > 0
+    ) {
+      // 单 agent 模式(无审查):完成且有结果时直达结果 tab
+      activeSidebarTab.value = 'results'
+    }
+  },
 )
 
 /** 暂停/恢复按钮 loading 态(防止重复点击) */
@@ -2289,11 +2351,6 @@ const inferredMetaFields = computed<InferredMetaField[]>(() => {
   }
   return fields
 })
-
-/** 结果清单正文 markdown 渲染(审计结果通常含标题/列表/代码块) */
-function renderResultContent(content: string | null | undefined): string {
-  return renderMarkdown(content)
-}
 
 function getResultMetaItems(r: TaskResult): ResultMetaItem[] {
   const items: ResultMetaItem[] = []
@@ -2530,9 +2587,6 @@ function plainsAfter(group: StepGroup, iterIdx: number): PlainSegment[] {
   return group.plains.filter((p) => p.afterIterationIdx === iterIdx)
 }
 
-// ---- 右侧栏结果清单展开状态(默认折叠,点击卡片展开正文) ----
-const expandedResults = reactive<Set<string>>(new Set())
-
 // ---- 生成练习题(把结果清单的真实发现转为自适应练习题,见 PracticeGenerateDialog) ----
 // 后端 PRACTICE_ENABLED=false 时隐藏入口并跳过 draft 拉取
 ensureFeaturesLoaded()
@@ -2638,14 +2692,6 @@ function openPracticeGenerate(): void {
   // 打开出题对话框前刷新一次模型展示(设置里可能刚换过默认模型)
   void refreshGenerateModel()
   practiceDialogOpen.value = true
-}
-
-function toggleResult(id: string): void {
-  if (expandedResults.has(id)) {
-    expandedResults.delete(id)
-  } else {
-    expandedResults.add(id)
-  }
 }
 </script>
 
@@ -3166,263 +3212,243 @@ function toggleResult(id: string): void {
           @toggle="toggleDetail"
         />
       </div>
+      <!-- 分段标签页 -->
+      <div class="sidebar-tabs" role="tablist" aria-label="核查与结果分栏">
+        <button
+          v-for="tab in SIDEBAR_TABS"
+          :key="tab.key"
+          type="button"
+          role="tab"
+          :class="['sidebar-tab', { active: activeSidebarTab === tab.key }]"
+          :aria-selected="activeSidebarTab === tab.key"
+          @click="selectSidebarTab(tab.key)"
+        >
+          {{ tab.label }}
+          <span
+            v-if="tab.key === 'review' && task.review_status === 'running'"
+            class="tab-badge tab-badge-live"
+          >●</span>
+          <span
+            v-if="tab.key === 'results' && (reviewItems.length + task.results.length) > 0"
+            class="tab-badge"
+          >{{ reviewItems.length + task.results.length }}</span>
+        </button>
+      </div>
       <div class="detail-sidebar-body">
-        <!-- 侧栏概览(精简后仅保留运行期实时阶段与错误提示):
-             场景/创建时间/完成时间已移除——场景降级为模板无展示价值,
-             创建时间主区标题行已有,完成时间改悬浮"已完成"徽章查看。
-             当前阶段是运行/暂停态唯一的实时进度文案,故仅活跃期保留;
-             任务进入终态(完成/失败)后收起,避免"任务完成,…"这类冗余收尾行。 -->
-        <section
-          v-if="(isRunning && task.current_stage) || task.error_message"
-          class="overview-section"
-        >
-          <div v-if="isRunning && task.current_stage" class="overview-stage">
-            <span class="label">当前阶段</span>
-            <p>{{ task.current_stage }}</p>
-          </div>
-          <div v-if="task.error_message" class="alert alert-error">
-            {{ task.error_message }}
-          </div>
-        </section>
-
-        <!-- 任务清单(原主对话流"计划清单"卡迁入;复杂任务时 agent1 输出,
-             最新一轮的计划与实时进度,随 SSE plan 事件/历史提取更新) -->
-        <section v-if="latestPlanSteps.length > 0" class="plan-section">
-          <h2 class="plan-section-title">
-            任务清单
-            <span class="plan-progress">{{ planProgress(latestPlanSteps) }}</span>
-          </h2>
-          <div class="plan-steps">
-            <div
-              v-for="s in latestPlanSteps"
-              :key="s.id"
-              :class="['plan-step', `plan-step-${s.status}`]"
-            >
-              <span class="plan-step-icon">{{
-                s.status === 'done' ? '✓' : s.status === 'in_progress' ? '◌' : '○'
-              }}</span>
-              <span class="plan-step-text">{{ s.text }}</span>
+        <!-- Tab: 概览 (阶段 + 任务清单 + 动态验证) -->
+        <div v-show="activeSidebarTab === 'overview'" class="sidebar-panel" role="tabpanel">
+          <section
+            v-if="(isRunning && task.current_stage) || task.error_message"
+            class="overview-section"
+          >
+            <div v-if="isRunning && task.current_stage" class="overview-stage">
+              <span class="label">当前阶段</span>
+              <p>{{ task.current_stage }}</p>
             </div>
-          </div>
-        </section>
-
-        <!-- 动态验证配置(仅当任务配了测试环境 URL 时显示)
-             对用户透明:不出现 verifier_agent 字样,只显示"动态验证"。
-             运行时可切换开关与授权模式,立即保存到后端。 -->
-        <section v-if="task.test_env_url" class="verifier-section">
-          <h2 class="verifier-title">
-            动态验证
-            <span
-              :class="['verifier-status', verifierActive ? 'verifier-on' : 'verifier-off']"
-            >{{ verifierActive ? '运行中' : '已关闭' }}</span>
-          </h2>
-          <div class="verifier-env">
-            <span class="label">测试环境</span>
-            <code :title="task.test_env_url">{{ task.test_env_url }}</code>
-          </div>
-          <button
-            type="button"
-            class="verifier-toggle-btn"
-            :disabled="verifierConfigSaving"
-            @click="toggleVerifierEnabled"
-          >
-            {{ task.verifier_enabled ? '关闭验证' : '开启验证' }}
-          </button>
-          <button
-            v-if="task.verifier_enabled"
-            type="button"
-            class="verifier-toggle-btn"
-            :disabled="verifierConfigSaving"
-            @click="toggleVerifierAuthMode"
-          >
-            {{ task.verifier_auth_mode === 'direct' ? '模式:直接执行' : '模式:逐动作授权' }}
-          </button>
-
-          <!-- 已配置的登录凭证(只读展示,header_value 脱敏) -->
-          <div
-            v-if="task.verifier_enabled && task.verifier_auth_tokens && task.verifier_auth_tokens.length > 0"
-            class="verifier-tokens"
-          >
-            <span class="label">登录凭证</span>
-            <div
-              v-for="(token, idx) in task.verifier_auth_tokens"
-              :key="idx"
-              class="verifier-token-item"
-            >
-              <span class="token-label">{{ token.label }}</span>
-              <code class="token-header">{{ token.header_name }}: {{ maskTokenValue(token.header_value) }}</code>
+            <div v-if="task.error_message" class="alert alert-error">
+              {{ task.error_message }}
             </div>
-          </div>
-        </section>
-
-        <!-- 检查助手核查过程(思考/评估/工具核查/最终结论;主对话流只留追问卡) -->
-        <Agent2Panel
-          v-if="hasAgent2Activity"
-          :conversations="task.conversations"
-          :streaming-items="streamingItems"
-          :is-running="isAgent2Running"
-          :review-status="task.review_status"
-          :stopping-review="stoppingReview"
-          :review-summary="reviewSummary"
-          :review-plan-live="reviewPlanLive"
-          :review-items="reviewItems"
-          @send-suggestion="handleSuggestionDig"
-          @stop-review="handleStopReview"
-        />
-
-        <!-- 审查结果(ReviewItem):证据驱动可信审查,按三态分桶(风险/已核查/缺口) -->
-        <section v-if="hasReviewResults" class="sidebar-review" data-onboarding="detail-review">
-          <h2>
-            审查结果 <span class="count">({{ reviewItems.length }})</span>
-            <span v-if="task.review_status === 'running'" class="review-interim-hint">检查助手核查中</span>
-          </h2>
-          <div v-for="bucket in REVIEW_BUCKET_ORDER" :key="bucket.key" class="review-bucket">
-            <template v-if="reviewBuckets[bucket.key].length">
-              <h3 class="review-bucket-head">
-                <span :class="['bucket-tag', `bucket-${bucket.key}`]">{{ bucket.label }}</span>
-                <span class="count">{{ reviewBuckets[bucket.key].length }}</span>
-              </h3>
-              <article
-                v-for="it in reviewBuckets[bucket.key]"
-                :key="it.id"
-                :class="['review-card', { 'review-card-expanded': expandedReviewItems.has(it.id) }]"
-                @click="toggleReviewItem(it.id)"
+          </section>
+      
+          <section v-if="latestPlanSteps.length > 0" class="plan-section">
+            <h2 class="plan-section-title">
+              任务清单
+              <span class="plan-progress">{{ planProgress(latestPlanSteps) }}</span>
+            </h2>
+            <div class="plan-steps">
+              <div
+                v-for="s in latestPlanSteps"
+                :key="s.id"
+                :class="['plan-step', `plan-step-${s.status}`]"
               >
-                <div class="review-header">
-                  <span class="review-toggle">{{ expandedReviewItems.has(it.id) ? '▼' : '▶' }}</span>
-                  <h4>{{ it.title }}</h4>
-                  <span :class="['conf-badge', `conf-${confidenceClass(it.confidence?.tier)}`]">
-                    {{ confidenceLabel(it.confidence?.tier) }} · {{ formatConfidenceScore(it.confidence?.score) }}
-                  </span>
-                  <span v-if="it.evidence_mismatch" class="conf-warn" title="有引用但后端核验未通过">⚠ 证据未核验</span>
-                </div>
-                <div v-if="it.severity || it.origin" class="review-meta">
-                  <span class="origin-tag" :title="it.origin">{{ it.origin }}</span>
-                  <span v-if="it.severity" :class="['sev-tag', `sev-${it.severity}`]">{{ it.severity }}</span>
-                </div>
-                <div v-if="expandedReviewItems.has(it.id)" class="review-body">
-                  <p class="rv-line"><strong>被核实对象:</strong>{{ it.review_target || '—' }}</p>
-                  <p v-if="it.description" class="rv-line"><strong>发现问题:</strong>{{ it.description }}</p>
-                  <div v-if="it.evidence?.source?.quote || it.evidence?.source?.file_path" class="rv-section">
-                    <strong>原始证据:</strong>
-                    <code
-                      v-if="it.evidence?.source?.file_path"
-                      class="rv-file"
-                      @click.stop="openReviewFile(it)"
-                    >{{ it.evidence.source.file_path }}<span v-if="it.evidence.source.line">:{{ it.evidence.source.line }}</span></code>
-                    <pre v-if="it.evidence?.source?.quote" class="rv-quote">{{ it.evidence.source.quote }}</pre>
-                  </div>
-                  <p v-if="it.evidence?.analysis_basis?.ref_url" class="rv-line">
-                    <strong>分析依据:</strong>{{ it.evidence.analysis_basis.ref_url }}
-                  </p>
-                  <p v-if="it.evidence?.verification" class="rv-line">
-                    <strong>验证测试:</strong>{{ it.evidence.verification.method || '—' }}
-                    <span v-if="it.evidence.verification.poc_evidence"> · {{ it.evidence.verification.poc_evidence }}</span>
-                  </p>
-                  <p v-if="it.suggestion" class="rv-line"><strong>建议:</strong>{{ it.suggestion }}</p>
-                </div>
-              </article>
-            </template>
-          </div>
-        </section>
-
-        <!-- 重点与知识点(原"结果清单";分组由 task.params._grouping 驱动,卡片默认折叠;置底展示) -->
-        <section
-          v-if="task.results.length > 0"
-          class="sidebar-results"
-          data-onboarding="detail-results"
-        >
-          <h2>
-            重点与知识点 <span class="count">({{ task.results.length }})</span>
-            <!-- 后台审查进行中:当前为临时结果,审查完成后由检查助手整理的重点与知识点替换 -->
-            <span
-              v-if="task.review_status === 'running'"
-              class="review-interim-hint"
-              title="检查助手正在后台核查,当前为临时结果,完成后自动更新"
-            >
-              检查助手整理中
-            </span>
-            <!-- 用户终止检查:临时结果就是最终结果(不会再有知识点替换) -->
-            <span
-              v-else-if="task.review_status === 'stopped'"
-              class="review-interim-hint is-stopped"
-              title="已终止检查,保留 AI助手执行结果;如需检查可继续追问(新一轮会自动重新核查)"
-            >
-              检查已终止
-            </span>
-            <!-- 本任务的出题 job 运行中时,隐藏「生成练习题」入口,改为展示跳转练习页看实时进度 -->
+                <span class="plan-step-icon">{{
+                  s.status === 'done' ? '✓' : s.status === 'in_progress' ? '◌' : '○'
+                }}</span>
+                <span class="plan-step-text">{{ s.text }}</span>
+              </div>
+            </div>
+          </section>
+      
+          <!-- 动态验证(默认折叠,减少视觉噪音) -->
+          <details v-if="task.test_env_url" class="verifier-section">
+            <summary class="verifier-title">
+              动态验证
+              <span
+                :class="['verifier-status', verifierActive ? 'verifier-on' : 'verifier-off']"
+              >{{ verifierActive ? '运行中' : '已关闭' }}</span>
+            </summary>
+            <div class="verifier-env">
+              <span class="label">测试环境</span>
+              <code :title="task.test_env_url">{{ task.test_env_url }}</code>
+            </div>
             <button
-              v-if="runningGenJob"
-              class="gen-progress-entry"
-              title="跳转到自适应练习查看出题进度"
-              @click="goToPracticeProgress"
+              type="button"
+              class="verifier-toggle-btn"
+              :disabled="verifierConfigSaving"
+              @click="toggleVerifierEnabled"
             >
-              <span class="gen-pulse-dot" aria-hidden="true" />
-              正在出题<template v-if="runningGenJob.total">({{ runningGenJob.done }}/{{ runningGenJob.total }})</template>
-              · 查看进度
+              {{ task.verifier_enabled ? '关闭验证' : '开启验证' }}
             </button>
             <button
-              v-else-if="task.status === 'completed' && practiceEnabled"
-              class="practice-generate-btn"
-              :title="pendingDraftCount > 0 ? '存在待确认的候选题,点击预览入库' : '把审计发现改编为自适应练习题'"
-              @click="openPracticeGenerate"
-            >{{ pendingDraftCount > 0 ? `确认练习题(${pendingDraftCount})` : '生成练习题' }}</button>
-          </h2>
-          <!-- 出题入口旁:展示本次出题将使用的模型,避免用户困惑为什么没用默认模型 -->
-          <p v-if="generateModelInfo && task.status === 'completed' && practiceEnabled" class="generate-model-hint">
-            本次出题将使用：<strong class="generate-model-name">{{ generateModelInfo.model }}</strong>
-            <span class="generate-model-source">（{{ generateModelSourceLabel }}）</span>
-          </p>
-          <template v-for="group in resultGroups" :key="group.key">
-            <h3 v-if="resultGrouping" class="sidebar-result-group">
-              <span :class="['severity-tag', `sev-${group.color}`]">{{ group.label }}</span>
-              <span class="count">{{ group.results.length }}</span>
-            </h3>
-            <div class="result-cards">
-              <article
-                v-for="r in group.results"
-                :key="r.id"
-                :class="['result-card', { 'result-card-expanded': expandedResults.has(r.id) }]"
-                @click="toggleResult(r.id)"
+              v-if="task.verifier_enabled"
+              type="button"
+              class="verifier-toggle-btn"
+              :disabled="verifierConfigSaving"
+              @click="toggleVerifierAuthMode"
+            >
+              {{ task.verifier_auth_mode === 'direct' ? '模式:直接执行' : '模式:逐动作授权' }}
+            </button>
+            <div
+              v-if="task.verifier_enabled && task.verifier_auth_tokens && task.verifier_auth_tokens.length > 0"
+              class="verifier-tokens"
+            >
+              <span class="label">登录凭证</span>
+              <div
+                v-for="(token, idx) in task.verifier_auth_tokens"
+                :key="idx"
+                class="verifier-token-item"
               >
-                <div class="result-header">
-                  <span class="result-toggle">{{ expandedResults.has(r.id) ? '▼' : '▶' }}</span>
-                  <h4>{{ r.title }}</h4>
-                  <!-- 学习点徽标(agent2 标记了 learning_note 的知识点) -->
-                  <span
-                    v-if="r.metadata_?.learning_note"
-                    class="learning-badge"
-                    title="检查助手标记的学习点"
-                  >值得学</span>
-                </div>
-                <div v-if="getResultMetaItems(r).length > 0" class="result-meta">
-                  <span
-                    v-for="item in getResultMetaItems(r)"
-                    :key="item.field.name"
-                    :class="['meta-tag', { 'meta-file': item.field.type === 'file' }]"
-                    @click.stop="item.field.type === 'file' ? onResultFileClick(r) : undefined"
-                  >
-                    {{ item.value }}
-                  </span>
-                </div>
-                <div
-                  v-if="expandedResults.has(r.id)"
-                  class="result-content-wrapper"
-                >
-                  <!-- 学习点说明:知识点正文上方的引用块(agent2 提炼的学习价值) -->
-                  <blockquote
-                    v-if="r.metadata_?.learning_note"
-                    class="learning-note"
-                  >{{ r.metadata_.learning_note }}</blockquote>
-                  <div
-                    class="result-content markdown-body"
-                    v-html="renderResultContent(r.content)"
-                  />
-                </div>
-              </article>
+                <span class="token-label">{{ token.label }}</span>
+                <code class="token-header">{{ token.header_name }}: {{ maskTokenValue(token.header_value) }}</code>
+              </div>
             </div>
-          </template>
-        </section>
+          </details>
+        </div>
+      
+        <!-- Tab: 核查 (Agent2Panel 核查过程) -->
+        <div v-show="activeSidebarTab === 'review'" class="sidebar-panel" role="tabpanel">
+          <Agent2Panel
+            v-if="hasAgent2Activity"
+            :conversations="task.conversations"
+            :streaming-items="streamingItems"
+            :is-running="isAgent2Running"
+            :review-status="task.review_status"
+            :stopping-review="stoppingReview"
+            :review-summary="reviewSummary"
+            :review-plan-live="reviewPlanLive"
+            :review-items="reviewItems"
+            @send-suggestion="handleSuggestionDig"
+            @stop-review="handleStopReview"
+          />
+          <p v-else class="panel-empty-hint">等待检查助手核查…</p>
+        </div>
+      
+        <!-- Tab: 结果 (审查结果 + 重点与知识点) -->
+        <div v-show="activeSidebarTab === 'results'" class="sidebar-panel" role="tabpanel">
+          <!-- 审查结果(ReviewItem):紧凑卡片,点击开 drawer -->
+          <section v-if="hasReviewResults" class="sidebar-review" data-onboarding="detail-review">
+            <h2>
+              审查结果 <span class="count">({{ reviewItems.length }})</span>
+              <span v-if="task.review_status === 'running'" class="review-interim-hint">检查助手核查中</span>
+            </h2>
+            <div v-for="bucket in REVIEW_BUCKET_ORDER" :key="bucket.key" class="review-bucket">
+              <template v-if="reviewBuckets[bucket.key].length">
+                <h3 class="review-bucket-head">
+                  <span :class="['bucket-tag', `bucket-${bucket.key}`]">{{ bucket.label }}</span>
+                  <span class="count">{{ reviewBuckets[bucket.key].length }}</span>
+                </h3>
+                <article
+                  v-for="it in reviewBuckets[bucket.key]"
+                  :key="it.id"
+                  class="review-card"
+                  @click="openCardDrawer(it, 'review')"
+                >
+                  <div class="review-header">
+                    <span class="card-chevron">›</span>
+                    <h4>{{ it.title }}</h4>
+                    <span :class="['conf-badge', `conf-${confidenceClass(it.confidence?.tier)}`]">
+                      {{ confidenceLabel(it.confidence?.tier) }} · {{ formatConfidenceScore(it.confidence?.score) }}
+                    </span>
+                    <span v-if="it.evidence_mismatch" class="conf-warn" title="有引用但后端核验未通过">⚠ 证据未核验</span>
+                  </div>
+                  <div v-if="it.severity || it.origin" class="review-meta">
+                    <span class="origin-tag" :title="it.origin">{{ it.origin }}</span>
+                    <span v-if="it.severity" :class="['sev-tag', `sev-${it.severity}`]">{{ it.severity }}</span>
+                  </div>
+                </article>
+              </template>
+            </div>
+          </section>
+      
+          <!-- 重点与知识点(紧凑卡片,点击开 drawer) -->
+          <section
+            v-if="task.results.length > 0"
+            class="sidebar-results"
+            data-onboarding="detail-results"
+          >
+            <h2>
+              重点与知识点 <span class="count">({{ task.results.length }})</span>
+              <span
+                v-if="task.review_status === 'running'"
+                class="review-interim-hint"
+                title="检查助手正在后台核查,当前为临时结果,完成后自动更新"
+              >
+                检查助手整理中
+              </span>
+              <span
+                v-else-if="task.review_status === 'stopped'"
+                class="review-interim-hint is-stopped"
+                title="已终止检查,保留 AI助手执行结果;如需检查可继续追问(新一轮会自动重新核查)"
+              >
+                检查已终止
+              </span>
+              <button
+                v-if="runningGenJob"
+                class="gen-progress-entry"
+                title="跳转到自适应练习查看出题进度"
+                @click="goToPracticeProgress"
+              >
+                <span class="gen-pulse-dot" aria-hidden="true" />
+                正在出题<template v-if="runningGenJob.total">({{ runningGenJob.done }}/{{ runningGenJob.total }})</template>
+                · 查看进度
+              </button>
+              <button
+                v-else-if="task.status === 'completed' && practiceEnabled"
+                class="practice-generate-btn"
+                :title="pendingDraftCount > 0 ? '存在待确认的候选题,点击预览入库' : '把审计发现改编为自适应练习题'"
+                @click="openPracticeGenerate"
+              >{{ pendingDraftCount > 0 ? `确认练习题(${pendingDraftCount})` : '生成练习题' }}</button>
+            </h2>
+            <p v-if="generateModelInfo && task.status === 'completed' && practiceEnabled" class="generate-model-hint">
+              本次出题将使用：<strong class="generate-model-name">{{ generateModelInfo.model }}</strong>
+              <span class="generate-model-source">（{{ generateModelSourceLabel }}）</span>
+            </p>
+            <template v-for="group in resultGroups" :key="group.key">
+              <h3 v-if="resultGrouping" class="sidebar-result-group">
+                <span :class="['severity-tag', `sev-${group.color}`]">{{ group.label }}</span>
+                <span class="count">{{ group.results.length }}</span>
+              </h3>
+              <div class="result-cards">
+                <article
+                  v-for="r in group.results"
+                  :key="r.id"
+                  class="result-card"
+                  @click="openCardDrawer(r, 'result')"
+                >
+                  <div class="result-header">
+                    <span class="card-chevron">›</span>
+                    <h4>{{ r.title }}</h4>
+                    <span
+                      v-if="r.metadata_?.learning_note"
+                      class="learning-badge"
+                      title="检查助手标记的学习点"
+                    >值得学</span>
+                  </div>
+                  <div v-if="getResultMetaItems(r).length > 0" class="result-meta">
+                    <span
+                      v-for="item in getResultMetaItems(r)"
+                      :key="item.field.name"
+                      :class="['meta-tag', { 'meta-file': item.field.type === 'file' }]"
+                      @click.stop="item.field.type === 'file' ? onResultFileClick(r) : undefined"
+                    >
+                      {{ item.value }}
+                    </span>
+                  </div>
+                </article>
+              </div>
+            </template>
+          </section>
+        </div>
       </div>
     </aside>
 
@@ -3466,6 +3492,15 @@ function toggleResult(id: string): void {
       :submitting="submittingCommandConfirm"
       @approve="handleApproveCommand"
       @reject="handleRejectCommand"
+    />
+
+    <!-- 卡片详情 Drawer(审查结果/知识点点击后展开) -->
+    <DetailCardDrawer
+      :open="drawerOpen"
+      :item="drawerItem"
+      :type="drawerType"
+      @close="drawerOpen = false"
+      @open-file="handleDrawerOpenFile"
     />
   </div>
 </template>
@@ -3622,7 +3657,97 @@ function toggleResult(id: string): void {
   padding: var(--space-4);
   display: flex;
   flex-direction: column;
+}
+
+/* ---- 分段标签页 ---- */
+.sidebar-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.sidebar-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-full, 999px);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.sidebar-tab:hover {
+  color: var(--color-text);
+  background: var(--color-bg-hover, rgba(0, 0, 0, 0.04));
+}
+
+.sidebar-tab.active {
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  border-color: var(--color-primary-border);
+  font-weight: var(--fw-semibold);
+}
+
+.tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: var(--fw-semibold);
+  color: var(--color-surface);
+  background: var(--color-primary);
+  border-radius: var(--radius-full, 999px);
+}
+
+.tab-badge-live {
+  background: none;
+  color: var(--color-success);
+  animation: tab-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes tab-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* Tab 内容面板 */
+.sidebar-panel {
+  display: flex;
+  flex-direction: column;
   gap: var(--space-4);
+}
+
+.panel-empty-hint {
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+  font-size: var(--fs-sm);
+  color: var(--color-text-muted);
+}
+
+/* 卡片右侧箭头(替代原先 ▼/▶ 折叠图标) */
+.card-chevron {
+  flex-shrink: 0;
+  font-size: var(--fs-sm);
+  color: var(--color-text-tertiary);
+  line-height: 1;
+  transition: color var(--transition-fast);
+}
+
+.review-card:hover .card-chevron,
+.result-card:hover .card-chevron {
+  color: var(--color-primary);
 }
 
 
@@ -4237,10 +4362,6 @@ function toggleResult(id: string): void {
   border-color: var(--color-border-strong);
 }
 
-.result-card-expanded {
-  border-color: var(--color-border-strong);
-}
-
 .result-header {
   display: flex;
   align-items: flex-start;
@@ -4269,14 +4390,6 @@ function toggleResult(id: string): void {
   background: var(--color-primary-light);
   border-left: 3px solid var(--color-primary);
   border-radius: var(--radius-sm);
-}
-
-.result-toggle {
-  flex-shrink: 0;
-  margin-top: 2px;
-  font-size: var(--fs-xs);
-  line-height: var(--lh-tight);
-  color: var(--color-text-muted);
 }
 
 .result-header h4 {
@@ -5015,10 +5128,8 @@ function toggleResult(id: string): void {
 .bucket-gap { background: rgba(217, 119, 6, 0.14); color: var(--color-warning, #d97706); }
 .review-card { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-2) var(--space-3); margin-bottom: var(--space-2); cursor: pointer; }
 .review-card:hover { background: var(--color-bg-hover, rgba(0,0,0,0.03)); }
-.review-card-expanded { background: var(--color-bg-subtle, rgba(0,0,0,0.02)); }
 .review-header { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 .review-header h4 { margin: 0; flex: 1; font-size: var(--fs-sm); }
-.review-toggle { color: var(--color-text-muted); font-size: var(--fs-xs); }
 .conf-badge { font-size: var(--fs-xs); padding: 1px 6px; border-radius: var(--radius-sm); border: 1px solid var(--color-border); white-space: nowrap; }
 .conf-verified { background: rgba(22,163,74,0.12); color: var(--color-success,#16a34a); }
 .conf-source { background: var(--color-info-light, rgba(37,99,235,0.12)); color: var(--color-info,#2563eb); }
@@ -5027,9 +5138,4 @@ function toggleResult(id: string): void {
 .conf-warn { font-size: var(--fs-xs); color: var(--color-warning,#d97706); }
 .review-meta { display: flex; gap: var(--space-2); margin-top: 4px; flex-wrap: wrap; }
 .origin-tag { font-size: var(--fs-xs); color: var(--color-text-muted); border: 1px dashed var(--color-border); padding: 0 6px; border-radius: var(--radius-sm); }
-.review-body { margin-top: var(--space-2); font-size: var(--fs-sm); color: var(--color-text); }
-.rv-line { margin: 4px 0; }
-.rv-section { margin: 6px 0; }
-.rv-file { display: inline-block; margin: 2px 0; padding: 1px 6px; background: var(--color-bg-subtle, #f3f4f6); border-radius: var(--radius-sm); cursor: pointer; color: var(--color-info,#2563eb); }
-.rv-quote { margin: 4px 0; padding: 6px 8px; background: var(--color-code-bg, #0b1021); color: inherit; border-radius: var(--radius-sm); white-space: pre-wrap; word-break: break-all; font-size: var(--fs-xs); }
 </style>
