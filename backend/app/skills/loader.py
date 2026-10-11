@@ -113,12 +113,17 @@ _FRONTMATTER_RE = re.compile(
 )
 
 
-def parse_skill_md(path: Path, scenario_id: str) -> ParsedSkill:
-    """解析一个 SKILL.md 文件
+def parse_skill_text(text: str, scenario_id: str, source: Path | str) -> ParsedSkill:
+    """从 SKILL.md 全文解析(纯内存,不读盘也不写盘)
+
+    "先验后写"的链路(在线编辑 upsert)必须在任何磁盘写入之前就拿到校验结果:
+    先落盘再验证的话,失败清理会动到已有文件(详见 routers/skills.py 的 upsert)。
 
     参数:
-        path: SKILL.md 绝对路径
-        scenario_id: 所属场景(从目录路径推断)
+        text: SKILL.md 全文(frontmatter + 正文)
+        scenario_id: 所属场景
+        source: 内容来源路径,用于错误信息与 skill_dir / source_path 字段。
+            内存校验时可以传"即将落盘的目标路径",此时该文件还不存在。
 
     抛出:
         ValueError: frontmatter 缺失或必填字段不完整,或 name 形状非法
@@ -127,30 +132,29 @@ def parse_skill_md(path: Path, scenario_id: str) -> ParsedSkill:
     注:scenario_id 不在此校验——上传解析时它还是空占位(由调用方按归属填),
         扫描侧由 _scan_root 校验目录名,落地侧由 storage 收口。
     """
-    text = path.read_text(encoding="utf-8")
     m = _FRONTMATTER_RE.match(text)
     if not m:
         raise ValueError(
-            f"SKILL.md 缺少 frontmatter 或格式错误(应以 --- 开头): {path}"
+            f"SKILL.md 缺少 frontmatter 或格式错误(应以 --- 开头): {source}"
         )
 
     frontmatter_text, body = m.group(1), m.group(2)
     try:
         frontmatter = yaml.safe_load(frontmatter_text) or {}
     except yaml.YAMLError as e:
-        raise ValueError(f"SKILL.md frontmatter YAML 解析失败: {path}: {e}") from e
+        raise ValueError(f"SKILL.md frontmatter YAML 解析失败: {source}: {e}") from e
 
     name = frontmatter.get("name")
     description = frontmatter.get("description")
 
     if not name or not description:
         raise ValueError(
-            f"SKILL.md frontmatter 缺少必填字段 name/description: {path}"
+            f"SKILL.md frontmatter 缺少必填字段 name/description: {source}"
         )
 
     if not isinstance(name, str) or not isinstance(description, str):
         raise ValueError(
-            f"SKILL.md frontmatter name/description 必须是字符串: {path}"
+            f"SKILL.md frontmatter name/description 必须是字符串: {source}"
         )
 
     # name 会被当作落盘目录名,形状非法(../ 或分隔符)直接拒绝:
@@ -158,16 +162,31 @@ def parse_skill_md(path: Path, scenario_id: str) -> ParsedSkill:
     try:
         safe_name = validate_skill_name(name)
     except ValueError as e:
-        raise ValueError(f"SKILL.md frontmatter name 非法: {path}: {e}") from e
+        raise ValueError(f"SKILL.md frontmatter name 非法: {source}: {e}") from e
 
+    origin = Path(source)
     return ParsedSkill(
         name=safe_name,
         description=description.strip(),
         scenario_id=scenario_id,
-        skill_dir=path.parent,
+        skill_dir=origin.parent,
         body=body.rstrip() + "\n",
-        source_path=path,
+        source_path=origin,
     )
+
+
+def parse_skill_md(path: Path, scenario_id: str) -> ParsedSkill:
+    """解析一个 SKILL.md 文件(读文件 + parse_skill_text)
+
+    参数:
+        path: SKILL.md 绝对路径
+        scenario_id: 所属场景(从目录路径推断)
+
+    抛出:
+        ValueError: 同 parse_skill_text
+        OSError / UnicodeDecodeError: 读盘失败或文件非 UTF-8(扫描侧按 Exception 兜底)
+    """
+    return parse_skill_text(path.read_text(encoding="utf-8"), scenario_id, path)
 
 
 # ============================================================

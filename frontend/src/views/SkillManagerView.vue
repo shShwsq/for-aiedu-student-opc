@@ -9,7 +9,8 @@
  * - 上传区为常规文件上传样式:左侧选择框点击弹出文件对话框并回显文件名,右侧上传按钮
  * - 点击列表项打开右侧栏:左边技能文件列表,右边文件编辑器(与记忆管理同款)
  *   · .md 文件支持「编辑 / 预览」切换,预览用 marked 渲染 + DOMPurify 净化
- *   · 自己的 skill 的 SKILL.md 可编辑保存(后端 upsert 热刷新);其余只读
+ *   · 自己的 skill 的 SKILL.md 可编辑保存(后端先验后写 + 热刷新);改 frontmatter
+ *     的 name 即重命名(整个 skill 目录跟着换名),其余只读
  *
  * 安全:zip 由后端校验(zip-slip / 大小 / frontmatter / 扩展名白名单);
  * 文件读取接口后端做了路径穿越防护与 UTF-8 校验。
@@ -304,7 +305,7 @@ const previewHtml = computed(() => {
   return DOMPurify.sanitize(raw)
 })
 
-async function loadFiles(s: SkillSummary): Promise<void> {
+async function loadFiles(s: SkillSummary, keepPath = ''): Promise<void> {
   const seq = ++filesReqSeq
   filesLoading.value = true
   filesError.value = ''
@@ -315,8 +316,12 @@ async function loadFiles(s: SkillSummary): Promise<void> {
     expandedFolders.value = collectFolderPaths(files)
     // 列表已就绪,先复位 loading 再联动选中文件(selectFile 会自增 contentReqSeq)
     filesLoading.value = false
-    // 默认选中 SKILL.md(后端已置顶),否则选第一个文件
-    const first = files.find((f) => f.path === 'SKILL.md') ?? files[0]
+    // 默认选中 SKILL.md(后端已置顶),否则选第一个文件;
+    // keepPath(改名后保留原选中文件)优先
+    const first =
+      files.find((f) => f.path === keepPath) ??
+      files.find((f) => f.path === 'SKILL.md') ??
+      files[0]
     if (first) {
       await selectFile(first.path)
     } else {
@@ -378,7 +383,7 @@ function closeSkill(): void {
   original.value = ''
 }
 
-/** 保存 SKILL.md(直写全文,含 frontmatter;后端热刷新注册表);返回是否保存成功 */
+/** 保存 SKILL.md(直写全文,含 frontmatter;后端先验后写 + 热刷新注册表);返回是否保存成功 */
 async function handleSave(): Promise<boolean> {
   const s = activeSkill.value
   if (!s || !canSave.value) return false
@@ -386,15 +391,24 @@ async function handleSave(): Promise<boolean> {
   try {
     const result = await updateSkill(s.scenario_id, s.name, draft.value)
     original.value = draft.value
-    showToast(`技能「${result.name}」已保存`, 'success')
+    const renamed = result.name !== s.name
+    showToast(
+      renamed ? `已重命名为「${result.name}」并保存` : `技能「${result.name}」已保存`,
+      'success',
+    )
     // frontmatter 改名/改描述时同步选中项与列表
-    activeSkill.value = {
+    const next: SkillSummary = {
       name: result.name,
       description: result.description,
       scenario_id: result.scenario_id,
       owned: result.owned,
     }
+    activeSkill.value = next
     await loadSkills()
+    // 改名后 skill 目录换了名字:按新名字重取文件列表(相对路径不变,保持当前选中文件)
+    if (renamed) {
+      await loadFiles(next, activePath.value)
+    }
     return true
   } catch (e) {
     showToast(extractErrorMessage(e), 'error')
@@ -694,6 +708,13 @@ onMounted(loadSkills)
                 </div>
               </header>
 
+              <!-- 命名规则/改名提示:编辑器才是 name 非法或与 URL 不一致的实际触发点 -->
+              <p v-if="canEdit" class="editor-hint">
+                改 frontmatter 的 <code>name</code> 即重命名该技能(资源文件随行,撞
+                内置或已有同名会被拒绝);名称需以字母或数字开头,仅含字母、数字与
+                <code>.</code> <code>_</code> <code>-</code>,不含 <code>..</code>,
+                长度不超过 64。内容校验不过时后端不会动磁盘上的旧版本。
+              </p>
               <div class="editor-content">
                 <div v-if="fileLoading" class="content-placeholder">
                   <span class="status-spinner" /> 加载中...
@@ -1339,6 +1360,23 @@ onMounted(loadSkills)
   border-bottom: 1px solid var(--color-border);
   background: var(--color-surface);
   flex-shrink: 0;
+}
+
+/* 命名/改名提示(只在可编辑的 SKILL.md 下出现) */
+.editor-hint {
+  margin: 0;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--color-text-muted);
+  background: var(--color-surface-alt);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.editor-hint code {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.9em;
 }
 
 .toolbar-left {

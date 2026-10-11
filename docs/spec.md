@@ -525,7 +525,7 @@ Result(任务结果项,通用)
 - **加载机制**:进程启动时扫描磁盘所有 SKILL.md,解析 frontmatter,注册到 SkillRegistry。管理员后台增删后调 `reload_registry()` 刷新。用户上传 skill 通过 API 触发热加载(后端 `upsert` + 注册到对应用户的 registry 视图)
 - **管理 API**:
   - 系统内置:`GET /skills`(列出全部,含内置 + 各用户自己的)+ `POST /skills/reload`(管理员重新扫描)
-  - 用户上传:`POST /skills/upload`(zip,含 `SKILL.md`)+ `DELETE /skills/{scenario_id}/{skill_name}`(只能删自己的)+ `PUT /skills/{scenario_id}/{skill_name}/SKILL.md`(在线编辑自己的 SKILL.md,热保存)
+  - 用户上传:`POST /skills/upload`(zip,含 `SKILL.md`)+ `POST /skills/{scenario_id}/{skill_name}`(在线编辑自己的 SKILL.md 全文,先验后写 + 热保存;frontmatter `name` 与 URL 不一致即重命名)+ `DELETE /skills/{scenario_id}/{skill_name}`(只能删自己的)
 - **react_agent 调用**:通过 `list_skills` 工具查看可用 skill(内置 + 当前用户上传的),通过 `skill` 工具加载指定 skill 的 body 到上下文,LLM 按其指引执行
 - **CLI 执行器调用**(Qoder/DeepSeek/Codex,经 ACP):外部 CLI 无进程内 SkillRegistry 与 skill 工具,故与记忆文件同构——任务启动时 `orchestrator._write_skill_files_for_task` 把"当前用户可见 ∩ `allowed_skills`"的 skill 物化进容器固定目录(sandbox 模式 `/home/user/.agent_skills/<skill>/`,local 模式 `<local_dir>/.agent_skills/<skill>/`,含 SKILL.md 全文 + 文本类附加资源,二进制跳过;先清后写避免残留),再在 prompt 末尾(并入记忆注入桶参与去重)追加"可用技能"清单与路径指针,引导 CLI 用自身文件读取工具按需查阅 SKILL.md 并执行。`build_cli_skills_section` 保持零 `app.*` 依赖,可见集解析与路径计算在调用侧(`loader.resolve_visible_skills` / `memory_injection.resolve_agent_skills_dir_path`)
 - **首版技能清单**(场景降级后按 scenario 组织,用户创建任务时可选 `allowed_skills` 过滤;均挂在 `code_review` 场景下):
@@ -536,18 +536,21 @@ Result(任务结果项,通用)
 - **用户上传 skill 限制**(`backend/app/config.py`):
   - zip 最大:`SKILL_MAX_ZIP_SIZE_MB=50`
   - 解压后最大:`SKILL_MAX_EXTRACT_SIZE_MB=200`
-  - 单文件最大:`SKILL_MAX_SINGLE_FILE_SIZE_MB=20`
+  - 单文件最大:`SKILL_MAX_SINGLE_FILE_SIZE_MB=20`(同样适用于在线编辑直写的 `SKILL.md`,超限即 400 且不落盘)
   - 文件数上限:`SKILL_MAX_FILES=100`
   - 列出文件上限:`SKILL_MAX_LISTED_FILES=200`
   - 默认放行的图片扩展名:`.png,.jpg,.jpeg,.webp,.gif`(`SKILL_ALLOWED_EXTENSIONS_EXTRA`;不建议追加 `.svg`,可含恶意脚本)
   - skill 存储目录:`USER_SKILLS_DIR=./data/user_skills`(统一数据根 `data/` 下,旧 `./user_skills` 由启动迁移自动搬家)
 - **名称形状与路径收口**(`skill_name` 既是注册表 key 又是落盘目录名,必须锁死):
   - 规则(`loader.validate_skill_name` / `validate_scenario_id`):以字母或数字开头,仅允许字母、数字与 `.` `_` `-`,不含 `..` 段,不以 `.` 收尾,长度 ≤64,拒 Windows 保留设备名(`CON` / `NUL` / `AUX` / `COM1-9` / `LPT1-9`)
-  - 生效点:`parse_skill_md`(上传解析与磁盘扫描同源→越界名进不了 SkillRegistry,也就无法借 URL 参数回传给删除逻辑)、`_scan_root`(非法场景目录名跳过并 warning)、`routers/skills` 的 upsert / delete 入口(非法即 400)
-  - 存储层自证:`DirectorySkillStorage._dest` 先校验再 `resolve()` 断言结果仍在 `USER_SKILLS_DIR` 内(不论调用方是否校验过);`save` 先拷同级 `.<name>.tmp-*` 暂存目录、成功后才换名替换,拷贝失败回滚不动旧 skill(暂存/备份目录以 `.` 开头,扫描会跳过)
+  - 生效点:`parse_skill_text` / `parse_skill_md`(上传解析、磁盘扫描与在线编辑同一入口→越界名进不了 SkillRegistry,也就无法借 URL 参数回传给删除逻辑)、`_scan_root`(非法场景目录名跳过并 warning)、`routers/skills` 的 upsert / delete 入口(非法即 400)
+  - 先验后写:两条写链路都不允许"先落盘再验证"。zip 链路在解压临时目录里校验通过才拷贝;在线编辑(upsert)在内存里过完编码 / 大小 / frontmatter / name 形状才写盘,失败返回 400 且磁盘上零痕迹(旧实现"写盘→reload→查不到就 unlink"会在用户改 name 时删掉原 skill 的 SKILL.md)
+  - 存储层自证:`DirectorySkillStorage._dest` 先校验再 `resolve()` 断言结果仍在 `USER_SKILLS_DIR` 内(不论调用方是否校验过);`save` 先拷同级 `.<name>.tmp-*` 暂存目录、成功后才换名替换,拷贝失败回滚不动旧 skill(暂存/备份目录以 `.` 开头,扫描会跳过);`write_skill_md` 同理先写 `.SKILL.md.tmp-*` 再 `os.replace`,改名以旧目录为源拷出暂存目录、一次换名落地后才拆旧目录(目标已存在则 409,不存在"新目录没建、旧目录已删"的窗口)
+  - 存储根目录:`DirectorySkillStorage` 可接收路径或返回路径的可调用对象;路由级实例传 `loader.get_user_skills_root`(每次调用求根),与扫描侧同源,不冻结 import 时的值
   - 删除收口:`DELETE` 只删"确在 `<root>/user_<uid>/` 之下"的目录(用户根 + 内置根遗留位置两处),内置 skill 的代码资产目录永远删不到
 - **隔离**:用户上传的 skill 仅自己可见,他人 `list_skills` 不会列出,也无法 `skill` 工具加载。内置 skill 全员可见但只读
-- **同名冲突**:用户上传与内置 / 他人 skill 同名时直接报错 `无法覆盖`;与自己已有 skill 同名时弹窗确认覆盖
+- **同名冲突**:用户上传与内置 / 他人 skill 同名时直接报错 `无法覆盖`;与自己已有 skill 同名时弹窗确认覆盖。在线编辑里改名与新建同样过这套检查(撞内置 → 409;改名撞自己已有同名 → 409),不与上传 zip 路径留口径差
+- **重命名**:注册表按 frontmatter `name` 注册,`<skill_name>` 目录名即约定落点;编辑器里改 `name` = 重命名,整个 skill 目录(含资源文件)搬到新名字下。仅对已存在的 skill 开放(新建时 `name` 必须与 URL 一致),他人场景同名不冲突
 - **扩展性**:管理员可通过 API 或直接编辑磁盘文件添加新 skill;用户通过 zip 上传添加自己的 skill(仅自己可用)
 
 

@@ -11,7 +11,9 @@
 - skill 名 / scenario_id 都会当作目录名拼路径,一律先过 loader 的形状校验
   (validate_skill_name / validate_scenario_id:拒 ".." 与路径分隔符、保留名等)。
 - 上传的 skill 名来自 zip 内 frontmatter(攻击者可控),校验放在落盘之前;
-  存储层 DirectorySkillStorage 另外做 resolve 收口,不论调用方是否校验过。
+  在线编辑(upsert)同样"先验后写":内容在内存里解析通过才落盘,失败不碰磁盘。
+- 写入一律经存储后端(DirectorySkillStorage),它另外做 resolve 收口 + 暂存换名,
+  不论调用方是否校验过,也不会把已存在的内容写坏一半。
 - 删除只针对"确在当前用户 user_<uid>/ 之下"的目录:内置 skill 的代码资产
   目录永远删不到。
 
@@ -22,7 +24,7 @@
     GET    /skills/{scenario_id}/{skill_name}/files           列出 skill 目录文件
     GET    /skills/{scenario_id}/{skill_name}/files/{path}    读取 skill 单文件内容
     POST   /skills/upload                          上传 zip(仅登录用户)
-    POST   /skills/{scenario_id}/{skill_name}      更新自己的 skill(仅 owner)
+    POST   /skills/{scenario_id}/{skill_name}      更新 / 重命名自己的 skill(仅 owner)
     DELETE /skills/{scenario_id}/{skill_name}      删除 skill(仅 owner)
     POST   /skills/reload                          重新扫描磁盘(登录用户)
 """
@@ -43,6 +45,7 @@ from app.skills import loader as skill_loader
 from app.skills.loader import (
     USER_SCENARIO_PREFIX,
     get_user_skills_root,
+    parse_skill_text,
     reload_registry,
     scenario_owner_id,
     validate_scenario_id,
@@ -57,9 +60,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/skills", tags=["skills"])
 
 
-# 用户上传 skill 的存储后端(目录实现,根目录来自 USER_SKILLS_DIR)
+# 用户上传 skill 的存储后端(目录实现,根目录由 get_user_skills_root 每次调用时求值)
+# 传函数而不是路径实例:避开"import 时冻结根目录"与 loader 运行时求值分叉
 # 未来切换数据库 / 对象存储时,替换此实例即可(实现同一 SkillStorage 接口)
-user_skill_storage: SkillStorage = DirectorySkillStorage(get_user_skills_root())
+user_skill_storage: SkillStorage = DirectorySkillStorage(get_user_skills_root)
 
 
 # ============================================================
@@ -68,10 +72,11 @@ user_skill_storage: SkillStorage = DirectorySkillStorage(get_user_skills_root())
 
 
 class SkillCreateRequest(BaseModel):
-    """更新 skill 的请求
+    """更新 / 重命名 skill 的请求
 
     body 直接传 SKILL.md 全文(frontmatter + 正文)。
-    仅允许更新自己上传的 skill(owner 校验)。
+    仅允许更新自己上传的 skill(owner 校验);frontmatter name 与 URL skill_name
+    不同时按改名处理(整个 skill 目录跟着换名字)。
     """
 
     content: str
@@ -145,7 +150,11 @@ def _is_owned(skill: ParsedSkill, user: User | None) -> bool:
 
 
 def _user_skill_path(scenario_id: str, skill_name: str) -> Path:
-    """构造用户 skill 的 SKILL.md 路径(upsert 直写用),校验合法性"""
+    """校验名称形状后算出用户 skill 的 SKILL.md 约定路径(非法 → 400)
+
+    upsert 用它做入口形状校验与错误信息里的来源路径;真正的写入走存储后端
+    (那边还会再校一次 + resolve 收口),这里不创建任何目录。
+    """
     try:
         safe_scenario = validate_scenario_id(scenario_id)
         safe_name = validate_skill_name(skill_name)
@@ -234,6 +243,12 @@ def _require_owned(skill: ParsedSkill, user: User) -> None:
 
 # 单文件内容读取上限(与上传单文件上限对齐,可经环境变量覆盖)
 MAX_READ_SIZE = settings.SKILL_MAX_READ_SIZE_MB * 1024 * 1024
+# SKILL.md 写入上限:与 zip 内单文件上限对齐(SKILL.md 就是一个单文件)
+# 不挡的话,一次写入的大文件会被每次 reload_registry 全量 read_text 进内存,
+# 而且超本接口大小的文件连拥有者自己都预览不了
+# 注:FastAPI 会先把 JSON body 读进内存,此上限护的是磁盘与注册表,不是请求内存
+# (生产由 nginx client_max_body_size 兜底)
+MAX_SKILL_MD_SIZE = settings.SKILL_MAX_SINGLE_FILE_SIZE_MB * 1024 * 1024
 # 文件列表条目数上限(防御异常目录,可经环境变量覆盖)
 MAX_LISTED_FILES = settings.SKILL_MAX_LISTED_FILES
 
@@ -503,46 +518,118 @@ def upsert_skill(
     req: SkillCreateRequest,
     current_user: User = Depends(get_current_user),
 ) -> SkillResponse:
-    """更新自己的 skill(直接写 SKILL.md 全文)
+    """更新 / 重命名自己的 skill(直写 SKILL.md 全文)
 
     仅允许写入自己上传的 skill 空间(user_<uid> 场景);内置/他人 skill 不可改。
-    写完后调用 reload_registry 刷新注册表。
+
+    先验后写:编码 / 大小 / frontmatter / name 形状全部在内存里过才落盘。
+    旧实现是"写盘 → reload → 查不到就 unlink",而注册表是按 frontmatter name
+    注册的:在编辑器里改了 name 时,get(URL name) 落空,unlink 删掉的正是原
+    skill 的 SKILL.md(实测会静默丢数据)。
+
+    改名(frontmatter name ≠ URL skill_name)= 把整个 skill 目录搬到新名字下,
+    资源文件随行;只对已存在的 skill 开放,目标名撞内置或已有同名时拒绝。
+    新建(name 与 URL 一致)与上传 zip 同口径:撞内置名 → 409(否则注册表
+    会出现两条同名,运行时同名去重"保留首个"会把用户那条整个遮蔽)。
     """
     if scenario_id != _user_scenario_id(current_user.id):
         raise HTTPException(
             status_code=403,
             detail="仅允许更新自己上传的 skill",
         )
+    # 入口先过形状校验(非法名 / 穿越串 → 400,不拼任何路径);得到目标落盘路径
     skill_md = _user_skill_path(scenario_id, skill_name)
-    skill_md.parent.mkdir(parents=True, exist_ok=True)
-    skill_md.write_text(req.content, encoding="utf-8")
+    current_name = skill_md.parent.name
 
-    # 立即重新扫描,校验 frontmatter 是否合法
-    reload_registry()
-    skill = skill_loader.REGISTRY.get(scenario_id, skill_name)
-    if not skill:
-        # 重载后找不到:回读刚写的文件拿到具体原因,别只丢一句"解析失败"
-        reason = ""
-        try:
-            skill_loader.parse_skill_md(skill_md, scenario_id)
-        except ValueError as e:
-            reason = str(e)
-        except OSError:
-            pass
-        # 删掉刚写的文件,避免污染磁盘(名字非法时注册表永远没这条,留着也看不见)
-        try:
-            skill_md.unlink()
-        except OSError:
-            pass
+    # ---- 以下三道全部在内存里完成,失败时磁盘上一点痕迹都不留 ----
+    try:
+        payload = req.content.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise HTTPException(
+            status_code=400, detail="SKILL.md 内容不是合法的 UTF-8 文本,无法保存"
+        ) from e
+    if len(payload) > MAX_SKILL_MD_SIZE:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "SKILL.md frontmatter 解析失败,请检查 name/description 字段"
-                + (f":{reason}" if reason else "")
-            ),
+            detail=f"SKILL.md 内容超过大小上限 {MAX_SKILL_MD_SIZE // 1024 // 1024}MB",
+        )
+    try:
+        parsed = parse_skill_text(req.content, scenario_id, skill_md)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"SKILL.md 校验失败,未做任何写入: {e}",
+        ) from e
+
+    # ---- 决定是原地更新还是改名 ----
+    target_name = parsed.name
+    existing = skill_loader.REGISTRY.get(scenario_id, current_name)
+    move_from: Path | None = None
+    if target_name != current_name:
+        if not existing:
+            # 新建时名字必须一致,否则 URL 与磁盘目录名会分叉(改名只对已有 skill 生效)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"新建 skill 时 frontmatter name({target_name})必须与 URL 的"
+                    f" skill_name({current_name})一致;改名只能针对已存在的 skill"
+                ),
+            )
+        # 目标名不能撞内置(抛 409),也不能撞自己场景里的其他 skill
+        clash = _check_upload_name_conflict(target_name, current_user.id)
+        if clash:
+            raise HTTPException(
+                status_code=409,
+                detail=f"skill「{target_name}」已存在,无法改名",
+            )
+        # 以注册表里的真实目录为源(旧数据的目录名可能不等于 name)
+        move_from = existing.skill_dir
+    elif existing is None:
+        # 新建(name 与 URL 一致):与上传 zip 同一套重名检查,撞内置 → 409。
+        # 自己场景内的同名已被 existing is None 排除,这里只会因内置名拒绝;
+        # 不查的话用户 skill 会与内置同名,运行时同名去重"保留首个"(内置先注册)
+        # 把它整个遮蔽——zip 上传路径本就 409,这里对齐口径
+        _check_upload_name_conflict(target_name, current_user.id)
+    elif Path(existing.skill_dir).resolve() != skill_md.parent.resolve():
+        # 历史数据把目录名与 name 分开了(手放磁盘 / 旧版本):原地更新只写约定路径
+        # 会留下同名两份,扫描后一个覆盖一个。顺手把目录搬到与 name 一致的约定位置
+        move_from = existing.skill_dir
+
+    # ---- 落地:由存储后端做 resolve 收口 + 暂存换名,失败不会毁掉旧数据 ----
+    try:
+        final_md = user_skill_storage.write_skill_md(
+            scenario_id, target_name, req.content, move_from=move_from
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"skill 无法落地: {e}") from e
+    except FileExistsError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"skill「{target_name}」已存在,无法改名",
+        ) from e
+    except FileNotFoundError as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"skill 不存在: {scenario_id}/{skill_name}",
+        ) from e
+
+    reload_registry()
+    skill = skill_loader.REGISTRY.get(scenario_id, target_name)
+    if not skill:
+        # 内容已在内存校验过,到这里还扫不到是服务端异常(权限/磁盘),不是用户写错了:
+        # 绝对不能再删文件(旧实现正是在这一步把数据删掉的)
+        logger.error(f"upsert skill 已落盘但未进注册表: {final_md}")
+        raise HTTPException(
+            status_code=500,
+            detail="skill 已保存但未能加载,请稍后重试或联系管理员",
         )
 
-    logger.info(f"upsert skill: {scenario_id}/{skill_name} ({skill_md})")
+    if target_name != current_name:
+        logger.info(
+            f"rename skill: {scenario_id}/{current_name} -> {target_name} ({final_md})"
+        )
+    else:
+        logger.info(f"upsert skill: {scenario_id}/{target_name} ({final_md})")
     return _to_detail(skill, current_user)
 
 
