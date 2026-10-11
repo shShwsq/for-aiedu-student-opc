@@ -2,8 +2,8 @@
 
 挂在 orchestrator 任务完成收尾处(与 memory_summarize 同模式):
 - 只生成 draft,仍需用户在任务详情页预览确认后转 active
-- 守卫条件:登录用户、开关开启、存在结构化 finding(metadata 非空);
-  单 agent 模式的纯摘要 Result 无元信息,自动跳过避免低质量题
+- 守卫条件:登录用户、开关开启;有结构化 finding 时据其出题,
+  无结构化 finding(如单 agent 纯摘要)时降级为基于 user↔agent1 对话出题
 - 同一任务已生成过(任何状态的题目)则跳过,避免追问/重试后重复出题
 - 生成过程创建 job 追踪(source=auto),练习页出题进度侧栏可实时查看
 """
@@ -55,13 +55,25 @@ def auto_generate_practice_for_task(task: Task, db: Session) -> int:
         logger.info("[task=%s] 匿名任务不支持自动生成练习题,跳过", task.id)
         return 0
 
-    # 2) 用户开关(practice_settings 独立表,1:1)
-    pref = db.query(PracticeSettings).filter(
-        PracticeSettings.user_id == task.user_id
-    ).first()
-    if pref is not None and not pref.auto_generate_practice:
-        logger.info("[task=%s] 用户关闭了自动生成练习题,跳过", task.id)
-        return 0
+    # 2) 自动出题开关:任务级 _practice.auto_generate > 用户级 PracticeSettings > 默认开。
+    # 任务级仅当显式传布尔时生效(未传=回退用户级/默认),与 _agent_policy 任务级覆盖同构。
+    practice_cfg = (task.params or {}).get("_practice") if isinstance(task.params, dict) else None
+    task_override = (
+        practice_cfg.get("auto_generate")
+        if isinstance(practice_cfg, dict) else None
+    )
+    if isinstance(task_override, bool):
+        if not task_override:
+            logger.info("[task=%s] 任务级关闭自动出题,跳过", task.id)
+            return 0
+    else:
+        # 用户开关(practice_settings 独立表,1:1)
+        pref = db.query(PracticeSettings).filter(
+            PracticeSettings.user_id == task.user_id
+        ).first()
+        if pref is not None and not pref.auto_generate_practice:
+            logger.info("[task=%s] 用户关闭了自动生成练习题,跳过", task.id)
+            return 0
 
     # 3) 已有题目(任意状态):追问/重试重新完成时不重复出题
     exists = db.query(Question.id).filter(
@@ -71,10 +83,11 @@ def auto_generate_practice_for_task(task: Task, db: Session) -> int:
         logger.info("[task=%s] 该任务已有练习题,跳过自动生成", task.id)
         return 0
 
-    # 4) 只对有结构化发现的任务出题(单 agent 纯摘要无元信息,质量差)
-    if not _has_structured_findings(db, task.id):
-        logger.info("[task=%s] 无结构化审计发现(元信息为空),跳过自动生成", task.id)
-        return 0
+    # 4) 素材:优先结构化发现;无结构化发现(单 agent / 未提炼知识点)时降级为「基于对话出题」。
+    # generator 会从 user↔agent1 对话提炼伪发现;对话也无可提炼内容时自然产 0 题。
+    conversation_fallback = not _has_structured_findings(db, task.id)
+    if conversation_fallback:
+        logger.info("[task=%s] 无结构化审计发现,降级为基于对话自动出题", task.id)
 
     # 5) 创建 job 追踪(source=auto):练习页侧栏轮询 jobs 列表可发现,
     #    并可通过 SSE 实时看到进度与大模型流式输出
@@ -101,6 +114,7 @@ def auto_generate_practice_for_task(task: Task, db: Session) -> int:
             event_callback=lambda etype, data: gen_jobs.append_event(
                 job_id, etype, data,
             ),
+            conversation_fallback=conversation_fallback,
             should_stop=lambda: gen_jobs.is_stop_requested(job_id),
         )
     except PracticeGenerateCancelled as e:

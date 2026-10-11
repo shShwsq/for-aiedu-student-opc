@@ -3,10 +3,10 @@
 不依赖数据库:mock Session 的 query 链,按调用顺序注入返回值,
 覆盖 orchestrator 钩子里 auto_generate_practice_for_task 的全部守卫:
 - 匿名任务(user_id 为空)跳过
-- 用户开关关闭跳过(开关开启/未配置不拦)
+- 开关关闭跳过(任务级 _practice.auto_generate > 用户级 > 默认开)
 - 同一任务已有题目(任意状态)跳过
-- 无结构化 finding(metadata 为空/全空白值)跳过
-- metadata 含任意非空值(含非安全场景的通用键)即可出题
+- 无结构化 finding(纯摘要/空)→降级为基于对话出题(conversation_fallback=True 传给生成器)
+- metadata 含任意非空值(含非安全场景的通用键)→据结构化发现出题(不降级)
 - 命中守卫后调 generator(带进度/事件回调),返回生成数
 - 生成过程创建 source=auto 的 job 追踪(练习页侧栏可见)
 """
@@ -68,6 +68,29 @@ def test_skip_when_preference_off():
     gen.assert_not_called()
 
 
+def test_skip_when_task_level_auto_generate_off():
+    """任务级 _practice.auto_generate=False → 立即跳过,不查 PracticeSettings(优先于用户级)。"""
+    db = MagicMock()
+    task = _task()
+    task.params = {"_practice": {"auto_generate": False}}
+    assert auto_generate_practice_for_task(task, db) == 0
+    db.query.assert_not_called()
+
+
+def test_task_level_auto_generate_on_skips_preference_lookup():
+    """任务级显式开启时不回退用户级:即使用户关了,也不在守卫②因偏好关闭而跳过。"""
+    task = _task()
+    task.params = {"_practice": {"auto_generate": True}}
+    # 守卫③命中已有题目(任意查询都返回有 existing),证明未走 PracticeSettings 分支
+    db = MagicMock()
+    q = MagicMock()
+    q.filter.return_value.first.return_value = (uuid4(),)
+    db.query.return_value = q
+    with patch("app.services.practice.auto_generate.generate_questions_for_task") as gen:
+        assert auto_generate_practice_for_task(task, db) == 0
+    gen.assert_not_called()
+
+
 def test_skip_when_questions_already_exist():
     db = _mock_db(pref_row=None, existing_question=(uuid4(),))
     with patch("app.services.practice.auto_generate.generate_questions_for_task") as gen:
@@ -75,13 +98,18 @@ def test_skip_when_questions_already_exist():
     gen.assert_not_called()
 
 
-def test_skip_without_structured_findings():
+def test_degrade_to_conversation_without_structured_findings():
+    """无结构化 finding(纯摘要/空)→ 不跳过,降级为对话出题(conversation_fallback=True)。"""
     # 纯摘要 Result:metadata 为空/None/空 dict/全空白值
     for metas in ([], [None], [{}], [{"severity": "   "}]):
         db = _mock_db(pref_row=None, result_metas=metas)
-        with patch("app.services.practice.auto_generate.generate_questions_for_task") as gen:
+        with patch(
+            "app.services.practice.auto_generate.generate_questions_for_task",
+            return_value=([], 0),
+        ) as gen:
             assert auto_generate_practice_for_task(_task(), db) == 0
-        gen.assert_not_called()
+        gen.assert_called_once()
+        assert gen.call_args.kwargs.get("conversation_fallback") is True
 
 
 def test_generate_with_generic_meta():

@@ -645,6 +645,8 @@ export interface RuntimeConfigUpdateRequest {
 export interface AgentPolicy {
   /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
   agent2_enabled: boolean
+  /** agent2 是否提炼重点与知识点(关闭=只做核查;任务级 _agent_policy 可覆盖) */
+  extract_knowledge_points?: boolean
   /** agent2 是否能自己在测试环境验证(实验性,先留开关) */
   allow_verify: boolean
   /** 验证授权默认模式:"direct" 直接执行 / "per_action" 逐动作授权(任务级可覆盖) */

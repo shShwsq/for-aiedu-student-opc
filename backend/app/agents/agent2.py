@@ -339,11 +339,17 @@ def run_agent2(
         if _memory_section:
             system_prompt = system_prompt + "\n\n" + _memory_section
 
-    # 学习主题词表:agent2 归类知识点(learning_topic 必填),
-    # 同时拿到校验集与默认主题交给发射处(非法/缺失回落 default)
+    # 是否提炼重点与知识点(agent 能力开关;默认开)
+    extract_kp = bool((agent_policy or {}).get("extract_knowledge_points", True))
     _topic_keys, _default_topic, _topic_prompt = _agent2_learning_topics(db, user_id)
-    if _topic_prompt:
+    if extract_kp and _topic_prompt:
+        # 归类知识点需学习主题词表:注入词表 + 校验集交给发射处(非法/缺失回落 default)
         system_prompt = system_prompt + "\n\n" + _topic_prompt
+    elif not extract_kp:
+        system_prompt = system_prompt + (
+            "\n\n## 本轮不提炼知识点\n用户已关闭「重点与知识点」提炼:只做核查/验证/复核,"
+            "不要调用 submit_knowledge_point,也不要在总结 JSON 里输出 results(留空)。"
+        )
 
     # 构造 user 消息:包含用户意图 + agent1 之前的所有摘要
     if not agent1_summaries:
@@ -447,9 +453,12 @@ def run_agent2(
         "allow_reference_check", True
     )
     tools = []
-    # 四发射工具始终注入(结构化落库 + 流式,不依赖 repo_path / 环境):
-    # submit_review_plan / submit_review_item / submit_knowledge_point / submit_suggestion
-    tools.extend(_SUBMIT_TOOLS)
+    # 发射工具注入(结构化落库 + 流式,不依赖 repo_path / 环境);
+    # 关闭提炼知识点时剔除 submit_knowledge_point
+    tools.extend(
+        _SUBMIT_TOOLS if extract_kp
+        else [t for t in _SUBMIT_TOOLS if t is not _SUBMIT_KNOWLEDGE_POINT_TOOL]
+    )
     if repo_path:
         tools.extend(_READ_ONLY_TOOL_DEFINITIONS)
     if verify_enabled:
@@ -627,6 +636,11 @@ def run_agent2(
                 continue
 
             if fn_name == "submit_knowledge_point":
+                if not extract_kp:
+                    _append_tool_receipt(messages, tc, {
+                        "ok": False, "reason": "用户已关闭重点与知识点提炼,本轮不接收知识点",
+                    })
+                    continue
                 if emit_state["kp"] >= MAX_KNOWLEDGE_POINTS:
                     _append_tool_receipt(messages, tc, {
                         "ok": False, "reason": f"知识点已达上限({MAX_KNOWLEDGE_POINTS}),拒收本条",

@@ -245,8 +245,47 @@ def build_topic_classify_prompt(topics: list[dict]) -> str:
         "你是审查发现的主题分类器。对给定的每条发现,判断它最适合改编成哪种主题的练习题:\n"
         + "\n".join(lines)
         + "\n\ntopic 必须是上述列表中给定的 key 之一。\n"
-        + "只输出 JSON 数组,不要任何其他文字。每个元素:\n"
+        "只输出 JSON 数组,不要任何其他文字。每个元素:\n"
         + '{"id": <发现序号,原样返回>, "topic": "<列表中的 key>", "reason": "一句话理由"}'
+    )
+
+
+def build_dialog_extract_prompt(topics: list[dict]) -> str:
+    """对话降级出题:从「用户↔AI助手」对话记录提炼可出题考点的 system prompt
+
+    仅在任务无结构化审查项/知识点时调用(如单 agent 模式或关闭了知识点提炼)。
+    产出若干「伪发现」交回现有出题管线(仍逐条 LLM 出题 + 质量关卡);
+    learning_topic 取启用主题词表的 key。topics 为启用主题 [{key,name,description}]。
+    """
+    builtin_keys = set(_TOPIC_PROMPT_HEADS)
+    lines: list[str] = []
+    for d in topics:
+        key = str(d.get("key") or "").strip()
+        if not key:
+            continue
+        if key in builtin_keys:
+            for line in _BUILTIN_CLASSIFY_LINES:
+                if line.startswith(f"- {key}:"):
+                    lines.append(line)
+                    break
+        else:
+            name = str(d.get("name") or key).strip()
+            desc = str(d.get("description") or "").strip()
+            entry = f"- {key}:{name}"
+            if desc:
+                entry += f"——{desc}"
+            lines.append(entry)
+    return (
+        "你是出题素材提炼器。下面是一段「用户与 AI助手」的对话记录(没有结构化审查发现可用)。\n"
+        "请从中提炼至多 6 个真正值得出题的考点(用户提问涉及的关键结论/易错点/风险/模式),\n"
+        "每个考点写成一条独立、可据以出客观题的「发现」(content 要带关键事实/代码/条款要点,便于据此出题)。\n"
+        "主题 learning_topic 必须取下列 key 之一:\n"
+        + "\n".join(lines)
+        + "\n\n只输出 JSON 数组,不要任何其他文字。每个元素:\n"
+        + '{"title": "一句话考点", "content": "背景与要点(含关键事实/代码)", '
+        + '"learning_topic": "<列表中的 key>", "knowledge_key": "CWE-xx 或短标签(可选)", '
+        + '"languages": ["python"](可选)}\n'
+        + "对话里没有可出题的实质内容时,输出空数组 []。"
     )
 
 

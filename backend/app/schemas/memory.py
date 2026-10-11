@@ -190,6 +190,7 @@ class SaveAgentPolicyRequest(BaseModel):
 
     结构与 agent_policy.DEFAULT_AGENT_POLICY 对齐:
     - agent2_enabled: 是否启用 agent2(关闭=单 agent 模式)
+    - extract_knowledge_points: agent2 是否提炼重点与知识点(关闭=只做核查)
     - allow_verify: agent2 是否能调用 verifier_agent 验证(需任务配了 test_env_url)
     - allow_reference_check: agent2 是否能复核 agent1 引用的网址
       (后端安全抓取 + SSRF 防护;结果仅供参考信号)
@@ -201,6 +202,7 @@ class SaveAgentPolicyRequest(BaseModel):
     """
 
     agent2_enabled: bool = True
+    extract_knowledge_points: bool = True
     allow_verify: bool = False
     allow_reference_check: bool = True
     verifier_auth_mode_default: str = Field(default="per_action", pattern="^(direct|per_action)$")

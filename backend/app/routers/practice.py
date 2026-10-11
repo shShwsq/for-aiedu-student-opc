@@ -211,9 +211,12 @@ def _run_generate_job(
             "[practice] 手动出题开始 job=%s task=%s user=%s max_findings=%d force_regenerate=%s",
             job_id, task_id, user_id, max_findings, force_regenerate,
         )
+        # 无结构化发现(单 agent / 未提炼知识点)时降级为基于对话出题(与自动出题同口径)
+        from app.services.practice.auto_generate import _has_structured_findings
         created, skipped = generate_questions_for_task(
             db, task, user_id, max_findings=max_findings,
             force_regenerate=force_regenerate,
+            conversation_fallback=not _has_structured_findings(db, task.id),
             progress_callback=lambda done, total: gen_jobs.update_job(
                 job_id, done=done, total=total
             ),

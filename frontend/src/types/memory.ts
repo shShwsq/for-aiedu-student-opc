@@ -85,6 +85,8 @@ export interface SavePracticeSettingsRequest {
 export interface SaveAgentPolicyRequest {
   /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
   agent2_enabled: boolean
+  /** agent2 是否提炼重点与知识点(关闭=只做核查;任务级 _agent_policy 可覆盖) */
+  extract_knowledge_points: boolean
   /** agent2 是否能自己验证(实验性,先留开关) */
   allow_verify: boolean
   /** agent2 是否能复核 AI助手引用的网址(后端安全抓取+SSRF 防护,结果仅供参考信号) */

@@ -39,6 +39,10 @@ class AgentPolicy(Base):
     agent2_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="true", default=True
     )
+    # agent2 是否提炼重点与知识点(关闭=只做核查,不发知识点、不写知识点 Result)
+    extract_knowledge_points: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
     # agent2 是否能调用 verifier_agent 验证(需任务配了 test_env_url)
     allow_verify: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False
@@ -74,6 +78,7 @@ class AgentPolicy(Base):
         """转成与 DEFAULT_AGENT_POLICY 键对齐的 dict(resolve_agent_policy 合并用)"""
         return {
             "agent2_enabled": self.agent2_enabled,
+            "extract_knowledge_points": self.extract_knowledge_points,
             "allow_verify": self.allow_verify,
             "allow_reference_check": self.allow_reference_check,
             "verifier_auth_mode_default": self.verifier_auth_mode_default,
@@ -107,6 +112,8 @@ def normalize_policy_dict(
 
     return {
         "agent2_enabled": _bool("agent2_enabled"),
+        # 老数据无此键 → 回退 defaults(True)
+        "extract_knowledge_points": _bool("extract_knowledge_points"),
         "allow_verify": _bool("allow_verify"),
         # 老数据无此键 → 回退 defaults(True)
         "allow_reference_check": _bool("allow_reference_check"),
@@ -222,6 +229,36 @@ def migrate_agent_policy_add_reference_check_column() -> None:
         ))
         conn.commit()
         log.info("agent_policies.allow_reference_check 列已补齐")
+
+
+def migrate_agent_policy_add_extract_kp_column() -> None:
+    """幂等迁移:agent_policies 表补 extract_knowledge_points 列
+
+    背景:无 Alembic,已存在的表不会自动加新列。模型新增提炼知识点开关(默认 true),
+    老库需显式 ALTER 补列;不回写已有行(server_default 兑底 true)。
+    表不存在(全新库)或列已存在 → 直接返回。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("agent_policies"):
+            return
+        cols = {c["name"] for c in insp.get_columns("agent_policies")}
+        if "extract_knowledge_points" in cols:
+            return
+        conn.execute(text(
+            "ALTER TABLE agent_policies ADD COLUMN extract_knowledge_points "
+            "BOOLEAN NOT NULL DEFAULT true"
+        ))
+        conn.commit()
+        log.info("agent_policies.extract_knowledge_points 列已补齐")
 
 
 def migrate_agent_policy_rename_columns() -> None:

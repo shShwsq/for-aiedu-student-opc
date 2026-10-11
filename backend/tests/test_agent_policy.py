@@ -59,6 +59,7 @@ def test_default_policy_has_all_required_fields():
     """DEFAULT_AGENT_POLICY 应包含所有必需字段,默认值符合设计。"""
     expected_keys = {
         "agent2_enabled",
+        "extract_knowledge_points",
         "allow_verify",
         "allow_reference_check",
         "verifier_auth_mode_default",
@@ -67,6 +68,7 @@ def test_default_policy_has_all_required_fields():
     assert set(DEFAULT_AGENT_POLICY.keys()) == expected_keys
     # 关键默认值(与设计文档 / 前端 DEFAULT_POLICY 对齐)
     assert DEFAULT_AGENT_POLICY["agent2_enabled"] is True
+    assert DEFAULT_AGENT_POLICY["extract_knowledge_points"] is True
     assert DEFAULT_AGENT_POLICY["allow_verify"] is False
     assert DEFAULT_AGENT_POLICY["allow_reference_check"] is True
     assert DEFAULT_AGENT_POLICY["verifier_auth_mode_default"] == "per_action"
@@ -107,6 +109,22 @@ def test_resolve_uses_user_level_defaults_when_no_overrides():
     assert policy["allow_reference_check"] is False
     # 未覆盖的字段仍用 DEFAULT
     assert policy["verifier_auth_mode_default"] == "per_action"
+
+
+def test_resolve_extract_knowledge_points_task_override():
+    """任务级 _agent_policy.extract_knowledge_points=False 覆盖用户默认(True)。"""
+    task = _make_task_with_overrides(
+        user_id=uuid.uuid4(),
+        params={"_agent_policy": {"extract_knowledge_points": False}},
+    )
+    policy_row = MagicMock()
+    policy_row.to_dict.return_value = {"extract_knowledge_points": True}
+    db = _mock_db_with_policy(policy_row=policy_row)
+    assert resolve_agent_policy(task, db)["extract_knowledge_points"] is False
+    # 未任务级覆盖且无用户行→默认 True
+    db2 = _mock_db_with_policy(policy_row=None)
+    task2 = _make_task_with_overrides(user_id=uuid.uuid4(), params=None)
+    assert resolve_agent_policy(task2, db2)["extract_knowledge_points"] is True
 
 
 def test_resolve_task_overrides_win_over_user_defaults():

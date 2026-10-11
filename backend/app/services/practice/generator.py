@@ -45,7 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from json_repair import repair_json
 from sqlalchemy.orm import Session
@@ -72,7 +72,7 @@ from app.models.practice import (
     QuestionType,
     ensure_user_topics,
 )
-from app.models.task import Result, Task
+from app.models.task import Conversation, Result, Task
 from app.models.audit import ReviewItem  # 溯源:题目可回指审查项(证据驱动可信审查)
 from app.models.user_llm_config import UserLLMConfig
 from app.services.practice.difficulty import clamp_difficulty
@@ -149,6 +149,7 @@ from app.prompts.practice import (
     _NO_CODE_FEEDBACK,
     _PRACTICE_TOOL_DEFINITIONS,
     build_system_prompt,
+    build_dialog_extract_prompt,
     build_topic_classify_prompt,
 )
 
@@ -1167,6 +1168,118 @@ def _is_degenerate_question(q: dict) -> bool:
     return False
 
 
+# ============================================================
+# 对话降级出题:无结构化发现时,从 user↔agent1 对话提炼伪发现
+# ============================================================
+
+# transcript 规模上限(防把整段长对话灌进提炼器)
+_DIALOG_MAX_MESSAGES = 60
+_DIALOG_MSG_CHARS = 1200
+_DIALOG_TOTAL_CHARS = 12000
+# 单次降级最多产出的伪发现数(与 max_findings 取小)
+DIALOG_MAX_FINDINGS = 6
+
+
+@dataclass
+class _ConvFinding:
+    """对话降级产生的伪发现:形状对齐 Result(id/title/content/metadata_),但 id
+    是合成 uuid、不对应 results 行(出题时 source_result_id 置空,避免悬空外键)。"""
+    id: str
+    title: str
+    content: str
+    metadata_: dict
+    is_conversation: bool = True
+
+
+def _build_dialog_transcript(db: Session, task_id) -> str:
+    """把 user↔agent1 对话拼成提炼器可读文本(角色前缀 + 单条/总量截断)。"""
+    rows = (
+        db.query(Conversation)
+        .filter(
+            Conversation.task_id == task_id,
+            Conversation.role.in_(("user", "agent1")),
+            Conversation.type.in_(("question", "message", "thinking")),
+        )
+        .order_by(Conversation.round_idx, Conversation.created_at)
+        .all()
+    )
+    lines: list[str] = []
+    total = 0
+    for c in rows[-_DIALOG_MAX_MESSAGES:]:
+        content = (c.content or "").strip()
+        if not content:
+            continue
+        speaker = "用户" if c.role == "user" else "AI助手"
+        line = f"【{speaker}】{content[:_DIALOG_MSG_CHARS]}"
+        if total + len(line) > _DIALOG_TOTAL_CHARS:
+            break
+        total += len(line)
+        lines.append(line)
+    return "\n\n".join(lines)
+
+
+def collect_conversation_findings(
+    db: Session, task, client: LLMClient, topic_defs: list[dict],
+    limit: int = DIALOG_MAX_FINDINGS,
+) -> list["_ConvFinding"]:
+    """对话降级:从对话提炼伪发现交回出题管线。异常静默返回空(不阻断)。"""
+    transcript = _build_dialog_transcript(db, task.id)
+    if len(transcript) < 200:
+        return []  # 对话过短,无可提炼
+    valid_keys = {d["key"] for d in topic_defs}
+    fallback_topic = topic_defs[0]["key"] if topic_defs else DEFAULT_LEARNING_TOPIC
+    messages = [
+        {"role": "system", "content": build_dialog_extract_prompt(topic_defs)},
+        {"role": "user", "content": f"对话记录:\n\n{transcript}"},
+    ]
+    try:
+        content, _ = _stream_one_round(client, messages, None)
+    except Exception as e:
+        logger.warning("[practice] task=%s 对话提炼失败(跳过降级出题): %s", task.id, e)
+        return []
+    try:
+        parsed = json.loads(repair_json(content)) if content else []
+    except Exception:
+        parsed = []
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+    findings: list[_ConvFinding] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()[:512]
+        body = str(item.get("content") or "").strip()
+        if not title or not body:
+            continue
+        topic = str(item.get("learning_topic") or "").strip()
+        if topic not in valid_keys:
+            topic = fallback_topic
+        meta: dict[str, Any] = {"learning_topic": topic, "practice_worthy": True}
+        kk = str(item.get("knowledge_key") or "").strip()[:64]
+        if kk:
+            meta["cwe" if kk.upper().startswith("CWE-") else "knowledge_key"] = kk
+        langs = item.get("languages")
+        if isinstance(langs, list):
+            meta["languages"] = [str(x)[:32] for x in langs][:8]
+        findings.append(_ConvFinding(
+            id=str(uuid4()), title=title, content=body, metadata_=meta,
+        ))
+        if len(findings) >= max(1, limit):
+            break
+    return findings
+
+
+def _findings_have_structure(findings) -> bool:
+    """findings 是否含带非空元信息的结构化发现(决定要不要走对话降级)。"""
+    for f in findings:
+        meta = getattr(f, "metadata_", None)
+        if isinstance(meta, dict) and any(str(v or "").strip() for v in meta.values()):
+            return True
+    return False
+
+
 def _select_findings(
     db: Session, task: Task, max_findings: int,
 ) -> list[Result]:
@@ -1482,6 +1595,7 @@ def generate_questions_for_task(
     progress_callback: Callable[[int, int], None] | None = None,
     event_callback: Callable[[str, dict], None] | None = None,
     force_regenerate: bool = False,
+    conversation_fallback: bool = False,
     should_stop: Callable[[], bool] | None = None,
 ) -> tuple[list[Question], int]:
     """为任务的 Results 生成 draft 题目
@@ -1573,6 +1687,12 @@ def generate_questions_for_task(
     # 选题:agent2 标记的学习点(practice_worthy)优先,不足补未标记的;
     # 无标记时与按 created_at 取前 N 条等价(向后兼容)
     findings = _select_findings(db, task, max_findings)
+    # 对话降级:无结构化发现且允许降级时,改从 user↔agent1 对话提炼伪发现
+    if conversation_fallback and not _findings_have_structure(findings):
+        findings = collect_conversation_findings(
+            db, task, client, topic_defs,
+            limit=min(max_findings, DIALOG_MAX_FINDINGS),
+        )
     total_findings = len(findings)
 
     # 主题自动匹配:规则先行 + LLM 批量兜底(每任务至多一次分类调用)
@@ -1728,9 +1848,11 @@ def generate_questions_for_task(
             return
 
         dup_skipped = 0
+        # 对话降级的伪发现无对应 results/review_item 行:source_result_id 置空,不做溯源
+        is_conv = bool(getattr(finding, "is_conversation", False))
         # 溯源:知识点 Result.metadata_.source_review_item_id → Question.source_review_item_id
         # 校验该审查项真实存在再写入(避免悬空外键破坏入库)
-        review_item_uuid = _resolve_source_review_item_id(db, finding.metadata_)
+        review_item_uuid = None if is_conv else _resolve_source_review_item_id(db, finding.metadata_)
         for q in work.questions:
             dedup_hash = compute_dedup_hash(q["stem"], q["code_snippet"])
             if dedup_hash in existing_hashes:
@@ -1744,13 +1866,13 @@ def generate_questions_for_task(
                 learning_topic=work.topic,
                 cache=kp_cache,
             )
-            # 任务知识点(Result)↔ 看板知识点(KnowledgePoint)链接:首条 KP 回写
-            if getattr(finding, "knowledge_point_id", None) is None:
+            # 任务知识点(Result)↔ 看板知识点(KnowledgePoint)链接:首条 KP 回写(对话伪发现无 Result 行,跳过)
+            if not is_conv and getattr(finding, "knowledge_point_id", None) is None:
                 finding.knowledge_point_id = kp.id
             question = Question(
                 user_id=user_id,
                 source_task_id=task.id,
-                source_result_id=finding.id,
+                source_result_id=None if is_conv else finding.id,
                 source_review_item_id=review_item_uuid,
                 knowledge_point_id=kp.id,
                 qtype=QuestionType(q["qtype"]),

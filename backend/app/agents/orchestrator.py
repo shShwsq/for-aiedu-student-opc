@@ -1036,10 +1036,16 @@ def _run_background_review(
         # 审查产物是 ReviewItem(不只是知识点),空 results 不再判失败
         _emitted = bool(ua_result.get("_emitted"))
         review_stopped = bool(ua_result.get("stopped"))
+        # 提炼知识点关闭时:非发射路径 results 为空属预期,不因“无知识点”判审查失败
+        _extract_enabled = bool((agent_policy or {}).get("extract_knowledge_points", True))
         review_failed = (
             bool(ua_result.get("degraded"))
             or bool(ua_result.get("parse_failed"))
-            or (not _emitted and not ua_result.get("results"))
+            or (
+                _extract_enabled
+                and not _emitted
+                and not ua_result.get("results")
+            )
         )
 
         if review_stopped:
@@ -1088,19 +1094,23 @@ def _run_background_review(
                 # 知识点落库不受世代门控影响 —— 按轮产出,历史完整)
                 structured_results = ua_result.get("results") or []
                 grouping = ua_result.get("grouping")
-                db.query(Result).filter(
-                    Result.task_id == task.id,
-                    Result.round_idx == round_idx,
-                ).delete()
-                for r in structured_results:
-                    db.add(Result(
-                        task_id=task.id,
-                        round_idx=round_idx,
-                        title=r.get("title", "(无标题)"),
-                        content=r.get("content", ""),
-                        metadata_=r.get("metadata"),
-                    ))
-                db.commit()
+                if _extract_enabled:
+                    db.query(Result).filter(
+                        Result.task_id == task.id,
+                        Result.round_idx == round_idx,
+                    ).delete()
+                    for r in structured_results:
+                        db.add(Result(
+                            task_id=task.id,
+                            round_idx=round_idx,
+                            title=r.get("title", "(无标题)"),
+                            content=r.get("content", ""),
+                            metadata_=r.get("metadata"),
+                        ))
+                    db.commit()
+                else:
+                    # 关闭提炼:不删不写,保留 agent1 本轮临时结果(知识点概念已关)
+                    structured_results = []
                 # 把 grouping 存到 task.params 供前端读取(结果分组声明)
                 if grouping:
                     if task.params is not None:
@@ -1112,6 +1122,7 @@ def _run_background_review(
                     task.review_status = "done"
                     task.current_stage = (
                         f"任务完成,检查助手整理出 {len(structured_results)} 个重点与知识点"
+                        if structured_results else "任务完成,检查助手已核查(未提炼知识点)"
                     )
                 logger.info(
                     f"[task={task.id}] 后台审查完成,"

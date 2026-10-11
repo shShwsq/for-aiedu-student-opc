@@ -23,6 +23,7 @@ import type { SaveAgentPolicyRequest } from '@/types/memory'
 
 const DEFAULT_POLICY = {
   agent2_enabled: true,
+  extract_knowledge_points: true,
   allow_verify: false,
   allow_reference_check: true,
   verifier_auth_mode_default: 'per_action' as 'direct' | 'per_action',
@@ -34,6 +35,8 @@ const DEFAULT_POLICY = {
 // ============================================================
 /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
 const policyAgent2Enabled = ref(DEFAULT_POLICY.agent2_enabled)
+/** agent2 是否提炼重点与知识点(关闭=只做核查) */
+const policyExtractKp = ref(DEFAULT_POLICY.extract_knowledge_points)
 /** agent2 是否能自己验证(实验性) */
 const policyAllowVerify = ref(DEFAULT_POLICY.allow_verify)
 /** agent2 是否能复核 AI助手引用的网址(后端安全抓取,结果仅供参考信号) */
@@ -58,6 +61,7 @@ const executorConfirmOptions = computed(() => [
 /** 策略原始值(脏检查基准,hydrate 时写入) */
 const originalPolicy = ref({
   agent2Enabled: DEFAULT_POLICY.agent2_enabled,
+  extractKp: DEFAULT_POLICY.extract_knowledge_points,
   allowVerify: DEFAULT_POLICY.allow_verify,
   allowReference: DEFAULT_POLICY.allow_reference_check,
   verifierAuthMode: DEFAULT_POLICY.verifier_auth_mode_default,
@@ -68,6 +72,7 @@ const originalPolicy = ref({
 const policyDirty = computed(() => {
   return (
     policyAgent2Enabled.value !== originalPolicy.value.agent2Enabled ||
+    policyExtractKp.value !== originalPolicy.value.extractKp ||
     policyAllowVerify.value !== originalPolicy.value.allowVerify ||
     policyAllowReference.value !== originalPolicy.value.allowReference ||
     policyVerifierAuthMode.value !== originalPolicy.value.verifierAuthMode ||
@@ -81,6 +86,7 @@ useUnsavedGuard(policyDirty, () => handleSave())
 /** 重置策略表单为系统默认值(不立即保存) */
 function resetPolicyToDefault(): void {
   policyAgent2Enabled.value = DEFAULT_POLICY.agent2_enabled
+  policyExtractKp.value = DEFAULT_POLICY.extract_knowledge_points
   policyAllowVerify.value = DEFAULT_POLICY.allow_verify
   policyAllowReference.value = DEFAULT_POLICY.allow_reference_check
   policyVerifierAuthMode.value = DEFAULT_POLICY.verifier_auth_mode_default
@@ -113,6 +119,7 @@ async function loadPolicy(): Promise<void> {
     updatedAt.value = data.updated_at ?? null
     const policy = data.agent_policy
     policyAgent2Enabled.value = policy?.agent2_enabled ?? DEFAULT_POLICY.agent2_enabled
+    policyExtractKp.value = policy?.extract_knowledge_points ?? DEFAULT_POLICY.extract_knowledge_points
     policyAllowVerify.value = policy?.allow_verify ?? DEFAULT_POLICY.allow_verify
     policyAllowReference.value = policy?.allow_reference_check ?? DEFAULT_POLICY.allow_reference_check
     policyVerifierAuthMode.value = policy?.verifier_auth_mode_default ?? DEFAULT_POLICY.verifier_auth_mode_default
@@ -120,6 +127,7 @@ async function loadPolicy(): Promise<void> {
     // 同步原始值(脏检查基准)
     originalPolicy.value = {
       agent2Enabled: policyAgent2Enabled.value,
+      extractKp: policyExtractKp.value,
       allowVerify: policyAllowVerify.value,
       allowReference: policyAllowReference.value,
       verifierAuthMode: policyVerifierAuthMode.value,
@@ -138,6 +146,7 @@ async function handleSave(): Promise<boolean> {
   try {
     const body: SaveAgentPolicyRequest = {
       agent2_enabled: policyAgent2Enabled.value,
+      extract_knowledge_points: policyExtractKp.value,
       allow_verify: policyAllowVerify.value,
       allow_reference_check: policyAllowReference.value,
       verifier_auth_mode_default: policyVerifierAuthMode.value,
@@ -149,6 +158,7 @@ async function handleSave(): Promise<boolean> {
     const policy = data.agent_policy
     if (policy) {
       policyAgent2Enabled.value = policy.agent2_enabled
+      policyExtractKp.value = policy.extract_knowledge_points ?? DEFAULT_POLICY.extract_knowledge_points
       policyAllowVerify.value = policy.allow_verify
       policyAllowReference.value = policy.allow_reference_check ?? DEFAULT_POLICY.allow_reference_check
       policyVerifierAuthMode.value = policy.verifier_auth_mode_default
@@ -156,6 +166,7 @@ async function handleSave(): Promise<boolean> {
     }
     originalPolicy.value = {
       agent2Enabled: policyAgent2Enabled.value,
+      extractKp: policyExtractKp.value,
       allowVerify: policyAllowVerify.value,
       allowReference: policyAllowReference.value,
       verifierAuthMode: policyVerifierAuthMode.value,
@@ -189,6 +200,8 @@ function formatTime(iso: string | null | undefined): string {
 const FIELD_HELP: Record<string, string> = {
   agent2_enabled:
     '开启后,检查助手参与协作(每轮执行后的质检评估、验证)。关闭后退化为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做质检评估、不验证。适合简单任务或用户完全信任 AI助手的场景。',
+  extract_knowledge_points:
+    '开启后,检查助手除核查外还会从全程产出提炼「重点与知识点」(供侧栏展示、驱动出题与知识点看板)。关闭时只做核查/验证/引用复核,不产出知识点;自动出题可降级为直接基于对话出题。',
   allow_verify:
     '开启后,检查助手可自行调用工具验证 AI助手的产出。安全审计类任务会在未显式设置时自动开启(实际验证仍需任务配置测试环境 URL)。开启后对"疑似但不确定"的安全发现会优先发送 PoC 到测试环境确认。',
   allow_reference_check:
@@ -249,6 +262,11 @@ onMounted(loadPolicy)
       <!-- agent2 依赖字段:关闭时整组隐藏(v-show 保留值,保存 payload 不变) -->
       <Transition name="collapse">
         <div v-show="policyAgent2Enabled" class="policy-dependent">
+      <label v-show="policyAgent2Enabled" class="policy-toggle-row">
+        <input v-model="policyExtractKp" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
+        <span>提炼重点与知识点</span>
+        <HelpPopover>{{ FIELD_HELP.extract_knowledge_points }}</HelpPopover>
+      </label>
       <label class="policy-toggle-row">
         <input v-model="policyAllowVerify" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
         <span>允许检查助手自行验证 <span class="policy-experimental">(实验性)</span></span>

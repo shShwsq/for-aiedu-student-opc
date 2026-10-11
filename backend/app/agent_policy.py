@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_AGENT_POLICY: dict[str, Any] = {
     "agent2_enabled": True,  # 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证)
+    # agent2 是否提炼重点与知识点(关闭=只做核查,不发 submit_knowledge_point、不写知识点 Result)
+    "extract_knowledge_points": True,
     "allow_verify": False,  # agent2 是否能调用 verifier_agent(需任务配了 test_env_url)
     "verifier_auth_mode_default": "per_action",  # 验证授权默认模式(任务级可覆盖)
     "executor_command_confirm_default": "always_approve",  # AI助手确认策略默认模式(任务级 _executor_command_confirm 可覆盖)

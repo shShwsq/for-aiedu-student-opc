@@ -186,6 +186,57 @@ def test_normalize_extracts_extra_knowledge_keys():
     assert _normalize_raw_question(_raw(knowledge_keys="oops"), {})["extra_knowledge_keys"] == []
 
 
+def test_findings_have_structure():
+    """结构化判定:带非空元信息→True;纯摘要/空/全空白→False。"""
+    assert gen._findings_have_structure(
+        [SimpleNamespace(metadata_={"cwe": "CWE-89"})]
+    ) is True
+    assert gen._findings_have_structure(
+        [SimpleNamespace(metadata_=None), SimpleNamespace(metadata_={"severity": "  "})]
+    ) is False
+    assert gen._findings_have_structure([]) is False
+
+
+def test_collect_conversation_findings_parses_and_validates_topic(monkeypatch):
+    """对话降级提炼:解析伪发现 + learning_topic 非法回落 + 无标题丢弃。"""
+    import json as _json
+
+    monkeypatch.setattr(gen, "_build_dialog_transcript", lambda db, tid: "X" * 300)
+    payload = [
+        {"title": "SQL 注入要点", "content": "拼接用户输入", "learning_topic": "security", "knowledge_key": "CWE-89"},
+        {"title": "非法主题", "content": "内容够长可以出题", "learning_topic": "nope"},
+        {"title": "", "content": "无标题应丢弃"},
+    ]
+    monkeypatch.setattr(
+        gen, "_stream_one_round",
+        lambda client, messages, tools: (_json.dumps(payload, ensure_ascii=False), []),
+    )
+    topic_defs = [{"key": "security"}, {"key": "coding"}]
+    out = gen.collect_conversation_findings(
+        MagicMock(), SimpleNamespace(id="t1"), MagicMock(), topic_defs,
+    )
+    assert len(out) == 2
+    assert out[0].metadata_["learning_topic"] == "security"
+    assert out[0].metadata_["cwe"] == "CWE-89"  # CWE 知识键归到 cwe,供规则分类/去重
+    assert out[1].metadata_["learning_topic"] == "security"  # 非法主题回落首个启用主题
+    assert all(f.is_conversation for f in out)
+
+
+def test_collect_conversation_findings_short_transcript_yields_none(monkeypatch):
+    """对话过短(不足提炼门槛)→直接返回空,不付提炼 LLM 成本。"""
+    monkeypatch.setattr(gen, "_build_dialog_transcript", lambda db, tid: "太短")
+    called = []
+    monkeypatch.setattr(
+        gen, "_stream_one_round",
+        lambda *a, **k: called.append(1) or ("[]", []),
+    )
+    out = gen.collect_conversation_findings(
+        MagicMock(), SimpleNamespace(id="t1"), MagicMock(), [{"key": "security"}],
+    )
+    assert out == []
+    assert called == []  # 短对话不发起 LLM 提炼
+
+
 # ============================================================
 # knowledge_key:CWE 元信息优先
 # ============================================================
