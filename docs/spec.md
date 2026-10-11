@@ -521,7 +521,7 @@ Result(任务结果项,通用)
 - **设计说明**:skill 不是硬编码步骤编排,而是给 LLM 的自然语言指令。LLM 读取 body 后自行决定调用哪些工具、按什么顺序执行,灵活性远高于固定 YAML 步骤
 - **目录结构**:
   - 系统内置:`<skills_root>/<scenario_id>/<skill_name>/SKILL.md`(skill 目录可含附加资源文件)
-  - 用户上传:`<USER_SKILLS_DIR>/<user_id>/<scenario_id>/<skill_name>/SKILL.md`(`scenario_id` 以 `user_` 前缀标识用户 skill)
+  - 用户上传:`<USER_SKILLS_DIR>/user_<uuid>/<skill_name>/SKILL.md`(用户目录以 `user_` 前缀标识,`skill_name` 取自 frontmatter `name`)
 - **加载机制**:进程启动时扫描磁盘所有 SKILL.md,解析 frontmatter,注册到 SkillRegistry。管理员后台增删后调 `reload_registry()` 刷新。用户上传 skill 通过 API 触发热加载(后端 `upsert` + 注册到对应用户的 registry 视图)
 - **管理 API**:
   - 系统内置:`GET /skills`(列出全部,含内置 + 各用户自己的)+ `POST /skills/reload`(管理员重新扫描)
@@ -541,6 +541,11 @@ Result(任务结果项,通用)
   - 列出文件上限:`SKILL_MAX_LISTED_FILES=200`
   - 默认放行的图片扩展名:`.png,.jpg,.jpeg,.webp,.gif`(`SKILL_ALLOWED_EXTENSIONS_EXTRA`;不建议追加 `.svg`,可含恶意脚本)
   - skill 存储目录:`USER_SKILLS_DIR=./data/user_skills`(统一数据根 `data/` 下,旧 `./user_skills` 由启动迁移自动搬家)
+- **名称形状与路径收口**(`skill_name` 既是注册表 key 又是落盘目录名,必须锁死):
+  - 规则(`loader.validate_skill_name` / `validate_scenario_id`):以字母或数字开头,仅允许字母、数字与 `.` `_` `-`,不含 `..` 段,不以 `.` 收尾,长度 ≤64,拒 Windows 保留设备名(`CON` / `NUL` / `AUX` / `COM1-9` / `LPT1-9`)
+  - 生效点:`parse_skill_md`(上传解析与磁盘扫描同源→越界名进不了 SkillRegistry,也就无法借 URL 参数回传给删除逻辑)、`_scan_root`(非法场景目录名跳过并 warning)、`routers/skills` 的 upsert / delete 入口(非法即 400)
+  - 存储层自证:`DirectorySkillStorage._dest` 先校验再 `resolve()` 断言结果仍在 `USER_SKILLS_DIR` 内(不论调用方是否校验过);`save` 先拷同级 `.<name>.tmp-*` 暂存目录、成功后才换名替换,拷贝失败回滚不动旧 skill(暂存/备份目录以 `.` 开头,扫描会跳过)
+  - 删除收口:`DELETE` 只删"确在 `<root>/user_<uid>/` 之下"的目录(用户根 + 内置根遗留位置两处),内置 skill 的代码资产目录永远删不到
 - **隔离**:用户上传的 skill 仅自己可见,他人 `list_skills` 不会列出,也无法 `skill` 工具加载。内置 skill 全员可见但只读
 - **同名冲突**:用户上传与内置 / 他人 skill 同名时直接报错 `无法覆盖`;与自己已有 skill 同名时弹窗确认覆盖
 - **扩展性**:管理员可通过 API 或直接编辑磁盘文件添加新 skill;用户通过 zip 上传添加自己的 skill(仅自己可用)

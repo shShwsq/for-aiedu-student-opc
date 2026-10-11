@@ -48,6 +48,61 @@ def get_user_skills_root() -> Path:
 
 
 # ============================================================
+# 名称形状校验(标识符 == 路径片段,必须在解析入口锁死)
+# ============================================================
+
+# skill 名 / 场景 id 既是注册表 key,又是落盘目录名(<root>/<scenario>/<name>/),
+# 所以非法形状必须在 parse_skill_md 这一层就拒掉:越界的名字根本进不了注册表,
+# 也就无法借 URL 参数把 "../" 回传给删除逻辑(详见 routers/skills.py)。
+NAME_MAX_LEN = 64
+
+# 首字符须为字母或数字(挡前导 "." / "-"),其后允许 . _ -
+_NAME_SHAPE_RE = re.compile(rf"\A[A-Za-z0-9][A-Za-z0-9._-]{{0,{NAME_MAX_LEN - 1}}}\Z")
+
+# Windows 保留设备名(CON/NUL/AUX/COM1-9/LPT1-9,含带扩展名形式):
+# 命中会让目录建得出、删不掉或干脆建不出
+_WIN_RESERVED_RE = re.compile(
+    r"\A(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?\Z", re.IGNORECASE
+)
+
+
+def _validate_path_segment(value: str, kind: str) -> str:
+    """校验"用作单层目录名"的字符串,返回规范化(strip)后的值
+
+    抛出 ValueError:空值 / 含路径分隔符 / "." 或 ".." / 首尾非法字符 /
+        Windows 保留名 / 超长
+    """
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise ValueError(f"非法 {kind}(为空)")
+    if len(cleaned) > NAME_MAX_LEN:
+        raise ValueError(f"非法 {kind}(超过 {NAME_MAX_LEN} 字符): {value!r}")
+    if not _NAME_SHAPE_RE.match(cleaned):
+        raise ValueError(
+            f"非法 {kind}(须以字母或数字开头,仅允许字母、数字与 . _ -): {value!r}"
+        )
+    # 形状正则已挡掉分隔符与前导 ".",这里再显式盯住 ".." 段(错误信息更好定位)
+    if ".." in cleaned:
+        raise ValueError(f"非法 {kind}(含 .. 穿越段): {value!r}")
+    if cleaned.endswith("."):
+        # 结尾的 "." 在 Windows 上会被静默截断,导致落盘目录名与注册表 key 不一致
+        raise ValueError(f"非法 {kind}(不得以 . 收尾): {value!r}")
+    if _WIN_RESERVED_RE.match(cleaned):
+        raise ValueError(f"非法 {kind}(Windows 保留设备名): {value!r}")
+    return cleaned
+
+
+def validate_skill_name(name: str) -> str:
+    """校验 skill 名可安全用作路径片段,返回规范化后的名字(抛 ValueError 表示非法)"""
+    return _validate_path_segment(name, "skill 名")
+
+
+def validate_scenario_id(scenario_id: str) -> str:
+    """校验场景 id 可安全用作路径片段,返回规范化后的值(抛 ValueError 表示非法)"""
+    return _validate_path_segment(scenario_id, "scenario_id")
+
+
+# ============================================================
 # frontmatter 解析
 # ============================================================
 
@@ -66,7 +121,11 @@ def parse_skill_md(path: Path, scenario_id: str) -> ParsedSkill:
         scenario_id: 所属场景(从目录路径推断)
 
     抛出:
-        ValueError: frontmatter 缺失或必填字段不完整
+        ValueError: frontmatter 缺失或必填字段不完整,或 name 形状非法
+            (不能安全用作目录名)
+
+    注:scenario_id 不在此校验——上传解析时它还是空占位(由调用方按归属填),
+        扫描侧由 _scan_root 校验目录名,落地侧由 storage 收口。
     """
     text = path.read_text(encoding="utf-8")
     m = _FRONTMATTER_RE.match(text)
@@ -94,8 +153,15 @@ def parse_skill_md(path: Path, scenario_id: str) -> ParsedSkill:
             f"SKILL.md frontmatter name/description 必须是字符串: {path}"
         )
 
+    # name 会被当作落盘目录名,形状非法(../ 或分隔符)直接拒绝:
+    # 越界名进不了注册表,删除/物化路径也就拿不到穿越段
+    try:
+        safe_name = validate_skill_name(name)
+    except ValueError as e:
+        raise ValueError(f"SKILL.md frontmatter name 非法: {path}: {e}") from e
+
     return ParsedSkill(
-        name=name.strip(),
+        name=safe_name,
         description=description.strip(),
         scenario_id=scenario_id,
         skill_dir=path.parent,
@@ -147,7 +213,12 @@ def _scan_root(root: Path, registry: SkillRegistry) -> None:
     for scenario_dir in sorted(root.iterdir()):
         if not scenario_dir.is_dir() or scenario_dir.name.startswith("."):
             continue
-        scenario_id = scenario_dir.name
+        # 目录名即 scenario_id,它会参与后续的拼路径;非法名跳过(留 warning)
+        try:
+            scenario_id = validate_scenario_id(scenario_dir.name)
+        except ValueError as e:
+            logger.warning(f"场景目录名非法,跳过: {scenario_dir}: {e}")
+            continue
 
         for skill_dir in sorted(scenario_dir.iterdir()):
             if not skill_dir.is_dir() or skill_dir.name.startswith("."):
@@ -227,6 +298,9 @@ def skill_subdir_name(name: str) -> str:
 
     skill.name 正常是标识符;兜一层防路径穿越/非法字符:去掉路径分隔符与空段/ ".",
     把 ".." 换成 "_",空/异常回退为 "skill"。
+
+    注:name 已在 parse_skill_md 过 validate_skill_name(合法名到这里是恒等变换);
+    这里保留兜底,是为了让"注册表里出现历史脏数据"也不会变成容器内的穿越路径。
     """
     cleaned = "".join(
         p for p in (name or "").strip().replace("\\", "/").split("/")

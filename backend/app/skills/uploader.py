@@ -16,6 +16,8 @@ zip 兼容结构(二选一):
 - 条目数 ≤ MAX_FILES
 - 附加文件仅允许白名单扩展名(防可执行文件/压缩包混入)
 - 所有条目必须位于解压根目录内(拒绝 ../ 与绝对路径)
+- frontmatter name 必须是可安全用作目录名的形状(parse_skill_md 内校验):
+  返回给调用方的 skill.name 会被当作落盘目录名,越界名在这里就拒绝,不留到写盘
 """
 import io
 import logging

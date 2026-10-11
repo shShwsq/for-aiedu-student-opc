@@ -7,6 +7,14 @@
 - 用户上传的 skill:落地到 <skills_root>/user_<uuid>/<skill_name>/,
   仅 owner 可见、可改、可删(用户隔离)。
 
+路径安全(写操作必读):
+- skill 名 / scenario_id 都会当作目录名拼路径,一律先过 loader 的形状校验
+  (validate_skill_name / validate_scenario_id:拒 ".." 与路径分隔符、保留名等)。
+- 上传的 skill 名来自 zip 内 frontmatter(攻击者可控),校验放在落盘之前;
+  存储层 DirectorySkillStorage 另外做 resolve 收口,不论调用方是否校验过。
+- 删除只针对"确在当前用户 user_<uid>/ 之下"的目录:内置 skill 的代码资产
+  目录永远删不到。
+
 路径设计:
     GET    /skills                                 列出当前用户可见的 skill
     GET    /skills/{scenario_id}                   列出某场景可见的 skill
@@ -33,11 +41,12 @@ from app.models.user import User
 from app.scenarios.base import resolve_scenario_id
 from app.skills import loader as skill_loader
 from app.skills.loader import (
-    DEFAULT_SKILLS_ROOT,
     USER_SCENARIO_PREFIX,
     get_user_skills_root,
     reload_registry,
     scenario_owner_id,
+    validate_scenario_id,
+    validate_skill_name,
 )
 from app.skills.schema import ParsedSkill
 from app.skills.storage import DirectorySkillStorage, SkillStorage
@@ -137,13 +146,51 @@ def _is_owned(skill: ParsedSkill, user: User | None) -> bool:
 
 def _user_skill_path(scenario_id: str, skill_name: str) -> Path:
     """构造用户 skill 的 SKILL.md 路径(upsert 直写用),校验合法性"""
-    # 防止路径穿越:scenario_id 和 skill_name 不能含 .. 或路径分隔符
-    if "/" in scenario_id or "\\" in scenario_id or ".." in scenario_id:
-        raise HTTPException(status_code=400, detail="非法 scenario_id")
-    if "/" in skill_name or "\\" in skill_name or ".." in skill_name:
-        raise HTTPException(status_code=400, detail="非法 skill_name")
+    try:
+        safe_scenario = validate_scenario_id(scenario_id)
+        safe_name = validate_skill_name(skill_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径参数: {e}") from e
 
-    return get_user_skills_root() / scenario_id / skill_name / "SKILL.md"
+    return get_user_skills_root() / safe_scenario / safe_name / "SKILL.md"
+
+
+def _owned_skill_dirs_on_disk(skill: ParsedSkill, scenario_id: str) -> list[Path]:
+    """列出该 skill 在两处根下的落地目录(逐个收口,只允许 <root>/user_<uid>/ 之内)
+
+    删除动作既不能直接吃 URL 参数拼出的字符串(可含 ../),也不能无条件吃
+    注册表里的 skill_dir(可能是旧版本遗留在内置根下的目录):每个候选路径
+    resolve 后断言"仍在当前用户的 user_<uid>/ 之下",内置 skill 的代码资产
+    目录因此永远删不到。目录名可能不等于 frontmatter name(旧数据手放),
+    所以 skill_dir 与约定路径 <root>/<scenario>/<name> 都列进候选。
+    """
+    try:
+        safe_scenario = validate_scenario_id(scenario_id)
+        safe_name = validate_skill_name(skill.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径参数: {e}") from e
+
+    bases: list[Path] = []
+    candidates: list[Path] = [skill.skill_dir]
+    # 经 loader 模块属性取内置根(与扫描侧同源,测试替换 skill_loader.DEFAULT_SKILLS_ROOT 生效)
+    for root in (get_user_skills_root(), skill_loader.DEFAULT_SKILLS_ROOT):
+        base = root / safe_scenario
+        bases.append(base.resolve())
+        candidates.append(base / safe_name)
+
+    dirs: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = Path(candidate).resolve()
+            if not resolved.is_dir():
+                continue  # 只清单上真实存在的落地目录(调用方无需再容错)
+        except OSError:
+            continue
+        # resolved != base:防止退化成"删掉整个用户目录"(那由注销账户流程负责)
+        if any(resolved != base and resolved.is_relative_to(base) for base in bases):
+            if resolved not in dirs:
+                dirs.append(resolved)
+    return dirs
 
 
 def _to_summary(skill: ParsedSkill, user: User | None) -> SkillSummaryResponse:
@@ -378,6 +425,8 @@ async def upload_skill_zip(
         SKILL.md                # 简化结构,单文件
 
     - skill 名以 SKILL.md frontmatter.name 为准
+    - skill 名会被当作落盘目录名,非法形状(../ / 路径分隔符 / 保留名)在
+      任何磁盘写入之前就拒绝(parse_skill_md 已挡,这里再显式过一遍)
     - 落地到 USER_SKILLS_DIR 下的 user_<uid>/<skill_name>/,仅上传者可见可用
     - 与全局(含内置/他人)skill 重名 → 409;与自己的 skill 重名时
       传 force=true 可覆盖,否则 409
@@ -399,7 +448,14 @@ async def upload_skill_zip(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-        skill_name = skill.name
+        # 落地前锁死名字形状:此后的任何一步都不该再拿未校验的名字拼路径
+        try:
+            skill_name = validate_skill_name(skill.name)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"SKILL.md frontmatter name 非法(不能用作目录名): {e}",
+            ) from e
 
         # 重名检查(规则见 _check_upload_name_conflict):
         # 与内置同名拒绝;与他人同名允许(运行时隔离);与自己同名需 force
@@ -411,7 +467,13 @@ async def upload_skill_zip(
             )
 
         # 落地(目录实现:拷贝到 USER_SKILLS_DIR;覆盖时由存储后端清旧数据)
-        replaced = user_skill_storage.save(scenario_id, skill_name, skill.skill_dir)
+        # 存储层会再校验 + resolve 收口,越界名到这里只会是 400,不会写到别人目录
+        try:
+            replaced = user_skill_storage.save(scenario_id, skill_name, skill.skill_dir)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"skill 无法落地: {e}"
+            ) from e
         logger.info(
             f"upload skill: user={current_user.id} name={skill_name} "
             f"replaced={replaced}"
@@ -459,15 +521,25 @@ def upsert_skill(
     reload_registry()
     skill = skill_loader.REGISTRY.get(scenario_id, skill_name)
     if not skill:
-        # 重载后找不到,说明 frontmatter 解析失败
-        # 删掉刚写的文件,避免污染磁盘
+        # 重载后找不到:回读刚写的文件拿到具体原因,别只丢一句"解析失败"
+        reason = ""
+        try:
+            skill_loader.parse_skill_md(skill_md, scenario_id)
+        except ValueError as e:
+            reason = str(e)
+        except OSError:
+            pass
+        # 删掉刚写的文件,避免污染磁盘(名字非法时注册表永远没这条,留着也看不见)
         try:
             skill_md.unlink()
         except OSError:
             pass
         raise HTTPException(
             status_code=400,
-            detail="SKILL.md frontmatter 解析失败,请检查 name/description 字段",
+            detail=(
+                "SKILL.md frontmatter 解析失败,请检查 name/description 字段"
+                + (f":{reason}" if reason else "")
+            ),
         )
 
     logger.info(f"upsert skill: {scenario_id}/{skill_name} ({skill_md})")
@@ -481,6 +553,13 @@ def delete_skill(
     current_user: User = Depends(get_current_user),
 ) -> None:
     """删除自己的 skill(删整个 skill 目录)"""
+    # 先过形状校验:非法 scenario_id / skill_name(含 ../)直接 400,不进任何拼路径
+    try:
+        validate_scenario_id(scenario_id)
+        validate_skill_name(skill_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"非法路径参数: {e}") from e
+
     skill = skill_loader.REGISTRY.get(scenario_id, skill_name)
     if not skill:
         raise HTTPException(
@@ -491,9 +570,10 @@ def delete_skill(
 
     # 删除:经存储后端(目录实现删 USER_SKILLS_DIR 下的落地位置)
     user_skill_storage.delete(scenario_id, skill_name)
-    # 注册表路径(可能为旧版本遗留的 backend/skills/user_* 位置)一并清理,幂等
-    shutil.rmtree(skill.skill_dir, ignore_errors=True)
-    shutil.rmtree(DEFAULT_SKILLS_ROOT / scenario_id / skill_name, ignore_errors=True)
+    # 一并清掉注册表指向的目录(含旧版本遗留在 backend/skills/user_* 的位置),幂等。
+    # 只删"确在当前用户 user_<uid>/ 之下"的目录,绝不在内置根的其他场景下拼路径
+    for target in _owned_skill_dirs_on_disk(skill, scenario_id):
+        shutil.rmtree(target, ignore_errors=True)
     reload_registry()
     logger.info(f"delete skill: {scenario_id}/{skill_name}")
 

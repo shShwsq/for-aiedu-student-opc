@@ -472,6 +472,11 @@ onMounted(loadSkills)
                 <code>&lt;skill_name&gt;/SKILL.md</code> 或根目录直接放
                 <code>SKILL.md</code>),上传后 AI助手的 list_skills / skill
                 工具立即可用。技能仅自己可见,他人无法查看或使用。zip 最大 50MB。
+                <br />
+                SKILL.md 的 <code>name</code> 会作为存储目录名,需以字母或数字开头,
+                仅含字母、数字与 <code>.</code> <code>_</code> <code>-</code>,
+                不含 <code>..</code>,长度不超过 64(如
+                <code>my_api_checker</code>)。
               </p>
             </div>
             <div class="upload-row">
