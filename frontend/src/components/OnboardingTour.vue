@@ -61,9 +61,12 @@ async function updatePosition(): Promise<void> {
   const step = currentStep.value
   if (!step) return
 
-  // 若该步骤指定了 activateTab,先通知侧栏切换标签页(目标元素可能在隐藏 panel 内)
-  if (step.activateTab) {
-    window.dispatchEvent(new CustomEvent('sidebar-activate-tab', { detail: step.activateTab }))
+  // 若该步骤指定了 activateSection,先通知侧栏展开对应分段
+  // (收起时该段面板根本不在 DOM 里,不展开就找不到目标)
+  if (step.activateSection) {
+    window.dispatchEvent(
+      new CustomEvent('sidebar-activate-section', { detail: step.activateSection }),
+    )
     await nextTick()
   }
 

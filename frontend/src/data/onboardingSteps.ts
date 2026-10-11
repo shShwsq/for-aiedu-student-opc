@@ -37,8 +37,11 @@ export interface OnboardingStep {
   requiresPractice?: boolean
   /** 练习功能启用时覆盖 content(同一锚点在两种部署下的不同文案) */
   contentWhenPractice?: string
-  /** 引导定位前需要激活的侧栏标签页 key(如 'results');用于 tab 布局下目标元素隐藏时自动切换 */
-  activateTab?: string
+  /**
+   * 引导定位前需要展开的右侧栏分段 key(如 'knowledge')。
+   * 收起时段面板不在 DOM 里,因此收到该指令的侧栏会**程序化展开**对应段。
+   */
+  activateSection?: string
 }
 
 /**
@@ -51,8 +54,11 @@ export interface OnboardingStep {
  *       欢迎步骤锚点从欢迎卡改到操作行,新增「最近任务」步骤。
  * - v5: 核查与结果侧栏改为分段标签页布局(概览/核查/结果),
  *       新增 activateTab 机制保证引导定位前自动切换 tab。
+ * - v6: 该布局改为常驻竖向分段 rail + 按需展开(概览/核查过程/审查结果/
+ *       重点与知识点),原「结果」段拆成两段,建议追问方向移入概览;
+ *       activateTab 改名 activateSection,且程序化展开段(收起时目标不在 DOM)。
  */
-export const ONBOARDING_VERSION = 5
+export const ONBOARDING_VERSION = 6
 
 /**
  * 全部引导步骤(按路由分组,组内按顺序播放)。
@@ -180,14 +186,33 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
 
   // ---- 路由:task-detail(任务详情) ----
   {
+    id: 'detail-rail',
+    target: 'detail-rail',
+    route: 'task-detail',
+    placement: 'left',
+    title: '核查与结果分段栏',
+    content:
+      '页面右缘这条竖栏是「核查与结果」的总入口:点图标展开对应分段(概览 / 核查过程 / 审查结果 / 重点与知识点),再点一下当前段就收起。后台检查助手开始核查时不会自动弹开这一栏(那会盖住你正在读的对话),只在对应图标上亮起提示环和数量角标。',
+  },
+  {
+    id: 'detail-findings',
+    target: 'detail-review',
+    route: 'task-detail',
+    placement: 'left',
+    activateSection: 'findings',
+    title: '审查结果',
+    content:
+      '检查助手核查 agent1 的产出后逐条落地的审查项,按「发现风险 / 已核查·剔除误报 / 缺口·待改进」三档分组;每条带后端核验证据后派生的置信度,点开看证据。',
+  },
+  {
     id: 'detail-results',
     target: 'detail-results',
     route: 'task-detail',
-    placement: 'right',
-    activateTab: 'results',
-    title: '结果清单',
+    placement: 'left',
+    activateSection: 'knowledge',
+    title: '重点与知识点',
     content:
-      '任务执行完成后,产出的结果会按维度分组显示在这里(安全审计场景按严重程度,代码审查场景按类别)。当前任务还没结果,等你提交第一个任务后回到这里就能看到。',
+      '任务执行完成后,从全程提炼的重点与知识点会按维度分组显示在这里(安全检查场景按严重程度,代码审查场景按类别),并可一键改编为自适应练习题。当前任务还没结果,等你提交第一个任务后回到这里就能看到。',
   },
   {
     id: 'detail-conversation',

@@ -2,26 +2,29 @@
 
 > 描述对象:`frontend/src/views/TaskDetailView.vue` —— 双 Agent 协作的核心可视化界面。
 > 本文档描述**迭代摘要行("N 个工具调用: xxx")及其外框移除后**、
-> **右侧栏布局调整(状态/导出迁入标题行、结果置底、移除用户意图卡片)后**的目标结构。
+> **右侧栏改为常驻竖向分段 rail + 按需展开面板(原「结果」段拆成「审查结果」与
+> 「重点与知识点」两段,建议追问方向归入「概览」)后**的目标结构。
 
-## 1. 页面整体:三栏布局
+## 1. 页面整体:三栏布局(右侧为常驻 rail + 按需展开面板)
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│ AppHeader(顶栏,左侧含历史任务栏折叠按钮)                              │
-├────────────┬──────────────────────────────────┬───────────────────────┤
-│ 左侧        │ 主区 main                        │ 右侧 detail-sidebar    │
-│ Workspace  │ (协作对话流,页面核心)             │ (核查与结果抽屉)         │
-│ Sidebar    │                                  │                       │
-│ 历史任务列表 │                                  │ 概览/任务清单/验证/     │
-│ (可折叠隐藏) │                                  │ 核查/结果(可折叠)       │
-└────────────┴──────────────────────────────────┴───────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ AppHeader(顶栏,左侧含历史任务栏折叠按钮)                       │
+├───────────┬────────────────────────────┬─────────┬────────┤
+│ 左侧       │ 主区 main                  │ 展开面板   │ rail   │
+│ Workspace │ (协作对话流,页面核心)        │ (按需渲染) │ (常驻)  │
+│ Sidebar   │                            │ 当前段内容  │ 4 段图标│
+│ 历史任务列表│                            │          │ +状态   │
+│ (可折叠隐藏)│                            │          │ +下载打印│
+└───────────┴────────────────────────────┴─────────┴────────┘
 ```
 
 - **左侧 WorkspaceSidebar**:历史任务列表,支持删除/重命名;折叠时完全隐藏,由顶栏按钮切换。
-- **右侧 detail-sidebar**:默认宽度 420px,可经左缘手柄拖拽调整(320px ~ min(640px, 50vw)),
-  按「用户 email + 栏位」记忆到 localStorage;默认展开,折叠后退化为右上角悬浮把手
-  (有结果时显示数量角标)。详见 §5。
+- **右侧 rail + 展开面板**:rail 常驻页面右缘(56px),是**唯一的展开入口**——收起态
+  没有独立把手,也没有折叠态悬浮角标(原有两套展开入口与 tab 行一并收敛成 rail)。
+  展开面板默认宽度 420px,可经其左缘手柄拖拽调整(320px ~ min(640px, 50vw)),
+  按「用户 email + 栏位」记忆到 localStorage;当前展开段按「用户 email」记忆到
+  `secondlook:sidebar-section:task-detail:{email}`。详见 §5。
 
 ## 2. 主区 main 纵向结构
 
@@ -57,7 +60,7 @@ conversation-section
         └── conclusion segment     该轮最终回答(正常消息样式,不折叠直接可见;每轮至多 1 个)
 ```
 
-> 计划清单已移至右侧栏"任务清单"(见 §5.2),主对话流只保留消息流。
+> 计划清单已移至右侧栏"任务清单"(见 §5.3),主对话流只保留消息流。
 > 结构取向:过程(思考+工具)整体收进折叠组,最终回答像正常聊天消息一样组外直出
 > ——类似把 ChatGPT 的"思考块"扩大到包含工具调用。展开由**生命周期**驱动而不是
 > 由点击驱动:运行中的活跃轮(过程组的前沿组 + 组内正在流动的思考卡)自动展开,
@@ -197,37 +200,83 @@ roundGroups(computed)
 RoundGroup { roundIdx, segments, planSteps }
 ```
 
-## 5. 右侧栏 detail-sidebar
+## 5. 右侧栏:常驻 rail + 按需展开面板
 
-### 5.1 标题行(detail-sidebar-header)
+右栏状态只有**一个** `activeSection: 'overview' | 'process' | 'findings' | 'knowledge' | null`
+(`null` = 收起为 rail)。原先「顶部横排 tab + 独立折叠开关 + 折叠态悬浮把手」
+三套展开入口收敛为 rail 上的四个 disclosure 按钮,因此不再用 `role="tablist"/tab/tabpanel`
+语义:按钮带 `aria-expanded` + `aria-controls="detail-panel"`,面板是带 `role="region"`
++ `aria-label`(取当前段名)的 `#detail-panel`。
+
+### 5.1 分段 rail(detail-rail,常驻 56px)
 
 ```
-┌──────────────────────────────────────────────┐
-│ 核查与结果        [状态徽标] [⬇下载] [🖨打印] [⟩⟩] │
-└──────────────────────────────────────────────┘
+┌─────┐
+│ (i) 3│  概览       角标 = 建议追问条数
+│ (⌕) ●│  核查过程   呼吸点 = review_status running
+│ (⛨) 5│  审查结果   角标 = reviewItems.length
+│ (▤) 8│  重点与知识点 角标 = task.results.length
+│ 已完成 │  状态徽标(悬浮 title 显示完成时间)
+│ [⬇]  │  下载 Markdown
+│ [🖨] │  打印 / 另存 PDF
+└─────┘
 ```
 
-- 左:标题"核查与结果";
-- 右(自左至右):**状态徽标**(如"已完成",随 task.status 实时变化)→
-  **下载按钮**(导出 Markdown 报告)→ **打印按钮**(打印/另存 PDF)→
-  **侧栏折叠按钮**(WorkspaceToggleButton);
-- 下载/打印按钮的显示条件保持原逻辑:任务 completed 或有结果时才出现;
-  状态徽标始终显示(按钮隐藏时仅剩徽标)。
+- 只有图标(段名放 `title`/`aria-label`),56px 宽摆不下「重点与知识点」这类长标签;
+  展开后由面板标题行交代在看哪一段(见 §5.2);
+- 角标超 99 显示 `99+`;点当前已展开段的按钮 = 收起;
+- **审查状态变化不自动弹栏**,只点亮对应按钮的提示环(`has-attention`)+ 角标:
+  running → 核查过程,done/failed/stopped → 审查结果,单 agent 模式完成且有结果 →
+  重点与知识点,建议追问从 0 变正 → 概览。自动弹开会打断主对话流(窄屏抽屉
+  直接盖住内容),用户点开该段即清提示环;唯一例外是新手引导的 `activateSection`
+  指令(收起时目标面板根本不在 DOM 里,必须程序化展开);
+- 状态徽标与下载/打印按钮住在 rail 底部:`.detail-sidebar-header` 收起时不存在,
+  它们若跟着标题行消失就完全不可达(任务状态在本页仅此一例展示);
+  下载/打印的显示条件保持原逻辑(任务 completed 或有结果时才出现),状态徽标始终显示;
+- 键盘:ArrowUp/Down 在四个段按钮间移动焦点,Escape 收起(原生 button 的
+  Enter/Space 即展开)。
 
-### 5.2 内容区(detail-sidebar-body)自上而下
+### 5.2 展开面板标题行(detail-sidebar-header)
 
-1. **任务概览**(条件渲染:`(isRunning && current_stage) || error_message`):
+```
+┌───────────────────────────────────┐
+│ 核查与结果     审查结果   [⟩⟩]            │
+└───────────────────────────────────┘
+```
+
+- 左:总标题"核查与结果"(栏级名,勿改成段名);
+- 右:**当前段名**(如"审查结果",rail 无文字标签,展开后靠它定位)+
+  **收起按钮**(WorkspaceToggleButton,收起为 rail)。
+
+### 5.3 四段内容(sidebar-panel,按 activeSection 展示)
+
+四段共用 `#detail-panel` 滚动容器,面板用 `v-show` 切换(保持 Agent2Panel 的
+轮组展开状态与流式卡片不因切段而丢,与原先 tab 行为一致)。
+
+#### 段 1:概览
+
+1. **当前阶段 / 错误**(条件渲染:`(isRunning && current_stage) || error_message`):
    仅活跃期(pending/running/paused)显示"当前阶段",失败任务显示错误信息;
    任务进入终态且无错误时整块收起。场景/创建时间/完成时间已移除——
-   创建时间在主区标题行,完成时间改为悬浮标题行状态徽标(title)查看。
-   不再包含:状态徽标与下载/打印按钮(已移至标题行,见 §5.1)、
+   创建时间在主区标题行,完成时间改为悬浮 rail 状态徽标(title)查看。
+   不再包含:状态徽标与下载/打印按钮(已移至 rail,见 §5.1)、
    用户意图卡片(不再显示;用户指令仍保留在对话流顶部 userDirective 气泡)。
 2. **任务清单**(有 plan 时):原主对话流"计划清单"卡迁入,展示最新一轮的
    计划步骤(✓ done / ◌ in_progress / ○ pending)与进度 x/y;数据来自
    SSE plan 事件与历史对话提取(`<plan>` 块 / TodoList tool_call),
    随运行实时更新(`latestPlanSteps`)。
 3. **动态验证**(配置了测试环境 URL 时):开关、授权模式切换、登录凭证(脱敏);不出现 verifier_agent 字样。
-4. **检查助手核查**(Agent2Panel,有 agent2 活动时):agent2 的全部过程输出——
+4. **建议追问方向**(`SuggestionCards`,审查完成后有建议时):原内联在 Agent2Panel 底部,
+   现随分段重构上移到概览——核查段只留过程,概览承担"现状 + 下一步"。
+   取**最新一条** `type=suggestions` 记录解析(`utils/agent2Suggestions.extractSuggestions`,
+   纯函数可单测;非法 JSON / 非数组 / 空白项均静默回空),每条一个「追问」按钮;
+   点击后把建议原文当用户消息发出走 resume 链路(`handleSuggestionDig`)。
+   **防重复锁 `diggingSuggestion` 上移到本视图**:发送成功保持锁定到新一轮审查开始
+   (`watch(review_status)` 解锁);被拒 / 异常时 `finally` 立即解锁(旧实现只靠
+   review_status 解锁,发送失败后按钮会一直灰着无法重试)。
+#### 段 2:核查过程
+
+**检查助手核查**(Agent2Panel,有 agent2 活动时):agent2 的全部过程输出——
    按轮折叠组(进行中轮自动展开),轮组标题为核查摘要文案(如"3 次核查 · 1 条
    修正指令",不显示轮次数字),**轮内是一条时序穿插的条目流**(思考 → 它触发的
    工具 → 下一段思考 …),由 `utils/agent2Timeline.buildAgent2Rounds` 算定:
@@ -245,17 +294,32 @@ RoundGroup { roundIdx, segments, planSteps }
    `stoppingReview` 置灰防重复点):后端是协作式取消(LLM 流 chunk 边界 / 工具
    循环边界生效),终态随 review_done=stopped 事件送达,本视图不轮询等终态
    (仅当后端告知"已无审查线程在跑"时拉一次快照兜底,防 SSE 已断时卡在"检查中")。
-5. **重点与知识点**(最底部,原"结果清单"):agent2 done=true 提炼的
+
+#### 段 3:审查结果
+
+**审查项清单**(原与其他段合并在一个 tab 里,现为独立段):`ReviewItem` 按
+`utils/reviewBucket.bucketizeReviewItems` 三分(发现风险 / 已核查·剔除误报 /
+缺口·待改进),每档下紧凑卡片(标题 + 置信档位/分数 + 来源/严重度),点击开
+`DetailCardDrawer` 看正文与证据;置信度由后端核验证据引用后派生,模型不自报。
+标题行的临时提示随 review_status 分流:running →「检查助手核查中」(审查项边核边落)。
+有建议追问时,标题行下方给一条「N 条建议追问 · 去概览」跳转(`sidebar-jump`)——
+建议卡在概览段,不提醒会明显降低这个 resume 入口的可达性。
+
+#### 段 4:重点与知识点
+
+**知识点清单**(原"结果清单",与审查结果拆开后独立成段):agent2 done=true 提炼的
    3-8 条精选知识点(老任务为全量发现,兼容);含 `learning_note` 的卡片
    带"值得学"徽标,展开时正文上方显示学习点引用块;按 `task.params._grouping`
    动态分组(如按严重度,老任务);文件类 meta 标签可点击打开左侧工作区文件。
    标题行的临时结果提示随 review_status 分流:running →「检查助手整理中」
    (呼吸点,完成后自动更新),stopped →「检查已终止」(静止中性点:临时结果
-   就是最终结果,不再等知识点替换;failed 不在这里另开提示,标题行 badge「检查失败」已说明)。
+   就是最终结果,不再等知识点替换;failed 不在这里另开提示,核查过程段 badge「检查失败」已说明)。
+   段内还包含练习题入口(`practice-generate-btn` / 待确认候选题计数)与出题进度
+   跳转(`gen-progress-entry`),它们作用于知识点,因此跟知识点段走,不在审查结果段。
 
 > 历史说明:覆盖度看板(task.checklist 驱动的维度卡片网格)已随覆盖度清单功能移除。
 
-### 5.3 左缘调宽手柄(detail-resize-handle)
+### 5.4 展开面板左缘调宽手柄(detail-resize-handle)
 
 侧栏与主区同底色,原先没有分隔线也看不出边界,故:
 
@@ -309,15 +373,15 @@ step 组折叠策略、工具行四种渲染类型。
 | 旧结构 | 新结构 |
 |---|---|
 | 标题行仅"任务详情" + 折叠按钮 | 标题行追加:状态徽标 + 下载按钮 + 打印按钮,排在折叠按钮左侧 |
-| body 顺序:任务概览 → 动态验证 → 结果清单 | body 顺序:任务概览 → 动态验证 → 结果清单(本次改动只调控件位置;现行完整顺序已进一步演进为“任务概览 → 任务清单 → 动态验证 → 检查助手核查 → 重点与知识点”,以 §5.2 为准) |
-| 状态徽标与下载/打印按钮在"任务概览"区块顶部(overview-header) | 迁入标题行;概览区块后又精简为仅活跃期"当前阶段"+错误信息(场景/创建/完成时间移除,见 §5.2) |
+| body 顺序:任务概览 → 动态验证 → 结果清单 | body 顺序:任务概览 → 动态验证 → 结果清单(本次改动只调控件位置;现行完整分段已进一步演进为「概览(任务清单/动态验证/建议追问) / 核查过程 / 审查结果 / 重点与知识点」,以 §5.3 为准) |
+| 状态徽标与下载/打印按钮在"任务概览"区块顶部(overview-header) | 迁入标题行;概览区块后又精简为仅活跃期"当前阶段"+错误信息(场景/创建/完成时间移除,见 §5.3。注:标题行这一档已在 §10 再移到常驻 rail) |
 | 任务概览含用户意图卡片(user_input 的 Markdown 渲染) | 移除,不再显示(对话流顶部 userDirective 气泡仍保留用户指令) |
 
 保留不变:下载/打印按钮的显示条件(completed 或有结果)、导出逻辑
 (exportMarkdown / exportPdf)、结果卡片折叠交互。
 
 > 本节为当时那次改动的对照表。“覆盖度”区块在更早的“覆盖度清单”功能移除时就已经
-> 不存在了(见 §5.2 历史说明),旧表两列均不应含它,已更正。
+> 不存在了(见 §5.3 历史说明),旧表两列均不应含它,已更正。
 
 实现要点(供代码改动参考):
 
@@ -337,7 +401,7 @@ step 组折叠策略、工具行四种渲染类型。
 | 结论卡带"本轮结论"胶囊标签;思考灰卡挂在结论消息上方 | 标签与思考卡均移除:最终思考留在"执行过程"组内(组内只显示思考卡),结论为纯正文消息 |
 | step 头部"N 次迭代"计数徽标、无状态组的"·"占位点 | 移除:头部只留折叠箭头 / 状态图标(有 plan)/ step 文本 / 流式动画 |
 | 无 plan 时所有迭代包进单个"执行过程"折叠块(总结也藏在里面) | "执行过程"折叠组保留(过程整体收起),但总结已提出组外,组内是纯过程噪音 |
-| 主对话流每轮顶部显示"计划清单"卡 | 移至右侧栏"任务清单"(最新一轮计划+实时进度,见 §5.2.2) |
+| 主对话流每轮顶部显示"计划清单"卡 | 移至右侧栏"任务清单"(最新一轮计划+实时进度,见 §5.3 段 1) |
 | 主对话流每轮显示轮次标签("初始评估"/"第 N 轮") | 移除,"轮"概念不暴露给用户(轮边界由修正指令卡自然标示) |
 | 重点与知识点卡片带"第 N 轮"徽标 | 移除徽标 |
 | Agent2Panel 轮组标题"第 N 轮核查" + 右侧摘要 | 标题即摘要文案("核查中…"/"3 次核查 · 1 条修正指令 · 已完成"/"核查完成") |
@@ -356,3 +420,35 @@ step 组折叠策略、工具行四种渲染类型。
    形态适配,克隆加 `-think`/`-body` 后缀保证 key 唯一,展开状态按 conv_id 共享)。
 4. 侧栏"任务清单"用 `latestPlanSteps` computed:遍历 `planPerRound`(reactive Map,
    SSE plan 事件与 `extractPlanFromHistory` 双来源写入)取有 plan 的最大 round。
+
+## 10. 右侧栏改为常驻分段 rail(本次改动)
+
+| 旧结构 | 新结构 |
+|---|---|
+| 顶部横排三 tab(概览 / 核查 / 结果)+ 标题行折叠开关 + 折叠态右上角悬浮把手:三套展开入口 | 常驻竖向 rail 上的四个 disclosure 按钮,**rail 就是折叠态**(`activeSection: key \| null` 单一状态;`detailCollapsed` / `activeSidebarTab` / `userPickedTab` 均删除) |
+| 「结果」tab 同时装审查结果与重点与知识点,角标是两者相加 | 拆为「审查结果」与「重点与知识点」两段,各自角标(`reviewItems.length` / `task.results.length`) |
+| tab 语义 `role="tablist" / tab / tabpanel` | disclosure 语义:按钮 `aria-expanded` + `aria-controls="detail-panel"`,面板 `role="region"` + `aria-label` 取段名 |
+| 审查状态变化**自动抢切 tab**(running→核查,done→结果),闸门 `userPickedTab` | **不自动展开**,只写 `attentionSection` 点亮提示环与角标(自动弹开会打断主对话流;窄屏抽屉直接盖住内容) |
+| 建议追问方向内联在 Agent2Panel 底部 | 上移到「概览」段(`SuggestionCards` 组件 + `utils/agent2Suggestions` 纯函数);审查结果段加一条「N 条建议追问 · 去概览」跳转,概览按钮带条数角标 |
+| 「核查」段名与拆出来的「审查结果」近义撞车 | 改名「核查过程」,与提示词里“审查过程”措辞对齐 |
+| 状态徽标 + 下载/打印在 `.detail-sidebar-header` 内 | 移到 rail 底部(面板收起时标题行不存在,否则任务状态与导出入口都不可达);标题行改为总标题 + 当前段名 + 收起按钮 |
+| 折叠/展开与段选择不持久化 | 展开段按用户存 `secondlook:sidebar-section:task-detail:{email}`(空串 = 收起);不复用 `buildStorageKey`,它前缀写死 `sidebar-width` |
+| 引导 v5:`activateTab` 机制 + `detail-results` 指 'results' | 引导 v6:`activateSection`(程序化展开,收起时目标不在 DOM)、`detail-results` 改指 'knowledge'、新增 `detail-rail` 与 `detail-findings` 步骤(后者接上此前无人引用的孤儿锚点 `data-onboarding="detail-review"`) |
+| 追问防重复锁仅靠 `review_status` 变化释放 | 发送被拒 / 异常时在 `finally` 立即解锁(旧实现下失败后按钮会一直禁用) |
+
+保留不变:栏级总名“核查与结果”(页面仍叫任务详情页)、面板四段的内容本体、
+`v-show` 切段(不丢 Agent2Panel 轮组展开状态)、拖宽与双击复位(`useResizableSidebar`
+零改动,断点仍 1024px)、导出报告的数据层拼装(`routers/tasks.py` 已按审查项 /
+知识点分节,UI 分段不影响它)。
+
+实现要点(供代码改动参考):
+
+1. 段定义 `SIDEBAR_SECTIONS`(key/label);rail 只放图标,`title`/`aria-label` 载段名,
+   段名同时在展开标题行 `.detail-sidebar-section` 可见。
+2. rail 是 `.detail-sidebar` 的兄弟节点(同在 `.page-body` flex 行内);
+   窄屏下两者各自 `position:absolute`,抽屉 `right: var(--detail-rail-width)` 给 rail 让位。
+3. 建议文本解析走 `extractSuggestions(task?.conversations)`,取最新一条 `type=suggestions`;
+   `diggingSuggestion` 锁属视图层(它要调 `sendTaskMessage`),Agent2Panel 不再
+   `emit('send-suggestion')`。
+4. 引导事件名 `sidebar-activate-section`(旧 `sidebar-activate-tab` 已废弃);
+   未知 key 仍由 `SIDEBAR_SECTIONS.some()` 守卫静默丢弃——改段名时记得同步引导步骤。

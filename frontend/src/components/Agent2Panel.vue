@@ -13,9 +13,12 @@
  *
  * 后台审查流程(agent1 结束即任务完成):
  * - reviewStatus=running:头部"检查中"badge,审查流式实时可见,可点"终止检查"
- * - reviewStatus=done:头部"检查完成"badge;建议追问卡(suggestions)可点"追问"
+ * - reviewStatus=done:头部"检查完成"badge
  * - reviewStatus=failed:头部"检查失败"badge(保留 AI助手执行结果)
  * - reviewStatus=stopped:头部"检查已终止"badge(用户主动停,同样保留执行结果)
+ *
+ * 本面板只承载**核查过程**;建议追问方向(suggestions)与审查结果清单已分到
+ * 侧栏的「概览」/「审查结果」段(见 TaskDetailView),此处不再重复展示。
  *
  * 数据来源:
  * - conversations:任务**全量** Conversation 列表(本组件只渲染 role=agent2,
@@ -76,11 +79,9 @@ const props = defineProps<{
 
 /**
  * 事件:
- * - send-suggestion:用户点"追问"建议,交给父组件走现有发消息流程(resume)
  * - stop-review:用户终止本次检查(有些对话不需要检查),父组件调 API
  */
 const emit = defineEmits<{
-  (e: 'send-suggestion', text: string): void
   (e: 'stop-review'): void
 }>()
 
@@ -105,24 +106,6 @@ const rounds = computed<Agent2RoundTimeline<Conversation, StreamingLike>[]>(() =
     [...props.streamingItems.values()].filter((s) => s.role === 'agent2'),
   ),
 )
-
-/** 建议追问方向(取最新一条 type=suggestions 的 JSON,旧版整块覆盖) */
-const suggestions = computed<string[]>(() => {
-  let latest: Conversation | null = null
-  for (const c of props.conversations) {
-    if (c.role === 'agent2' && c.type === 'suggestions') latest = c
-  }
-  if (!latest) return []
-  try {
-    const payload = JSON.parse(latest.content) as { suggestions?: unknown }
-    if (!Array.isArray(payload.suggestions)) return []
-    return payload.suggestions.filter(
-      (s): s is string => typeof s === 'string' && !!s.trim(),
-    )
-  } catch {
-    return [] // JSON 解析失败(老数据/异常形态)静默容错
-  }
-})
 
 /** 审查计划条目(优先聚合 _review.plan,回退实时 review_plan_update) */
 const reviewPlanItems = computed<ReviewPlanItem[] | null>(() => {
@@ -149,15 +132,6 @@ const reviewPlanTally = computed(() => {
   return null
 })
 
-/** 追问按钮防重复(点击后由父组件发消息,审查重新开始) */
-const diggingSuggestion = ref<string | null>(null)
-/** 点击"追问":把建议文本作为用户消息发出(emit 给父组件走 resume 链路) */
-function handleDig(text: string): void {
-  if (diggingSuggestion.value) return
-  diggingSuggestion.value = text
-  emit('send-suggestion', text)
-}
-
 /** 头部审查 badge 文案 */
 const reviewBadge = computed<{ text: string; cls: string } | null>(() => {
   if (props.reviewStatus === 'running') return { text: '检查中', cls: 'is-running' }
@@ -166,12 +140,6 @@ const reviewBadge = computed<{ text: string; cls: string } | null>(() => {
   if (props.reviewStatus === 'stopped') return { text: '检查已终止', cls: 'is-stopped' }
   return null
 })
-
-// 新一轮审查开始(resume 追问/追加消息)→ 解除追问按钮的防重复锁
-watch(
-  () => props.reviewStatus,
-  () => { diggingSuggestion.value = null },
-)
 
 /** 轮组展开状态;默认展开最新一轮(含运行中新轮自动展开) */
 const expanded = ref<Set<number>>(new Set())
@@ -403,24 +371,6 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
         </template>
       </div>
     </div>
-
-    <!-- 建议追问方向(审查完成后;点击"追问"作为用户消息发出去走 resume) -->
-    <div v-if="suggestions.length > 0" class="panel-suggestions">
-      <p class="panel-suggestions-title">建议追问方向</p>
-      <div
-        v-for="(s, i) in suggestions"
-        :key="i"
-        :class="['panel-suggestion-card', { 'is-digging': diggingSuggestion === s }]"
-      >
-        <p class="panel-suggestion-text">{{ s }}</p>
-        <button
-          type="button"
-          class="panel-suggestion-btn"
-          :disabled="!!diggingSuggestion"
-          @click="handleDig(s)"
-        >{{ diggingSuggestion === s ? '已发起追问…' : '追问' }}</button>
-      </div>
-    </div>
   </section>
 </template>
 
@@ -510,63 +460,6 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
 .panel-review summary {
   color: var(--color-text-secondary);
   font-weight: var(--fw-medium);
-}
-
-/* 建议追问卡片 */
-.panel-suggestions {
-  margin-top: var(--space-3);
-}
-
-.panel-suggestions-title {
-  margin: 0 0 var(--space-2);
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-semibold);
-  color: var(--color-text-primary);
-}
-
-.panel-suggestion-card {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  margin-bottom: var(--space-2);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-}
-
-.panel-suggestion-card.is-digging {
-  border-color: var(--color-primary-border);
-  background: var(--color-primary-light);
-}
-
-.panel-suggestion-text {
-  flex: 1;
-  margin: 0;
-  font-size: var(--fs-xs);
-  line-height: 1.5;
-  color: var(--color-text-secondary);
-}
-
-.panel-suggestion-btn {
-  flex-shrink: 0;
-  padding: var(--space-1) var(--space-3);
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-medium);
-  color: var(--color-primary);
-  background: transparent;
-  border: 1px solid var(--color-primary-border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-
-.panel-suggestion-btn:hover:not(:disabled) {
-  background: var(--color-primary-light);
-}
-
-.panel-suggestion-btn:disabled {
-  cursor: not-allowed;
-  opacity: 0.6;
 }
 
 @keyframes panel-pulse {

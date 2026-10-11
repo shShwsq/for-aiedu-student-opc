@@ -4,8 +4,9 @@
  *
  * 布局区域:
  * 1. 主区协作对话流:按 round_idx 分组,展示 agent2 与 agent1 的来回
- * 2. 右侧栏:结果清单(默认折叠,分组由 task.params._grouping 驱动)/
- *    任务概览 / 动态验证配置
+ * 2. 右侧「核查与结果」:常驻竖向 rail(概览 / 核查过程 / 审查结果 /
+ *    重点与知识点),点 rail 按钮展开对应段面板(rail 即折叠态);
+ *    概览含当前阶段/任务清单/动态验证/建议追问方向
  *
  * 实时更新:SSE 接收每条对话/状态变更 + thinking_delta(流式 token 增量)。
  * 初始加载 GET /tasks/{id} 拿快照(补历史),然后 SSE 接收增量。
@@ -27,6 +28,7 @@ import { jsonrepair } from 'jsonrepair'
 import AppHeader from '@/components/AppHeader.vue'
 import Agent2Panel from '@/components/Agent2Panel.vue'
 import DetailCardDrawer from '@/components/DetailCardDrawer.vue'
+import SuggestionCards from '@/components/SuggestionCards.vue'
 import ConversationMessage from '@/components/ConversationMessage.vue'
 import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
 import UserMessageInput from '@/components/UserMessageInput.vue'
@@ -58,6 +60,7 @@ import { ensureFeaturesLoaded, practiceEnabled } from '@/composables/useFeatures
 import { buildStorageKey, useResizableSidebar } from '@/composables/useResizableSidebar'
 import { useAuthStore } from '@/stores/auth'
 import { listArtifacts } from '@/api/taskArtifacts'
+import { extractSuggestions } from '@/utils/agent2Suggestions'
 import { clientLog } from '@/utils/clientLog'
 import { extractErrorMessage } from '@/utils/error'
 import { parseDiffFileSegments } from '@/utils/diffFiles'
@@ -120,34 +123,171 @@ const followBottom = ref(true)
 /** 工作区侧栏是否折叠(默认折叠,完全隐藏) */
 const workspaceCollapsed = ref(true)
 
-/** 核查与结果侧栏是否折叠(右侧栏,默认展开;折叠时完全隐藏,主区聚焦对话) */
-const detailCollapsed = ref(false)
+const auth = useAuthStore()
 
-// ---- 侧栏分段标签页 ----
-const SIDEBAR_TABS = [
+// ---- 核查与结果侧栏:常驻竖向 rail + 按需展开面板 ----
+/**
+ * 右栏四段。rail 固定在页面右缘,**它本身就是折叠态**:段面板只在
+ * activeSection 命中时渲染。原先「顶部横排 tab + 独立折叠开关 +
+ * 折叠态悬浮把手」三套展开入口由此收敛成一个状态(段 key 或 null)。
+ */
+const SIDEBAR_SECTIONS = [
   { key: 'overview', label: '概览' },
-  { key: 'review', label: '核查' },
-  { key: 'results', label: '结果' },
+  { key: 'process', label: '核查过程' },
+  { key: 'findings', label: '审查结果' },
+  { key: 'knowledge', label: '重点与知识点' },
 ] as const
 
-type SidebarTabKey = (typeof SIDEBAR_TABS)[number]['key']
-const activeSidebarTab = ref<SidebarTabKey>('overview')
-/** 用户是否手动选过 tab:选过后不再自动抢切(避免把正在浏览其它 tab 的用户拽走) */
-const userPickedTab = ref(false)
+type SidebarSectionKey = (typeof SIDEBAR_SECTIONS)[number]['key']
 
-/** 用户点击 tab:记录手动选择 + 切换 */
-function selectSidebarTab(key: SidebarTabKey): void {
-  userPickedTab.value = true
-  activeSidebarTab.value = key
+/** 段状态的持久化键(用户未就位时返回 null,不读写)。
+ *  不复用 buildStorageKey:它的前缀写死为 sidebar-width,语义不符。 */
+function sectionStorageKey(): string | null {
+  const email = auth.user?.email
+  if (!email) return null
+  // email 可能含特殊字符,encodeURIComponent 防 key 解析异常
+  return `secondlook:sidebar-section:task-detail:${encodeURIComponent(email)}`
 }
 
-/** 接收 onboarding tour 切换标签指令(程序性切换,不算用户手动选择) */
-function onOnboardingActivateTab(e: Event): void {
-  const tab = (e as CustomEvent).detail as SidebarTabKey
-  if (SIDEBAR_TABS.some((t) => t.key === tab)) activeSidebarTab.value = tab
+/**
+ * 按用户读回上次展开段。空串 = 上次是收起态;未存过 / 未知 key 保持默认的
+ * 「概览」(不写回,避免把别人存的值当成本用户默认值覆盖)。
+ */
+function restoreSection(): void {
+  const key = sectionStorageKey()
+  if (!key) return
+  let raw: string | null = null
+  try {
+    raw = localStorage.getItem(key)
+  } catch {
+    // 隐私模式 / 禁用 localStorage:保持当前段
+    return
+  }
+  if (raw === '') activeSection.value = null
+  else if (raw !== null && SIDEBAR_SECTIONS.some((s) => s.key === raw)) {
+    activeSection.value = raw as SidebarSectionKey
+  }
 }
-onMounted(() => window.addEventListener('sidebar-activate-tab', onOnboardingActivateTab))
-onUnmounted(() => window.removeEventListener('sidebar-activate-tab', onOnboardingActivateTab))
+
+/** 当前展开段;null = 收起为 rail(段内容不渲染) */
+const activeSection = ref<SidebarSectionKey | null>('overview')
+/**
+ * 需要用户注意的段:只点亮 rail 上对应按钮的提示环,**绝不自动展开**。
+ * 后台审查动辄数分钟,自动弹开会打断主对话流(窄屏下还是覆盖式抽屉,
+ * 直接盖住用户正在读的内容)。
+ */
+const attentionSection = ref<SidebarSectionKey | null>(null)
+/** 用户是否已自己选过段(选过后用户状态异步就位时不再拿存档覆盖) */
+let sectionTouched = false
+/** 段状态是否已按用户读回过(只读一次) */
+let sectionRestored = false
+
+function persistSection(): void {
+  const key = sectionStorageKey()
+  if (!key) return
+  try {
+    localStorage.setItem(key, activeSection.value ?? '')
+  } catch {
+    // 隐私模式 / 禁用 localStorage:静默,本次会话内仍可切换
+  }
+}
+
+// auth.user 由 fetchMe 异步填充,硬刷新时本组件挂载那一刻它还是 null,
+// 因此不能只在初始化和切换时读写:用户就位后再读回一次
+watch(
+  () => auth.user?.email,
+  (email) => {
+    if (!email || sectionRestored) return
+    sectionRestored = true
+    if (sectionTouched) return
+    restoreSection()
+  },
+  { immediate: true },
+)
+
+/** 点 rail 按钮:同段再点收起为 rail,异段切换展开;选中即清提示环 */
+function selectSection(key: SidebarSectionKey): void {
+  activeSection.value = activeSection.value === key ? null : key
+  attentionSection.value = null
+  sectionTouched = true
+  persistSection()
+}
+
+/** 标题行折叠按钮:收起为 rail(展开入口在 rail,故只需处理收起) */
+function collapseDetail(): void {
+  activeSection.value = null
+  attentionSection.value = null
+  sectionTouched = true
+  persistSection()
+}
+
+/** rail 按钮元素(键盘上下键在段间移动焦点用) */
+const railBtnEls = ref<(HTMLElement | null)[]>([])
+function setRailBtnEl(el: unknown, idx: number): void {
+  railBtnEls.value[idx] = (el as HTMLElement | null) ?? null
+}
+
+/** rail 键盘导航:ArrowUp/Down 在段按钮间移动焦点,Escape 收起 */
+function onRailKeydown(e: KeyboardEvent): void {
+  if (e.key === 'Escape') {
+    if (activeSection.value) collapseDetail()
+    return
+  }
+  const dir = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0
+  if (!dir) return
+  e.preventDefault()
+  const btns = railBtnEls.value.filter(Boolean) as HTMLElement[]
+  if (!btns.length) return
+  const cur = btns.indexOf(document.activeElement as HTMLElement)
+  const next = cur < 0 ? (dir > 0 ? 0 : btns.length - 1) : (cur + dir + btns.length) % btns.length
+  btns[next]?.focus()
+}
+
+/**
+ * 接收 onboarding tour 切段指令:程序性切段**要连带展开**——
+ * 收起时段面板不在 DOM 里,引导目标元素找不到就不能定位。
+ * 这是「不自动展开」的唯一例外。
+ */
+function onOnboardingActivateSection(e: Event): void {
+  const key = (e as CustomEvent).detail as SidebarSectionKey
+  if (SIDEBAR_SECTIONS.some((s) => s.key === key)) activeSection.value = key
+}
+onMounted(() =>
+  window.addEventListener('sidebar-activate-section', onOnboardingActivateSection),
+)
+onUnmounted(() =>
+  window.removeEventListener('sidebar-activate-section', onOnboardingActivateSection),
+)
+
+/** 建议追问方向(检查助手审查完成时产出;展示在「概览」段) */
+const suggestions = computed<string[]>(() => extractSuggestions(task.value?.conversations))
+
+/** 追问按钮防重复(点击后本组件发消息,新一轮审查开始才解锁) */
+const diggingSuggestion = ref<string | null>(null)
+
+// 新一轮审查开始(resume 追问/追加消息)→ 解除追问按钮的防重复锁
+watch(
+  () => task.value?.review_status,
+  () => { diggingSuggestion.value = null },
+)
+
+/** 当前展开段的显示名(rail 无文字标签,展开后在标题行/无障碍名称里交代) */
+const activeSectionLabel = computed<string>(() =>
+  SIDEBAR_SECTIONS.find((s) => s.key === activeSection.value)?.label ?? '核查与结果',
+)
+
+/** rail 各段角标数值(核查过程走呼吸点,恒为 0) */
+const sectionBadge = computed<Record<SidebarSectionKey, number>>(() => ({
+  overview: suggestions.value.length,
+  process: 0,
+  findings: reviewItems.value.length,
+  knowledge: task.value?.results.length ?? 0,
+}))
+
+/** 完成时间不再单列,改为悬浮 rail 状态徽标时以 title 展示 */
+const statusBadgeTitle = computed<string | undefined>(() =>
+  task.value?.completed_at ? `完成时间 ${formatTime(task.value.completed_at)}` : undefined,
+)
 
 // ---- 卡片详情 Drawer ----
 const drawerItem = ref<ReviewItem | TaskResult | null>(null)
@@ -167,12 +307,12 @@ async function handleDrawerOpenFile(item: ReviewItem): Promise<void> {
 }
 
 /**
- * 核查与结果侧栏宽度:左缘手柄拖拽调宽,松手按「用户 email + 栏位」存 localStorage。
+ * 展开面板的宽度:左缘手柄拖拽调宽,松手按「用户 email + 栏位」存 localStorage。
  * narrowMax / maxViewportRatio 两个约束都对应下面的 CSS 与主区体验:
  * - 1024px 以下侧栏改成覆盖式抽屉(见 @media),那档宽度归 CSS,手柄隐藏;
  * - 上限收一半视口:右栏每变宽 1px 都是从主对话流身上扣的,别让它顶掉阅读宽度。
+ * 注意另有常驻 rail(.detail-rail,RAIL_WIDTH)在这之外,总占位 = 面板宽 + rail 宽。
  */
-const auth = useAuthStore()
 const {
   inlineWidth: detailSidebarStyle,
   resizing: detailSidebarResizing,
@@ -193,10 +333,6 @@ const {
 
 function toggleWorkspace(): void {
   workspaceCollapsed.value = !workspaceCollapsed.value
-}
-
-function toggleDetail(): void {
-  detailCollapsed.value = !detailCollapsed.value
 }
 
 // 从首页「最近任务」进入时带 ?workspace=1:自动展开历史任务侧栏
@@ -544,8 +680,8 @@ async function initTask(): Promise<void> {
   reviewPlanLive.value = null
   drawerOpen.value = false
   drawerItem.value = null
-  // 新任务重新允许自动切换 tab(清除上一任务残留的手动选择闸门)
-  userPickedTab.value = false
+  // 新任务重新允许提示环计算(上一任务的 attention 与本任务无关)
+  attentionSection.value = null
   try {
     // 拉任务快照(场景降级后不再需要单独拉 /scenarios:结果分组/meta
     // 从 task.params._grouping 和 results 的 metadata keys 推断)
@@ -2226,26 +2362,32 @@ const isAgent2Running = computed(
     (task.value?.current_stage || '').includes('检查助手'),
 )
 
-// ---- 标签自动切换 ----
+// ---- 段注意力提示(不自动展开) ----
 // 实时后台审查的权威信号是 review_status:agent1 一结束 status 就置 COMPLETED,
 // 审查全程 status 不再变化,故不能用要求 status==='running' 的 isAgent2Running。
-// 用户手动选过 tab(userPickedTab)后不再抢占;呼吸点/计数 badge 仍是常态提示。
+// rail 重构后**不再自动抢切段 + 弹栏**:只点亮对应段按钮的提示环与角标,
+// 开不开由用户决定(自动弹开会打断主对话流,窄屏下还会盖住抽屉)。
 watch(
-  [() => task.value?.review_status, () => task.value?.status],
-  ([reviewStatus, status]) => {
-    if (userPickedTab.value) return
-    if (reviewStatus === 'running') {
-      activeSidebarTab.value = 'review'
-    } else if (
+  [() => task.value?.review_status, () => task.value?.status, () => suggestions.value.length],
+  ([reviewStatus, status, suggestionCount], prev) => {
+    if (reviewStatus === 'running') attentionSection.value = 'process'
+    else if (
       reviewStatus === 'done' || reviewStatus === 'failed' || reviewStatus === 'stopped'
-    ) {
-      activeSidebarTab.value = 'results'
-    } else if (
+    ) attentionSection.value = 'findings'
+    else if (
       status === 'completed' && !reviewStatus && (task.value?.results.length ?? 0) > 0
     ) {
-      // 单 agent 模式(无审查):完成且有结果时直达结果 tab
-      activeSidebarTab.value = 'results'
+      // 单 agent 模式(无审查):完成且有结果时提示看知识点段
+      attentionSection.value = 'knowledge'
+    } else {
+      attentionSection.value = null
     }
+    // 建议追问刚到达(0 → 正)且看的不是概览:提示去概览(建议卡在那)
+    if (suggestionCount > 0 && !prev?.[2] && activeSection.value !== 'overview') {
+      attentionSection.value = 'overview'
+    }
+    // 提示的段已经展开:提示环无意义,直接清掉
+    if (attentionSection.value === activeSection.value) attentionSection.value = null
   },
 )
 
@@ -2510,13 +2652,16 @@ async function handleWithdrawPendingMessage(messageId: string): Promise<void> {
  * (置 running + 标记 resume 窗口 + 重连 SSE)。
  */
 async function handleSuggestionDig(text: string): Promise<void> {
-  if (!task.value?.id) return
+  if (!task.value?.id || diggingSuggestion.value) return
+  diggingSuggestion.value = text
+  let accepted = false
   try {
     const resp = await sendTaskMessage(String(task.value.id), { content: text })
     clientLog(String(task.value.id), 'suggestion_dig', {
       accepted: resp.accepted,
       message: resp.message,
     })
+    accepted = resp.accepted
     if (resp.accepted) {
       handleMessageSent(resp)
     } else {
@@ -2524,6 +2669,10 @@ async function handleSuggestionDig(text: string): Promise<void> {
     }
   } catch (err) {
     error.value = extractErrorMessage(err)
+  } finally {
+    // 发送成功:锁到新一轮审查开始(review_status 变化时解锁,见上方 watch);
+    // 被拒 / 异常:立即解锁,否则追问按钮会一直灰着无法重试
+    if (!accepted) diggingSuggestion.value = null
   }
 }
 
@@ -3140,10 +3289,10 @@ function openPracticeGenerate(): void {
       </div>
     </main>
 
-    <!-- 右侧:核查与结果侧栏(抽屉把手式;展开时顶部条带标题+折叠按钮,折叠时悬浮把手在 page-body 右上角;
-         宽度可经左缘手柄拖拽调整,双击复位) -->
+    <!-- 右侧:核查与结果展开面板(仅 activeSection 命中时渲染;宽度可经左缘手柄
+         拖拽调整,双击复位)。收起态没有独立把手——常驻 rail 就是展开入口 -->
     <aside
-      v-if="task && !detailCollapsed"
+      v-if="task && activeSection"
       class="detail-sidebar"
       :class="{ 'detail-sidebar-resizing': detailSidebarResizing }"
       :style="detailSidebarStyle"
@@ -3167,76 +3316,24 @@ function openPracticeGenerate(): void {
       />
       <div class="detail-sidebar-header">
         <span class="detail-sidebar-title">核查与结果</span>
-        <!-- 状态徽标 + 下载/打印:自任务概览区块顶部迁入,排在折叠按钮左侧
-             完成时间不再单列,改为悬浮徽标时以 title 展示 -->
-        <span
-          :class="['badge', statusConfig[task.status].class]"
-          :title="task.completed_at ? '完成时间 ' + formatTime(task.completed_at) : undefined"
-        >
-          {{ statusConfig[task.status].label }}
-        </span>
-        <div
-          v-if="task.status === 'completed' || task.results.length > 0"
-          class="overview-actions"
-        >
-          <button
-            class="btn-export"
-            :disabled="exporting"
-            title="下载 Markdown 报告"
-            @click="exportMarkdown"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
-            </svg>
-          </button>
-          <button
-            class="btn-export"
-            :disabled="exporting"
-            title="打印或另存为 PDF"
-            @click="exportPdf"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="6 9 6 2 18 2 18 9" />
-              <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />
-              <rect x="6" y="14" width="12" height="8" />
-            </svg>
-          </button>
-        </div>
+        <!-- rail 只有图标,展开后在这里交代当前看的是哪一段。
+             状态徽标与下载/打印不在这里(它们随 rail 常驻,收起态也要能用) -->
+        <span class="detail-sidebar-section">{{ activeSectionLabel }}</span>
         <WorkspaceToggleButton
           side="right"
           :collapsed="false"
-          expand-title="展开核查与结果"
-          collapse-title="折叠核查与结果"
-          @toggle="toggleDetail"
+          collapse-title="收起为分段栏"
+          @toggle="collapseDetail"
         />
       </div>
-      <!-- 分段标签页 -->
-      <div class="sidebar-tabs" role="tablist" aria-label="核查与结果分栏">
-        <button
-          v-for="tab in SIDEBAR_TABS"
-          :key="tab.key"
-          type="button"
-          role="tab"
-          :class="['sidebar-tab', { active: activeSidebarTab === tab.key }]"
-          :aria-selected="activeSidebarTab === tab.key"
-          @click="selectSidebarTab(tab.key)"
-        >
-          {{ tab.label }}
-          <span
-            v-if="tab.key === 'review' && task.review_status === 'running'"
-            class="tab-badge tab-badge-live"
-          >●</span>
-          <span
-            v-if="tab.key === 'results' && (reviewItems.length + task.results.length) > 0"
-            class="tab-badge"
-          >{{ reviewItems.length + task.results.length }}</span>
-        </button>
-      </div>
-      <div class="detail-sidebar-body">
-        <!-- Tab: 概览 (阶段 + 任务清单 + 动态验证) -->
-        <div v-show="activeSidebarTab === 'overview'" class="sidebar-panel" role="tabpanel">
+      <div
+        id="detail-panel"
+        class="detail-sidebar-body"
+        role="region"
+        :aria-label="activeSectionLabel"
+      >
+        <!-- 段: 概览(阶段 + 任务清单 + 动态验证 + 建议追问方向) -->
+        <div v-show="activeSection === 'overview'" class="sidebar-panel">
           <section
             v-if="(isRunning && task.current_stage) || task.error_message"
             class="overview-section"
@@ -3313,10 +3410,18 @@ function openPracticeGenerate(): void {
               </div>
             </div>
           </details>
+
+          <!-- 建议追问方向(原在核查段底部,现随分段重构上移到概览:
+               核查段只留过程,概览承担"现状 + 下一步") -->
+          <SuggestionCards
+            :suggestions="suggestions"
+            :digging="diggingSuggestion"
+            @dig="handleSuggestionDig"
+          />
         </div>
       
-        <!-- Tab: 核查 (Agent2Panel 核查过程) -->
-        <div v-show="activeSidebarTab === 'review'" class="sidebar-panel" role="tabpanel">
+        <!-- 段: 核查过程(Agent2Panel) -->
+        <div v-show="activeSection === 'process'" class="sidebar-panel">
           <Agent2Panel
             v-if="hasAgent2Activity"
             :conversations="task.conversations"
@@ -3327,20 +3432,28 @@ function openPracticeGenerate(): void {
             :review-summary="reviewSummary"
             :review-plan-live="reviewPlanLive"
             :review-items="reviewItems"
-            @send-suggestion="handleSuggestionDig"
             @stop-review="handleStopReview"
           />
           <p v-else class="panel-empty-hint">等待检查助手核查…</p>
         </div>
       
-        <!-- Tab: 结果 (审查结果 + 重点与知识点) -->
-        <div v-show="activeSidebarTab === 'results'" class="sidebar-panel" role="tabpanel">
+        <!-- 段: 审查结果(ReviewItem 三态分桶) -->
+        <div v-show="activeSection === 'findings'" class="sidebar-panel">
           <!-- 审查结果(ReviewItem):紧凑卡片,点击开 drawer -->
           <section v-if="hasReviewResults" class="sidebar-review" data-onboarding="detail-review">
             <h2>
               审查结果 <span class="count">({{ reviewItems.length }})</span>
               <span v-if="task.review_status === 'running'" class="review-interim-hint">检查助手核查中</span>
             </h2>
+            <!-- 建议卡在「概览」段:从这里给一条跳转,别让用户找不到追问入口 -->
+            <button
+              v-if="suggestions.length > 0"
+              type="button"
+              class="sidebar-jump"
+              @click="selectSection('overview')"
+            >
+              {{ suggestions.length }} 条建议追问 · 去概览
+            </button>
             <div v-for="bucket in REVIEW_BUCKET_ORDER" :key="bucket.key" class="review-bucket">
               <template v-if="reviewBuckets[bucket.key].length">
                 <h3 class="review-bucket-head">
@@ -3369,7 +3482,11 @@ function openPracticeGenerate(): void {
               </template>
             </div>
           </section>
+          <p v-else class="panel-empty-hint">暂无审查项</p>
+        </div>
       
+        <!-- 段: 重点与知识点(Result 分组 + 练习题入口) -->
+        <div v-show="activeSection === 'knowledge'" class="sidebar-panel">
           <!-- 重点与知识点(紧凑卡片,点击开 drawer) -->
           <section
             v-if="task.results.length > 0"
@@ -3448,23 +3565,115 @@ function openPracticeGenerate(): void {
               </div>
             </template>
           </section>
+          <p v-else class="panel-empty-hint">暂无重点与知识点</p>
         </div>
       </div>
     </aside>
 
-    <!-- 折叠态:page-body 右上角悬浮把手(header 下方右侧,点击重新展开;有结果时显示数量角标) -->
-    <div v-else-if="task" class="detail-handle">
-      <WorkspaceToggleButton
-        side="right"
-        :collapsed="true"
-        expand-title="展开核查与结果"
-        collapse-title="折叠核查与结果"
-        @toggle="toggleDetail"
-      />
-      <span v-if="task.results.length > 0" class="detail-handle-badge">
-        {{ task.results.length }}
-      </span>
-    </div>
+    <!-- 常驻竖向分段 rail(右栏的展开入口,它本身就是折叠态):点段按钮展开对应面板,
+         再点当前段收起。审查状态变化只点亮提示环/角标,不自动弹栏。
+         收起时状态徽标与导出入口也在这里(rail 是唯一入口,否则二者都不可达) -->
+    <nav
+      v-if="task"
+      class="detail-rail"
+      aria-label="核查与结果分段"
+      data-onboarding="detail-rail"
+      @keydown="onRailKeydown"
+    >
+      <button
+        v-for="(sec, i) in SIDEBAR_SECTIONS"
+        :key="sec.key"
+        :ref="(el) => setRailBtnEl(el, i)"
+        type="button"
+        class="rail-btn"
+        :class="{
+          'is-active': activeSection === sec.key,
+          'has-attention': attentionSection === sec.key,
+        }"
+        :title="sec.label"
+        :aria-label="sec.label"
+        :aria-expanded="activeSection === sec.key"
+        aria-controls="detail-panel"
+        @click="selectSection(sec.key)"
+      >
+        <svg
+          class="rail-icon"
+          viewBox="0 0 24 24"
+          width="20"
+          height="20"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <!-- 概览:info -->
+          <template v-if="sec.key === 'overview'">
+            <circle cx="12" cy="12" r="9" />
+            <line x1="12" y1="11" x2="12" y2="16" />
+            <line x1="12" y1="8" x2="12.01" y2="8" />
+          </template>
+          <!-- 核查过程:放大镜 -->
+          <template v-else-if="sec.key === 'process'">
+            <circle cx="11" cy="11" r="7" />
+            <line x1="16.5" y1="16.5" x2="21" y2="21" />
+          </template>
+          <!-- 审查结果:护盾 -->
+          <template v-else-if="sec.key === 'findings'">
+            <path d="M12 3l7 3v6c0 4.4-3 7.4-7 9-4-1.6-7-4.6-7-9V6z" />
+            <line x1="9.5" y1="12" x2="14.5" y2="12" />
+          </template>
+          <!-- 重点与知识点:书 -->
+          <template v-else>
+            <path d="M12 6c-2-1.4-4.5-2-8-2v14c3.5 0 6 .6 8 2 2-1.4 4.5-2 8-2V4c-3.5 0-6 .6-8 2z" />
+            <line x1="12" y1="6" x2="12" y2="20" />
+          </template>
+        </svg>
+        <span
+          v-if="sec.key === 'process' && task.review_status === 'running'"
+          class="rail-badge rail-badge-live"
+        >●</span>
+        <span v-else-if="sectionBadge[sec.key] > 0" class="rail-badge">
+          {{ sectionBadge[sec.key] > 99 ? '99+' : sectionBadge[sec.key] }}
+        </span>
+      </button>
+
+      <div class="rail-foot">
+        <span
+          :class="['rail-status', statusConfig[task.status].class]"
+          :title="statusBadgeTitle"
+        >
+          {{ statusConfig[task.status].label }}
+        </span>
+        <button
+          v-if="task.status === 'completed' || task.results.length > 0"
+          class="btn-export"
+          :disabled="exporting"
+          title="下载 Markdown 报告"
+          @click="exportMarkdown"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+        </button>
+        <button
+          v-if="task.status === 'completed' || task.results.length > 0"
+          class="btn-export"
+          :disabled="exporting"
+          title="打印或另存为 PDF"
+          @click="exportPdf"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 6 2 18 2 18 9" />
+            <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />
+            <rect x="6" y="14" width="12" height="8" />
+          </svg>
+        </button>
+      </div>
+    </nav>
     </div>
 
     <!-- 验证动作授权弹窗(per_action 模式,每个 HTTP/PoC 动作需用户确认) -->
@@ -3510,10 +3719,12 @@ function openPracticeGenerate(): void {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  /* 手机地址栏伸缩兜底 */
+  /* 手机地址栏伸缩兑底 */
   height: 100dvh;
   overflow: hidden;
   background: var(--color-bg);
+  /* 分段 rail 常驻宽度:展开面板与窄屏抽屉都按它让位 */
+  --detail-rail-width: 56px;
 }
 
 .page-body {
@@ -3522,7 +3733,7 @@ function openPracticeGenerate(): void {
   align-items: stretch;
   min-height: 0;
   overflow: hidden;
-  position: relative; /* 给折叠态悬浮把手定位 */
+  position: relative; /* 给窄屏覆盖抽屉态定位 */
 }
 
 .main {
@@ -3554,7 +3765,8 @@ function openPracticeGenerate(): void {
   max-width: 80%;
 }
 
-/* ---- 右侧核查与结果栏(抽屉把手式;展开时顶部条+滚动内容区,折叠时不渲染) ---- */
+/* ---- 右侧核查与结果展开面板(仅 activeSection 命中时渲染;
+   收起态由常驻 rail 接管,见下面 .detail-rail) ---- */
 .detail-sidebar {
   position: relative; /* 供左缘调宽手柄绝对定位 */
   flex-shrink: 0;
@@ -3612,7 +3824,8 @@ function openPracticeGenerate(): void {
   cursor: col-resize;
 }
 
-/* 顶部条:标题 + 折叠按钮(header 下方,固定不滚) */
+/* 顶部条:标题 + 当前段名 + 收起按钮(固定不滚)。
+   状态徽标与导出按钮不在这条里——它们随 rail 常驻,收起态也要能点 */
 .detail-sidebar-header {
   display: flex;
   align-items: center;
@@ -3633,20 +3846,11 @@ function openPracticeGenerate(): void {
   color: var(--color-text);
 }
 
-/* 标题行内的状态徽标与导出按钮:紧凑不换行、不被压缩,
-   窄屏下优先保标题截断 */
-.detail-sidebar-header .badge {
+/* 当前段名(如「审查结果」):rail 只有图标,展开后靠它交代在看哪一段 */
+.detail-sidebar-section {
   flex-shrink: 0;
-  white-space: nowrap;
-}
-
-.detail-sidebar-header .overview-actions {
-  flex-shrink: 0;
-}
-
-.detail-sidebar-header .btn-export {
-  width: 28px;
-  height: 28px;
+  font-size: var(--fs-xs);
+  color: var(--color-text-tertiary);
 }
 
 /* 内容区:独立滚动,卡片间距用 gap 统一 */
@@ -3659,45 +3863,73 @@ function openPracticeGenerate(): void {
   flex-direction: column;
 }
 
-/* ---- 分段标签页 ---- */
-.sidebar-tabs {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 6px var(--space-4);
-  border-bottom: 1px solid var(--color-border);
+/* ---- 常驻竖向分段 rail(右栏的展开入口;rail 就是折叠态) ---- */
+.detail-rail {
   flex-shrink: 0;
+  width: var(--detail-rail-width);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) 0;
+  background: var(--color-bg);
+  /* 与展开面板同一套 20% 淡线:静置时不抢视线,窄屏抽屉态靠它区分层级 */
+  border-left: 1px solid color-mix(in srgb, var(--color-border) 20%, transparent);
 }
 
-.sidebar-tab {
+.rail-btn {
+  position: relative; /* 角标 / 提示环的绝对定位基准 */
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 12px;
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-medium);
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
   color: var(--color-text-secondary);
   background: transparent;
   border: 1px solid transparent;
-  border-radius: var(--radius-full, 999px);
+  border-radius: var(--radius-md);
   cursor: pointer;
   transition: all var(--transition-fast);
-  white-space: nowrap;
 }
 
-.sidebar-tab:hover {
-  color: var(--color-text);
+.rail-btn:hover {
+  color: var(--color-primary);
   background: var(--color-bg-hover, rgba(0, 0, 0, 0.04));
 }
 
-.sidebar-tab.active {
+.rail-btn.is-active {
   color: var(--color-primary);
   background: var(--color-primary-light);
   border-color: var(--color-primary-border);
-  font-weight: var(--fw-semibold);
 }
 
-.tab-badge {
+/* 需要用户注意但不自动弹栏:按钮外圈提示环,点开该段即消 */
+.rail-btn.has-attention::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border: 2px solid var(--color-primary);
+  border-radius: var(--radius-md);
+  pointer-events: none;
+  animation: rail-attention 1.6s ease-in-out infinite;
+}
+
+@keyframes rail-attention {
+  0%, 100% { opacity: 0.9; }
+  50% { opacity: 0.25; }
+}
+
+.rail-icon {
+  display: block;
+  flex-shrink: 0;
+}
+
+/* 段角标:计数或核查进行中的呼吸点 */
+.rail-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -3709,20 +3941,59 @@ function openPracticeGenerate(): void {
   color: var(--color-surface);
   background: var(--color-primary);
   border-radius: var(--radius-full, 999px);
+  pointer-events: none;
 }
 
-.tab-badge-live {
+.rail-badge-live {
   background: none;
   color: var(--color-success);
-  animation: tab-pulse 1.4s ease-in-out infinite;
+  animation: rail-pulse 1.4s ease-in-out infinite;
 }
 
-@keyframes tab-pulse {
+@keyframes rail-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
 }
 
-/* Tab 内容面板 */
+/* rail 底部:状态徽标 + 导出/打印(收起态的唯一入口) */
+.rail-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* 状态徽标紧凑到能竖着堆在 56px 里;颜色由 badge-* 提供 */
+.rail-status {
+  max-width: calc(var(--detail-rail-width) - 8px);
+  padding: 2px 4px;
+  font-size: 10px;
+  font-weight: var(--fw-semibold);
+  line-height: 1.4;
+  text-align: center;
+  white-space: nowrap;
+  border-radius: var(--radius-full);
+}
+
+/* 段间跳转(如「审查结果 → 去概览看建议追问」) */
+.sidebar-jump {
+  align-self: flex-start;
+  padding: var(--space-1) var(--space-2);
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--color-primary);
+  background: transparent;
+  border: 1px dashed var(--color-primary-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.sidebar-jump:hover {
+  background: var(--color-primary-light);
+}
+
+/* 段内容面板 */
 .sidebar-panel {
   display: flex;
   flex-direction: column;
@@ -3752,46 +4023,30 @@ function openPracticeGenerate(): void {
 
 
 
-/* ---- 折叠态悬浮把手(page-body 右上角,header 下方右侧) ---- */
-.detail-handle {
-  position: absolute;
-  right: var(--space-3);
-  top: var(--space-3);
-  z-index: 5;
-}
-
-/* 折叠态结果数量角标(提示折叠栏内有结果) */
-.detail-handle-badge {
-  position: absolute;
-  top: -4px;
-  right: -4px;
-  min-width: 16px;
-  height: 16px;
-  padding: 0 4px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 10px;
-  font-weight: var(--fw-semibold);
-  color: var(--color-surface);
-  background: var(--color-primary);
-  border-radius: var(--radius-full);
-  pointer-events: none;
-}
-
-/* ---- 响应式:窄屏下右侧栏改为覆盖式抽屉 ---- */
+/* ---- 响应式:窄屏下展开面板与 rail 都改为覆盖式(抽屉盖在主区上,
+   rail 仍贴最右缘,面板让开 rail 宽) ---- */
 @media (max-width: 1024px) {
   .detail-sidebar {
     position: absolute;
-    right: 0;
+    right: var(--detail-rail-width);
     top: 0;
     bottom: 0;
     z-index: 20;
-    width: min(420px, 85vw);
+    /* 抽屉 + 常驻 rail 的总占位不越过原定的 85vw(宽度归 CSS,不叠加 rail 宽) */
+    width: min(420px, calc(85vw - var(--detail-rail-width)));
     box-shadow: var(--shadow-xl);
     /* 抽屉盖在主区上,shadow-xl 已交代层级,左缘分隔线在窄屏是多余装饰,
        连同常态 20% 淡线一起抹掉,让抽屉边缘更干净 */
     border-left-color: transparent;
+  }
+
+  .detail-rail {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 21; /* 浮在抽屉之上,收起态也要能点 */
+    box-shadow: var(--shadow-xl);
   }
 
   /* 抽屉态宽度归 CSS,拖宽没有意义(断点须与 useResizableSidebar 的 narrowMax 一致) */
@@ -3803,7 +4058,7 @@ function openPracticeGenerate(): void {
 /* ---- 手机档:抽屉更宽、主区滚动内边距收紧 ---- */
 @media (max-width: 640px) {
   .detail-sidebar {
-    width: min(420px, 92vw);
+    width: min(420px, calc(92vw - var(--detail-rail-width)));
   }
 
   .main-scroll {
@@ -3900,11 +4155,6 @@ function openPracticeGenerate(): void {
 @keyframes gen-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.35; transform: scale(0.7); }
-}
-
-.overview-actions {
-  display: flex;
-  gap: var(--space-2);
 }
 
 .btn-export {
@@ -5119,7 +5369,9 @@ function openPracticeGenerate(): void {
 .diff-line-ctx { color: var(--color-text); }
 
 /* ---- 审查结果(ReviewItem):三态分桶 + 证据链 + 置信徽标 ---- */
-.sidebar-review { margin-top: var(--space-4); }
+/* 原先与重点与知识点同在一个 tab 里,靠 margin-top 拉开两段;
+   拆成独立段后段内间距由 .sidebar-panel 的 gap 统一给 */
+.sidebar-review { margin-top: 0; }
 .review-bucket { margin-top: var(--space-2); }
 .review-bucket-head { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-2) 0; }
 .bucket-tag { font-size: var(--fs-sm); font-weight: var(--fw-semibold); padding: 1px 8px; border-radius: var(--radius-sm); }
