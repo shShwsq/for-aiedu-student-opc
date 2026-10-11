@@ -19,6 +19,7 @@ import app.models.task_artifact  # noqa: F401  注册 TaskArtifact,Task mapper �
 import app.models.audit  # noqa: F401  注册 ReviewItem,Task.review_items 关系可配置
 import app.agents.agent2 as agent2
 from app.agents.agent2 import run_agent2
+from app.agents.agent2 import _persist_knowledge_point as _agent2_persist
 from app.models.audit import ReviewItem
 from app.models.task import Result, Task
 
@@ -273,5 +274,33 @@ def test_partial_commit_preserves_items_on_stop(monkeypatch):
     added_items = [c.args[0] for c in db.add.call_args_list if isinstance(c.args[0], ReviewItem)]
     assert len(added_items) == 2          # 已发射的两条保留
     assert "_review" not in result        # 终止不聚合下游
+
+
+def test_persist_knowledge_point_validates_learning_topic():
+    """learning_topic 必填且校验:命中启用主题直接用,非法/缺失回落默认"""
+    base = {"title": "T", "content": "C", "learning_note": "N"}
+    ok = _agent2_persist(
+        None, None, 1, {**base, "learning_topic": "coding"},
+        valid_topic_keys={"security", "coding"}, default_topic="security",
+    )
+    assert ok["metadata_"]["learning_topic"] == "coding"
+    bad = _agent2_persist(
+        None, None, 1, {**base, "learning_topic": "bogus"},
+        valid_topic_keys={"security", "coding"}, default_topic="security",
+    )
+    assert bad["metadata_"]["learning_topic"] == "security"
+    miss = _agent2_persist(
+        None, None, 1, base,
+        valid_topic_keys={"security"}, default_topic="security",
+    )
+    assert miss["metadata_"]["learning_topic"] == "security"
+
+
+def test_agent2_learning_topics_falls_back_to_builtin_without_user():
+    """无 db/user(匿名任务)时回退内置四主题,不碰库"""
+    keys, default_key, prompt = agent2._agent2_learning_topics(None, None)
+    assert {"security", "architecture", "coding", "contract"} <= keys
+    assert default_key in keys
+    assert "学习主题词表" in prompt
 
 

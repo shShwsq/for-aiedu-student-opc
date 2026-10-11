@@ -150,7 +150,7 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 |---|---|---|---|---|
 | `submit_review_plan` | **`task.params._review.plan`**(审查计划,不落表) | 规划先行:声明本轮拟核实的审查清单与取证调度;发现新疑点可**全量重发修订** | `items[]`(每条 `target` 拟核实对象 + `origin` 四类来源 + `priority` + `planned_evidence`:`source/verify/reference/none`)+ `note?`(规划理由) | 1 次起,可重发(覆盖式) |
 | `submit_review_item` | **`ReviewItem`(新表)——审查项(三态合一)** | 声明并落定一个审查项:发现风险 / 已核查·剔除误报 / 缺口·待改进 | `review_target`(被核实的 agent1 具体结论/动作)+ `origin`(agent1_claim/agent1_action/user_requirement/domain_baseline)+ `status`(covered/partial/missing)+ `verdict`(confirmed/suspected/false_positive/none/pending)+ `severity?` + `evidence{source,analysis_basis,verification}`(各带 `call_ref`,缺口可省)+ `suggestion?` + `agent1_ref?` + `dimension?`(分组标签);**不含 confidence**(后端派生) | 每项一次(约 3–8) |
-| `submit_knowledge_point` | **`Result`——知识点** | 发射一条学习提炼(重点/知识点) | `title`/`content` + `learning_note`/`practice_worthy` + `source_review_item_id?`(回指派生它的审查项)/`learning_topic_hint?` | 0..N |
+| `submit_knowledge_point` | **`Result`——知识点** | 发射一条学习提炼(重点/知识点) | `title`/`content` + `learning_note`/`practice_worthy` + `source_review_item_id?`(回指派生它的审查项)/`learning_topic`**必填**(取「学习主题词表」的 key,后端校验;非法/缺失回落默认主题) | 0..N |
 | `submit_suggestion` | 累积进 `task.params._review` | 发射一条"建议追问方向" | `text`(具体可执行,用户点击后作为指令交回 agent1) | 0..3 |
 
 > **审查项 ≠ 知识点**:`ReviewItem` 回答"代码有没有问题、多可信"(三态:风险/已核查/缺口,带证据者附证据链 + 置信度),`Result`(知识点)回答"该记住什么"(学习提炼,喂知识点看板/出题);二者用 `source_review_item_id` 显式连边,**分型但不割裂,保住"素材同源"**。三态由 `status`+`verdict`+是否带 `evidence` 组合判读(风险=verdict∈{confirmed,suspected};已核查/误报=verdict∈{none,false_positive}+covered;缺口=status∈{missing,partial})。

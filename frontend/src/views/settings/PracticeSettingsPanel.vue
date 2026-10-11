@@ -60,8 +60,6 @@ const thinkingMode = ref<PracticeThinkingMode>('follow')
 const defaultModelId = ref('')
 /** 始终用默认出题模型(忽略任务自带模型配置) */
 const forceDefaultLlm = ref(false)
-/** 出题完成后是否顺带批量更新知识点讲解 */
-const explainWithQuestions = ref(false)
 /** 讲解专用模型配置 id(空串=沿用出题/默认模型) */
 const explainModelId = ref('')
 /** 出题并发度(1=串行;2/4=并行逐条 finding) */
@@ -233,7 +231,6 @@ async function load(): Promise<void> {
     thinkingMode.value = pref.thinking_mode_for_practice
     defaultModelId.value = pref.default_llm_config_id ?? ''
     forceDefaultLlm.value = pref.force_default_llm
-    explainWithQuestions.value = pref.generate_explanation_with_questions
     explainModelId.value = pref.explain_llm_config_id ?? ''
     generateConcurrency.value = pref.generate_concurrency
   } catch (err) {
@@ -338,7 +335,6 @@ async function patchPracticeSettings(
       auto_generate_practice: autoGenerate.value,
       ...patch,
     })
-    explainWithQuestions.value = latest.generate_explanation_with_questions
     explainModelId.value = latest.explain_llm_config_id ?? ''
     generateConcurrency.value = latest.generate_concurrency
     showToast(successMsg, 'success')
@@ -347,16 +343,6 @@ async function patchPracticeSettings(
   } finally {
     saving.value = false
   }
-}
-
-async function toggleExplainWithQuestions(): Promise<void> {
-  const next = !explainWithQuestions.value
-  await patchPracticeSettings(
-    { generate_explanation_with_questions: next },
-    next
-      ? '已开启出题完成后批量更新知识点讲解(一次 job 只多几次轻调用)'
-      : '已关闭自动更新讲解,可在知识点看板上按需生成',
-  )
 }
 
 async function selectExplainModel(event: Event): Promise<void> {
@@ -626,28 +612,9 @@ onBeforeUnmount(() => {
         <div class="setting-title-row">
           <span class="setting-title">知识点讲解</span>
           <HelpPopover :max-height="300" max-width="min(380px, 86vw)">
-            开启后,出题完成会顺带把本次涉及的知识点写成一段讲解(看板上可折叠展开阅读)。
-            一次 job 只多几次轻任务调用(≤8 个知识点一批),不是每个知识点跑一次;
-            自己编辑过的讲解(标「已编辑」)永远不会被自动覆盖。
+            知识点讲解在看板上逐点按需生成(依据该知识点最近的题目与关联发现原文),
+            出题不再顺带写讲解;自己编辑过的讲解(标「已编辑」)永远不会被自动生成覆盖。
           </HelpPopover>
-        </div>
-        <div class="force-default-row">
-          <div class="setting-info">
-            <div class="setting-title-row">
-              <span class="setting-title">出题后自动更新讲解</span>
-              <HelpPopover>默认关闭;关闭后仍可在知识点看板上逐点生成。</HelpPopover>
-            </div>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            :aria-checked="explainWithQuestions"
-            :class="['switch', { 'switch-on': explainWithQuestions }]"
-            :disabled="busy"
-            @click="toggleExplainWithQuestions"
-          >
-            <span class="switch-thumb" />
-          </button>
         </div>
         <div class="setting-title-row">
           <span class="setting-title sub-title">讲解专用模型</span>

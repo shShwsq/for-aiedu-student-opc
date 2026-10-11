@@ -379,8 +379,52 @@ class Result(Base):
     # 安全场景示例:{"cwe": "CWE-89", "severity": "high", "file_path": "src/x.py", "line_range": "42"}
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
 
+    # 关联的练习域知识点(per-user 全局、按 key 去重)。出题收尾回写(见
+    # services/practice/generator):任务级知识点(Result)与看板知识点
+    # (KnowledgePoint)的形式化链接,供按知识点回溯任务上下文/多任务溯源。
+    # 可空:未出题的知识点(仅展在侧栏)尚未落到看板时为 NULL。
+    # 升级见 migrate_result_add_knowledge_point_id_column
+    knowledge_point_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_points.id", ondelete="SET NULL"),
+        nullable=True, default=None, index=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     task: Mapped[Task] = relationship(back_populates="results")
+
+
+def migrate_result_add_knowledge_point_id_column() -> None:
+    """幂等给 results 加 knowledge_point_id 列(任务知识点 ↔ 看板知识点链接)
+
+    背景同其他迁移:无 Alembic,已存在的表不会自动加列;全新库由 create_all 建好。
+    FK 指向 knowledge_points(须晚于该表创建;create_all 已建)。老数据该列 NULL。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("results"):
+            return  # 全新库由 create_all 建好
+        cols = {c["name"] for c in insp.get_columns("results")}
+        if "knowledge_point_id" in cols:
+            return  # 已迁过
+        conn.execute(text(
+            "ALTER TABLE results ADD COLUMN knowledge_point_id "
+            "UUID REFERENCES knowledge_points(id) ON DELETE SET NULL"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_results_knowledge_point_id "
+            "ON results (knowledge_point_id)"
+        ))
+        conn.commit()
+    log.info("results.knowledge_point_id 列迁移完成")

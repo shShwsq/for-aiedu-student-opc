@@ -47,6 +47,7 @@ from app.services.practice.generator import (
     _parse_llm_questions,
     _prefetch_materials,
     _salvage_json_array,
+    _topic_from_meta,
     compute_dedup_hash,
 )
 
@@ -161,6 +162,28 @@ def test_difficulty_clamped_and_default():
     assert _normalize_raw_question(_raw(difficulty=9), {})["difficulty"] == 5.0
     assert _normalize_raw_question(_raw(difficulty=0), {})["difficulty"] == 1.0
     assert _normalize_raw_question(_raw(difficulty="abc"), {})["difficulty"] == 3.0
+
+
+def test_topic_from_meta_inherits_only_valid_keys():
+    """agent2 校验过的 learning_topic 仅在启用词表内才继承;非法/停用 key 交回分类"""
+    valid = {"security", "architecture", "coding", "contract"}
+    assert _topic_from_meta({"learning_topic": "architecture"}, valid) == "architecture"
+    assert _topic_from_meta({"learning_topic": "removed_topic"}, valid) is None
+    assert _topic_from_meta({"learning_topic": "  "}, valid) is None
+    assert _topic_from_meta({}, valid) is None
+    assert _topic_from_meta(None, valid) is None
+
+
+def test_normalize_extracts_extra_knowledge_keys():
+    """LLM 的 knowledge_keys 落成 extra_knowledge_keys,且排除主 knowledge_key"""
+    q = _normalize_raw_question(
+        _raw(knowledge_key="CWE-89", knowledge_keys=["CWE-89", " CWE-79 ", "xss"]),
+        {},
+    )
+    assert q["extra_knowledge_keys"] == ["CWE-79", "xss"]
+    # 无 knowledge_keys 时为空列表(非 list 输入也不炸)
+    assert _normalize_raw_question(_raw(), {})["extra_knowledge_keys"] == []
+    assert _normalize_raw_question(_raw(knowledge_keys="oops"), {})["extra_knowledge_keys"] == []
 
 
 # ============================================================

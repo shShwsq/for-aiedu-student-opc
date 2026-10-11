@@ -178,7 +178,7 @@ def test_serial_path_matches_current_behaviour(monkeypatch):
     assert [d["index"] for t, d in events if t == "finding"] == [1, 2, 3]
     assert progress[-1] == (3, 3)
     assert added  # 主线程写入
-    assert len(added) == 2  # 1 道题 + 1 个知识点
+    assert len(added) == 3  # 1 道题 + 1 个知识点 + 1 条题目↔知识点关联(主关联)
 
 
 def test_concurrent_path_is_faster_and_writes_in_main_thread(monkeypatch):

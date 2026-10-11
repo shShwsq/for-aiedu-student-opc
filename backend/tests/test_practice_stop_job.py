@@ -85,12 +85,11 @@ def _gen_task():
     )
 
 
-def _settings(concurrency=1, explain=False):
+def _settings(concurrency=1):
     """练习设置行(字段与真模同名称;并发路径需要 generate_concurrency>1)"""
     return SimpleNamespace(
         restore_workspace_for_practice=False,
         thinking_mode_for_practice="follow",
-        generate_explanation_with_questions=explain,
         explain_llm_config_id=None,
         generate_concurrency=concurrency,
     )
@@ -260,38 +259,6 @@ def test_concurrent_stop_keeps_future_that_triggered_checkpoint(monkeypatch):
     # 两条都真的进了 LLM:确认走的是并发分支且未被提前 cancel
     # (串行下第二条根本不会被调用)
     assert state["calls"] == 2
-
-
-def test_stop_after_last_finding_keeps_explain_phase(monkeypatch):
-    """停止落在最后一条之后:题已出齐,知识点讲解不能被静默跳过
-
-    generator 的 stopped_early 与 job 层的 is_cancelled 必须同一口径(都要求
-    "确实少跑了活")。旧写法只看标志:job 那边按 done 收口,这边的讲解却因
-    stopped_early=True 被跳过 —— 用户看到"已完成"却少了知识点讲解。
-    """
-    state = {"flag": False}
-    explained = []
-
-    def _fake_call_llm(*args, **kwargs):
-        state["flag"] = True              # 唯一一条正在跑时用户点了停止
-        return json.dumps([_raw()], ensure_ascii=False)
-
-    monkeypatch.setattr(gen, "_call_llm", _fake_call_llm)
-    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
-    monkeypatch.setattr(gen, "resolve_explain_client", lambda *a, **k: MagicMock())
-    monkeypatch.setattr(
-        gen, "explain_knowledge_points",
-        lambda db, uid, digests, **kw: explained.append(len(digests)) or len(digests),
-    )
-    db = _gen_db(finding_count=1, settings_row=_settings(explain=True))
-
-    created, _skipped = gen.generate_questions_for_task(
-        db, _gen_task(), "u1", client=MagicMock(),
-        should_stop=lambda: state["flag"],
-    )
-
-    assert len(created) == 1
-    assert explained, "全部 finding 已处理完时应照常收尾讲解"
 
 
 def test_stop_after_topic_classification_raises_cancelled(monkeypatch):

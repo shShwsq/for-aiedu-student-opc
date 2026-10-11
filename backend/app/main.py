@@ -134,6 +134,10 @@ async def lifespan(app: FastAPI):
     from app.models.practice import migrate_practice_learning_columns
 
     migrate_practice_learning_columns()
+    # 废弃「出题顺带生成知识点讲解」自动路径:删 practice_settings 旧列(幂等)
+    from app.models.practice import migrate_practice_drop_explain_with_questions_column
+
+    migrate_practice_drop_explain_with_questions_column()
     # 迁移用户级 agent_policy:user_preferences.agent_policy JSONB → agent_policies 独立表
     # (拷数据后删旧列;必须晚于 migrate_user_preference_columns,新表已由 create_all 建好)
     from app.models.agent_policy import (
@@ -164,6 +168,7 @@ async def lifespan(app: FastAPI):
     from app.models.task import (
         migrate_conversation_add_attachments_column,
         migrate_conversation_tool_call_id,
+        migrate_result_add_knowledge_point_id_column,
         migrate_stale_review_status,
         migrate_task_add_review_status_column,
         migrate_task_drop_checklist_column,
@@ -172,6 +177,9 @@ async def lifespan(app: FastAPI):
     migrate_conversation_tool_call_id()
     # 追问多文件上传:加 conversations.attachments 列(附件展示信息,刷新后气泡仍渲染 chip)
     migrate_conversation_add_attachments_column()
+    # 任务知识点 ↔ 看板知识点链接:给 results 加 knowledge_point_id 列(幂等;
+    # 须晚于 knowledge_points 建表,新表由 create_all 已建)
+    migrate_result_add_knowledge_point_id_column()
     # 覆盖度清单功能移除:删 tasks.checklist 旧列(幂等)
     migrate_task_drop_checklist_column()
     # agent2 后台审查:加 tasks.review_status 列 + 清理遗留 running 状态

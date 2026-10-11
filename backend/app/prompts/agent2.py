@@ -305,6 +305,7 @@ _SUBMIT_KNOWLEDGE_POINT_TOOL: dict[str, Any] = {
         "description": (
             "提炼一条知识点(该记住什么,3-8 条精选,非全量发现清单)。用 "
             "source_review_item_id(来自 submit_review_item 回执的 review_item_id)回指派生它的审查项。"
+            "learning_topic 必填,取下方「学习主题词表」中的 key。"
         ),
         "parameters": {
             "type": "object",
@@ -314,9 +315,12 @@ _SUBMIT_KNOWLEDGE_POINT_TOOL: dict[str, Any] = {
                 "learning_note": {"type": "string", "description": "为什么值得学/记住(必有)"},
                 "practice_worthy": {"type": "boolean", "description": "是否有出题价值(默认 true)"},
                 "source_review_item_id": {"type": "string", "description": "派生它的审查项 id(可选)"},
-                "learning_topic_hint": {"type": "string", "description": "建议主题 key(可选)"},
+                "learning_topic": {"type": "string", "description": (
+                    "所属学习主题 key(必填):必须取「学习主题词表」里的一个 key"
+                    "(如 security/architecture/coding/contract 或自定义 custom_*)"
+                )},
             },
-            "required": ["title", "content", "learning_note"],
+            "required": ["title", "content", "learning_note", "learning_topic"],
         },
     },
 }
@@ -469,7 +473,7 @@ agent1 结论若引用了外部依据(URL / CVE 编号 / 安全公告 / 官方�
   - **`learning_note`(必有)**:一句话说明为什么值得学/记住
   - `practice_worthy: true`(默认带上;确无出题价值的条目可省略)
   - `source_review_item_id`(可选):回指派生它的审查项,保住"素材同源又不焊死"
-  - `learning_topic_hint`(可选):建议主题 key(与出题主题词表对齐)
+  - `learning_topic`(必有):把该知识点归入的学习主题 key(必须取「学习主题词表」中的一个)；与出题主题词表对齐
 - 审查字段(severity/file_path/line/verified/ref_url/ref_status 等)放**审查项的
   evidence/verdict**,不再写进知识点(知识点只谈"该记住什么")。
 - covered/missing/reasoning/grouping 由后端在审查结束时依据审查项聚合派生(仅兼容

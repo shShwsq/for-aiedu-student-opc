@@ -67,6 +67,7 @@ from app.models.practice import (
     KnowledgePoint,
     PracticeSettings,
     Question,
+    QuestionKnowledgePoint,
     QuestionStatus,
     QuestionType,
     ensure_user_topics,
@@ -75,11 +76,6 @@ from app.models.task import Result, Task
 from app.models.audit import ReviewItem  # 溯源:题目可回指审查项(证据驱动可信审查)
 from app.models.user_llm_config import UserLLMConfig
 from app.services.practice.difficulty import clamp_difficulty
-from app.services.practice.explainer import (
-    add_digest,
-    explain_knowledge_points,
-    make_source_digest,
-)
 from app.services.practice.parse_utils import (
     salvage_json_array as _salvage_json_array,
 )
@@ -361,6 +357,17 @@ def _match_topic_by_rule(task: Task, meta: dict | None) -> str | None:
     return None
 
 
+def _topic_from_meta(meta: dict | None, valid_keys: set) -> str | None:
+    """agent2 已在知识点上落好校验过的 learning_topic 时直接继承(免再分类)
+
+    只在主题仍在启用词表内时采纳;已停用/非法 key 交给后续规则+LLM 重新分类。
+    """
+    if not isinstance(meta, dict):
+        return None
+    t = str(meta.get("learning_topic") or "").strip()
+    return t if t and t in valid_keys else None
+
+
 def _classify_topics_with_llm(
     client: LLMClient, pending: list[tuple[int, Result]], task_id: str,
     topic_defs: list[dict],
@@ -417,10 +424,14 @@ def _match_finding_topics(
     异常静默降级,不阻断出题主流程。
     """
     fallback_topic = topic_defs[0]["key"] if topic_defs else DEFAULT_LEARNING_TOPIC
+    valid_keys = {d["key"] for d in topic_defs}
     topics: dict = {}
     pending: list[tuple[int, Result]] = []
     for idx, f in enumerate(findings):
-        t = _match_topic_by_rule(task, f.metadata_ or {})
+        # 优先继承 agent2 已校验的知识点主题(免再分类);否则规则 → LLM 兑底
+        t = _topic_from_meta(f.metadata_, valid_keys) or _match_topic_by_rule(
+            task, f.metadata_ or {}
+        )
         if t:
             topics[f.id] = t
         else:
@@ -757,25 +768,6 @@ def resolve_llm_client(db: Session, task: Task) -> LLMClient:
     return LLMClient()
 
 
-def resolve_explain_client(
-    db: Session, user_id, settings_row: PracticeSettings | None,
-    fallback: LLMClient,
-) -> LLMClient:
-    """讲解模型解析:practice_settings.explain_llm_config_id > 出题模型(fallback)
-
-    讲解是轻任务:用思考类模型出题要 ~160s/条,写一段讲解用不着那个代价,
-    所以允许单独挂个快/便宜的模型。配置缺失或失效静默回退出题模型。
-    """
-    cid = getattr(settings_row, "explain_llm_config_id", None)
-    if not cid or user_id is None:
-        return fallback
-    client = _client_from_config_id(db, user_id, cid)
-    if client is None:
-        logger.warning("[explain] 未找到讲解模型配置 id=%s,回退出题模型", cid)
-        return fallback
-    return client
-
-
 def resolve_explain_client_for_user(
     db: Session, user_id, settings_row: PracticeSettings | None,
 ) -> LLMClient:
@@ -998,6 +990,15 @@ def _normalize_raw_question(raw: Any, finding_meta: dict) -> dict | None:
         cwe = f"CWE-{cwe}"
     knowledge_key = cwe or str(raw.get("knowledge_key") or "").strip() or "general"
 
+    # 可选多知识点打标签:LLM 可在 knowledge_keys 里给出该题额外涉及的知识点 key
+    # (主关联仍是 knowledge_key;extras 排除主 key 后写 question_knowledge_points)
+    extra_keys: list[str] = []
+    if isinstance(raw.get("knowledge_keys"), list):
+        for x in raw["knowledge_keys"]:
+            s = str(x).strip()[:64]
+            if s and s != knowledge_key and s not in extra_keys:
+                extra_keys.append(s)
+
     code_snippet = raw.get("code_snippet")
     code_snippet = str(code_snippet).strip() if code_snippet else None
 
@@ -1024,6 +1025,7 @@ def _normalize_raw_question(raw: Any, finding_meta: dict) -> dict | None:
         "source_lines": source_lines,
         "origin": origin,
         "languages": _normalize_languages(raw.get("languages"), source_file),
+        "extra_knowledge_keys": extra_keys,
     }
 
 
@@ -1668,12 +1670,6 @@ def generate_questions_for_task(
     skipped = 0
     fatal_reason = ""  # 非空表示遇到不可重试致命错误,需中止原因冒泡
     kp_cache: dict[str, KnowledgePoint] = {}
-    # 收尾知识点讲解:开关开启时边出题边汇上下文素材(关掉时零开销)
-    want_explain = bool(
-        settings_row is not None
-        and getattr(settings_row, "generate_explanation_with_questions", False)
-    )
-    explain_digests: dict[str, dict] = {}
 
     # 先剔除本用户已出过题的 finding(整条跳过的不计入 LLM 工作量)
     pending = [f for f in findings if str(f.id) not in already_generated]
@@ -1732,8 +1728,6 @@ def generate_questions_for_task(
             return
 
         dup_skipped = 0
-        kp_questions: dict[str, list[dict]] = {}   # 本条 finding 在各知识点下产出的题
-        kp_meta: dict[str, tuple[str, str]] = {}    # key → (展示名, 主题)
         # 溯源:知识点 Result.metadata_.source_review_item_id → Question.source_review_item_id
         # 校验该审查项真实存在再写入(避免悬空外键破坏入库)
         review_item_uuid = _resolve_source_review_item_id(db, finding.metadata_)
@@ -1750,10 +1744,9 @@ def generate_questions_for_task(
                 learning_topic=work.topic,
                 cache=kp_cache,
             )
-            if want_explain:
-                # 攒下「这道题当初基于什么材料/发现出出来的」,供收尾批量讲解
-                kp_questions.setdefault(kp.key, []).append(q)
-                kp_meta[kp.key] = (kp.name, work.topic)
+            # 任务知识点(Result)↔ 看板知识点(KnowledgePoint)链接:首条 KP 回写
+            if getattr(finding, "knowledge_point_id", None) is None:
+                finding.knowledge_point_id = kp.id
             question = Question(
                 user_id=user_id,
                 source_task_id=task.id,
@@ -1776,22 +1769,28 @@ def generate_questions_for_task(
             )
             db.add(question)
             created.append(question)
+            # 题目↔知识点 多对多:主关联行(is_primary)+ 可选标签(需 question.id → flush)
+            db.flush()
+            db.add(QuestionKnowledgePoint(
+                question_id=question.id, knowledge_point_id=kp.id, is_primary=True,
+            ))
+            for extra_key in q.get("extra_knowledge_keys") or []:
+                tag_kp = _get_or_create_knowledge_point(
+                    db, user_id, extra_key, "",
+                    languages=q["languages"], learning_topic=work.topic,
+                    cache=kp_cache,
+                )
+                if tag_kp.id != kp.id:
+                    db.add(QuestionKnowledgePoint(
+                        question_id=question.id, knowledge_point_id=tag_kp.id,
+                        is_primary=False,
+                    ))
 
         if dup_skipped:
             logger.info(
                 "[practice] finding=%s 去重跳过 %d 题(同用户已有相同题目)",
                 finding.id, dup_skipped,
             )
-
-        if want_explain:
-            for key, qs in kp_questions.items():
-                name, kp_topic = kp_meta[key]
-                add_digest(
-                    explain_digests, key, name, kp_topic,
-                    make_source_digest(
-                        finding.title, finding.content, work.meta, work.snippets, qs,
-                    ),
-                )
 
     # 已处理条数(串行/并发共用):既喂 progress 口径,也用于下面的
     # 「是否真的少跑了活」判定(旧写法在并发分支里另起 finished,停止路径
@@ -1906,27 +1905,9 @@ def generate_questions_for_task(
     for q in created:
         db.refresh(q)
 
-    # 收尾批量更新知识点讲解:一次调用覆盖 ≤8 个知识点(不是每题一次),
-    # 失败只记日志 —— 讲解是增益,不能拖垮已生成的题目
-    explain_written = 0
-    if want_explain and explain_digests and not stopped_early:
-        try:
-            explain_written = explain_knowledge_points(
-                db, user_id, explain_digests,
-                client=resolve_explain_client(db, user_id, settings_row, client),
-                custom_defs=custom_defs,
-                event_callback=event_callback,
-            )
-        except Exception as e:
-            logger.warning(
-                "[practice] task=%s 知识点讲解生成失败(题目不受影响): %s",
-                task.id, e,
-            )
-
     logger.info(
-        "[practice] 出题结束 task=%s: 生成 %d 题, %d/%d 条 finding 未出题,"
-        " 知识点讲解更新 %d 条%s",
-        task.id, len(created), skipped, total_findings, explain_written,
+        "[practice] 出题结束 task=%s: 生成 %d 题, %d/%d 条 finding 未出题%s",
+        task.id, len(created), skipped, total_findings,
         f"(致命错误中止: {fatal_reason})" if fatal_reason else "",
     )
     if stopped_early:

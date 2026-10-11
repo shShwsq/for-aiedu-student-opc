@@ -301,6 +301,40 @@ class Question(Base):
     )
 
 
+class QuestionKnowledgePoint(Base):
+    """题目 ↔ 知识点 多对多关联(主关联 + 可选打标签)
+
+    Question.knowledge_point_id 仍为主关联(SM-2 唯一调度对象);本表记录该题
+    实际触及的全部知识点(主关联行 is_primary=true + 若干的标签行 false),
+    供按知识点聚合题目/展示标签。SM-2/错题统计不受标签影响(仍走主关联)。
+    新表随 Base.metadata.create_all 自动建好(无需列迁移)。
+    """
+
+    __tablename__ = "question_knowledge_points"
+    __table_args__ = (
+        UniqueConstraint("question_id", "knowledge_point_id", name="uq_question_kp"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("practice_questions.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    knowledge_point_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("knowledge_points.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # 是否主关联(与 Question.knowledge_point_id 一致);其余为标签
+    is_primary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class UserKnowledgeState(Base):
     """用户对单个知识点的 SM-2 记忆状态(遗忘曲线核心)
 
@@ -494,11 +528,6 @@ class PracticeSettings(Base):
         String(16), nullable=False,
         server_default=DEFAULT_THINKING_MODE, default=DEFAULT_THINKING_MODE,
     )
-    # 出题完成后是否顺带批量更新知识点讲解(默认关)
-    # 开启时一次 job 只多 1~2 次轻任务调用(按 ≤8 个知识点一批)
-    generate_explanation_with_questions: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default="false", default=False
-    )
     # 讲解专用模型(UserLLMConfig 中某条配置 id;None=沿用出题模型)
     # 讲解是轻任务,可以用比出题快/便宜的模型(思考类模型出题要 160s/条)
     explain_llm_config_id: Mapped[str | None] = mapped_column(
@@ -585,8 +614,7 @@ def migrate_practice_learning_columns() -> None:
     背景:项目用 Base.metadata.create_all(无 Alembic),已存在的表不会自动加新列。
     - practice_settings 加 learning_topic / restore_workspace_for_practice /
       default_llm_config_id / thinking_mode_for_practice / force_default_llm /
-      generate_explanation_with_questions / explain_llm_config_id /
-      generate_concurrency
+      explain_llm_config_id / generate_concurrency
     - knowledge_points 加 languages / learning_topic(加列时一次性回填:
       取该 KP 题目中最常见的非空 learning_topic,无题保持默认 'security')
       与讲解四列 explanation / explanation_source / explanation_model /
@@ -638,12 +666,6 @@ def migrate_practice_learning_columns() -> None:
                     "force_default_llm BOOLEAN NOT NULL DEFAULT false"
                 ))
                 log.info("practice_settings.force_default_llm 列迁移完成")
-            if "generate_explanation_with_questions" not in cols:
-                conn.execute(text(
-                    "ALTER TABLE practice_settings ADD COLUMN "
-                    "generate_explanation_with_questions BOOLEAN NOT NULL DEFAULT false"
-                ))
-                log.info("practice_settings.generate_explanation_with_questions 列迁移完成")
             if "explain_llm_config_id" not in cols:
                 conn.execute(text(
                     "ALTER TABLE practice_settings ADD COLUMN "
@@ -733,3 +755,35 @@ def migrate_practice_learning_columns() -> None:
             """))
             log.info("knowledge_points.learning_topic 存量回填完成(取题目主题众数)")
         conn.commit()
+
+
+def migrate_practice_drop_explain_with_questions_column() -> None:
+    """幂等删除 practice_settings.generate_explanation_with_questions 旧列
+
+    背景:「出题完成后顺带生成知识点讲解」的自动路径已整体废弃
+    (讲解改为仅看板按需生成 + 用户手工编辑)。列已从 ORM 模型移除,
+    create_all 不会删已存在表的列,故老库需显式 DROP。全新库/已迁过 → 直接返回。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("practice_settings"):
+            return
+        cols = {c["name"] for c in insp.get_columns("practice_settings")}
+        if "generate_explanation_with_questions" not in cols:
+            return  # 全新库(create_all 未建该列)或已删过
+        conn.execute(text(
+            "ALTER TABLE practice_settings DROP COLUMN generate_explanation_with_questions"
+        ))
+        conn.commit()
+    log.info(
+        "practice_settings.generate_explanation_with_questions 旧列已删除"
+        "(自动讲解路径废弃)"
+    )

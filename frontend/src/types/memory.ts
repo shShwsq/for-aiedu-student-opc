@@ -30,8 +30,6 @@ export interface UserPreferenceOut {
   force_default_llm: boolean
   /** 出题思考模式覆盖(follow=跟随模型配置/on=强制开/off=强制关,默认 follow) */
   thinking_mode_for_practice: PracticeThinkingMode
-  /** 出题完成后是否顺带批量更新知识点讲解(默认关) */
-  generate_explanation_with_questions: boolean
   /** 讲解专用模型(UserLLMConfig 配置 id;null=沿用出题/默认模型) */
   explain_llm_config_id: string | null
   /** 出题并发度(1=串行;2/4=并行逐条 finding,受厂商并发上限约束) */
@@ -63,10 +61,11 @@ export interface SaveUserPreferenceRequest {
  *
  * restore_workspace_for_practice / default_llm_config_id /
  * force_default_llm / thinking_mode_for_practice /
- * generate_explanation_with_questions / explain_llm_config_id /
+ * explain_llm_config_id /
  * generate_concurrency 可选,不传表示本次不修改(后端 None 语义);
  * *_llm_config_id 传空串表示清空(回退任务级/env 默认)。
- * (learning_topic 已移除:出题主题改为按发现内容自动匹配)
+ * (learning_topic 已移除:出题主题改为按发现内容自动匹配;
+ *  generate_explanation_with_questions 已废弃:知识点讲解改为仅看板按需生成)
  */
 export interface SavePracticeSettingsRequest {
   auto_generate_practice: boolean
@@ -74,7 +73,6 @@ export interface SavePracticeSettingsRequest {
   default_llm_config_id?: string | null
   force_default_llm?: boolean
   thinking_mode_for_practice?: PracticeThinkingMode
-  generate_explanation_with_questions?: boolean
   explain_llm_config_id?: string | null
   generate_concurrency?: number
 }

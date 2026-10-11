@@ -133,8 +133,6 @@ class UserPreferenceOut(BaseModel):
     force_default_llm: bool = False
     # 出题思考模式覆盖(follow=跟随模型配置/on=强制开/off=强制关,默认 follow)
     thinking_mode_for_practice: str = THINKING_MODE_FOLLOW
-    # 出题完成后是否顺带批量更新知识点讲解(默认关)
-    generate_explanation_with_questions: bool = False
     # 讲解专用模型(UserLLMConfig 配置 id;None=沿用出题/默认模型)
     explain_llm_config_id: str | None = None
     # 出题并发度(1=串行;2/4=并行,受厂商并发上限约束)
@@ -166,13 +164,12 @@ class SavePracticeSettingsRequest(BaseModel):
       None 表示本次不修改
     - thinking_mode_for_practice:出题思考模式覆盖(follow/on/off);
       None 表示本次不修改
-    - generate_explanation_with_questions:出题完成后是否顺带批量更新
-      知识点讲解;None 表示本次不修改
     - explain_llm_config_id:讲解专用模型配置 id;None 表示不修改,
       空串表示清空(回退出题/默认模型)
     - generate_concurrency:出题并发度(1-4);None 表示本次不修改
 
-    (learning_topic 已移除:出题主题现按发现内容自动匹配)
+    (learning_topic 已移除:出题主题现按发现内容自动匹配;
+     generate_explanation_with_questions 已废弃:知识点讲解改为仅看板按需生成)
     """
 
     auto_generate_practice: bool = True
@@ -184,7 +181,6 @@ class SavePracticeSettingsRequest(BaseModel):
         THINKING_MODE_ON,
         THINKING_MODE_OFF,
     ] | None = None
-    generate_explanation_with_questions: bool | None = None
     explain_llm_config_id: str | None = Field(default=None, max_length=36)
     generate_concurrency: int | None = Field(default=None, ge=1, le=4)
 

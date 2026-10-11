@@ -110,15 +110,16 @@ def save_practice_settings(
     db: Session = Depends(get_db),
 ) -> UserPreferenceOut:
     """保存/更新练习设置(自动生成开关 / 出题前恢复工作区 / 默认出题模型 / 思考模式 /
-    知识点讲解开关与模型 / 出题并发度)
+    讲解模型 / 出题并发度)
 
     存于 practice_settings 独立表(1:1),get_or_create:无行时自动创建。
     restore_workspace_for_practice / default_llm_config_id /
     force_default_llm / thinking_mode_for_practice /
-    generate_explanation_with_questions / explain_llm_config_id /
+    explain_llm_config_id /
     generate_concurrency 可选:传 None 表示不修改;
     *_llm_config_id 传空串表示清空。
-    (learning_topic 已移除:出题主题按发现内容自动匹配)
+    (learning_topic 已移除:出题主题按发现内容自动匹配;
+     generate_explanation_with_questions 已废弃:知识点讲解改为仅看板按需生成)
     """
     # 默认出题模型归属校验:必须是当前用户已保存的 LLM 配置
     if req.default_llm_config_id:
@@ -167,8 +168,6 @@ def save_practice_settings(
         row.force_default_llm = req.force_default_llm
     if req.thinking_mode_for_practice is not None:
         row.thinking_mode_for_practice = req.thinking_mode_for_practice
-    if req.generate_explanation_with_questions is not None:
-        row.generate_explanation_with_questions = req.generate_explanation_with_questions
     if req.explain_llm_config_id is not None:
         row.explain_llm_config_id = req.explain_llm_config_id or None
     if req.generate_concurrency is not None:
@@ -180,12 +179,11 @@ def save_practice_settings(
     logger.info(
         "用户 %s 更新练习设置: auto_generate_practice=%s "
         "restore_workspace=%s default_llm_config_id=%s force_default_llm=%s "
-        "thinking_mode=%s explain_with_questions=%s explain_llm_config_id=%s concurrency=%s",
+        "thinking_mode=%s explain_llm_config_id=%s concurrency=%s",
         current_user.id, req.auto_generate_practice,
         req.restore_workspace_for_practice,
         row.default_llm_config_id, row.force_default_llm,
         row.thinking_mode_for_practice,
-        row.generate_explanation_with_questions,
         row.explain_llm_config_id, row.generate_concurrency,
     )
     return _build_preference_out(db, current_user.id, settings_row=row)
@@ -549,9 +547,6 @@ def _build_preference_out(
         thinking_mode_for_practice=(
             settings_row.thinking_mode_for_practice
             if settings_row else DEFAULT_THINKING_MODE
-        ),
-        generate_explanation_with_questions=(
-            settings_row.generate_explanation_with_questions if settings_row else False
         ),
         explain_llm_config_id=(
             settings_row.explain_llm_config_id if settings_row else None

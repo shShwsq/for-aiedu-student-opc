@@ -133,6 +133,44 @@ MAX_REVIEW_ITEMS = 15
 MAX_KNOWLEDGE_POINTS = 12
 MAX_SUGGESTIONS = 5
 
+
+def _agent2_learning_topics(db, user_id):
+    """解析 agent2 归类知识点用的学习主题词表:返回 (valid_keys, default_key, prompt_text)。
+
+    有 db + 已登录 + PRACTICE_ENABLED 时取用户启用主题(ensure_user_topics 幂等播种,
+    只 flush 不 commit,事务由发射处的 commit 收口);否则回退内置四主题。
+    """
+    topic_defs = None
+    if db is not None and user_id is not None:
+        try:
+            from app.config import settings
+            if getattr(settings, "PRACTICE_ENABLED", True):
+                from app.models.practice import ensure_user_topics
+                rows = ensure_user_topics(db, user_id)
+                enabled = [t for t in rows if getattr(t, "enabled", True)]
+                if enabled:
+                    topic_defs = [
+                        {"key": t.key, "name": t.name, "description": t.description}
+                        for t in enabled
+                    ]
+        except Exception as e:  # 词表解析失败不阻断审查
+            logger.warning(f"[agent2] 解析学习主题词表失败(回退内置): {e}")
+    if not topic_defs:
+        from app.models.practice import BUILTIN_TOPIC_DEFS
+        topic_defs = [dict(d) for d in BUILTIN_TOPIC_DEFS]
+
+    keys = {d["key"] for d in topic_defs}
+    default_key = topic_defs[0]["key"] if topic_defs else "security"
+    lines = "\n".join(
+        f"- {d['key']}:{(d.get('name') or d['key'])}" for d in topic_defs
+    )
+    prompt_text = (
+        "## 学习主题词表(每条知识点必须归入其中之一)\n"
+        "调用 submit_knowledge_point 时,`learning_topic` 只能取下列 key 之一:\n"
+        f"{lines}"
+    )
+    return keys, default_key, prompt_text
+
 # ============================================================
 # 工具调用窗口构造(完整评估注入)
 # ============================================================
@@ -300,6 +338,12 @@ def run_agent2(
         _memory_section = build_agent2_memory_section(db, user_id, repo_url)
         if _memory_section:
             system_prompt = system_prompt + "\n\n" + _memory_section
+
+    # 学习主题词表:agent2 归类知识点(learning_topic 必填),
+    # 同时拿到校验集与默认主题交给发射处(非法/缺失回落 default)
+    _topic_keys, _default_topic, _topic_prompt = _agent2_learning_topics(db, user_id)
+    if _topic_prompt:
+        system_prompt = system_prompt + "\n\n" + _topic_prompt
 
     # 构造 user 消息:包含用户意图 + agent1 之前的所有摘要
     if not agent1_summaries:
@@ -599,7 +643,10 @@ def run_agent2(
                     except Exception as e:
                         logger.warning(f"[task={task_id}] 清理本轮临时 Result 失败(忽略): {e}")
                     emit_state["round_cleared_kp"] = True
-                payload = _persist_knowledge_point(db, task, round_idx, args)
+                payload = _persist_knowledge_point(
+                    db, task, round_idx, args,
+                    valid_topic_keys=_topic_keys, default_topic=_default_topic,
+                )
                 publish(task_id, "knowledge_point_add", payload)
                 emit_state["kp"] += 1
                 emit_state["emitted"] = True
@@ -1291,18 +1338,28 @@ def _persist_review_item(
 
 def _persist_knowledge_point(
     db: Session | None, task: Task | None, round_idx: int, args: dict[str, Any],
+    valid_topic_keys: set[str] | None = None,
+    default_topic: str = "security",
 ) -> dict[str, Any]:
-    """落 Result(知识点)→ 返回 payload。db/task 为空时只算 payload 不落库。"""
+    """落 Result(知识点)→ 返回 payload。db/task 为空时只算 payload 不落库。
+
+    learning_topic 必填并校验:命中启用主题直接用;非法/缺失回落 default_topic,
+    保证每条知识点都带一个合法主题(供后续出题继承)。
+    """
     title = (args.get("title") or "").strip() or "(未命名知识点)"
     content = args.get("content") or ""
+    raw_topic = str(args.get("learning_topic") or "").strip()
+    if raw_topic and (valid_topic_keys is None or raw_topic in valid_topic_keys):
+        topic = raw_topic
+    else:
+        topic = default_topic
     meta: dict[str, Any] = {
         "learning_note": args.get("learning_note") or "",
         "practice_worthy": bool(args.get("practice_worthy", True)),
+        "learning_topic": topic,
     }
     if args.get("source_review_item_id"):
         meta["source_review_item_id"] = str(args["source_review_item_id"])
-    if args.get("learning_topic_hint"):
-        meta["learning_topic_hint"] = str(args["learning_topic_hint"])
     rid = uuid4()
     payload = {
         "id": str(rid), "round_idx": round_idx, "title": title[:512],
