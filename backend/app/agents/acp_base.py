@@ -3240,7 +3240,7 @@ def run_acp_agent(
     if reused is None:
         if prewarm is None:
             # ---- 全新链路(未预热):走完整重建 ----
-            _set_stage(task, db, "正在启动 CLI 执行器(首次约 10~15 秒)…")
+            _set_stage(task, db, "AI助手启动中(首次约 10~15 秒)…")
 
             # ---- 准备 CLI 环境 ----
             _t0 = time.perf_counter()
@@ -3310,7 +3310,7 @@ def run_acp_agent(
                     bridge_protocol = int(bridge_health.get("bridge_protocol") or 1)
                 except (TypeError, ValueError):
                     bridge_protocol = 1
-            _set_stage(task, db, "CLI 已就绪,正在打开会话…")
+            _set_stage(task, db, "AI助手已就绪,正在开始…")
 
         # ---- ACP 通信 ----
         recorder = _ACPRecorder(task.id, round_idx)

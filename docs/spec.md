@@ -618,7 +618,7 @@ Result(任务结果项,通用)
 - 凭证注入:从 `user_agent_configs` 加载用户保存的 CLI token,注入沙箱环境变量
 - **bridge 驻留复用**:每任务的 bridge + ACP session 缓存在 `_bridge_cache`,追问/续跑命中时跳过「启 CLI 环境 → 起 bridge → initialize → session/new」重建链路(实测:命中时 `acp_enter→prompt_send` 只剩 0.2~0.3s,未命中 median ≈12.5s / max 20.4s),CLI 侧对话上下文随 session 延续;沙箱重建/agent 类型或启动指纹变化/健康检查不过则降级全新链路(失效判定与回收见 agent 架构文档 §4.3)
 - **CLI 冷启动预热(与预克隆重叠)**:冷启动链路里不依赖仓库内容的那几段(准备 CLI 环境 → git 凭证注入 → 起 bridge → 等就绪 → initialize)由 `app/agents/acp_prewarm.py` 在**预克隆窗口(实测 24~235s)内**用后台线程同时做完;执行阶段 `run_acp_agent` 按同一启动指纹认领,认领不到(没预热/预热失败/超预算/指纹不符)就自己走全串行——预热只是加速器,不是依赖。只剩 `session/new`(≈6s)留在克隆之后(它的 cwd 必须指向已存在的仓库目录,且 cwd 口径决定会话能不能恢复)。仅 sandbox 模式 + 名单内 executor(默认 `qoder_cli`,无 wrapper 钩子)生效,`ACP_PREWARM_ENABLED=false` 一键回退;预热线程不持有 ORM Session(db 非线程安全,凭证与 git token 由主线程取好递入),未被认领的 bridge 在克隆失败/跳过、会话关闭、任务删除路径上都会被停掉。命令层跨线程并发的前提由 `backend/scripts/smoke_sandbox_concurrency.py` 在真实 Server 上实测
-- **阶段反馈**:冷启动期间推 `current_stage`(「正在启动 CLI 执行器(首次约 10~15 秒)…」→「CLI 已就绪,正在打开会话…」),避免十余秒空白看着像卡死;前端无需改动(已渲染 `current_stage`)
+- **阶段反馈**:冷启动期间推 `current_stage`(「AI助手启动中(首次约 10~15 秒)…」→「AI助手已就绪,正在开始…」),避免十余秒空白看着像卡死;文案面向用户,不暴露 CLI/会话等内部实现;前端无需改动(已渲染 `current_stage`)
 - **local 模式**:仅当 `SANDBOX_LOCAL_ALLOW_CLI=true`(默认开)时允许跑外部 CLI,bridge/CLI 直接跑在宿主机(无隔离边界,仅开发调试)
 - **挂死/崩溃兜底**:prompt 期间按活动工具状态分级 idle 超时;CLI 崩溃或连接中断走同款善后——用已累积输出收尾本轮并在 summary 标注"本轮提前终止",不把崩溃当正常完成、不 fail 任务
 
