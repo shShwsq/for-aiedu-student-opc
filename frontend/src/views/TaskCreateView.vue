@@ -23,7 +23,7 @@ import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import ModelCombobox from '@/components/ModelCombobox.vue'
 import BaseSelect from '@/components/BaseSelect.vue'
 import BrandLogo from '@/components/BrandLogo.vue'
-import { createTask, getScenarios } from '@/api/task'
+import { createTask, getScenarios, polishPrompt } from '@/api/task'
 import { uploadTaskFile, type UploadResult } from '@/api/uploads'
 import { getMyModels } from '@/api/model_configs'
 import { getAgentConfigs } from '@/api/agent_configs'
@@ -34,7 +34,7 @@ import {
 import { getSkills, type SkillSummary } from '@/api/skill'
 import { getPreferences } from '@/api/memory'
 import { extractErrorMessage } from '@/utils/error'
-import type { Scenario } from '@/types/task'
+import type { PromptTemplate, Scenario } from '@/types/task'
 import type { LLMConfigItemOut } from '@/types/model_configs'
 import type { AgentConfigOut } from '@/types/agent_configs'
 import type { GitProvider, GitRepoItem } from '@/types/git_provider'
@@ -62,6 +62,23 @@ const selectedScenario = ref('')
 const selectedScenarioDecl = computed<Scenario | null>(() =>
   scenarios.value.find((s) => s.id === selectedScenario.value) ?? null,
 )
+
+/**
+ * 当前场景的维度提示词模板(可选)
+ *
+ * 场景仍为降级模板;模板只是创建页的快捷预填文案,不绑定智能体行为。
+ * 用 userInput 是否等于模板 prompt 判定选中态(用户一改即自动取消高亮)。
+ */
+const scenarioPromptTemplates = computed<PromptTemplate[]>(
+  () => selectedScenarioDecl.value?.prompt_templates ?? [],
+)
+
+function applyTemplate(t: PromptTemplate): void {
+  userInput.value = t.prompt
+}
+
+/** AI 润色进行中标志 */
+const polishing = ref(false)
 
 // ---- 模型列表 ----
 
@@ -723,6 +740,31 @@ function onTextareaKeydown(e: KeyboardEvent): void {
 }
 
 // ---- 提交 ----
+
+/**
+ * AI 润色:调后端把当前输入改写得更清晰,成功后回填输入框。
+ * 不改变原意/范围(后端提示词已约束);失败仅提示,不阻断提交。
+ */
+async function handlePolishPrompt(): Promise<void> {
+  const text = userInput.value.trim()
+  if (!text || polishing.value) return
+  polishing.value = true
+  error.value = ''
+  try {
+    const res = await polishPrompt({
+      text,
+      scenario: selectedScenario.value || undefined,
+    })
+    if (res.polished && res.polished.trim()) {
+      userInput.value = res.polished
+    }
+  } catch (err: unknown) {
+    error.value = `润色失败:${extractErrorMessage(err)}`
+  } finally {
+    polishing.value = false
+    nextTick(autoResize)
+  }
+}
 
 async function handleSubmit(): Promise<void> {
   error.value = ''
@@ -1405,6 +1447,25 @@ onUnmounted(() => {
             <!-- 分隔线 -->
             <div class="chat-divider" />
   
+            <!-- 维度模板(场景内可选,点一下预填输入框) -->
+            <div
+              v-if="scenarioPromptTemplates.length"
+              class="template-chips"
+              role="group"
+              aria-label="维度提示词模板"
+            >
+              <button
+                v-for="t in scenarioPromptTemplates"
+                :key="t.id"
+                type="button"
+                class="template-chip"
+                :class="{ active: userInput === t.prompt }"
+                @click="applyTemplate(t)"
+              >
+                {{ t.label }}
+              </button>
+            </div>
+  
             <!-- 主体:大 textarea -->
             <textarea
               ref="textareaRef"
@@ -1415,6 +1476,20 @@ onUnmounted(() => {
               data-onboarding="create-input"
               @keydown="onTextareaKeydown"
             />
+  
+            <!-- 输入工具栏:AI 润色 -->
+            <div class="input-toolbar">
+              <button
+                type="button"
+                class="polish-btn"
+                :disabled="polishing || !userInput.trim()"
+                :title="polishing ? '润色中…' : '用 AI 把描述改得更清晰(保持原意与范围)'"
+                @click="handlePolishPrompt"
+              >
+                <span v-if="polishing" class="polish-spinner" aria-hidden="true" />
+                {{ polishing ? '润色中…' : 'AI 润色' }}
+              </button>
+            </div>
   
             <!-- 分隔线 -->
             <div class="chat-divider" />
@@ -1905,6 +1980,89 @@ onUnmounted(() => {
 
 .chat-input::placeholder {
   color: var(--color-text-muted);
+}
+
+/* ---- 维度模板 chips(场景内快捷预填) ---- */
+.template-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.template-chip {
+  padding: 3px 12px;
+  font-size: var(--fs-sm);
+  font-family: var(--font-sans);
+  color: var(--color-text-muted);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition:
+    color var(--transition-fast),
+    border-color var(--transition-fast),
+    background var(--transition-fast);
+}
+
+.template-chip:hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.template-chip.active {
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  border-color: var(--color-primary);
+}
+
+/* ---- 输入工具栏:AI 润色 ---- */
+.input-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.polish-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: var(--fs-sm);
+  font-family: var(--font-sans);
+  color: var(--color-text-muted);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition:
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.polish-btn:not(:disabled):hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.polish-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.polish-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: polish-spin 0.7s linear infinite;
+}
+
+@keyframes polish-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* ---- 任务标题输入(可选) ---- */

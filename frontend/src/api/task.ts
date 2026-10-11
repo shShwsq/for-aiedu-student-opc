@@ -30,6 +30,18 @@ export function getScenarios(): Promise<Scenario[]> {
 }
 
 /**
+ * AI 润色:把任务描述改写得更清晰、结构化(POST /tasks/polish_prompt)
+ *
+ * 返回 polished 纯文本,供输入框直接回填;scenario 仅作背景提示。
+ */
+export function polishPrompt(req: {
+  text: string
+  scenario?: string
+}): Promise<{ polished: string }> {
+  return client.post('/tasks/polish_prompt', req).then((r) => r.data)
+}
+
+/**
  * 列出当前用户可见的任务(自己的 + 匿名的)
  *
  * 用于侧栏历史任务列表。按创建时间倒序。

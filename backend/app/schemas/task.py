@@ -216,11 +216,20 @@ class TaskCreateResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PromptTemplateInfo(BaseModel):
+    """场景内维度提示词模板(创建页一点即预填输入框)"""
+
+    id: str
+    label: str
+    prompt: str
+
+
 class ScenarioInfo(BaseModel):
     """场景模板信息(给前端展示用)
 
-    场景降级后:仅提供预设提示词 + 推荐 skill,不再驱动表单/分组/覆盖度。
-    前端用 preset_prompt 预填输入框,用 recommended_skills 默认勾选 skill。
+    场景降级后:仅提供预设提示词 + 推荐 skill(+ 可选的维度提示词模板),
+    不再驱动表单/分组/覆盖度。前端用 preset_prompt 预填输入框,
+    用 recommended_skills 默认勾选 skill,用 prompt_templates 渲染维度 chip。
     """
 
     id: str
@@ -228,6 +237,23 @@ class ScenarioInfo(BaseModel):
     description: str = ""
     preset_prompt: str = ""
     recommended_skills: list[str] = []
+    prompt_templates: list[PromptTemplateInfo] = []
+
+
+class PolishPromptRequest(BaseModel):
+    """AI 润色请求(POST /tasks/polish_prompt)
+
+    text: 待润色的任务描述;scenario: 当前选中场景 id(可选,仅作背景提示)。
+    """
+
+    text: str
+    scenario: str | None = None
+
+
+class PolishPromptResponse(BaseModel):
+    """润色结果:直接回填输入框的纯文本。"""
+
+    polished: str
 
 
 # ============================================================

@@ -133,3 +133,13 @@ def test_review_prompt_material_wording_generalized():
     assert "文书审核任务" in AGENT2_REVIEW_PROMPT
     # 旧的纯代码措辞已移除
     assert "真实源码依据" not in AGENT2_REVIEW_PROMPT
+
+
+def test_review_prompt_has_architecture_and_scope_broadening():
+    """代码审查维度含「架构设计」,并要求主动拓宽过窄的用户范围。
+
+    老师反馈:常用维度应补上架构设计(OPC 缺架构师);用户只问部分维度时,
+    agent2 应在审查计划里补上未提及的标准维度(以 domain_baseline 体现)。
+    """
+    assert "架构设计" in AGENT2_REVIEW_PROMPT
+    assert "主动拓宽过窄的用户范围" in AGENT2_REVIEW_PROMPT

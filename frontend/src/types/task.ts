@@ -33,6 +33,15 @@ export interface Scenario {
   preset_prompt?: string
   /** 推荐使用的 skill 列表(展示给用户参考,不强制) */
   recommended_skills?: string[]
+  /** 场景内维度提示词模板(可选):点一下预填输入框,不改变场景行为 */
+  prompt_templates?: PromptTemplate[]
+}
+
+/** 场景内维度提示词模板 */
+export interface PromptTemplate {
+  id: string
+  label: string
+  prompt: string
 }
 
 /** 提交任务请求(后端 TaskCreateRequest) */

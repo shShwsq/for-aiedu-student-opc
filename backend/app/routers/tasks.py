@@ -63,13 +63,15 @@ from app.review_stop import (
     clear_review_stop_state,
     request_stop as request_review_stop,
 )
-from app.scenarios.base import list_scenarios
+from app.scenarios.base import get_scenario, list_scenarios
 from app.schemas.task import (
     ScenarioInfo,
     SendMessageRequest,
     CommandConfirmRequest,
     CommandConfirmResponse,
     MessageWithdrawResponse,
+    PolishPromptRequest,
+    PolishPromptResponse,
     SendMessageResponse,
     TaskCreateRequest,
     TaskCreateResponse,
@@ -83,6 +85,10 @@ from app.schemas.task import (
 )
 from app.schemas.task_artifact import TaskArtifactOut
 from app.config import settings
+from app.services.prompt_polish import (
+    MAX_POLISH_INPUT_CHARS,
+    polish_prompt as run_prompt_polish,
+)
 from app.services.uploads import (
     UploadError,
     load_upload_meta,
@@ -106,6 +112,36 @@ router = APIRouter(tags=["tasks"])
 def list_all_scenarios() -> list[dict[str, Any]]:
     """列出所有可用场景(含前端声明:表单字段/结果分组/meta字段/覆盖度看板)"""
     return list_scenarios()
+
+
+@router.post("/tasks/polish_prompt", response_model=PolishPromptResponse)
+def polish_task_prompt(req: PolishPromptRequest) -> PolishPromptResponse:
+    """AI 润色:把用户的任务描述改写得更清晰、结构化,直接回填输入框。
+
+    轻量单轮调用(env 默认模型),不落库、不建任务;LLM 异常转 502,
+    返回为空时回退原文。scenario 仅作背景提示,不据此扩展用户未提出的维度。
+    """
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="待润色内容为空",
+        )
+    scenario_name: str | None = None
+    if req.scenario:
+        try:
+            scenario_name = get_scenario(req.scenario).name
+        except ValueError:
+            scenario_name = None
+    try:
+        polished = run_prompt_polish(text[:MAX_POLISH_INPUT_CHARS], scenario_name)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("prompt 润色调用失败: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="润色服务暂时不可用,请稍后再试",
+        )
+    return PolishPromptResponse(polished=polished or text)
 
 
 @router.get("/tasks", response_model=list[TaskListItem])

@@ -39,6 +39,17 @@ class ScenarioTemplate(Protocol):
         """
         ...
 
+    @property
+    def prompt_templates(self) -> list[dict[str, str]]:
+        """场景内可选的维度提示词模板(可选,默认无)
+
+        一个场景仍可保留单一 preset_prompt 作默认,但额外提供若干「维度模板」
+        供用户在创建页一点即预填输入框(如代码分代码质量/安全性/架构设计,
+        文书分合同/商业计划书/需求文档)。每项为 {id, label, prompt}。
+        模板只是快捷预填文案,不改变场景/智能体行为(场景保持降级)。
+        """
+        ...
+
 
 # 场景别名:旧场景 id → 现行场景 id。
 # 场景合并/更名后,老任务记录里仍存旧 id(agent_policy 场景匹配、
@@ -86,6 +97,7 @@ def list_scenarios() -> list[dict[str, Any]]:
             "description": _get_attr(s, "description", ""),
             "preset_prompt": _get_attr(s, "preset_prompt", ""),
             "recommended_skills": _get_attr(s, "recommended_skills", []),
+            "prompt_templates": _get_attr(s, "prompt_templates", []),
         })
     return result
 
