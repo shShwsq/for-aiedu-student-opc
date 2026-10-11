@@ -242,12 +242,19 @@ RoundGroup { roundIdx, segments, planSteps }
 
 ```
 ┌───────────────────────────────────┐
-│ 审查结果                          │
+│ 审查结果 (12)                     │
 └───────────────────────────────────┘
 ```
 
-- 标题 = **当前段名**(概览 / 核查过程 / 审查结果 / 重点与知识点),取 `activeSectionLabel`;
-  标题行**不放任何控件**——收起在 rail(再点当前段),状态徽标与导出在 rail 底部;
+- 标题 = **当前段名 + 该段规模**(如「审查结果 (12)」):段名取 `activeSectionLabel`,
+  计数取 `activeSectionCount`(审查结果 = `reviewItems.length`,重点与知识点 =
+  `task.results.length`,与段内卡片同源;概览是混合区块不给计数,核查过程的时间线
+  条数不是用户要的“规模”也不给;0 不显示,空态交给段内 empty hint);
+- 标题是 **`<h2>` 而不是 `<span>`**:段名从段内 h2 上移过来后,段内正文仍有 h3(分档
+  头)/ h4(卡片标题),需要一个段级标题做它们的父级;这一行也就是 `#detail-panel`
+  这个 `role="region"` 内唯一的可见标题(区名由 `aria-label` 另行交代);
+- 标题行**不放控件**——收起在 rail(再点当前段),状态徽标与导出在 rail 底部;
+  也不放临时结果提示与段内动作(它们留在段内首行,见 §5.3);
 - 栏级总名「核查与结果」不再钉在标题行:它对「正在看哪一段」零信息量,而原先跟在后面的
   那个小段名标签才是有信息量的,两者合并成一个(总名仍保留在 rail 的 `aria-label`
   「核查与结果分段」与新手引导措辞里,不作为面板标题)。
@@ -305,8 +312,10 @@ RoundGroup { roundIdx, segments, planSteps }
 `utils/reviewBucket.bucketizeReviewItems` 三分(发现风险 / 已核查·剔除误报 /
 缺口·待改进),每档下紧凑卡片(标题 + 置信档位/分数 + 来源/严重度),点击开
 `DetailCardDrawer` 看正文与证据;置信度由后端核验证据引用后派生,模型不自报。
-标题行的临时提示随 review_status 分流:running →「检查助手核查中」(审查项边核边落)。
-有建议追问时,标题行下方给一条「N 条建议追问 · 去概览」跳转(`sidebar-jump`)——
+**段内不再有「审查结果 (N)」同名 h2**(段名与计数已上移标题行,见 §5.2),
+只剩一条 `sidebar-section-status` 状态行,且仅在 running 时渲染(「检查助手核查中」,
+审查项边核边落);完成态卡片直接顶到标题行下。
+有建议追问时,状态行下方给一条「N 条建议追问 · 去概览」跳转(`sidebar-jump`)——
 建议卡在概览段,不提醒会明显降低这个 resume 入口的可达性。
 
 #### 段 4:重点与知识点
@@ -315,11 +324,13 @@ RoundGroup { roundIdx, segments, planSteps }
    3-8 条精选知识点(老任务为全量发现,兼容);含 `learning_note` 的卡片
    带"值得学"徽标,展开时正文上方显示学习点引用块;按 `task.params._grouping`
    动态分组(如按严重度,老任务);文件类 meta 标签可点击打开左侧工作区文件。
-   标题行的临时结果提示随 review_status 分流:running →「检查助手整理中」
+   段内首行(`sidebar-section-status`,**不再重复段名**,计数在标题行)只承担临时结果
+   提示与出题入口:提示随 review_status 分流,running →「检查助手整理中」
    (呼吸点,完成后自动更新),stopped →「检查已终止」(静止中性点:临时结果
    就是最终结果,不再等知识点替换;failed 不在这里另开提示,核查过程段 badge「检查失败」已说明)。
-   段内还包含练习题入口(`practice-generate-btn` / 待确认候选题计数)与出题进度
-   跳转(`gen-progress-entry`),它们作用于知识点,因此跟知识点段走,不在审查结果段。
+   入口为练习题(`practice-generate-btn`,待确认候选题计数时文案换成「确认练习题(N)」)
+   与出题进度跳转(`gen-progress-entry`,与前者互斥),它们作用于知识点,因此跟知识点段走,
+   不在审查结果段。三者全部不成立时(`showKnowledgeToolbar`)整行不渲染。
 
 > 历史说明:覆盖度看板(task.checklist 驱动的维度卡片网格)已随覆盖度清单功能移除。
 
@@ -461,7 +472,7 @@ step 组折叠策略、工具行四种渲染类型。
 
 | 旧结构 | 新结构 |
 |---|---|
-| 标题行 = 总标题「核查与结果」+ 小段名标签 + `WorkspaceToggleButton`(收起为分段栏) | 标题行 = **当前段名**一个纯文本,无控件 |
+| 标题行 = 总标题「核查与结果」+ 小段名标签 + `WorkspaceToggleButton`(收起为分段栏) | 标题行 = **当前段名**一个纯文本,无控件(现进一步演为段名 + 计数的 `<h2>`,以 §12 为准) |
 | 收起有两条鼠标路径(标题行按钮 / 再点当前段按钮),是 §10「三套展开入口收敛为 rail 四个 disclosure」之后漏网的第四个入口 | 收起只剩 rail 当前段按钮一条鼠标路径(`title`/`aria-label` 带「再次点击收起」补足可发现性) |
 | 栏级总名占着标题行主位,段名退为附属小标签 | 段名上位成标题(`activeSectionLabel`);栏级总名退到 rail `aria-label` 与引导/帮助文案 |
 
@@ -480,3 +491,45 @@ agent2 提示词里的指称不变),左侧历史任务栏在 `AppHeader` 里的 
    把同一处理器挂到 `<aside class="detail-sidebar">` 上即可。
 4. 引导步骤 `detail-rail` 早已写明「再点一下当前段就收起」,本次改动后它成了唯一路径,
    文案无需改。
+
+## 12. 段名不再一处两遍:标题行扛段名与计数(本次改动)
+
+§11 把段名提为标题后,与段内原有的同名 `<h2>` 撞成字面重复(审查结果 / 重点与知识点
+两处各读一遍)。**该重复在 §11 之前就已存在**(当时以 `.detail-sidebar-section` 小标签
+的形式与段内 h2 并存),§11 只是把它从重音提到了标题级——所以回退 §11 并不是解法。
+
+职责划分:**标题行管身份与规模,段内首行管状态与动作,rail 管导航。**
+
+| 旧结构 | 新结构 |
+|---|---|
+| 标题行「审查结果」+ 段内 `<h2>审查结果 (N)</h2>` | 标题行 `<h2>审查结果 (N)</h2>`;段内同名 h2 删除,仅 running 时留一条 `sidebar-section-status` 状态行 |
+| 标题行「重点与知识点」+ 段内 `<h2>重点与知识点 (N)</h2>` + 提示 + 出题入口 | 计数上提标题行;段内行降为 `div.sidebar-section-status`,只留临时结果提示 + 出题入口,且由 `showKnowledgeToolbar` gate（临时结果提示与出题入口两类都不出现时整行不渲染） |
+| 标题是 `<span>`,段内 h2 才是真标题 | 标题行用 `<h2>`:段内仍有 h3/h4,需要段级标题做父级,否则 `#detail-panel` 干脆没标题 |
+| 空态文案「暂无重点与知识点」重申一遍段名 | 「任务收尾时由检查助手提炼学习点」 |
+| 段名/计数只能随正文滚走 | 标题行不滚（`flex-shrink: 0`），段名与规模在滚动期间常驻可见 |
+
+保留不变:概览段无自名标题(正文开头是任务清单/动态验证/建议追问方向),所以标题行
+对它是唯一身份来源——这也是不能反过来删标题行留段内 h2 的原因;核查过程段的
+`Agent2Panel` 标题「检查助手核查」**不改**:它点名的是行为主体(带状态 badge 与
+「终止检查」按钮),与段名「核查过程」不是字面重复,且 help.md 里「点『检查助手核查』
+标题行的『终止检查』」就靠它定位;`v-show` 切段、面板 `role="region"` + `aria-label`、
+审查结果段的「去概览」跳转与模型提示段落位置。
+
+实现要点(供代码改动参考):
+
+1. 新增 `activeSectionCount`(与段内卡片同一数据源,不在模板里直写 `reviewItems.length`
+   以便“哪些段有计数”这件事只有一处口径);定义位置紧跟 `activeSectionLabel`,
+   它引用的 `reviewItems` 在其后声明——computed 懒执行,不会踩 TDZ(先例
+   `sectionBadge` 同样如此)。
+2. 段内行用 `div.sidebar-section-status` 而非标题元素(它已不是标题),因此
+   `.sidebar-results h2` 这条 CSS 是死规则,直接替换掉(原「重点与知识点」分区标题注释
+   一并换);行内 margin 不能简单归零——外层 `.sidebar-panel` 是 flex(gap 只作用于
+   section 之间),section 内部是普通块流,**垂直 margin 会折叠**:`margin-bottom:
+   var(--space-2)` 与相邻块的 margin 叠加后取最大值,因此审查结果分档头与知识点分组头
+   的间距与改前一致,仅「本次出题将使用」提示紧 4px。
+3. `.practice-generate-btn` / `.gen-progress-entry` 都带 `margin-left: auto`,靠的是
+   父行 flex:改成 `div` 后仍是 flex,动作按钮依旧靠最右——不需要动它们的样式。
+4. 本仓无 `@vue/test-utils`(devDependencies 里没有,现有 20 个 spec 全部是
+   纯函数/composable),所以本轮改动靠 `vue-tsc --noEmit` + `vite build` +
+   全量单测回归,没有新增组件级断言。若要覆盖 `showKnowledgeToolbar` / `activeSectionCount`,
+   得先把它们抽成 `utils/` 里的纯函数(与 `utils/reviewBucket` 同族口径)再写单测。

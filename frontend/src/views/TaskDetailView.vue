@@ -287,6 +287,23 @@ const activeSectionLabel = computed<string>(() =>
   SIDEBAR_SECTIONS.find((s) => s.key === activeSection.value)?.label ?? '核查与结果',
 )
 
+/**
+ * 标题行跟随的计数:段名上移到标题行后,段内原来的同名 h2 只剩「(N) + 状态」,
+ * 于是把计数一并接到标题上,段内那一行收敛为纯状态/动作。
+ * 概览是混合区块(任务清单/动态验证/建议追问),没有单一计数;核查过程的时间线
+ * 条数不是用户关心的“规模”,也不给。0 不显示——空态由段内 empty hint 交代。
+ */
+const activeSectionCount = computed<number>(() => {
+  switch (activeSection.value) {
+    case 'findings':
+      return reviewItems.value.length
+    case 'knowledge':
+      return task.value?.results.length ?? 0
+    default:
+      return 0
+  }
+})
+
 /** rail 各段角标数值(核查过程走呼吸点,恒为 0) */
 const sectionBadge = computed<Record<SidebarSectionKey, number>>(() => ({
   overview: suggestions.value.length,
@@ -2853,6 +2870,22 @@ function openPracticeGenerate(): void {
   void refreshGenerateModel()
   practiceDialogOpen.value = true
 }
+
+/**
+ * 「重点与知识点」段内首行是否要渲染。段名与计数已上移到面板标题行,这一行
+ * 只剩两类内容:临时结果提示(running / stopped)与出题入口(进行中的 job,
+ * 或完成后的出题按钮)——两类都不出现时整行消失,卡片直接顶到标题下。
+ */
+const showKnowledgeToolbar = computed<boolean>(() => {
+  const t = task.value
+  if (!t) return false
+  return (
+    t.review_status === 'running' ||
+    t.review_status === 'stopped' ||
+    !!runningGenJob.value ||
+    (t.status === 'completed' && practiceEnabled.value)
+  )
+})
 </script>
 
 <template>
@@ -3326,11 +3359,14 @@ function openPracticeGenerate(): void {
         @keydown="onDetailResizeKeydown"
       />
       <div class="detail-sidebar-header">
-        <!-- 标题就是当前段名:栏级总名「核查与结果」钉在这里对「正在看哪一段」零信息量,
-             而段名原本以一个小标签跟在后面——两处交代合并成一处,标题行不留控件
-             (收起在 rail:再点当前段即收起,按钮 tooltip 已写明)。
-             状态徽标与下载/打印也不在这里(它们随 rail 常驻,收起态也要能用) -->
-        <span class="detail-sidebar-title">{{ activeSectionLabel }}</span>
+        <!-- 标题 = 当前段名 + 该段规模。用 h2 而不是 span:段内正文有 h3/h4,
+             需要一个段级标题做父级——段内那个同名 h2 删掉后,这一行就是本 region 唯一标题
+             (栏级总名「核查与结果」不钉在这里:它对「正在看哪一段」零信息量)。
+             状态徽标与下载/打印不在这里(它们随 rail 常驻,收起态也要能用) -->
+        <h2 class="detail-sidebar-title">
+          {{ activeSectionLabel }}
+          <span v-if="activeSectionCount > 0" class="count">({{ activeSectionCount }})</span>
+        </h2>
       </div>
       <div
         id="detail-panel"
@@ -3447,10 +3483,10 @@ function openPracticeGenerate(): void {
         <div v-show="activeSection === 'findings'" class="sidebar-panel">
           <!-- 审查结果(ReviewItem):紧凑卡片,点击开 drawer -->
           <section v-if="hasReviewResults" class="sidebar-review" data-onboarding="detail-review">
-            <h2>
-              审查结果 <span class="count">({{ reviewItems.length }})</span>
-              <span v-if="task.review_status === 'running'" class="review-interim-hint">检查助手核查中</span>
-            </h2>
+            <!-- 段名与计数在面板标题行,这里只留核查进行中的状态行 -->
+            <p v-if="task.review_status === 'running'" class="sidebar-section-status">
+              <span class="review-interim-hint">检查助手核查中</span>
+            </p>
             <!-- 建议卡在「概览」段:从这里给一条跳转,别让用户找不到追问入口 -->
             <button
               v-if="suggestions.length > 0"
@@ -3499,8 +3535,7 @@ function openPracticeGenerate(): void {
             class="sidebar-results"
             data-onboarding="detail-results"
           >
-            <h2>
-              重点与知识点 <span class="count">({{ task.results.length }})</span>
+            <div v-if="showKnowledgeToolbar" class="sidebar-section-status">
               <span
                 v-if="task.review_status === 'running'"
                 class="review-interim-hint"
@@ -3531,7 +3566,7 @@ function openPracticeGenerate(): void {
                 :title="pendingDraftCount > 0 ? '存在待确认的候选题,点击预览入库' : '把审计发现改编为自适应练习题'"
                 @click="openPracticeGenerate"
               >{{ pendingDraftCount > 0 ? `确认练习题(${pendingDraftCount})` : '生成练习题' }}</button>
-            </h2>
+            </div>
             <p v-if="generateModelInfo && task.status === 'completed' && practiceEnabled" class="generate-model-hint">
               本次出题将使用：<strong class="generate-model-name">{{ generateModelInfo.model }}</strong>
               <span class="generate-model-source">（{{ generateModelSourceLabel }}）</span>
@@ -3571,7 +3606,7 @@ function openPracticeGenerate(): void {
               </div>
             </template>
           </section>
-          <p v-else class="panel-empty-hint">暂无重点与知识点</p>
+          <p v-else class="panel-empty-hint">任务收尾时由检查助手提炼学习点</p>
         </div>
       </div>
     </aside>
@@ -4404,14 +4439,20 @@ function openPracticeGenerate(): void {
   margin-bottom: var(--space-6);
 }
 
-/* 右侧栏分区标题("重点与知识点"区块;原"覆盖度"区块已随覆盖度清单功能移除) */
-.sidebar-results h2 {
+/* 段内首行:段名与计数已上移到面板标题行,这里只留临时结果提示与该段动作
+   (生成练习题 / 出题进度)。行本身无可渲染内容时整行不渲染,不留空行;
+   行间距靠下方区块自己的 margin 给,此处只补一个最小值避免贴脸 */
+.sidebar-section-status {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  margin-bottom: var(--space-3);
-  font-size: var(--fs-base);
-  font-weight: var(--fw-semibold);
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-xs);
+}
+
+/* 状态点原来寄生在段名标题里,margin-left 是用来跟标题文字拉开距离的;独立成行后不需要 */
+.sidebar-section-status .review-interim-hint {
+  margin-left: 0;
 }
 
 /* 结果清单标题旁的「生成练习题」入口(仅任务完成后可用) */
