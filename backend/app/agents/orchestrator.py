@@ -1306,6 +1306,61 @@ def _load_git_tokens(db: Session, user_id) -> dict[str, str]:
 # ============================================================
 
 
+def _prewarm_cli_runtime(
+    task: Task, db: Session, task_id_str: str, git_tokens: dict | None,
+) -> None:
+    """提前把 CLI 执行器运行时热起来(与预克隆重叠),尽力而为
+
+    冷启动链路(环境准备 → git 凭证注入 → 起 bridge → 等就绪 → initialize)实测
+    median ≈12.5s,全程串行排在预克隆(24~235s)之后 —— 这些步骤都不依赖仓库内容,
+    可以在克隆的同时做完;只剩 session/new(≈6s)必须等克隆结束(cwd 要指向仓库)。
+    执行阶段 run_acp_agent 按同一指纹认领,认领不到就自己走全串行,所以本函数
+    任何失败只记日志,不影响任务启动。
+
+    db 只在本函数(主线程)用:取凭证 + 解密 git token。SQLAlchemy Session 非线程
+    安全,预热线程不持有它(见 app/agents/acp_prewarm 模块 docstring)。
+    """
+    from app.agents import acp_prewarm
+    from app.agents.acp_base import (
+        _bridge_fingerprint,
+        _build_credential_envs,
+        _get_acp_args,
+        _load_credentials,
+    )
+
+    agent_type = (task.executor or "").strip().lower()
+    if not acp_prewarm.should_prewarm(agent_type):
+        return
+    try:
+        # 会话已在本函数之前预建(带 bare 缓存挂载),这里只取句柄
+        ctx = sandbox_tools._get_or_create_session(task_id_str)
+        credentials = _load_credentials(db, task.user_id, agent_type)
+        credential_envs = _build_credential_envs(credentials, agent_type)
+        if not credential_envs:
+            # 无凭证:执行阶段本来就会报错,不必预热,也不在这里抢跑错误
+            logger.debug(f"[task={task.id}] {agent_type} 无可用凭证,跳过预热")
+            return
+        # 与 run_acp_agent 完全同口径(不带 extra_args),否则指纹对不上
+        acp_args = _get_acp_args(task, agent_type)
+        fingerprint = _bridge_fingerprint(acp_args, credential_envs)
+        acp_prewarm.prewarm_agent_runtime(
+            task_id=task_id_str,
+            session=ctx["session"],
+            ctx=ctx,
+            agent_type=agent_type,
+            fingerprint=fingerprint,
+            acp_args=acp_args,
+            credential_envs=credential_envs,
+            git_tokens=git_tokens or {},
+        )
+        logger.info(f"[task={task.id}] CLI 运行时预热已启动: {agent_type}")
+    except Exception as e:
+        logger.warning(
+            f"[task={task.id}] CLI 预热启动失败(忽略,执行阶段按原串行链路跑): "
+            f"{type(e).__name__}: {e}"
+        )
+
+
 def _prepare_repo_context(
     task: Task, db: Session, task_id_str: str, git_tokens: dict | None = None,
 ) -> tuple[str | None, str]:
@@ -1348,6 +1403,10 @@ def _prepare_repo_context(
     # CLI 执行器:把可见且允许的 skill 物化进容器(内置 react_agent 跳过)
     _write_skill_files_for_task(task, task_id_str)
 
+    # CLI 执行器预热:上面的文件都已就位,下面的克隆/上传传输都与预热无依赖,
+    # 这一段就是留给预热线程的重叠窗口(仅限名单内的 executor)
+    _prewarm_cli_runtime(task, db, task_id_str, git_tokens)
+
     # 上传交付物分支(优先于 clone;创建时已保证与 repo_url 互斥):
     # 把上传内容传输进沙箱工作区。上传文件 agent 无法自行重新获取,
     # 服务端文件缺失/传输失败都直接失败,不降级
@@ -1374,6 +1433,10 @@ def _prepare_repo_context(
         # CloneSkippedError 的子类,若被下面的"跳过预克隆"分支接住,停止会被
         # 静默转成"改由执行阶段自主克隆"—— 任务照跑,LLM 成本照付。
         # 本路径当前不传 cancel_check(只有出题链传),这条是防日后接线的护栏。
+        # 停止就是停止:预热起的 bridge 也一并丢掉,再冒泡。
+        from app.agents.acp_prewarm import discard_task_prewarm
+
+        discard_task_prewarm(task_id_str, reason="clone_cancelled")
         raise
     except sandbox_tools.CloneSkippedError:
         # 用户主动跳过预克隆:与失败降级同路径,改由 react_agent 自主克隆
@@ -1381,6 +1444,10 @@ def _prepare_repo_context(
         logger.info(
             f"[task={task.id}] 用户跳过预克隆,降级为 react_agent 自主克隆"
         )
+        # 预热起的 bridge 不能无人认领地空转(它占本任务沙箱的 TTL 与端口),丢掉
+        from app.agents.acp_prewarm import discard_task_prewarm
+
+        discard_task_prewarm(task_id_str, reason="clone_skipped")
         task.current_stage = "已跳过预克隆,改由执行阶段自主克隆..."
         db.commit()
         _publish_status(task)
@@ -1397,6 +1464,10 @@ def _prepare_repo_context(
         logger.warning(
             f"[task={task.id}] 主动 clone 失败,降级为 react_agent 自主 clone: {e}"
         )
+        # 同 clone_skipped:无人认领的预热 bridge 先停掉(执行阶段会自己重建)
+        from app.agents.acp_prewarm import discard_task_prewarm
+
+        discard_task_prewarm(task_id_str, reason="clone_failed")
         task.current_stage = "预克隆失败,改由 react_agent 自主克隆..."
         db.commit()
         _publish_status(task)

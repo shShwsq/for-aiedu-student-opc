@@ -622,12 +622,19 @@ def main():
 
     # 启动 CLI 子进程(继承当前环境变量,凭证经 envs 注入到 bridge 进程)
     _cli = ACPCLIProcess(bin_name=args.bin, args=cli_args)
-    _cli.start()
-
-    # 等待 CLI 就绪(短暂等待进程稳定)
-    time.sleep(1)
+    # 就地捕获 spawn 失败(bin 不存在/不可执行):原先靠"sleep 1 秒后判 alive"兜,
+    # 代价是每个任务的 bridge 都白等 1 秒才开 HTTP 服务。/health 本就按 _cli.alive
+    # 报告状态,不需要那 1 秒。
+    # 注意:下面两行日志都含 "ACP CLI 启动失败" —— 后端 _wait_for_bridge_ready
+    # 按这个字符串快速失败(而非空等 BRIDGE_STARTUP_TIMEOUT),改动/删除前先确认口径。
+    try:
+        _cli.start()
+    except Exception as e:
+        print(f"[bridge] ACP CLI 启动失败:{type(e).__name__}: {e},退出",
+              file=sys.stderr, flush=True)
+        sys.exit(1)
     if not _cli.alive:
-        print("[bridge] ACP CLI 启动失败,退出", file=sys.stderr, flush=True)
+        print("[bridge] ACP CLI 启动失败(进程立即退出),退出", file=sys.stderr, flush=True)
         sys.exit(1)
 
     # 启动 HTTP 服务器

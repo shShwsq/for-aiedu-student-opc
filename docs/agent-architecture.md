@@ -504,13 +504,27 @@ ExecutorAgent (ABC)
     → 复用条件(须同时满足):同一沙箱会话对象(容器未重建)+ agent_type 一致 +
       启动配置指纹一致 + GET /health 通过;任一不满足则清缓存走全新链路
     → agent_type 或指纹变化时先 _stop_acp_bridge 停旧 bridge(防端口冲突)再清缓存
-    → 命中时跳过步骤 8-13 与 15-16 的重建链路(实测省 ~25s),perf 事件 acp_bridge_reuse(hit)
+    → 命中时跳过步骤 8-13 与 15-16 的重建链路(实测:命中后 acp_enter→prompt_send 仅 0.2~0.3s,
+      未命中 median ≈12.5s / max 20.4s),perf 事件 acp_bridge_reuse(hit)
       (步骤 14 的 recorder/ACPClient 每轮仍新建,仅底层 bridge 进程与 ACP session 复用)
-8.  [全新链路] _ensure_cli_env(session, agent_type)
-    → 创建 bridge 脚本目录 + 写入 bridge 脚本 + 检查 CLI(不可用则安装)
+7.5 【预热认领】prewarm = acp_prewarm.consume_prewarm(task_id, agent_type, fingerprint)
+    → 仅在 reuse miss 且无 wrapper 钩子(pre_bridge_hook / post_session_setup)时尝试;
+      拿到 handle 就跳过步骤 8-9-11-12-13 与 initialize(那些步在预克隆窗口里已由
+      后台线程做完),bridge 归属转给本任务
+    → 拿不到(没预热 / 预热失败 / 超预算 / agent_type 或指纹不符)则丢弃 handle 开旧 bridge
+      并回落到下面的全串行链路——预热只是加速器,不是正确性依赖
+    → 发起端在 orchestrator._prepare_repo_context:记忆/skill 文件写完、bridge/CLI 启动参数
+      与凭证由**主线程**算好递入(db+task 不在子线程碰,SQLAlchemy Session 非线程安全)
+    → perf 事件:acp_prewarm_start / acp_prewarm_ready(ok) / acp_prewarm_join(hit) / acp_prewarm_discard(reason)
+8.  [全新链路] _ensure_cli_env(session, agent_type, ctx)
+    → 一条命令同时建 bridge 脚本目录 + 检查 CLI(不可用则安装),再写 bridge 脚本
+      → 2 次沙箱往返(旧版 3 次);同一会话内脚本内容未变则整体短路(0 次,
+      指纹记在 ctx 上 → 容器重建换新 ctx 后自然重来)
 9.  [全新链路] _inject_git_credentials_to_cache(session, db, task)
     → git token 注入沙箱内 credential helper cache(不进环境变量/磁盘文件/命令行),
-      让 CLI 能克隆/拉取私有仓库
+      让 CLI 能克隆/拉取私有仓库;多 provider 合并为 write_file + 1 条命令
+      (`git config && chmod 600 && git credential approve < f; rm -f f`,双 provider 9 次 → 2 次;
+      rm 用 `;` 收尾保证 approve 失败也删掉含 token 的临时文件)
 10. [全新链路] pre_bridge_hook(session, credentials, agent_type, task)  [wrapper 钩子]
     → Codex 用此写 ~/.codex/config.toml;钩子可返回额外 envs 合并进 bridge 环境
       (如 codex local 模式的 CODEX_HOME)
@@ -522,7 +536,10 @@ ExecutorAgent (ABC)
     → 复用路径直接取缓存值,跳过 session.get_endpoint(SDK 端口转发,resume 场景实测最长 ~70s)
     → 全新路径 session.get_endpoint(bridge_port)
 13. [全新链路] _wait_for_bridge_ready(session, bridge_exec_id, endpoint_url, ...)
-    → 健康检查轮询(30s 超时,失败时读 bridge 日志辅助排查)
+    → 健康轮询(默认 0.2s 间隔、30s 超时,可由 ACP_BRIDGE_HEALTH_INTERVAL_SECONDS 覆盖);
+      成功路径**不取**后台日志(省一次沙箱往返),只有 health 未通过才读 bridge 日志
+      以保留 "ACP CLI 启动失败" 的快速失败口径
+    → bridge 侧 main() 也不再无条件 sleep(1s) 才起 HTTP 服务(旧链路白付 1s)
 14. recorder = _ACPRecorder(task.id, round_idx)
     client = ACPClient(endpoint_url, endpoint_headers, recorder=..., permission_handler=...)
     → _permission_handler:CLI 关闭 yolo 时发来 request_permission(危险命令)
@@ -620,12 +637,40 @@ ExecutorAgent (ABC)
 
 模块级 `{task_id: 条目}` 缓存（`_bridge_cache_lock` 保护），条目含沙箱会话对象 / `bridge_exec_id` / `endpoint_url+headers` / `acp_session_id` / 启动配置指纹。意义：
 
-- **省时**：命中时跳过「准备 CLI 环境 → 启 bridge → initialize → session/new」整条链路（~25s），并跳过 `session.get_endpoint` 端口转发（resume 场景实测最长 ~70s）
+- **省时**：命中时跳过「准备 CLI 环境 → 启 bridge → initialize → session/new」整条链路(实测命中后 acp_enter→prompt_send 仅 0.2~0.3s),并跳过 `session.get_endpoint` 端口转发（resume 场景实测最长 ~70s）；未命中时另有一层**预热**(见 §4.3.1)把那些步骤挑到预克隆重叠窗口里做完
 - **会话延续**：CLI 进程不退出，ACP session 存于进程内，追问/续跑共用同一 session → CLI 自身能看到之前的对话（这是 CLI 侧跨轮记忆的首要手段，见 §4.4）
 - **失效判定**：沙箱会话对象变了（容器重建）/ `agent_type` 变了 / 指纹（acp_args + 凭证 env）变了 / `GET /health` 不通过 → 清缓存走全新链路（类型/指纹变化时先停旧 bridge 防端口冲突）
 - **失效后的补偿**：降为全新链路时,先按 `task.params["_acp_session"]` 里持久化的 sessionId 让 CLI 恢复自己的会话(需 CLI 声明能力 + bridge_protocol>=2 + cwd 一致,见 §4.4 归档);恢复不可用或失败才把之前轮次执行记录文本回放（`_load_history_replay`，仅 `round_idx > 1`，构造异常则不注入，见 §4.4）；复用命中但条目 `prompt_accepted=False`（上一轮业务性失败留下的空 session）同样走回放
 - **生命周期**：正常轮次结束 **不** 停 bridge；仅初始化失败（未入缓存）时停掉防残留，或连接层异常时清缓存，或由 `stop_task_bridge(task_id)`（沙箱会话关闭/任务删除）主动回收
 - **并发边界**：ACP over stdio 是串行协议（bridge 侧锁保护 send+collect 全程，同一时刻仅一个 prompt）；agent2 后台审查不经 bridge（它是进程内 LLM 调用），它与新轮 CLI 执行共享的是**同一沙箱会话**（只读核查 / verifier PoC 侧），详见 §1.2 并行世代门控
+
+### 4.3.1 CLI 冷启动预热(`acp_prewarm`)
+
+复用命中只覆盖"同一任务的多轮";新任务仍要付整条冷启动链路(实测 median ≈12.5s)。
+预热利用的是那个被浪费的重叠窗口:链路里除 `session/new` 外的每一步都不依赖仓库内容,
+而预克隆要 24~235s。
+
+```
+主线程:  建会话 → 写记忆/skill → ───── clone / 上传传输(24~235s) ───── → session/new → prompt
+预热线:                                └ ensure_cli_env → git 凭证 → 起 bridge → 等就绪 → initialize ┘
+```
+
+- **handle 与注册表**:`PrewarmHandle` 挂在 `task_id` 上(与 `_bridge_cache` 分开:那张表记
+  "任务正在用的 bridge",这张记"还没人拿的热运行态")。同一任务重复触发不会重开线程
+  (single-flight,避免端口冲突与白烧容器 TTL)
+- **认领即交接**:`consume_prewarm(task_id, agent_type, fingerprint)` 一次性取走,并校验
+  agent_type + 启动指纹、等 `done` 事件(预算 = `ACP_PREWARM_TIMEOUT_SECONDS` 减去
+  已跑秒数,不与 `BRIDGE_STARTUP_TIMEOUT` 叠加);任一项不就则停旧 bridge 返回 None
+- **不携带 ORM 对象**:SQLAlchemy Session 非线程安全 —— 凭证与 git token 由主线程取好递入,
+  bridge 启动参数用 `_start_acp_bridge(..., acp_args=已算好的参数, task=None)` 显式传入,
+  与 `run_acp_agent` 同源于 `_get_acp_args` + `_bridge_fingerprint`(两边算出不一致时自动作废)
+- **失败不升级**:预热线程内任一步异常 → 记 `handle.error`、停可能已起的 bridge、
+  产物字段清零;消费方按"没有预热"走全串行,任务绝不因预热失败而 failed
+- **回收路径**:预热线程不持有 db,清理全靠三处兼管——克隆失败/跳过时
+  `discard_task_prewarm(...)`;`stop_task_bridge(task_id)`(会话关闭/任务删除)顶部先丢弃未认领 handle
+- **适用边界**:仅 sandbox 模式(命令层跨线程并发仅在真实沙箱实测过,
+  见 `backend/scripts/smoke_sandbox_concurrency.py`),且默认只含无 wrapper 钩子的
+  `qoder_cli`(`ACP_PREWARM_AGENTS`);`ACP_PREWARM_ENABLED=false` 一键回到旧行为
 
 ### 4.4 Prompt 消息构造（`_build_base_prompt` + 共享段落工厂）
 

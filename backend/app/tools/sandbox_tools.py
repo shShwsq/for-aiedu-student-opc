@@ -7,6 +7,7 @@ local 模式:沙箱会话的 run_command 走本地 subprocess,但 Windows 不支
          Python 实现,绕过 shell
 sandbox 模式:走真实沙箱,在 Linux 容器里执行 Unix 命令
 """
+import hashlib
 import json
 import logging
 import os
@@ -1757,8 +1758,26 @@ def _list_files_sandbox_shell(
 
 
 # ============================================================
-# 项目记忆文件写入(orchestrator 在 clone 后调用,供 react_agent / CLI 随时 read_file 查阅)
+# 会话内写入去重(记忆 / skill 物化)
 # ============================================================
+
+
+def _written_unchanged(ctx: dict[str, Any], key: str, content: str) -> bool:
+    """本会话已成功写入过同内容 → True(可跳过重写)
+
+    指纹存在 ctx 里,**只在写成功后**由 _mark_written 记录:
+    - 容器被回收/重建 → _get_or_create_session 换新 ctx → 标记自然消失,
+      下一轮必重写(新容器里没有那些文件,跳过会造成"agent 读不到记忆/skill")
+    - 写失败时尚未记录 → 下一轮仍会重试
+    """
+    digest = hashlib.sha1(content.encode("utf-8")).hexdigest()
+    return ctx.get("_written_hash", {}).get(key) == digest
+
+
+def _mark_written(ctx: dict[str, Any], key: str, content: str) -> None:
+    """写入成功后记下内容指纹(与 _written_unchanged 配对)"""
+    digest = hashlib.sha1(content.encode("utf-8")).hexdigest()
+    ctx.setdefault("_written_hash", {})[key] = digest
 
 
 def write_project_memory_file(task_id: str, content: str) -> None:
@@ -1769,8 +1788,14 @@ def write_project_memory_file(task_id: str, content: str) -> None:
 
     local 模式:写 ctx["local_dir"]/.agent_memory/project_memory.md(Python 直接写)。
     sandbox 模式:mkdir -p 记忆目录 + session.write_file 写绝对路径。
+
+    同一会话内内容未变则跳过追问轮的重写(两条命令 ≈ 1.4s);指纹仅在写成功后
+    才记录,写失败下一轮仍会重写。
     """
     ctx = _get_or_create_session(task_id)
+    if _written_unchanged(ctx, "project_memory", content):
+        logger.debug(f"[task={task_id}] 项目记忆文件内容未变,跳过重写")
+        return
     mode = ctx["mode"]
     if mode == "local":
         mem_dir = Path(ctx["local_dir"]) / ".agent_memory"
@@ -1780,6 +1805,7 @@ def write_project_memory_file(task_id: str, content: str) -> None:
         session: SandboxSession = ctx["session"]
         session.run_command(f"mkdir -p {shlex.quote(_MEMORY_DIR_SANDBOX)}")
         session.write_file(f"{_MEMORY_DIR_SANDBOX}/{_MEMORY_FILE}", content)
+    _mark_written(ctx, "project_memory", content)
 
 
 def write_global_memory_file(task_id: str, content: str) -> None:
@@ -1788,9 +1814,13 @@ def write_global_memory_file(task_id: str, content: str) -> None:
     固定路径 /home/user/.agent_memory/global_memory.md(每任务启动时覆盖为当前
     用户的全局记忆)。content 为空也写(清空旧文件,避免看到上一个用户的记忆)。
 
-    与 write_project_memory_file 同构:local 模式写本地目录,sandbox 模式写沙箱绝对路径。
+    与 write_project_memory_file 同构:local 模式写本地目录,sandbox 模式写沙箱绝对路径;
+    同一会话内内容未变同样跳过重写。
     """
     ctx = _get_or_create_session(task_id)
+    if _written_unchanged(ctx, "global_memory", content):
+        logger.debug(f"[task={task_id}] 全局记忆文件内容未变,跳过重写")
+        return
     mode = ctx["mode"]
     if mode == "local":
         mem_dir = Path(ctx["local_dir"]) / ".agent_memory"
@@ -1800,6 +1830,7 @@ def write_global_memory_file(task_id: str, content: str) -> None:
         session: SandboxSession = ctx["session"]
         session.run_command(f"mkdir -p {shlex.quote(_MEMORY_DIR_SANDBOX)}")
         session.write_file(f"{_MEMORY_DIR_SANDBOX}/{_GLOBAL_MEMORY_FILE}", content)
+    _mark_written(ctx, "global_memory", content)
 
 
 def _skill_dir_name(name: str) -> str:
@@ -1818,54 +1849,65 @@ def write_skill_files(task_id: str, skills: list) -> None:
 
     skills 为空 → 只清空目录(该任务无可用 skill,不留旧文件)。
     与 write_global_memory_file 同构:local 用 Python 直接写,sandbox 用 mkdir + write_file。
+
+    往返成本:sandbox 模式原先每文件要 1 次 mkdir + 1 次 write(6 个 skill ≈ 14 次往返
+    ≈ 10s),现在父目录一次建齐 + 集合内容未变整段跳过。
     """
     ctx = _get_or_create_session(task_id)
     mode = ctx["mode"]
+
+    # 1) 先读齐要落盘的文本(local / sandbox 共用同一份计划,指纹也基于它)
+    entries: list[tuple[str, str]] = []  # (相对 skills 根的路径, 内容)
+    for skill in skills or []:
+        src_dir = getattr(skill, "skill_dir", None)
+        if not src_dir:
+            continue
+        src_dir = Path(src_dir)
+        name_dir = _skill_dir_name(getattr(skill, "name", ""))
+        for f in sorted(src_dir.rglob("*")):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(src_dir).as_posix()
+            try:
+                content = f.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue  # 二进制/不可读资源跳过,CLI 只依赖 SKILL.md
+            entries.append((f"{name_dir}/{rel}", content))
+
+    # 2) 同一会话内集合未变 → 整段跳过(skill 集在任务内恒定,每轮重写纯烧往返)
+    manifest = json.dumps(entries, ensure_ascii=False)
+    if _written_unchanged(ctx, "skill_files", manifest):
+        logger.debug(f"[task={task_id}] skill 物化集合未变,跳过重写({len(entries)} 个文件)")
+        return
 
     if mode == "local":
         skills_root = Path(ctx["local_dir"]) / ".agent_skills"
         shutil.rmtree(skills_root, ignore_errors=True)
         skills_root.mkdir(parents=True, exist_ok=True)
-        for skill in skills or []:
-            src_dir = getattr(skill, "skill_dir", None)
-            if not src_dir:
-                continue
-            src_dir = Path(src_dir)
-            dest_dir = skills_root / _skill_dir_name(getattr(skill, "name", ""))
-            for f in sorted(src_dir.rglob("*")):
-                if not f.is_file():
-                    continue
-                rel = f.relative_to(src_dir)
-                try:
-                    content = f.read_text(encoding="utf-8")
-                except (UnicodeDecodeError, OSError):
-                    continue  # 二进制/不可读资源跳过,CLI 只依赖 SKILL.md
-                out = dest_dir / rel
-                out.parent.mkdir(parents=True, exist_ok=True)
-                out.write_text(content, encoding="utf-8")
+        for rel, content in entries:
+            out = skills_root / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(content, encoding="utf-8")
     else:
         session: SandboxSession = ctx["session"]
-        # 先清空再重建(skills 为空也要清掉残留)
-        session.run_command(f"rm -rf {shlex.quote(_SKILLS_DIR_SANDBOX)}")
-        session.run_command(f"mkdir -p {shlex.quote(_SKILLS_DIR_SANDBOX)}")
-        for skill in skills or []:
-            src_dir = getattr(skill, "skill_dir", None)
-            if not src_dir:
-                continue
-            src_dir = Path(src_dir)
-            name_dir = _skill_dir_name(getattr(skill, "name", ""))
-            for f in sorted(src_dir.rglob("*")):
-                if not f.is_file():
-                    continue
-                rel = f.relative_to(src_dir).as_posix()
-                try:
-                    content = f.read_text(encoding="utf-8")
-                except (UnicodeDecodeError, OSError):
-                    continue
-                abs_path = f"{_SKILLS_DIR_SANDBOX}/{name_dir}/{rel}"
-                parent = abs_path.rsplit("/", 1)[0]
-                session.run_command(f"mkdir -p {shlex.quote(parent)}")
-                session.write_file(abs_path, content)
+        # 先清空再重建(skills 为空也要清掉残留);两条合一一次往返
+        session.run_command(
+            f"rm -rf {shlex.quote(_SKILLS_DIR_SANDBOX)}"
+            f" && mkdir -p {shlex.quote(_SKILLS_DIR_SANDBOX)}"
+        )
+        # 父目录一次建齐(去重后拼一条命令),避免每文件各一次 mkdir 往返
+        parents = sorted({
+            f"{_SKILLS_DIR_SANDBOX}/{rel}".rsplit("/", 1)[0]
+            for rel, _ in entries
+        })
+        if parents:
+            session.run_command(
+                "mkdir -p " + " ".join(shlex.quote(p) for p in parents)
+            )
+        for rel, content in entries:
+            session.write_file(f"{_SKILLS_DIR_SANDBOX}/{rel}", content)
+
+    _mark_written(ctx, "skill_files", manifest)
 
 
 def _is_memory_file_path(file_path: str) -> bool:

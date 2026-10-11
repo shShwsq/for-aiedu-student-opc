@@ -305,6 +305,25 @@ class Settings(BaseSettings):
     ACP_IDLE_TIMEOUT_OUTPUT_SECONDS: int = 300
     ACP_IDLE_TIMEOUT_TOOL_SECONDS: int = 1800
 
+    # ---- ACP 冷启动提速(预热)----
+    # 冷启动链路(acp_enter→prompt_send)实测 median ≈12.5s:环境准备 → 凭证注入 →
+    # 起 bridge → 等就绪 → initialize 全程串行,而它前面的预克隆要 24~235s。
+    # 开启后这些步骤在预克隆窗口里由后台线程做完,只剩 session/new(≈6s)留在克隆之后。
+    # 预热失败/指纹不符一律静默回落全串行,只损失时间不影响正确性。
+    # 背景与实测见 .trae/documents/CLI冷启动提速实施计划.md、app/agents/acp_prewarm.py
+    ACP_PREWARM_ENABLED: bool = True
+    # 允许预热的 agent 类型(逗号分隔)。只放无 wrapper 钩子的类型:
+    # - qoder_cli:无 credential_env_builder / pre_bridge_hook,启动参数与 run_acp_agent 同源
+    # - deepseek_cli / codex_cli 需要 per-task 的 env 构建或 bridge 前写配置文件,暂未纳入
+    #   (deepseek 会因 envs 不一致被指纹自动作废;codex 由 consume 侧显式拒绝带钩子的预热)
+    ACP_PREWARM_AGENTS: str = "qoder_cli"
+    # 认领预热成果的最长等待(秒):从 handle 创建起算,扣掉已经跑的秒数
+    # (不与 BRIDGE_STARTUP_TIMEOUT=30 叠加成两倍等待)
+    ACP_PREWARM_TIMEOUT_SECONDS: int = 30
+    # bridge 健康轮询间隔(秒):bridge 侧 HTTP 服务已不再无条件 sleep(1s)才监听,
+    # 粒度收到 0.2s;设 0 则回落到 acp_base.BRIDGE_HEALTH_INTERVAL 默认值
+    ACP_BRIDGE_HEALTH_INTERVAL_SECONDS: float = 0.2
+
     # ACP 异步子 Agent(后台派生)提前收尾的结果回收:
     # 部分 CLI(Qoder 的 Agent 工具)以 fire-and-forget 方式派生子 Agent,工具调用
     # 立刻回 "Async agent launched…background" 回执并被标 completed;模型常在子 Agent

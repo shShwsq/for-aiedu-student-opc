@@ -54,6 +54,7 @@ import json
 import logging
 import queue
 import re
+import shlex
 import shutil
 import socket
 import sys
@@ -119,7 +120,10 @@ BRIDGE_WORK_DIR = "/home/user"
 
 # bridge 启动超时(秒):等待 CLI 进程就绪 + HTTP 服务监听
 BRIDGE_STARTUP_TIMEOUT = 30
-BRIDGE_HEALTH_INTERVAL = 1.0
+# 健康轮询间隔默认值(秒):实际取 settings.ACP_BRIDGE_HEALTH_INTERVAL_SECONDS
+# 0.2 而非 1.0:bridge 侧 HTTP 服务已不再无条件 sleep(1s)才监听,
+# 粒度到 1s 会让链路白等半个到一个轮询周期
+BRIDGE_HEALTH_INTERVAL = 0.2
 
 # ACP 协议版本(数字 1,见 https://github.com/agentclientprotocol/agent-client-protocol
 # "The current stable ACP protocol version is 1.")
@@ -1104,8 +1108,8 @@ def _get_acp_args(
     return args
 
 
-def _write_bridge_script(session, agent_type: str = "") -> None:
-    """将 bridge 脚本写入沙箱(从本地源文件读取)
+def _read_bridge_script(agent_type: str = "") -> str:
+    """读该 agent 应使用的 bridge 源文件内容(供写入沙箱 / 算内容指纹)
 
     agent_type 决定使用哪个 bridge(从 registry sandbox.bridge_script 读取):
     - "acp_bridge"(默认):通用 ACP stdio 桥接,适用于原生支持 ACP 的 CLI(qoder/deepseek)
@@ -1118,31 +1122,49 @@ def _write_bridge_script(session, agent_type: str = "") -> None:
         raise RuntimeError(f"未知 bridge 脚本: {bridge_name}")
     if not source.exists():
         raise RuntimeError(f"bridge 源文件不存在: {source}")
-    content = source.read_text(encoding="utf-8")
-    session.write_file(BRIDGE_SCRIPT_PATH, content)
+    return source.read_text(encoding="utf-8")
 
 
-def _ensure_cli_env(session, agent_type: str) -> None:
+def _write_bridge_script(session, agent_type: str = "") -> None:
+    """将 bridge 脚本写入沙箱(从本地源文件读取,per-agent 默认 acp_bridge.py)"""
+    session.write_file(BRIDGE_SCRIPT_PATH, _read_bridge_script(agent_type))
+
+
+def _ensure_cli_env(session, agent_type: str, ctx: dict[str, Any] | None = None) -> None:
     """准备 CLI 运行环境(sandbox:沙箱内 / local:宿主机)
 
-    1. 写入 bridge 脚本(local 模式落 local_dir/.acp/,write_file 自动建父目录)
-    2. 检查 CLI 是否可用:
+    1. 检查 CLI 是否可用:
        - sandbox:`command -v` / `which` shell 检查,未装则执行安装命令
        - local:Python shutil.which 检查(跨平台,可解析 Windows .cmd/.exe),
          未装直接报错要求预装 —— 不自动 npm install -g,避免修改宿主机全局环境
+    2. 写入 bridge 脚本(local 模式落 local_dir/.acp/,write_file 自动建父目录)
+
+    往返成本(sandbox 模式每次沙箱命令 ≈0.7s):建脚本目录 + 检查 CLI 已合并成
+    **一条命令**,再单独写脚本 → 2 次往返(原先 3 次)。同一会话内 bridge 脚本
+    内容未变则整体跳过(0 次):把指纹记在 ctx 上,容器重建时 ctx 换新、
+    标记自然失效,不会误跳过。
+
+    ctx(可选,来自 sandbox_tools._get_or_create_session)只为承载该短路标记。
     """
     cli_bin = _get_bin(agent_type)
     is_local = getattr(session, "mode", "") == "local"
 
-    if not is_local:
-        # 创建脚本目录(local 模式 _local_write_file 自动建父目录,跳过)
-        session.run_command(f"mkdir -p {Path(BRIDGE_SCRIPT_PATH).parent.as_posix()}")
-
-    # 写入 bridge 脚本(per-agent,默认 acp_bridge.py)
-    _write_bridge_script(session, agent_type)
+    # 内容指纹:脚本没变 + 上次已就绪 → 整段跳过(写失败时不记标记,下次仍会重试)
+    try:
+        memo_hash = hashlib.sha1(_read_bridge_script(agent_type).encode("utf-8")).hexdigest()
+    except Exception:
+        memo_hash = ""  # 读不到源文件后面必炸,这里不重复报错
+    if (
+        memo_hash
+        and ctx is not None
+        and ctx.get("_cli_env_memo") == memo_hash
+    ):
+        logger.info(f"[{agent_type}] 环境就绪(会话内已准备,跳过检查与写入)")
+        return
 
     if is_local:
-        # local 模式:宿主机 PATH 检查(Python 端,不走 shell)
+        # local 模式:写脚本(自动建父目录)+ 宿主机 PATH 检查(Python 端,不走 shell)
+        _write_bridge_script(session, agent_type)
         if not shutil.which(cli_bin):
             raise RuntimeError(
                 f"宿主机未找到 {cli_bin}(local 模式 CLI 直接跑在宿主机)。"
@@ -1153,11 +1175,17 @@ def _ensure_cli_env(session, agent_type: str) -> None:
             f"[{agent_type}] 环境就绪(local): {cli_bin} 可用,"
             f"bridge 脚本已写入 {session.local_dir / '.acp'}"
         )
+        if memo_hash and ctx is not None:
+            ctx["_cli_env_memo"] = memo_hash
         return
 
-    # sandbox 模式:shell 检查 + 未装自动安装
+    # sandbox 模式:建目录 + 检查 CLI 合成一次往返
+    # (`command -v` 失败时子 shell 退出码非 0,但 run_command 默认不看退出码,
+    #  我们以"输出为空"判未安装,与原 check_cmd 口径一致)
+    script_dir = Path(BRIDGE_SCRIPT_PATH).parent.as_posix()
     check_cmd = f"command -v {cli_bin} || which {cli_bin} 2>/dev/null"
-    result = session.run_command(check_cmd, timeout=10)
+    merged_cmd = f"mkdir -p {script_dir} && ({check_cmd})"
+    result = session.run_command(merged_cmd, timeout=15)
     if not result.strip():
         # CLI 未安装,尝试安装
         install_cmd = _get_install_cmd(agent_type)
@@ -1176,6 +1204,11 @@ def _ensure_cli_env(session, agent_type: str) -> None:
                 f"安装日志: {install_result[:500]}"
             )
 
+    # 写入 bridge 脚本(目录已由上面那条命令建好)
+    _write_bridge_script(session, agent_type)
+
+    if memo_hash and ctx is not None:
+        ctx["_cli_env_memo"] = memo_hash
     logger.info(f"[{agent_type}] 环境就绪: {cli_bin} 可用,bridge 脚本已写入 {BRIDGE_SCRIPT_PATH}")
 
 
@@ -1201,13 +1234,14 @@ def _inject_git_credentials_to_cache(session, db: Session, task: Task | None) ->
     token 只存在于 git credential-cache 守护进程的内存中,
     仅 git 命令在 HTTPS 鉴权时自动取用。沙箱容器销毁时 cache 随进程退出清理。
 
-    工作流程:
-    1. 配置 git config --global credential.helper 'cache --timeout=86400'
-    2. 对每个有 token 的 provider(GitHub / Gitee):
-       a. write_file 写临时输入文件(含 protocol/host/username/password)
-       b. chmod 600 限制文件权限
-       c. git credential approve < 临时文件(注入到 cache 守护进程内存)
-       d. rm -f 删除临时文件(token 只留在 cache 内存中)
+    工作流程(已合并往返:双 provider 从 9 次降到 2 次):
+    1. write_file 写**一个**临时输入文件,内含全部 provider 的 credential record
+       (每条 protocol/host/username/password 四行 + 空行分隔;
+        git credential approve 支持从 stdin 连续读多条)
+    2. 一条命令串完:
+       git config --global credential.helper 'cache --timeout=86400'
+       && chmod 600 文件 && git credential approve < 文件; rm -f 文件
+       —— rm 用 `;` 收尾而不是 `&&`:approve 失败也必须删掉含 token 的临时文件
 
     失败不阻断流程(降级为无 token,CLI 走 SSH / 匿名 HTTPS 回退)。
     task=None(测试连接场景)时跳过。
@@ -1236,57 +1270,67 @@ def _inject_git_credentials_to_cache(session, db: Session, task: Task | None) ->
 
     # 延迟导入避免循环依赖
     from app.agents.orchestrator import _load_git_tokens
-    from app.git_provider import PROVIDERS
 
     tokens = _load_git_tokens(db, task.user_id)
     if not tokens:
         return
 
-    try:
-        # 配置 git credential helper cache(timeout 覆盖任务最长时长)
-        session.run_command(
-            f"git config --global credential.helper 'cache --timeout={_GIT_CRED_CACHE_TIMEOUT}'",
-            timeout=10,
+    _inject_git_tokens_to_cache(session, task.id, tokens)
+
+
+def _inject_git_tokens_to_cache(session, task_id, tokens: dict[str, str]) -> None:
+    """把已解密的 git token 注入沙箱 credential cache(不碰 db)
+
+    从 _inject_git_credentials_to_cache 拆出:预热线程不能复用主线程的 ORM
+    Session(非线程安全),但 token 可以在主线程先加载好再递进来。
+    失败只 warning 降级(不阻断任务),安全约束见上层 docstring。
+    """
+    from app.git_provider import PROVIDERS
+
+    # 多条 credential record 拼一个输入文件(每条以空行结束)
+    blocks: list[str] = []
+    injected: list[str] = []
+    for provider_id, token in tokens.items():
+        provider = PROVIDERS.get(provider_id)
+        if not provider or not token:
+            continue
+        blocks.append(
+            f"protocol=https\n"
+            f"host={provider.host}\n"
+            f"username={provider.token_username}\n"
+            f"password={token}\n"
+            f"\n"  # 空行结束一条 record(也是多条之间的分隔)
         )
+        injected.append(provider_id)
+    if not blocks:
+        return
 
-        # 对每个有 token 的 provider,注入到 credential cache
-        injected: list[str] = []
-        for provider_id, token in tokens.items():
-            provider = PROVIDERS.get(provider_id)
-            if not provider or not token:
-                continue
-
-            # 写临时输入文件(token 不走命令行,避免 ps / /proc 泄露 + shell 解析问题)
-            cred_input = (
-                f"protocol=https\n"
-                f"host={provider.host}\n"
-                f"username={provider.token_username}\n"
-                f"password={token}\n"
-                f"\n"  # 空行结束输入(git credential approve 读到空行表示输入结束)
-            )
-            cred_file = f"/tmp/.git_cred_{provider_id}_{int(time.time() * 1000)}.tmp"
-            session.write_file(cred_file, cred_input)
-            # 限制文件权限(仅 owner 可读,防止同容器其他用户读取)
-            session.run_command(f"chmod 600 {cred_file}", timeout=5)
-
-            # 注入到 credential cache(git credential approve 启动 cache 守护进程并存入 token)
-            session.run_command(
-                f"git credential approve < {cred_file}",
-                timeout=10, check=False,
-            )
-
-            # 立即删除临时文件(token 只留在 cache 守护进程内存中)
-            session.run_command(f"rm -f {cred_file}", timeout=5)
-            injected.append(provider_id)
-
-        if injected:
-            logger.info(
-                f"[task={task.id}] git credential cache 注入成功: "
-                f"{injected}(沙箱内 git 可访问私有仓库)"
-            )
+    cred_file = f"/tmp/.git_cred_{int(time.time() * 1000)}.tmp"
+    try:
+        # token 只经 write_file 落临时文件,不进命令行/env/ps(避免 ps 与 /proc 泄露)
+        session.write_file(cred_file, "".join(blocks))
+        # chmod 在 approve 之前;rm 用 `;` 衔接 —— 即使前面任一步失败也要执行,
+        # 含 token 的临时文件不能留在磁盘上
+        session.run_command(
+            f"git config --global credential.helper"
+            f" 'cache --timeout={_GIT_CRED_CACHE_TIMEOUT}'"
+            f" && chmod 600 {shlex.quote(cred_file)}"
+            f" && git credential approve < {shlex.quote(cred_file)}"
+            f"; rm -f {shlex.quote(cred_file)}",
+            timeout=30, check=False,
+        )
+        logger.info(
+            f"[task={task_id}] git credential cache 注入成功: "
+            f"{injected}(沙箱内 git 可访问私有仓库)"
+        )
     except Exception as e:
         # 降级:不阻断流程,CLI 走 SSH / 匿名 HTTPS 回退
-        logger.warning(f"[task={task.id}] git credential cache 注入失败(降级为无 token): {e}")
+        logger.warning(f"[task={task_id}] git credential cache 注入失败(降级为无 token): {e}")
+        # 尽力善后:异常可能发生在 write_file 之后,临时文件已落盘
+        try:
+            session.run_command(f"rm -f {shlex.quote(cred_file)}", timeout=5, check=False)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1300,6 +1344,7 @@ def _start_acp_bridge(
     task: Task | None = None,
     agent_type: str = "",
     extra_acp_args: list[str] | None = None,
+    acp_args: list[str] | None = None,
 ) -> tuple[str, int]:
     """后台启动 ACP bridge,返回 (execution_id, port)
 
@@ -1315,10 +1360,12 @@ def _start_acp_bridge(
 
     task 参数用于从 task.params 读取模型/思考强度/上下文窗口配置(见 _get_acp_args)。
     extra_acp_args: 额外 CLI 参数(如测试时强制特定模型),透传给 _get_acp_args。
+    acp_args: 已算好的完整启动参数(预热路径专用)—— 预热线程不能携带 ORM 对象
+    去读 task.params,改由主线程算好后传入,与指纹同源,避免两边算出不一致的启动参数。
     """
     cli_bin = _get_bin(agent_type)
-    acp_args = _get_acp_args(task, agent_type, extra_acp_args)
-    args_json = json.dumps(acp_args, ensure_ascii=False)
+    args = acp_args if acp_args is not None else _get_acp_args(task, agent_type, extra_acp_args)
+    args_json = json.dumps(args, ensure_ascii=False)
 
     if getattr(session, "mode", "") == "local":
         # local 模式:bridge 脚本经 _write_bridge_script 写入
@@ -1372,27 +1419,21 @@ def _wait_for_bridge_ready(
     """
     deadline = time.time() + BRIDGE_STARTUP_TIMEOUT
     client = httpx.Client(headers=endpoint_headers, timeout=5)
+    interval = (
+        getattr(settings, "ACP_BRIDGE_HEALTH_INTERVAL_SECONDS", None)
+        or BRIDGE_HEALTH_INTERVAL
+    )
 
     logger.info(
         f"[{agent_type}] 等待 bridge 就绪: endpoint={endpoint_url}, "
-        f"timeout={BRIDGE_STARTUP_TIMEOUT}s"
+        f"timeout={BRIDGE_STARTUP_TIMEOUT}s, interval={interval}s"
     )
 
     last_logs_len = 0
     try:
         while time.time() < deadline:
-            # 先检查后台进程是否还活着(避免 bridge 崩溃后空等)
-            logs, _ = session.get_background_logs(execution_id)
-            if "ACP CLI 启动失败" in (logs or ""):
-                raise RuntimeError(
-                    f"ACP bridge 启动失败:CLI 进程退出。日志:\n{logs[-1000:]}"
-                )
-            if logs and len(logs) > last_logs_len:
-                new_part = logs[last_logs_len:]
-                logger.debug(f"[{agent_type}] bridge 日志增量: {new_part.rstrip()}")
-                last_logs_len = len(logs)
-
-            # 健康检查
+            # 健康检查优先:就绪成功就返回,整轮不必取一次后台日志
+            # (取日志 = 一次沙箱往返 ≈0.7s;原先每轮都取,成功路径也白取)
             try:
                 resp = client.get(f"{endpoint_url}/health")
                 if resp.status_code == 200:
@@ -1408,7 +1449,19 @@ def _wait_for_bridge_ready(
             except Exception as e:
                 logger.debug(f"[{agent_type}] health 请求失败: {type(e).__name__}: {e}")
 
-            time.sleep(BRIDGE_HEALTH_INTERVAL)
+            # health 未通过才查日志:避免 bridge/CLI 崩溃后空等到超时
+            # (bridge 启不起来时会打印 "ACP CLI 启动失败",靠这条快速失败)
+            logs, _ = session.get_background_logs(execution_id)
+            if "ACP CLI 启动失败" in (logs or ""):
+                raise RuntimeError(
+                    f"ACP bridge 启动失败:CLI 进程退出。日志:\n{logs[-1000:]}"
+                )
+            if logs and len(logs) > last_logs_len:
+                new_part = logs[last_logs_len:]
+                logger.debug(f"[{agent_type}] bridge 日志增量: {new_part.rstrip()}")
+                last_logs_len = len(logs)
+
+            time.sleep(interval)
 
         # 超时:读取日志辅助排查
         logs, _ = session.get_background_logs(execution_id)
@@ -1630,7 +1683,15 @@ def _try_reuse_bridge(
 
 
 def stop_task_bridge(task_id: str) -> None:
-    """停止任务的 bridge 并清缓存(沙箱会话关闭/任务删除时调用)"""
+    """停止任务的 bridge 并清缓存(沙箱会话关闭/任务删除时调用)
+
+    顶上先丢弃未被认领的预热 handle:预热了但执行阶段没走到(任务在克隆阶段
+    就失败/被删)时,那个 bridge 进程仍占着本任务沙箱的端口与 TTL;
+    已被 consume 的 handle 不在注册表里,这里是空转(不会误停正在用的 bridge)。
+    """
+    from app.agents import acp_prewarm  # 延迟导入:acp_prewarm 顶层 import 本模块
+
+    acp_prewarm.discard_task_prewarm(task_id, reason="session_closed")
     with _bridge_cache_lock:
         entry = _bridge_cache.pop(task_id, None)
     if not entry:
@@ -2900,6 +2961,28 @@ def _load_history_replay(
 
 
 # ============================================================
+# 阶段文案(冷启动链路期间的可见反馈)
+# ============================================================
+
+
+def _set_stage(task: Task, db: Session, text: str) -> None:
+    """把链路阶段推给前端(冷启动 ≈10s 期间只有阶段文案在动,否则看着像卡死)
+
+    与 orchestrator._publish_status 同源(延迟导入避免循环依赖,
+    与 _inject_git_credentials_to_cache 内取 _load_git_tokens 同一手法)。
+    失败只记 debug:阶段文案是体验优化,绝不能拖挂执行链路。
+    """
+    try:
+        task.current_stage = text
+        db.commit()
+        from app.agents.orchestrator import _publish_status
+
+        _publish_status(task)
+    except Exception as e:
+        logger.debug(f"[task={task.id}] 阶段文案推送失败(忽略): {e}")
+
+
+# ============================================================
 # 主入口:通用 ACP agent 运行流程
 # ============================================================
 
@@ -3023,33 +3106,60 @@ def run_acp_agent(
         agent_type=agent_type, hit=reused is not None,
     )
 
+    # ---- 尝试认领预热成果(环境准备/起 bridge/等就绪/initialize 已在预克隆重叠做完)----
+    # 带 wrapper 钩子的不认领:pre_bridge_hook 会改 env / 写配置文件,预热期没这些产物;
+    # post_session_setup 依赖 session/new 后的客户端,同理。
+    # (名单已由 acp_prewarm.should_prewarm 收窄到无钩子类型,这里是第二道闸)
+    prewarm = None
+    if (
+        reused is None
+        and pre_bridge_hook is None
+        and post_session_setup is None
+    ):
+        # 延迟导入:acp_prewarm 顶层 import acp_base,避免循环依赖
+        from app.agents import acp_prewarm
+
+        _t0 = time.perf_counter()
+        prewarm = acp_prewarm.consume_prewarm(task_id_str, agent_type, fingerprint)
+        perf_log(
+            task.id, "acp_prewarm_join", time.perf_counter() - _t0,
+            agent_type=agent_type, hit=prewarm is not None,
+        )
+
     if reused is None:
-        # ---- 全新链路:准备 CLI 环境 ----
-        _t0 = time.perf_counter()
-        _ensure_cli_env(session, agent_type)
-        perf_log(task.id, "acp_ensure_cli_env", time.perf_counter() - _t0, agent_type=agent_type)
+        if prewarm is None:
+            # ---- 全新链路(未预热):走完整重建 ----
+            _set_stage(task, db, "正在启动 CLI 执行器(首次约 10~15 秒)…")
 
-        # ---- 注入 git token 到 credential helper cache ----
-        # 让 CLI 在沙箱内能克隆/拉取私有仓库(token 不进环境变量/磁盘文件/命令行)
-        _t0 = time.perf_counter()
-        _inject_git_credentials_to_cache(session, db, task)
-        perf_log(task.id, "acp_inject_git_cred", time.perf_counter() - _t0, agent_type=agent_type)
-
-        # ---- wrapper 层钩子:bridge 启动前的沙箱文件准备 ----
-        # codex 用此回调写入 ~/.codex/config.toml(按 task.params 决定 approval_policy)
-        # deepseek 不需要(凭证/权限均经环境变量注入,无配置文件)
-        # hook 可返回额外环境变量 dict(如 codex local 模式返回 CODEX_HOME),合并注入 bridge
-        if pre_bridge_hook:
+            # ---- 准备 CLI 环境 ----
             _t0 = time.perf_counter()
-            hook_envs = pre_bridge_hook(session, credentials, agent_type, task)
-            if hook_envs:
-                credential_envs = {**credential_envs, **hook_envs}
-            perf_log(task.id, "acp_pre_bridge_hook", time.perf_counter() - _t0, agent_type=agent_type)
+            _ensure_cli_env(session, agent_type, ctx)
+            perf_log(task.id, "acp_ensure_cli_env", time.perf_counter() - _t0, agent_type=agent_type)
 
-        # ---- 启动 ACP bridge ----
-        _t0 = time.perf_counter()
-        bridge_exec_id, bridge_port = _start_acp_bridge(session, credential_envs, task, agent_type=agent_type)
-        perf_log(task.id, "acp_start_bridge", time.perf_counter() - _t0, agent_type=agent_type)
+            # ---- 注入 git token 到 credential helper cache ----
+            # 让 CLI 在沙箱内能克隆/拉取私有仓库(token 不进环境变量/磁盘文件/命令行)
+            _t0 = time.perf_counter()
+            _inject_git_credentials_to_cache(session, db, task)
+            perf_log(task.id, "acp_inject_git_cred", time.perf_counter() - _t0, agent_type=agent_type)
+
+            # ---- wrapper 层钩子:bridge 启动前的沙箱文件准备 ----
+            # codex 用此回调写入 ~/.codex/config.toml(按 task.params 决定 approval_policy)
+            # deepseek 不需要(凭证/权限均经环境变量注入,无配置文件)
+            # hook 可返回额外环境变量 dict(如 codex local 模式返回 CODEX_HOME),合并注入 bridge
+            if pre_bridge_hook:
+                _t0 = time.perf_counter()
+                hook_envs = pre_bridge_hook(session, credentials, agent_type, task)
+                if hook_envs:
+                    credential_envs = {**credential_envs, **hook_envs}
+                perf_log(task.id, "acp_pre_bridge_hook", time.perf_counter() - _t0, agent_type=agent_type)
+
+            # ---- 启动 ACP bridge ----
+            _t0 = time.perf_counter()
+            bridge_exec_id, bridge_port = _start_acp_bridge(session, credential_envs, task, agent_type=agent_type)
+            perf_log(task.id, "acp_start_bridge", time.perf_counter() - _t0, agent_type=agent_type)
+        else:
+            # ---- 预热命中:bridge/CLI 已在克隆窗口里起来,bridge 归属转给本任务 ----
+            bridge_exec_id, bridge_port = prewarm.bridge_exec_id, prewarm.bridge_port
     else:
         bridge_exec_id = reused["bridge_exec_id"]
 
@@ -3057,6 +3167,9 @@ def run_acp_agent(
         # 复用路径:缓存的 endpoint 已被 _bridge_alive 健康检查验证可用,
         # 跳过 get_endpoint(SDK 端口转发调用,resume 场景实测最长 ~70s)
         endpoint_url, endpoint_headers = reused["endpoint_url"], reused["endpoint_headers"]
+    elif prewarm is not None:
+        # 预热路径:endpoint 在预热期已取过并通过 /health 验证可用
+        endpoint_url, endpoint_headers = prewarm.endpoint_url, prewarm.endpoint_headers
     else:
         _t0 = time.perf_counter()
         # local 模式 bridge 用动态分配端口(_start_acp_bridge 返回),
@@ -3072,15 +3185,21 @@ def run_acp_agent(
 
     try:
         if reused is None:
-            _t0 = time.perf_counter()
-            bridge_health = _wait_for_bridge_ready(
-                session, bridge_exec_id, endpoint_url, endpoint_headers, agent_type
-            )
-            perf_log(task.id, "acp_wait_bridge_ready", time.perf_counter() - _t0, agent_type=agent_type)
-            try:
-                bridge_protocol = int(bridge_health.get("bridge_protocol") or 1)
-            except (TypeError, ValueError):
-                bridge_protocol = 1
+            if prewarm is not None:
+                # 能门控会话恢复的 bridge_protocol 随预热一起取回(不能绕过:
+                # 老 bridge 不会排空回放通知,误用会污染落库)
+                bridge_protocol = prewarm.bridge_protocol
+            else:
+                _t0 = time.perf_counter()
+                bridge_health = _wait_for_bridge_ready(
+                    session, bridge_exec_id, endpoint_url, endpoint_headers, agent_type
+                )
+                perf_log(task.id, "acp_wait_bridge_ready", time.perf_counter() - _t0, agent_type=agent_type)
+                try:
+                    bridge_protocol = int(bridge_health.get("bridge_protocol") or 1)
+                except (TypeError, ValueError):
+                    bridge_protocol = 1
+            _set_stage(task, db, "CLI 已就绪,正在打开会话…")
 
         # ---- ACP 通信 ----
         recorder = _ACPRecorder(task.id, round_idx)
@@ -3118,10 +3237,18 @@ def run_acp_agent(
                 # 直接用缓存的 session_id 发 prompt(对话上下文随 session 延续)
                 acp_session_id = reused["acp_session_id"]
             else:
-                # 握手
-                _t0 = time.perf_counter()
-                init_result = client.initialize()
-                perf_log(task.id, "acp_initialize", time.perf_counter() - _t0, agent_type=agent_type)
+                # 握手(预热路径直接取回已拿到的 initialize 响应:
+                # 能力声明与 authenticate 无关,复用不会错过 authMethods/恢复能力)
+                if prewarm is not None:
+                    init_result = prewarm.init_result
+                    perf_log(
+                        task.id, "acp_initialize", 0.0,
+                        agent_type=agent_type, via="prewarm",
+                    )
+                else:
+                    _t0 = time.perf_counter()
+                    init_result = client.initialize()
+                    perf_log(task.id, "acp_initialize", time.perf_counter() - _t0, agent_type=agent_type)
 
                 # 跳过 authenticate,直接 session/new
                 # 凭证经环境变量注入后内部已自动认证,session/new 可直接成功。
