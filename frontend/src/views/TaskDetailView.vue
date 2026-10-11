@@ -3715,6 +3715,19 @@ const showKnowledgeToolbar = computed<boolean>(() => {
         </button>
       </div>
     </nav>
+
+    <!-- 卡片详情 Drawer(审查结果/知识点点击后展开)。必须住在 .page-body 里:
+         它是本视图的定位基准(position: relative + overflow: hidden),Drawer 的遮罩
+         以绝对定位铺满这一块,上缘就自然落在 AppHeader 下缘——顶栏既不被盖住也不被
+         压暗,不需知道顶栏多高(它是内容撑出来的)。挪出 .page-body 或改回
+         Teleport to body 会让抽屉重新变成整视口高 -->
+    <DetailCardDrawer
+      :open="drawerOpen"
+      :item="drawerItem"
+      :type="drawerType"
+      @close="drawerOpen = false"
+      @open-file="handleDrawerOpenFile"
+    />
     </div>
 
     <!-- 验证动作授权弹窗(per_action 模式,每个 HTTP/PoC 动作需用户确认) -->
@@ -3742,15 +3755,6 @@ const showKnowledgeToolbar = computed<boolean>(() => {
       :submitting="submittingCommandConfirm"
       @approve="handleApproveCommand"
       @reject="handleRejectCommand"
-    />
-
-    <!-- 卡片详情 Drawer(审查结果/知识点点击后展开) -->
-    <DetailCardDrawer
-      :open="drawerOpen"
-      :item="drawerItem"
-      :type="drawerType"
-      @close="drawerOpen = false"
-      @open-file="handleDrawerOpenFile"
     />
   </div>
 </template>

@@ -365,12 +365,34 @@ RoundGroup { roundIdx, segments, planSteps }
 窄屏判定 / 可选持久化),`PracticeCodeSidebar`(做题页源码查阅栏,默认 760px、
 断点 640px、**不持久化**)复用同一套,两处不再各写一份拖拽代码。
 
+### 5.5 卡片详情 Drawer(DetailCardDrawer):定位基准是 `.page-body`,不是视口
+
+- **布局**:遮罩 `position: absolute; inset: 0` 铺在 `.page-body` 里(它已是
+  `position: relative` + `overflow: hidden`),面板作为遮罩的 flex 子项
+  (`justify-content: flex-end` + 默认 `align-items: stretch` 撑满高),自身不再 `fixed`;
+- **为何不 Teleport 到 body,也不写 `top: <顶栏高>`**:顶栏高度是内容撑出来的
+  (本视图 `leading` 插槽里的历史任务按钮 34px,首页没有),任何常量都会飘;交给
+  布局 containment,上缘自然落在 AppHeader 下缘,与 rail / 侧栏表头连成一条水平缝。
+  同族口径见 `PracticeGenerateSidebar` 覆盖态(注释已写明「定位基准为宿主 .page-body」);
+- **得到**:抽屉开着时顶栏照常亮着——主题切换 / 帮助 / 主导航 / 到期复习角标都直接可点,
+  不用先关抽屉;`aria-modal="true"` 因此拿掉(它不再是真 modal),`role="dialog"` +
+  `aria-label` 保留;
+- **不变**:主对话流、左侧历史任务栏、右侧 rail 仍在遮罩之下(与改前一致),Esc / 点遮罩 / 关闭
+  按钮三条出路也没动;
+- **宿主约束**:组件必须写在 `.page-body` 内部(本视图 `<nav class="detail-rail">` 之后)。
+  挪到 `.page` 末尾或改回 Teleport,定位基准就退回视口,抽屉重新盖住顶栏;
+- **窄屏**:≤640px 面板 `width: 100%`——不再写 `100vw`(基准已是容器,视口单位在有
+  纵向滚动条的桌面浏览器上会比容器宽几个像素,被 `overflow: hidden` 削掉)。
+
 ## 6. 全局弹窗
 
 | 弹窗 | 触发 |
 |---|---|
 | VerifyActionDialog | 动态验证 per_action 模式,逐动作授权 |
 | CommandConfirmDialog | local 模式危险命令确认 |
+
+> 这两个是真 modal:Teleport 到 body + 遮整个视口。`DetailCardDrawer` **不属于本表**——
+> 它是阅读面板,基准 `.page-body`、不遮顶栏、不带 `aria-modal`(见 §5.5)。
 
 ## 7. 与旧版结构的差异(本次改动)
 
@@ -533,3 +555,23 @@ agent2 提示词里的指称不变),左侧历史任务栏在 `AppHeader` 里的 
    纯函数/composable),所以本轮改动靠 `vue-tsc --noEmit` + `vite build` +
    全量单测回归,没有新增组件级断言。若要覆盖 `showKnowledgeToolbar` / `activeSectionCount`,
    得先把它们抽成 `utils/` 里的纯函数(与 `utils/reviewBucket` 同族口径)再写单测。
+
+## 13. 卡片详情 Drawer 改为贴在顶栏下方(本次改动)
+
+| 旧结构 | 新结构 |
+|---|---|
+| Teleport 到 body,遮罩 `fixed inset:0` + 面板 `fixed top:0` —— 整视口高,顶栏被压暗且被面板盖住右侧(主题/帮助/设置/登出都要先关抽屉) | 不 Teleport,写在宿主 `.page-body` 里;遮罩 `absolute inset:0`,面板作 flex 子项撑满 —— 上缘自然对齐顶栏下缘 |
+| 顶栏高度若要用 `top` 避开,只能写常量 | 常量干脆不需要:交给布局 containment(顶栏高度由内容撑出,各页不一) |
+| `role="dialog" aria-modal="true"` | 去掉 `aria-modal`(顶栏真的可达了,留着就是给读屏报一个假的 inert) |
+| 手机档 `width: 100vw` | `width: 100%`(基准已是容器) |
+
+保留不变:遮罩仍盖住主对话流 / 历史任务栏 / rail,Esc 与点遮罩关闭、背景 overflow 锁、
+滑入动画(`translateX(100%)`,与定位方式无关)。`VerifyActionDialog` / `CommandConfirmDialog`
+等真 modal 不改。
+
+实现要点(供代码改动参考):
+
+1. 模板根由 `<Teleport>` 换成 `<Transition>`(整块内容少两级缩进),遮罩与面板
+   的 `z-index` 不再需要两级:遮罩 1000 带着面板一起排层即可。
+2. 宿主放置位置是这个改动的**唯一不能随手改的约束**:`.page-body` 里 `<nav class="detail-rail">` 之后。
+   两边都写了注释互指,免得下次重构把它“归位”到页尾。

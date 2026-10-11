@@ -2,11 +2,17 @@
 /**
  * 右侧 Drawer 详情阅读组件
  *
- * 点击核查与结果侧栏中的 ReviewItem / TaskResult 卡片时,
- * 打开右侧滑入抽屉展示完整正文,替代原先的 inline-expand。
+ * 点击核查与结果侧栏中的 ReviewItem / TaskResult 卡片时,打开右侧滑入
+ * 抽屉展示完整正文,替代原先的 inline-expand。
  *
- * 复用仓库已有的 Teleport + mask + dialog-card 交互模式
- * (参见 PracticeQuestionDetailDialog / VerifyActionDialog)。
+ * 与仓库已有的弹窗模式不同点(有意为之,不要“顺手改回” Teleport to body):
+ * 弹窗(VerifyActionDialog / PracticeGenerateDialog)是真 modal,遮整个视口是对的;
+ * 本组件是**阅读面板**,不 Teleport,由宿主把它放在 .page-body 里,靠布局 containment
+ * 拿到「AppHeader 下缘」这个偏移——不用顶栏真实高度(它是内容撑出来的,各页不一样),
+ * 也就不需要一个会飘的魔法数字。同族口径见 PracticeGenerateSidebar 的覆盖态。
+ *
+ * 因此它也不再是 aria-modal:顶栏在遮罩之外,依旧可见可点(主题/帮助/导航不用先关
+ * 抽屉);内容区与右侧 rail 仍在遮罩之下,阅读专注度不变。
  */
 import { computed, onMounted, onUnmounted, watch } from 'vue'
 import type { ReviewItem, TaskResult } from '@/types/task'
@@ -59,106 +65,106 @@ function renderContent(content: string | null | undefined): string {
 </script>
 
 <template>
-  <Teleport to="body">
-    <Transition name="drawer">
-      <div
-        v-if="open && item"
-        class="detail-drawer-mask"
-        @click.self="emit('close')"
-      >
-        <aside class="detail-drawer" role="dialog" aria-modal="true" aria-label="卡片详情">
-          <!-- 头部:标题 + 关闭按钮 -->
-          <header class="detail-drawer-header">
-            <h3 class="detail-drawer-title">{{ item.title }}</h3>
-            <!-- 审查项:置信度徽标 -->
-            <span
-              v-if="isReview"
-              :class="['conf-badge', `conf-${confidenceClass((item as ReviewItem).confidence?.tier)}`]"
-            >
-              {{ confidenceLabel((item as ReviewItem).confidence?.tier) }}
-              · {{ formatConfidenceScore((item as ReviewItem).confidence?.score) }}
-            </span>
-            <!-- 知识点:学习点徽标 -->
-            <span
-              v-if="!isReview && (item as TaskResult).metadata_?.learning_note"
-              class="learning-badge"
-            >值得学</span>
-            <button class="detail-drawer-close" aria-label="关闭" @click="emit('close')">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-                <line x1="18" y1="6" x2="6" y2="18" />
-                <line x1="6" y1="6" x2="18" y2="18" />
-              </svg>
-            </button>
-          </header>
+  <Transition name="drawer">
+    <div
+      v-if="open && item"
+      class="detail-drawer-mask"
+      @click.self="emit('close')"
+    >
+      <aside class="detail-drawer" role="dialog" aria-label="卡片详情">
+        <!-- 头部:标题 + 关闭按钮 -->
+        <header class="detail-drawer-header">
+          <h3 class="detail-drawer-title">{{ item.title }}</h3>
+          <!-- 审查项:置信度徽标 -->
+          <span
+            v-if="isReview"
+            :class="['conf-badge', `conf-${confidenceClass((item as ReviewItem).confidence?.tier)}`]"
+          >
+            {{ confidenceLabel((item as ReviewItem).confidence?.tier) }}
+            · {{ formatConfidenceScore((item as ReviewItem).confidence?.score) }}
+          </span>
+          <!-- 知识点:学习点徽标 -->
+          <span
+            v-if="!isReview && (item as TaskResult).metadata_?.learning_note"
+            class="learning-badge"
+          >值得学</span>
+          <button class="detail-drawer-close" aria-label="关闭" @click="emit('close')">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
+        </header>
 
-          <!-- 可滚动内容区 -->
-          <div class="detail-drawer-body">
-            <!-- 审查项详情 -->
-            <template v-if="isReview">
-              <div class="drawer-section">
-                <p class="rv-line"><strong>被核实对象:</strong>{{ (item as ReviewItem).review_target || '—' }}</p>
-                <p v-if="(item as ReviewItem).description" class="rv-line">
-                  <strong>发现问题:</strong>{{ (item as ReviewItem).description }}
-                </p>
-                <div
-                  v-if="(item as ReviewItem).evidence?.source?.quote || (item as ReviewItem).evidence?.source?.file_path"
-                  class="rv-section"
-                >
-                  <strong>原始证据:</strong>
-                  <code
-                    v-if="(item as ReviewItem).evidence?.source?.file_path"
-                    class="rv-file"
-                    @click="emit('open-file', item as ReviewItem)"
-                  >{{ (item as ReviewItem).evidence!.source!.file_path }}<span v-if="(item as ReviewItem).evidence!.source!.line">:{{ (item as ReviewItem).evidence!.source!.line }}</span></code>
-                  <pre
-                    v-if="(item as ReviewItem).evidence?.source?.quote"
-                    class="rv-quote"
-                  >{{ (item as ReviewItem).evidence!.source!.quote }}</pre>
-                </div>
-                <p v-if="(item as ReviewItem).evidence?.analysis_basis?.ref_url" class="rv-line">
-                  <strong>分析依据:</strong>{{ (item as ReviewItem).evidence!.analysis_basis!.ref_url }}
-                </p>
-                <p v-if="(item as ReviewItem).evidence?.verification" class="rv-line">
-                  <strong>验证测试:</strong>{{ (item as ReviewItem).evidence!.verification!.method || '—' }}
-                  <span v-if="(item as ReviewItem).evidence!.verification!.poc_evidence">
-                    · {{ (item as ReviewItem).evidence!.verification!.poc_evidence }}
-                  </span>
-                </p>
-                <p v-if="(item as ReviewItem).suggestion" class="rv-line">
-                  <strong>建议:</strong>{{ (item as ReviewItem).suggestion }}
-                </p>
-              </div>
-              <!-- 元信息 -->
-              <div v-if="(item as ReviewItem).severity || (item as ReviewItem).origin" class="drawer-meta">
-                <span class="origin-tag" :title="(item as ReviewItem).origin">{{ (item as ReviewItem).origin }}</span>
-                <span v-if="(item as ReviewItem).severity" :class="['sev-tag', `sev-${(item as ReviewItem).severity}`]">
-                  {{ (item as ReviewItem).severity }}
-                </span>
-              </div>
-            </template>
-
-            <!-- 知识点详情 -->
-            <template v-else>
-              <blockquote
-                v-if="(item as TaskResult).metadata_?.learning_note"
-                class="learning-note"
-              >{{ (item as TaskResult).metadata_!.learning_note }}</blockquote>
+        <!-- 可滚动内容区 -->
+        <div class="detail-drawer-body">
+          <!-- 审查项详情 -->
+          <template v-if="isReview">
+            <div class="drawer-section">
+              <p class="rv-line"><strong>被核实对象:</strong>{{ (item as ReviewItem).review_target || '—' }}</p>
+              <p v-if="(item as ReviewItem).description" class="rv-line">
+                <strong>发现问题:</strong>{{ (item as ReviewItem).description }}
+              </p>
               <div
-                class="result-content markdown-body"
-                v-html="renderContent((item as TaskResult).content)"
-              />
-            </template>
-          </div>
-        </aside>
-      </div>
-    </Transition>
-  </Teleport>
+                v-if="(item as ReviewItem).evidence?.source?.quote || (item as ReviewItem).evidence?.source?.file_path"
+                class="rv-section"
+              >
+                <strong>原始证据:</strong>
+                <code
+                  v-if="(item as ReviewItem).evidence?.source?.file_path"
+                  class="rv-file"
+                  @click="emit('open-file', item as ReviewItem)"
+                >{{ (item as ReviewItem).evidence!.source!.file_path }}<span v-if="(item as ReviewItem).evidence!.source!.line">:{{ (item as ReviewItem).evidence!.source!.line }}</span></code>
+                <pre
+                  v-if="(item as ReviewItem).evidence?.source?.quote"
+                  class="rv-quote"
+                >{{ (item as ReviewItem).evidence!.source!.quote }}</pre>
+              </div>
+              <p v-if="(item as ReviewItem).evidence?.analysis_basis?.ref_url" class="rv-line">
+                <strong>分析依据:</strong>{{ (item as ReviewItem).evidence!.analysis_basis!.ref_url }}
+              </p>
+              <p v-if="(item as ReviewItem).evidence?.verification" class="rv-line">
+                <strong>验证测试:</strong>{{ (item as ReviewItem).evidence!.verification!.method || '—' }}
+                <span v-if="(item as ReviewItem).evidence!.verification!.poc_evidence">
+                  · {{ (item as ReviewItem).evidence!.verification!.poc_evidence }}
+                </span>
+              </p>
+              <p v-if="(item as ReviewItem).suggestion" class="rv-line">
+                <strong>建议:</strong>{{ (item as ReviewItem).suggestion }}
+              </p>
+            </div>
+            <!-- 元信息 -->
+            <div v-if="(item as ReviewItem).severity || (item as ReviewItem).origin" class="drawer-meta">
+              <span class="origin-tag" :title="(item as ReviewItem).origin">{{ (item as ReviewItem).origin }}</span>
+              <span v-if="(item as ReviewItem).severity" :class="['sev-tag', `sev-${(item as ReviewItem).severity}`]">
+                {{ (item as ReviewItem).severity }}
+              </span>
+            </div>
+          </template>
+
+          <!-- 知识点详情 -->
+          <template v-else>
+            <blockquote
+              v-if="(item as TaskResult).metadata_?.learning_note"
+              class="learning-note"
+            >{{ (item as TaskResult).metadata_!.learning_note }}</blockquote>
+            <div
+              class="result-content markdown-body"
+              v-html="renderContent((item as TaskResult).content)"
+            />
+          </template>
+        </div>
+      </aside>
+    </div>
+  </Transition>
 </template>
 
 <style scoped>
-/* ---- Mask ---- */
+/* ---- Mask ----
+   absolute + inset:0 是相对宿主的 .page-body(它已是 position: relative + overflow: hidden),
+   不是相对视口——顶栏因此不在遮罩范围内,依旧亮着可点 */
 .detail-drawer-mask {
-  position: fixed;
+  position: absolute;
   inset: 0;
   background: rgba(0, 0, 0, 0.35);
   z-index: 1000;
@@ -166,18 +172,16 @@ function renderContent(content: string | null | undefined): string {
   justify-content: flex-end;
 }
 
-/* ---- Drawer panel ---- */
+/* ---- Drawer panel ----
+   它是 mask 的 flex 子项,默认 align-items: stretch 已经撑满内容区高度,
+   不需要再自己挂一层 position: fixed(那会把基准抢回视口,又盖住顶栏) */
 .detail-drawer {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
+  flex-shrink: 0;
   width: min(520px, 90vw);
   background: var(--color-bg);
   box-shadow: var(--shadow-xl);
   display: flex;
   flex-direction: column;
-  z-index: 1001;
 }
 
 /* ---- Header ---- */
@@ -375,10 +379,12 @@ function renderContent(content: string | null | undefined): string {
   transform: translateX(100%);
 }
 
-/* ---- Mobile: fullscreen ---- */
+/* ---- Mobile: fullscreen ----
+   用 100% 而不是 100vw:宽度基准已经是 .page-body,写 100vw 在有纵向
+   滚动条的桌面浏览器上会比容器宽几个像素,被 overflow: hidden 削掉 */
 @media (max-width: 640px) {
   .detail-drawer {
-    width: 100vw;
+    width: 100%;
   }
 }
 </style>
