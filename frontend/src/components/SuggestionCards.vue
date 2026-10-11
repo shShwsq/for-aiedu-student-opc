@@ -52,12 +52,14 @@ defineEmits<{
   gap: var(--space-2);
 }
 
+/* 段内小标题统一 14px/600:「概览」段的三个小标题(任务清单 / 动态验证 / 本组件)
+   不得比面板标题行的段名(15px/700)更大 */
 .suggestion-title {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   margin: 0;
-  font-size: var(--fs-base);
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--color-text);
 }

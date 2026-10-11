@@ -3880,14 +3880,18 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   flex-shrink: 0;
 }
 
+/* 段名是这一栏里唯一的标题级文字,靠「全栏最大的字号 + 最重的字重」当上定位:
+   15px/700 > 段内小标题 14px/600 > 卡片正文 14px。字号只给到 fs-base(与主区
+   任务标题同大小,侧栏不抢主对话流的视觉权重),拉开靠的是字重与段内降级。
+   旁边那个 `.count` 仍是 14px/400 淡色,从属于标题 */
 .detail-sidebar-title {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-semibold);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-bold);
   color: var(--color-text);
 }
 
@@ -4524,7 +4528,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   align-items: center;
   gap: var(--space-2);
   margin: 0;
-  font-size: var(--fs-base);
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--color-text);
 }
@@ -4767,12 +4771,14 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   gap: var(--space-2);
 }
 
+/* 段内小标题统一 14px/600(与核查过程 panel-title、分档/分组头同档),
+   不得与面板标题行同大小——原先这三个 fs-base 比段名自己还大 */
 .plan-section-title {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   margin: 0;
-  font-size: var(--fs-base);
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--color-text);
 }
