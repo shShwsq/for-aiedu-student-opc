@@ -225,6 +225,12 @@ def _is_async_agent_launch(tool_name: str, raw_output: str) -> bool:
     return bool(_ASYNC_AGENT_LAUNCH_RE.search(raw_output or ""))
 
 
+def _is_agent_tool(tool_name: str) -> bool:
+    """工具名是否为"派生子智能体"的 Agent 工具(宽松匹配,跨 CLI 命名不一:
+    Agent / Task / subagent)。用于子智能体扇出窗口的开/关与内部工具隔离判定。"""
+    return (tool_name or "").strip().lower() in _ASYNC_AGENT_TOOL_NAMES
+
+
 def _async_delivered_min_chars() -> int:
     """判定"已产出实质报告"的字符阈值(配置非法时返回 0=该判据不启用)。"""
     try:
@@ -1915,6 +1921,15 @@ class _ACPCollector:
         # Qoder CN 的 rawInput 在 tool_call 事件里一次性给出;
         # Kimi(如 Agent 子任务)/Hermes 的参数经 tool_call_update(in_progress)增量构建,需累积 input_text。
         self._pending_tool_calls: dict[str, dict] = {}
+        # 子智能体并行扇出窗口:已发起未完成的 Agent 工具 toolCallId 集合。非空
+        # 表示"至少一个子智能体在跑"。期间 CLI 把各子智能体的思考/正文/内部工具
+        # 无差别混在同一条 session/update 上发来(ACP 事件不带子智能体身份,实测
+        # 并行两路 chunk 交织成乱码),故窗口内:文本块不并入主 agent 思考流,
+        # 非 Agent 工具调用整体隔离不落库。每个 Agent 的完整报告在其 completed
+        # 回执里,照常作为 tool_result 落库,前端据此渲染可折叠的子智能体块。
+        self._pending_agent_ids: set[str] = set()
+        # 窗口内被隔离的子智能体内部工具 toolCallId(result 同 id 一并跳过)
+        self._suppressed_tool_ids: set[str] = set()
         self._agent_type = agent_type
         # 最近一次 TodoList 工具(部分编码 CLI 的计划工具)解析出的计划清单,
         # 供收尾时续接 current_plan 链(content 里无 <plan> 时回退)
@@ -2033,6 +2048,14 @@ class _ACPCollector:
         """
         return bool(self._pending_tool_calls)
 
+    @property
+    def in_subagent_window(self) -> bool:
+        """是否处于"至少一个子智能体在跑"的扇出窗口(见 _pending_agent_ids)。
+
+        窗口内的文本块与内部工具属于子智能体,不并入主 agent 线性流(乱码/重复)。
+        """
+        return bool(self._pending_agent_ids)
+
     def __call__(self, msg: dict) -> None:
         """处理一条 ACP 通知"""
         # [perf] 首个 ACP 事件 = CLI 侧首 token 到达(前端可见响应的起点)
@@ -2094,6 +2117,10 @@ class _ACPCollector:
     def _handle_thinking(self, delta: str) -> None:
         if not delta:
             return
+        # 子智能体扇出窗口内的思考属于子任务内部过程(并行时多路交织成乱码),
+        # 不是主 agent 的决策回合 → 不并入主思考流,也不落主迭代
+        if self.in_subagent_window:
+            return
         # 思考文本段的开始 = 新决策回合(新迭代)的开始
         self._start_new_iteration_if_needed()
         self._ensure_iter_started()
@@ -2110,6 +2137,10 @@ class _ACPCollector:
 
     def _handle_text(self, delta: str) -> None:
         if not delta:
+            return
+        # 同上:窗口内的正文属于子智能体,不写入主 agent 的 content 流
+        # (子智能体报告在其 Agent 工具 completed 回执里单独落库)
+        if self.in_subagent_window:
             return
         # 对话文本段的开始 = 新决策回合(新迭代)的开始
         self._start_new_iteration_if_needed()
@@ -2164,6 +2195,13 @@ class _ACPCollector:
                 tool_name = "Grep"
                 raw_input = {"pattern": title[8:].strip()}
 
+        # 子智能体窗口内的非 Agent 工具 = 子智能体自己的内部工具(Bash/Read/Grep…);
+        # ACP 无法证明它属于哪个子智能体、也不属于主 agent 决策 → 整体隔离:不落库、
+        # 不推事件。其 completed 回执按同 id 命中 _suppressed_tool_ids 一并跳过。
+        if self.in_subagent_window and not _is_agent_tool(tool_name):
+            self._suppressed_tool_ids.add(tool_call_id)
+            return
+
         # 缓存,等 tool_call_update 累积输入 / completed 拿输出
         self._pending_tool_calls[tool_call_id] = {
             "title": title,
@@ -2187,6 +2225,10 @@ class _ACPCollector:
             content=content,
         )
         self._pending_tool_calls[tool_call_id]["conv_id"] = conv.id
+
+        # Agent 工具:开启子智能体扇出窗口(其 completed 回执里关闭)
+        if _is_agent_tool(tool_name):
+            self._pending_agent_ids.add(tool_call_id)
 
     def _accumulate_tool_input(self, tool_call_id: str, text: str) -> None:
         """记录 Kimi 的 tool_call_update(in_progress)累积参数
@@ -2246,6 +2288,12 @@ class _ACPCollector:
         更新 tool_call conversation 的 content(补全 intent + detail),
         并推 SSE 让前端刷新显示。
         """
+        # 子智能体内部工具结果:call 阶段已隔离 → 这里同 id 命中一并跳过,
+        # 既不向主流程补落一条 tool_result,也避免 pending 缺失带来的 tool_name 兜底
+        if tool_call_id in self._suppressed_tool_ids:
+            self._suppressed_tool_ids.discard(tool_call_id)
+            return
+
         raw_output = update.get("rawOutput", "")
         if not raw_output:
             raw_output = _extract_text(update.get("content"))
@@ -2306,6 +2354,8 @@ class _ACPCollector:
             # 记住派生点:收尾判定只比对这之后新写出的文本
             self.async_agent_launch_tail_start = len(self.content_full)
 
+        # Agent 工具完成:关闭对应子智能体扇出窗口(报告已在上面作为 tool_result 落库)
+        self._pending_agent_ids.discard(tool_call_id)
         # 该 tool_call 已完成,清理 pending(避免累积 + 防止重复 completed 重复触发)
         self._pending_tool_calls.pop(tool_call_id, None)
 

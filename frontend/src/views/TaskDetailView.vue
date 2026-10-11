@@ -67,6 +67,7 @@ import { parseDiffFileSegments } from '@/utils/diffFiles'
 import { triggerBlobDownload } from '@/utils/download'
 import { renderMarkdown } from '@/utils/markdown'
 import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
+import { isAgentBlockOpen, toggleAgentBlock } from '@/utils/agentBlock'
 import { COLLAPSE_GRACE_MS, isThinkingExpanded, shouldLatchAutoExpand } from '@/utils/thinkingExpand'
 import { findRetiredCardConvId } from '@/utils/thinkingReconcile'
 import {
@@ -1537,6 +1538,8 @@ const collapsedSteps = reactive<Set<string>>(new Set())
 /** 用户展开过的工具行(紧凑行轻量展开 / 子智能体卡片 / 普通工具卡片),存 tool_call id,
  * 内部思考小卡用 `${callId}-think` 复合 key */
 const expandedToolRows = reactive<Set<string>>(new Set())
+/** 用户手动折叠过的工具行(仅子智能体卡片用):覆盖“运行中默认展开” */
+const collapsedToolRows = reactive<Set<string>>(new Set())
 
 /** 判断 DisplayItem 是否为 agent1 的 thinking(迭代起点) */
 function isReactThinkingItem(item: DisplayItem): boolean {
@@ -2092,6 +2095,23 @@ function toggleRow(key: string): void {
   } else {
     expandedToolRows.add(key)
   }
+}
+
+/** 子智能体折叠块是否展开:运行中默认展开、完成默认折叠,手动展开/折叠优先
+ *  (状态机在 utils/agentBlock,与主展开集 expandedToolRows 共用“手动展开”语义) */
+function agentBlockOpen(row: ToolRenderRow): boolean {
+  return isAgentBlockOpen(row.callId, row.hasResult, {
+    expanded: expandedToolRows,
+    collapsed: collapsedToolRows,
+  })
+}
+
+/** 点击子智能体标题:翻转并记入手动集(展开进 expanded,折叠进 collapsed) */
+function toggleAgentBlockRow(row: ToolRenderRow): void {
+  toggleAgentBlock(row.callId, row.hasResult, {
+    expanded: expandedToolRows,
+    collapsed: collapsedToolRows,
+  })
 }
 
 /** 工具渲染行:compact 单行摘要 / agent 子智能体卡片 / toolpair 普通工具卡片 / plain 兜底。
@@ -3081,11 +3101,11 @@ const showKnowledgeToolbar = computed<boolean>(() => {
                           </div>
                           <!-- 子智能体卡片:标题单行,展开后参数 + 内部思考 + Markdown 报告 -->
                           <div v-else-if="row.kind === 'agent'" class="tool-card tool-card-agent">
-                            <div class="tool-card-header" @click="toggleRow(row.callId)">
-                              <span class="tool-group-toggle">{{ isRowExpanded(row.callId) ? '▼' : '▶' }}</span>
+                            <div class="tool-card-header" @click="toggleAgentBlockRow(row)">
+                              <span class="tool-group-toggle">{{ agentBlockOpen(row) ? '▼' : '▶' }}</span>
                               <span class="tool-card-title">{{ row.summary }}</span>
                             </div>
-                            <div v-if="isRowExpanded(row.callId)" class="tool-card-body">
+                            <div v-if="agentBlockOpen(row)" class="tool-card-body">
                               <div v-if="row.callDetail" class="tool-card-section">
                                 <div class="tool-card-section-label">子任务参数</div>
                                 <div class="tool-card-mono">{{ row.callDetail }}</div>
