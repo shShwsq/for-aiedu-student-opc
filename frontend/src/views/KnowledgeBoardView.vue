@@ -6,7 +6,9 @@
  *   主题折叠区展开后是知识点卡片网格,组内保持后端排序
  *   (weak > due > mastered > learning > fresh)
  * - 每张卡片 = 一个知识点:SM-2 记忆状态 + 作答统计 + 题库题数 + 状态徽章
- *   + 可折叠的「知识点讲解」(Markdown,依据出题当时的材料与题目写成)
+ *   + 一行紧凑的「查看讲解」入口(不再在卡片内就地展开占空间):点了在右侧栏
+ *     查看 / 编辑该知识点讲解(Markdown,依据出题当时的材料与题目写成),
+ *     右侧栏停靠可拖拽调宽(窄屏转覆盖式抽屉),编辑走 PUT .../explanation(source=manual)
  *   + 卡片底部「改主题」下拉:手工修正自动匹配出错的主题
  *     (PUT /practice/knowledge-points/{key}/topic,知识点级改动会级联其下题目,
  *      保存后整板刷新让卡片流入新分区)
@@ -28,6 +30,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 
 import AppHeader from '@/components/AppHeader.vue'
+import CodeMirrorEditor from '@/components/CodeMirrorEditor.vue'
 import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
 import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import {
@@ -35,8 +38,11 @@ import {
   getGenerateJob,
   listKnowledgePoints,
   listLearningTopics,
+  saveKnowledgeExplanation,
   setKnowledgeTopic,
 } from '@/api/practice'
+import { buildStorageKey, useResizableSidebar } from '@/composables/useResizableSidebar'
+import { useAuthStore } from '@/stores/auth'
 import { extractErrorMessage } from '@/utils/error'
 import { formatDate } from '@/utils/practiceFormat'
 import { renderMarkdown } from '@/utils/markdown'
@@ -47,6 +53,7 @@ import type {
 } from '@/types/practice'
 
 const router = useRouter()
+const auth = useAuthStore()
 
 // ============================================================
 // 历史任务侧栏(与首页/其他视图一致的折叠模式)
@@ -446,6 +453,120 @@ function explainMissing(): void {
 }
 
 // ============================================================
+// 右侧栏:查看 / 编辑知识点讲解(停靠可拖拽;窄屏覆盖抽屉)
+// ============================================================
+/**
+ * 停靠宽度:与任务详情右侧栏同款约束(min 320 / 窄屏 1024 转覆盖 / 上限收半屏),
+ * 拖拽宽度按用户邮箱存 localStorage(双键口径与 buildStorageKey 一致)。
+ */
+const {
+  inlineWidth: panelWidthStyle,
+  resizing: panelResizing,
+  isNarrow: panelNarrow,
+  ariaValueNow: panelAriaNow,
+  ariaValueMin: panelAriaMin,
+  ariaValueMax: panelAriaMax,
+  startResize: onPanelResizeStart,
+  onResizeKeydown: onPanelResizeKeydown,
+} = useResizableSidebar({
+  min: 320,
+  max: 640,
+  defaultWidth: 440,
+  narrowMax: 1024,
+  maxViewportRatio: 0.5,
+  storageKey: () => (auth.user ? buildStorageKey('knowledge-explain', auth.user.email) : null),
+})
+
+/** 当前在右侧栏查看的知识点 key(空 = 未选中) */
+const selectedKey = ref('')
+/** 右侧栏是否打开(点卡片「查看讲解」即开;关闭置 false) */
+const panelOpen = ref(false)
+/** 右栏展示态:view=渲染正文 / edit=CodeMirror 编辑 */
+const panelMode = ref<'view' | 'edit'>('view')
+/** 编辑态草稿(Markdown) */
+const draft = ref('')
+/** 保存中 */
+const saving = ref(false)
+/** 右栏错误提示(与操作头 explainStatus 分开,免得相互遮挡) */
+const panelError = ref('')
+
+/** 选中卡片(从 cards 派生:loadBoard / 保存回填后自动刷新讲解正文) */
+const selectedCard = computed<KnowledgePointCard | null>(
+  () => cards.value.find((c) => c.knowledge_key === selectedKey.value) ?? null,
+)
+
+/** 打开右栏查看某知识点讲解(切换卡片丢弃上一份未保存草稿,同题详情弹窗口径) */
+function openExplainPanel(c: KnowledgePointCard): void {
+  selectedKey.value = c.knowledge_key
+  panelOpen.value = true
+  panelMode.value = 'view'
+  draft.value = ''
+  panelError.value = ''
+}
+
+function closePanel(): void {
+  panelOpen.value = false
+  panelMode.value = 'view'
+  draft.value = ''
+  panelError.value = ''
+}
+
+function startEdit(): void {
+  draft.value = selectedCard.value?.explanation ?? ''
+  panelError.value = ''
+  panelMode.value = 'edit'
+}
+
+function cancelEdit(): void {
+  panelMode.value = 'view'
+  draft.value = ''
+  panelError.value = ''
+}
+
+/**
+ * 保存手工编辑的讲解:成功后就地回填该卡片字段(不整板刷新)
+ *
+ * 写入后 source=manual,批量生成 / 「重新生成」都不再覆盖它(后端保证)。
+ * 清空正文同样落库(后端把状态回退为「未生成」),回填后 htmlOf 缓存随之重算。
+ */
+async function saveEdit(): Promise<void> {
+  const c = selectedCard.value
+  if (!c || saving.value) return
+  saving.value = true
+  panelError.value = ''
+  try {
+    const updated = await saveKnowledgeExplanation(c.knowledge_key, draft.value)
+    cards.value = cards.value.map((x) =>
+      x.knowledge_key === updated.knowledge_key
+        ? {
+            ...x,
+            explanation: updated.explanation,
+            explanation_source: updated.explanation_source,
+            explanation_model: updated.explanation_model,
+            explanation_updated_at: updated.explanation_updated_at,
+          }
+        : x,
+    )
+    panelMode.value = 'view'
+    draft.value = ''
+  } catch (err) {
+    panelError.value = extractErrorMessage(err)
+  } finally {
+    saving.value = false
+  }
+}
+
+/** 对当前选中知识点生成 / 更新讲解(复用既有异步 job 路径,收尾 loadBoard 刷新右栏) */
+function explainSelected(): void {
+  if (selectedCard.value) explainOne(selectedCard.value)
+}
+
+/** 当前选中知识点发起专项练习 */
+function focusSelected(): void {
+  if (selectedCard.value) startFocus(selectedCard.value)
+}
+
+// ============================================================
 // 展示辅助
 // ============================================================
 function statusLabel(status: BoardStatus): string {
@@ -590,7 +711,11 @@ onMounted(() => {
                   <article
                     v-for="c in sec.cards"
                     :key="c.knowledge_key"
-                    :class="['kp-card', { 'kp-card-weak': c.board_status === 'weak' }]"
+                    :class="[
+                      'kp-card',
+                      { 'kp-card-weak': c.board_status === 'weak' },
+                      { 'kp-card-selected': panelOpen && selectedKey === c.knowledge_key },
+                    ]"
                   >
                     <div class="kp-head">
                       <span class="kp-name" :title="c.knowledge_name">{{ c.knowledge_name }}</span>
@@ -635,35 +760,22 @@ onMounted(() => {
                       </select>
                     </div>
 
-                    <!-- 知识点讲解:有正文或(有题可依据时)才渲染折叠区 -->
-                    <details v-if="c.explanation || c.can_generate_explanation" class="kp-explain">
-                      <summary class="kp-explain-head">
-                        <svg class="chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <path d="m9 18 6-6-6-6" />
-                        </svg>
-                        <span class="kp-explain-title">知识点讲解</span>
-                        <span
-                          v-if="explainSourceLabel(c.explanation_source)"
-                          :class="['explain-badge', c.explanation_source === 'manual' ? 'explain-badge-manual' : 'explain-badge-auto']"
-                          :title="c.explanation_source === 'manual'
-                            ? '你自己编辑过:自动生成不会覆盖'
-                            : `模型生成${c.explanation_model ? '(' + c.explanation_model + ')' : ''}`"
-                        >{{ explainSourceLabel(c.explanation_source) }}</span>
-                        <span v-if="c.explanation_updated_at" class="kp-explain-time">更新于 {{ formatDate(c.explanation_updated_at) }}</span>
-                      </summary>
-                      <div v-if="c.explanation" class="markdown-body kp-explain-body" v-html="htmlOf(c.knowledge_key)" />
-                      <p v-else class="kp-muted kp-explain-empty">还没有讲解 — 生成时会带上出题当时的材料与题目,不是空谈概念</p>
+                    <!-- 知识点讲解:卡片只留一行紧凑入口,正文改到右侧栏查看 / 编辑 -->
+                    <div class="kp-explain-cta">
+                      <span
+                        v-if="explainSourceLabel(c.explanation_source)"
+                        :class="['explain-badge', c.explanation_source === 'manual' ? 'explain-badge-manual' : 'explain-badge-auto']"
+                        :title="c.explanation_source === 'manual'
+                          ? '你自己编辑过:自动生成不会覆盖'
+                          : `模型生成${c.explanation_model ? '(' + c.explanation_model + ')' : ''}`"
+                      >{{ explainSourceLabel(c.explanation_source) }}</span>
+                      <span v-else class="kp-muted kp-no-explain">{{ c.can_generate_explanation ? '可生成讲解' : '暂无讲解' }}</span>
                       <button
-                        class="btn-secondary btn-small kp-explain-btn"
-                        :disabled="explaining"
-                        :title="explaining
-                          ? '讲解生成中,请等待当前任务完成'
-                          : (c.explanation
-                            ? '重新生成这段讲解(手工编辑的讲解不会被自动覆盖)'
-                            : '依据出题材料与题目生成一段讲解')"
-                        @click.stop.prevent="explainOne(c)"
-                      >{{ busyKey === c.knowledge_key ? '生成中…' : (c.explanation ? '更新讲解' : '生成讲解') }}</button>
-                    </details>
+                        class="btn-secondary kp-open-btn"
+                        title="在右侧查看 / 编辑知识点讲解"
+                        @click="openExplainPanel(c)"
+                      >{{ panelOpen && selectedKey === c.knowledge_key ? '已打开' : '查看讲解' }}</button>
+                    </div>
                   </article>
                 </div>
               </details>
@@ -671,6 +783,98 @@ onMounted(() => {
           </main>
         </div>
       </div>
+
+      <!-- 右侧栏:知识点讲解查看 / 编辑(停靠可拖拽;窄屏覆盖抽屉) -->
+      <aside
+        v-if="panelOpen"
+        class="explain-panel"
+        :class="{ 'panel-narrow': panelNarrow, 'panel-resizing': panelResizing }"
+        :style="panelWidthStyle"
+      >
+        <!-- 左缘调宽手柄(桌面态;窄屏覆盖态隐藏):拖动调宽 / 双击复位 / 键盘微调 -->
+        <div
+          v-if="!panelNarrow"
+          class="explain-resize-handle"
+          role="separator"
+          aria-orientation="vertical"
+          :aria-valuenow="panelAriaNow"
+          :aria-valuemin="panelAriaMin"
+          :aria-valuemax="panelAriaMax"
+          aria-label="调整讲解面板宽度"
+          tabindex="0"
+          title="拖动调整宽度，双击复位"
+          @pointerdown="onPanelResizeStart"
+          @keydown="onPanelResizeKeydown"
+        />
+
+        <!-- 栏头：知识点名 + 状态 + 关闭 -->
+        <div class="panel-header">
+          <div class="panel-title">
+            <span class="panel-kp-name" :title="selectedCard?.knowledge_name">{{ selectedCard?.knowledge_name }}</span>
+            <span
+              v-if="selectedCard"
+              :class="['status-badge', `status-${selectedCard.board_status}`]"
+            >{{ statusLabel(selectedCard.board_status) }}</span>
+          </div>
+          <button class="panel-close" aria-label="关闭讲解面板" @click="closePanel">×</button>
+        </div>
+
+        <!-- 副头：key + 来源 + 更新于 + 错误 -->
+        <div class="panel-subhead">
+          <span class="panel-kp-key">{{ selectedCard?.knowledge_key }}</span>
+          <span
+            v-if="selectedCard && explainSourceLabel(selectedCard.explanation_source)"
+            :class="['explain-badge', selectedCard.explanation_source === 'manual' ? 'explain-badge-manual' : 'explain-badge-auto']"
+            :title="selectedCard.explanation_source === 'manual'
+              ? '你自己编辑过：自动生成不会覆盖'
+              : `模型生成${selectedCard.explanation_model ? '(' + selectedCard.explanation_model + ')' : ''}`"
+          >{{ explainSourceLabel(selectedCard.explanation_source) }}</span>
+          <span v-if="selectedCard?.explanation_updated_at" class="panel-time">更新于 {{ formatDate(selectedCard.explanation_updated_at) }}</span>
+          <span v-if="panelError" class="panel-error">{{ panelError }}</span>
+        </div>
+
+        <!-- 正文：预览 / 编辑 -->
+        <div class="panel-body" :class="{ 'panel-body-edit': panelMode === 'edit' }">
+          <div v-if="panelMode === 'view'" class="panel-view">
+            <div v-if="selectedCard?.explanation" class="markdown-body panel-preview" v-html="htmlOf(selectedKey)" />
+            <p v-else class="panel-empty">还没有讲解 — 「生成讲解」会依据出题当时的材料与题目写成，也可以直接「编辑」自己写一段。</p>
+          </div>
+          <CodeMirrorEditor
+            v-else
+            v-model="draft"
+            class="panel-editor"
+            placeholder="用 Markdown 编辑这段知识点讲解…"
+          />
+        </div>
+
+        <!-- 底栏动作 -->
+        <div class="panel-footer">
+          <template v-if="panelMode === 'view'">
+            <button class="btn-secondary" @click="startEdit">编辑</button>
+            <button
+              class="btn-secondary"
+              :disabled="explaining || !selectedCard"
+              :title="explaining
+                ? '讲解生成中，请等待当前任务完成'
+                : (selectedCard?.explanation
+                  ? '重新生成这段讲解（手工编辑的讲解不会被自动覆盖）'
+                  : '依据出题材料与题目生成一段讲解')"
+              @click="explainSelected"
+            >{{ busyKey === selectedKey ? '生成中…' : (selectedCard?.explanation ? '重新生成' : '生成讲解') }}</button>
+            <button
+              class="btn-secondary"
+              :disabled="!selectedCard || selectedCard.question_count === 0"
+              title="只练习该知识点的题目"
+              @click="focusSelected"
+            >专项练习</button>
+          </template>
+          <template v-else>
+            <button class="btn-primary" :disabled="saving" @click="saveEdit">{{ saving ? '保存中…' : '保存' }}</button>
+            <button class="btn-secondary" :disabled="saving" @click="cancelEdit">取消</button>
+            <span class="panel-hint">保存后来源标记为「已编辑」，自动生成不再覆盖</span>
+          </template>
+        </div>
+      </aside>
     </div>
   </div>
 </template>
@@ -1171,40 +1375,35 @@ onMounted(() => {
   cursor: not-allowed;
 }
 
-/* ============ 知识点讲解(卡片内折叠区) ============ */
-.kp-explain {
-  margin-top: var(--space-1);
-  border-top: 1px dashed var(--color-border);
-  padding-top: var(--space-1);
-}
-
-/* summary 只占一行:标题 + 来源徽章 + 更新于 + 自绘三角 */
-.kp-explain-head {
+/* ============ 知识点讲解:卡片紧凑入口 + 右侧栏 ============ */
+/* 卡片只留一行入口(有正文/来源显徽章,否则显可生成/暂无提示) */
+.kp-explain-cta {
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  margin-top: var(--space-1);
+  padding-top: var(--space-1);
+  border-top: 1px dashed var(--color-border);
+}
+
+.kp-no-explain {
   font-size: var(--fs-xs);
-  color: var(--color-text-secondary);
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
 }
 
-.kp-explain-head::-webkit-details-marker {
-  display: none;
+.kp-open-btn {
+  margin-left: auto;
 }
 
-.kp-explain-title {
-  font-weight: var(--fw-medium);
+/* 选中卡片描边高亮(与右侧栏内容对应) */
+.kp-card-selected {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 2px var(--color-primary-light);
 }
 
-/* 展开时三角旋转(与区头同款,但不受区头选择器影响) */
-.kp-explain[open] > .kp-explain-head .chevron {
-  transform: rotate(90deg);
-}
-
+/* 讲解来源徽章(auto=AI / manual=已编辑) */
 .explain-badge {
   padding: 0 var(--space-1);
+  font-size: var(--fs-xs);
   border-radius: 999px;
   border: 1px solid var(--color-border);
   color: var(--color-text-muted);
@@ -1221,57 +1420,215 @@ onMounted(() => {
   border-color: var(--color-success);
 }
 
-.kp-explain-time {
+/* ============ 右侧栏:讲解查看 / 编辑(停靠可拖拽) ============ */
+.explain-panel {
+  position: relative; /* 供左缘调宽手柄经对定位 */
+  flex-shrink: 0;
+  min-width: 320px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-surface);
+  /* 分隔线常态淡,悬停/拖拽时才实心(见下 :has 规则) */
+  border-left: 1px solid color-mix(in srgb, var(--color-border) 20%, transparent);
+  transition: border-left-color var(--transition-fast);
+}
+
+/* 手柄 hover / focus / active 或拖拽中,把左缘边界线还原成实心 */
+.explain-panel:has(.explain-resize-handle:hover),
+.explain-panel:has(.explain-resize-handle:focus-visible),
+.explain-panel:has(.explain-resize-handle:active),
+.explain-panel.panel-resizing {
+  border-left-color: var(--color-border);
+}
+
+/* 左缘调宽手柄:热区压住分隔线两侧 */
+.explain-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  width: 6px;
+  z-index: 6;
+  cursor: col-resize;
+  /* 触屏:阻止浏览器把 pointermove 当滚动手势接管 */
+  touch-action: none;
+  background: transparent;
+  transition: background var(--transition-fast);
+}
+
+.explain-resize-handle:hover,
+.explain-resize-handle:focus-visible {
+  background: var(--color-primary-light);
+}
+
+/* 拖拽中整栏禁选中 */
+.explain-panel.panel-resizing {
+  user-select: none;
+  cursor: col-resize;
+}
+
+/* 栏头:知识点名 + 状态 + 关闭 */
+.panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.panel-kp-name {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.panel-close {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fs-lg);
+  line-height: 1;
+  color: var(--color-text-muted);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.panel-close:hover {
+  color: var(--color-text);
+  background: var(--color-surface-alt);
+}
+
+/* 副头:key + 来源 + 更新于 + 错误 */
+.panel-subhead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.panel-kp-key {
+  color: var(--color-text-muted);
+  word-break: break-all;
+}
+
+.panel-time {
   color: var(--color-text-muted);
 }
 
-.kp-explain-body {
-  margin: var(--space-2) 0 0;
-  font-size: var(--fs-xs);
+.panel-error {
+  color: var(--color-danger);
+}
+
+/* 正文:预览滚动 / 编辑内部滚动 */
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-4);
+}
+
+.panel-body.panel-body-edit {
+  overflow: hidden;
+  padding: 0;
+}
+
+.panel-empty {
+  margin: 0;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--color-text-muted);
+}
+
+/* 讲解预览正文(Markdown;字号比卡片略大一号,宽栏更好读) */
+.panel-preview {
+  font-size: var(--fs-sm);
   line-height: var(--lh-relaxed);
   color: var(--color-text);
   word-break: break-word;
 }
 
-.kp-explain-body :deep(h3) {
-  margin: var(--space-2) 0 var(--space-1);
-  font-size: var(--fs-xs);
+.panel-preview :deep(h1),
+.panel-preview :deep(h2),
+.panel-preview :deep(h3) {
+  margin: var(--space-3) 0 var(--space-2);
   font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
 }
 
-.kp-explain-body :deep(p) {
-  margin: 0 0 var(--space-1);
+.panel-preview :deep(h1) { font-size: var(--fs-lg); }
+.panel-preview :deep(h2) { font-size: var(--fs-base); }
+.panel-preview :deep(h3) { font-size: var(--fs-sm); }
+
+.panel-preview :deep(p) { margin: 0 0 var(--space-3); }
+
+.panel-preview :deep(ul),
+.panel-preview :deep(ol) {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-5);
 }
 
-.kp-explain-body :deep(ul),
-.kp-explain-body :deep(ol) {
-  margin: 0 0 var(--space-1);
-  padding-left: var(--space-4);
-}
-
-.kp-explain-body :deep(code) {
-  padding: 0 var(--space-1);
-  font-size: var(--fs-xs);
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
+.panel-preview :deep(code) {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  padding: 1px var(--space-1);
+  background: var(--color-surface-alt);
   border-radius: var(--radius-sm);
 }
 
-.kp-explain-body :deep(pre) {
-  margin: 0 0 var(--space-1);
-  padding: var(--space-2);
+.panel-preview :deep(pre) {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
   overflow-x: auto;
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  background: var(--color-surface-alt);
+  border-radius: var(--radius-md);
 }
 
-.kp-explain-empty {
-  margin: var(--space-2) 0 0;
+.panel-preview :deep(pre code) { padding: 0; background: transparent; }
+
+/* 编辑器铺满正文高度(.panel-editor 即 CodeMirrorEditor 的 .cm-host 根) */
+.panel-editor {
+  height: 100%;
 }
 
-.kp-explain-btn {
-  margin-top: var(--space-2);
+/* 底栏动作 */
+.panel-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.panel-hint {
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
 }
 
 /* 操作头里的讲解进度/结果提示 */
@@ -1300,6 +1657,19 @@ onMounted(() => {
 @media (max-width: 900px) {
   .board-nav {
     display: none;
+  }
+}
+
+/* ---- 响应式:窄屏(≤1024)右栏改覆盖式抽屉,手柄隐藏,宽度归本 CSS ---- */
+@media (max-width: 1024px) {
+  .explain-panel.panel-narrow {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(90vw, 460px);
+    z-index: 50;
+    box-shadow: -8px 0 30px rgba(0, 0, 0, 0.18);
   }
 }
 
