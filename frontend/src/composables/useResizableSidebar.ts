@@ -1,8 +1,10 @@
 /**
- * 右侧栏「左缘手柄拖拽调宽」通用逻辑
+ * 停靠侧栏「缘手柄拖拽调宽」通用逻辑(手柄贴停靠边的对侧)
  *
- * 交互模型:栏停靠视口右缘,手柄贴在栏的左边界 —— 手柄往左拖(clientX 变小)变宽,
- * 主区按 flex 自动让位。只改宽度,不负责把面板拖离右缘(那不是本 composable 的范围)。
+ * 交互模型由 side 决定停靠方向(默认 right,兼容旧调用):
+ * - side='right':栏停靠视口右缘,手柄贴左边界 —— 手柄往左拖(clientX 变小)变宽;
+ * - side='left': 栏停靠视口左缘,手柄贴右边界 —— 手柄往右拖(clientX 变大)变宽。
+ * 主区按 flex 自动让位。只改宽度,不负责把面板拖离停靠边(那不是本 composable 的范围)。
  *
  * 五个易踩的点收敛在这里,调用方不必各写一遍:
  * 1. 钳位:上限可再按视口比例收(maxViewportRatio),避免右栏吃掉主对话流的阅读宽度;
@@ -50,6 +52,9 @@ export interface ResizableSidebarOptions {
   max: number
   /** 默认宽度,同时是双击手柄的复位值 */
   defaultWidth: number
+  /** 停靠边(手柄在侧面的对边):'right' 栏靠右、手柄在左缘(往左拖变宽);
+   *  'left' 栏靠左、手柄在右缘(往右拖变宽)。默认 'right'。 */
+  side?: 'left' | 'right'
   /** 窄屏断点(px):视口 ≤ 该值视为覆盖抽屉态,禁用拖拽与内联宽度。默认 640 */
   narrowMax?: number
   /** 上限按视口宽度再收一道(0~1;0 = 不额外限制),保护主区阅读宽度 */
@@ -97,6 +102,7 @@ export function readStoredWidth(
 
 export function useResizableSidebar(options: ResizableSidebarOptions) {
   const { min, max, defaultWidth } = options
+  const side = options.side ?? 'right'
   const narrowMax = options.narrowMax ?? 640
   const ratio = options.maxViewportRatio ?? 0
 
@@ -165,8 +171,9 @@ export function useResizableSidebar(options: ResizableSidebarOptions) {
   function onResizeMove(e: PointerEvent): void {
     if (!resizing.value) return
     if (Math.abs(e.clientX - startX) > CLICK_SLOP_PX) movedDuringDrag = true
-    // 栏靠右:手柄往左拖(clientX 变小)应变宽,故 dx 取反
-    applyWidth(startW + (startX - e.clientX))
+    // 靠右:手柄往左拖(clientX 变小)变宽(dx 取反);靠左:手柄往右拖(clientX 变大)变宽
+    const dx = side === 'right' ? startX - e.clientX : e.clientX - startX
+    applyWidth(startW + dx)
   }
 
   function onResizeEnd(): void {
@@ -190,11 +197,14 @@ export function useResizableSidebar(options: ResizableSidebarOptions) {
     }
   }
 
-  /** 键盘微调(无障碍):← 变宽 / → 变窄,与手柄拖动同向;Home 复位 */
+  /** 键盘微调(无障碍):与手柄拖动同向 —— 靠右 ← 变宽 / → 变窄,靠左反之;Home 复位 */
   function onResizeKeydown(e: KeyboardEvent): void {
     if (isNarrow.value) return
-    if (e.key === 'ArrowLeft') applyWidth(width.value + KEY_STEP)
-    else if (e.key === 'ArrowRight') applyWidth(width.value - KEY_STEP)
+    // 「变宽 / 变窄键」随停靠边翻转:手柄往哪拖变宽,方向键就往哪走
+    const widenKey = side === 'right' ? 'ArrowLeft' : 'ArrowRight'
+    const narrowKey = side === 'right' ? 'ArrowRight' : 'ArrowLeft'
+    if (e.key === widenKey) applyWidth(width.value + KEY_STEP)
+    else if (e.key === narrowKey) applyWidth(width.value - KEY_STEP)
     else if (e.key === 'Home') resetWidth()
     else return
     e.preventDefault()

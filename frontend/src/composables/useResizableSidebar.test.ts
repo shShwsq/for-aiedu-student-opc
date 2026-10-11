@@ -5,6 +5,7 @@
  * - 钳位:min 优先于 max(极端窄屏下比例上限被压穿时不返回非法宽度)
  * - 视口比例上限:与绝对 max 取小,视口变窄时重算已存宽度
  * - 拖拽方向:右栏手柄往左拖(clientX 变小)应变宽
+ * - 停靠翻转:side='left'(左停靠)时拖拽/键盘方向整体镜像,默认仍为 'right'
  * - 窄屏态:覆盖抽屉下不响应拖拽,内联宽度交给 CSS
  * - 持久化:松手才落盘,读盘时非法回落默认、越界钳回区间
  *
@@ -217,6 +218,67 @@ describe('useResizableSidebar 拖拽', () => {
     unmount()
     dispatchPointer('pointermove', 500)
     expect(result.width.value).toBe(420)
+  })
+})
+
+describe('useResizableSidebar side=left(左停靠:手柄贴右缘,往右拖变宽)', () => {
+  it('拖拽方向翻转:往右拖(clientX 变大)变宽,往左拖变窄', () => {
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({
+        min: 360, max: 720, defaultWidth: 480, narrowMax: 640, side: 'left',
+      }),
+    )
+    result.startResize(pointer('pointerdown', 1000))
+
+    dispatchPointer('pointermove', 1100)
+    expect(result.width.value).toBe(580)
+
+    dispatchPointer('pointermove', 950)
+    expect(result.width.value).toBe(430)
+
+    dispatchPointer('pointerup', 950)
+    expect(result.resizing.value).toBe(false)
+    unmount()
+  })
+
+  it('拖不出绝对上限 max', () => {
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({
+        min: 360, max: 720, defaultWidth: 480, narrowMax: 640, side: 'left',
+      }),
+    )
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointermove', 9999)
+    expect(result.width.value).toBe(720)
+    dispatchPointer('pointerup')
+    unmount()
+  })
+
+  it('键盘微调方向随停靠边翻转:→ 变宽 / ← 变窄,Home 复位', () => {
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({
+        min: 360, max: 720, defaultWidth: 480, narrowMax: 640, side: 'left',
+      }),
+    )
+    result.onResizeKeydown(new KeyboardEvent('keydown', { key: 'ArrowRight' }))
+    expect(result.width.value).toBe(504)
+    result.onResizeKeydown(new KeyboardEvent('keydown', { key: 'ArrowLeft' }))
+    result.onResizeKeydown(new KeyboardEvent('keydown', { key: 'ArrowLeft' }))
+    expect(result.width.value).toBe(456)
+    result.onResizeKeydown(new KeyboardEvent('keydown', { key: 'Home' }))
+    expect(result.width.value).toBe(480)
+    unmount()
+  })
+
+  it('不传 side 仍默认右停靠(旧调用不受影响:往左拖变宽)', () => {
+    const { result, unmount } = withSetup(
+      () => useResizableSidebar({ min: 360, max: 720, defaultWidth: 480, narrowMax: 640 }),
+    )
+    result.startResize(pointer('pointerdown', 1000))
+    dispatchPointer('pointermove', 900)
+    expect(result.width.value).toBe(580)
+    dispatchPointer('pointerup')
+    unmount()
   })
 })
 

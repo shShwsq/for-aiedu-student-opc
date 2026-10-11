@@ -20,6 +20,10 @@
 ```
 
 - **左侧 WorkspaceSidebar**:历史任务列表,支持删除/重命名;折叠时完全隐藏,由顶栏按钮切换。
+  切到某任务的工作区并选中文件时,右侧会滑出「文件查看面板」(`.file-panel`,默认 480px,
+  `.workspace-sidebar` 固定 280px 在其左):可经其**右缘手柄**拖拽调宽(360px ~ min(720px, 50vw),
+  ≤640px 覆盖抽屉态隐藏手柄),双击复位,同样复用 `useResizableSidebar`(`side:'left'`,方向相对右栏
+  镜像),按「用户 email + 槽位」记忆到 `secondlook:sidebar-width:file-panel:{email}`。
 - **右侧 rail + 展开面板**:rail 常驻页面右缘(56px),是**唯一的展开与收起入口**——收起态
   没有独立把手,展开面板标题行也没有收起按钮,也没有折叠态悬浮角标(原有两套展开入口与
   tab 行一并收敛成 rail)。

@@ -22,6 +22,7 @@ import {
   readWorkspaceUploadsFile,
 } from '@/api/workspace'
 import { useFileDownload } from '@/composables/useFileDownload'
+import { buildStorageKey, useResizableSidebar } from '@/composables/useResizableSidebar'
 import { useWorkspaceRestore } from '@/composables/useWorkspaceRestore'
 import {
   deleteTask,
@@ -33,6 +34,7 @@ import { extractErrorMessage } from '@/utils/error'
 import { isLikelyBinaryPath } from '@/utils/fileKind'
 import { toWorkspaceRelative } from '@/utils/workspacePath'
 import FileContentViewer from './FileContentViewer.vue'
+import { useAuthStore } from '@/stores/auth'
 import type { TaskListItem, TaskStatus } from '@/types/task'
 import type {
   WorkspaceEntry,
@@ -42,6 +44,35 @@ import type {
 
 const router = useRouter()
 const route = useRoute()
+
+const auth = useAuthStore()
+
+/**
+ * 文件查看面板(.file-panel)右缘调宽:左停靠,手柄贴右缘,往右拖(clientX 变大)变宽。
+ * - min/max 给内容留呼吸(窄了代码换行、宽了顶穿主对话流);
+ * - maxViewportRatio=0.5 与右侧核查面板同档,单栏最多半屏;另有常驻 .workspace-sidebar
+ *   (280px)同在这条 flex 行里,合计占位再叠加,靠比例上限 + 主区 flex 兵分当缓冲;
+ * - narrowMax=640 对齐下面 @media(≤60…40 侧栏转覆盖抽屉,拖一个浮层无意义→隐藏手柄、宽度交 CSS);
+ * - 按「用户 email + 槽位」记忆到 localStorage(email 未就位则不读写,刷新回默认 480)。
+ */
+const {
+  inlineWidth: filePanelStyle,
+  resizing: filePanelResizing,
+  isNarrow: filePanelNarrow,
+  ariaValueNow: filePanelWidth,
+  ariaValueMin: filePanelMin,
+  ariaValueMax: filePanelMax,
+  startResize: onFilePanelResizeStart,
+  onResizeKeydown: onFilePanelResizeKeydown,
+} = useResizableSidebar({
+  min: 360,
+  max: 720,
+  defaultWidth: 480,
+  side: 'left',
+  narrowMax: 640,
+  maxViewportRatio: 0.5,
+  storageKey: () => (auth.user ? buildStorageKey('file-panel', auth.user.email) : null),
+})
 
 // ============================================================
 // 当前查看的任务(基于路由 /tasks/:id,用于侧栏 active 高亮)
@@ -1859,7 +1890,28 @@ defineExpose({ openTaskFile })
     </aside>
 
     <!-- 文件查看面板(右侧,仅工作区视图且选中文件且未手动隐藏时显示) -->
-    <section v-if="showFilePanel" class="file-panel">
+    <section
+      v-if="showFilePanel"
+      class="file-panel"
+      :class="{ 'file-panel-resizing': filePanelResizing }"
+      :style="filePanelStyle"
+    >
+      <!-- 右缘调宽手柄(左停靠:往右拖变宽,双击复位;≤640 覆盖抽屉态隐藏)。
+           悬停/聚焦染主色提示可拖;可聚焦 separator 按 WAI-ARIA Window Splitter 暴露取值范围 -->
+      <div
+        v-if="!filePanelNarrow"
+        class="file-panel-resize-handle"
+        role="separator"
+        aria-orientation="vertical"
+        :aria-valuenow="filePanelWidth"
+        :aria-valuemin="filePanelMin"
+        :aria-valuemax="filePanelMax"
+        aria-label="调整文件查看面板宽度"
+        tabindex="0"
+        title="拖动调整宽度，双击复位"
+        @pointerdown="onFilePanelResizeStart"
+        @keydown="onFilePanelResizeKeydown"
+      />
       <div class="file-panel-header">
         <span class="file-path" :title="selectedFilePath ?? undefined">{{ selectedFileName }}</span>
         <!-- 二进制文件没有行概念,分页条整体隐藏 -->
@@ -2725,6 +2777,9 @@ defineExpose({ openTaskFile })
 
 /* ---- 文件查看面板 ---- */
 .file-panel {
+  position: relative; /* 供右缘调宽手柄绝对定位 */
+  /* 默认宽 480px;useResizableSidebar 下发内联宽度覆盖(拖拽 + localStorage 记忆)。
+     拖拽期间 overflow:hidden 会裁掉外溢手柄,故手柄贴右缘内侧(right:0) */
   width: 480px;
   flex-shrink: 0;
   min-width: 0;
@@ -2733,6 +2788,32 @@ defineExpose({ openTaskFile })
   overflow: hidden;
   background: var(--color-bg);
   border-right: 1px solid var(--color-border);
+}
+
+/* 右缘调宽手柄:左停靠,往右拖变宽。热区贴边 6px,悬停/聚焦染主色提示可拖 */
+.file-panel-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 6px;
+  z-index: 6;
+  cursor: col-resize;
+  /* 触屏:阻止浏览器把 pointermove 当滚动手势接管 */
+  touch-action: none;
+  background: transparent;
+  transition: background var(--transition-fast);
+}
+
+.file-panel-resize-handle:hover,
+.file-panel-resize-handle:focus-visible {
+  background: var(--color-primary-light);
+}
+
+/* 拖拽中:整栏禁选中(栏内是源码/正文,否则一路选蓝)+ 光标保持左右箭头 */
+.file-panel.file-panel-resizing {
+  user-select: none;
+  cursor: col-resize;
 }
 
 .file-panel-header {
