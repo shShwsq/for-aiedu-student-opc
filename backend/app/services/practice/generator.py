@@ -29,10 +29,11 @@
    + 同用户 sha256 去重
 6. 落库为 draft(记录出题时实际匹配的主题与源码定位),前端预览确认后转 active
 
-出题模型解析:task.llm_config_id > 用户级默认出题模型
-(practice_settings.default_llm_config_id) > env 默认,逐级回退;
+出题模型解析:task.llm_config_id > 默认出题模型槽位
+(model_slot_defaults.slot=practice_generate,旧列 practice_settings.default_llm_config_id
+只作新表无行时的兜底) > env 默认,逐级回退;
 用户开启「始终用默认出题模型」(force_default_llm)时跳过任务级配置,
-直接按 用户级默认 > env 默认 解析。
+直接按 槽位默认 > env 默认 解析。
 """
 import hashlib
 import json
@@ -75,6 +76,7 @@ from app.models.practice import (
 from app.models.task import Conversation, Result, Task
 from app.models.audit import ReviewItem  # 溯源:题目可回指审查项(证据驱动可信审查)
 from app.models.user_llm_config import UserLLMConfig
+from app.services import model_slots
 from app.services.practice.difficulty import clamp_difficulty
 from app.services.practice.parse_utils import (
     salvage_json_array as _salvage_json_array,
@@ -729,26 +731,36 @@ def _ensure_workspace(
 
 
 def resolve_llm_client(db: Session, task: Task) -> LLMClient:
-    """解析出题模型:task.llm_config_id > 用户级默认出题模型 > env 默认
+    """解析出题模型:task.llm_config_id > 默认出题模型槽位 > env 默认
 
-    任务级与用户级配置都存于 UserLLMConfig.llm_configs(一次查询,
+    任务级配置与槽位默认都落在 UserLLMConfig.llm_configs 里(一次查询,
     按优先级逐个匹配);任一级配置缺失/失效均回退下一级,全部失败回退 env 默认。
     用户开启「始终用默认出题模型」(practice_settings.force_default_llm)时
-    跳过任务级配置,直接按 用户级默认 > env 默认 解析。
+    跳过任务级配置,直接按 槽位默认 > env 默认 解析。
     手动出题与任务完成自动出题共用本解析。
     """
-    config_ids: list[str] = []
+    client, _source = resolve_generate_client(db, task)
+    return client
+
+
+def resolve_generate_client(db: Session, task: Task) -> tuple[LLMClient, str]:
+    """出题模型解析并带出来源:source ∈ {task, default, env}
+
+    与 resolve_llm_client 同一实现(避免展示链路自己重拼优先级口径不一致)。
+    """
     pref = None
     if task.user_id is not None:
         pref = db.query(PracticeSettings).filter(
             PracticeSettings.user_id == task.user_id
         ).first()
-    # 「始终用默认出题模型」开启时忽略任务自带配置(用户级默认 > env 默认)
-    force_default = pref is not None and pref.force_default_llm is True
-    if not force_default and task.llm_config_id:
-        config_ids.append(task.llm_config_id)
-    if pref is not None and pref.default_llm_config_id:
-        config_ids.append(pref.default_llm_config_id)
+    # 「始终用默认出题模型」开启时忽略任务自带配置(槽位默认 > env 默认)
+    force_default = getattr(pref, "force_default_llm", None) is True
+    task_config_id = None if force_default else (task.llm_config_id or None)
+    default_config_id = model_slots.get_slot_config_id(
+        db, task.user_id, model_slots.SLOT_PRACTICE_GENERATE,
+        legacy_value=getattr(pref, "default_llm_config_id", None),
+    )
+    config_ids: list[str] = [cid for cid in (task_config_id, default_config_id) if cid]
     if config_ids:
         try:
             cfg_row = db.query(UserLLMConfig).filter(
@@ -760,25 +772,29 @@ def resolve_llm_client(db: Session, task: Task) -> LLMClient:
             for cid in config_ids:
                 cfg = configs.get(cid)
                 if cfg:
-                    return LLMClient.from_config_dict(cfg)
+                    source = "task" if cid == task_config_id else "default"
+                    return LLMClient.from_config_dict(cfg), source
             logger.warning(
                 "[practice] 未找到出题模型配置 ids=%s,回退 env 默认", config_ids
             )
         except Exception as e:
             logger.warning("[practice] 加载出题模型配置失败,回退 env 默认: %s", e)
-    return LLMClient()
+    return LLMClient(), "env"
 
 
 def resolve_explain_client_for_user(
     db: Session, user_id, settings_row: PracticeSettings | None,
 ) -> LLMClient:
-    """看板按需生成讲解时的模型:讲解专用 > 默认出题模型 > env 默认
+    """看板按需生成讲解时的模型:讲解槽位 > 默认出题模型槽位 > env 默认
 
     这条路径没有 task(与任务无关,只围绕知识点),所以不走任务级配置。
     """
-    cid = (
-        getattr(settings_row, "explain_llm_config_id", None)
-        or getattr(settings_row, "default_llm_config_id", None)
+    cid = model_slots.get_slot_config_id(
+        db, user_id, model_slots.SLOT_PRACTICE_EXPLAIN,
+        legacy_value=getattr(settings_row, "explain_llm_config_id", None),
+    ) or model_slots.get_slot_config_id(
+        db, user_id, model_slots.SLOT_PRACTICE_GENERATE,
+        legacy_value=getattr(settings_row, "default_llm_config_id", None),
     )
     if cid and user_id is not None:
         client = _client_from_config_id(db, user_id, cid)
@@ -819,38 +835,24 @@ def user_custom_topic_defs(db: Session, user_id) -> list[dict]:
 def resolve_generate_model_info(db: Session, task: Task) -> dict[str, str]:
     """解析本次出题将使用的模型与来源(任务详情页展示用)
 
-    与 resolve_llm_client 同一优先级(含「始终用默认出题模型」开关),
+    与 resolve_llm_client 共用同一条解析链(含「始终用默认出题模型」开关),
     返回 {model: 模型名, source: task=任务配置 / default=练习默认 / env=环境默认}。
     """
-    client = resolve_llm_client(db, task)
+    client, source = resolve_generate_client(db, task)
     model = getattr(client, "model", None) or "?"
-    source = "env"
-    if task.user_id is not None:
-        pref = db.query(PracticeSettings).filter(
-            PracticeSettings.user_id == task.user_id
-        ).first()
-        if pref is not None and pref.force_default_llm is True:
-            if pref.default_llm_config_id:
-                source = "default"
-        elif task.llm_config_id:
-            source = "task"
-        elif pref is not None and pref.default_llm_config_id:
-            source = "default"
-    elif task.llm_config_id:
-        source = "task"
     return {"model": model, "source": source}
 
 
-def _apply_thinking_mode(client: LLMClient, settings_row: PracticeSettings | None) -> None:
+def _apply_thinking_mode(client: LLMClient, mode: str | None) -> None:
     """应用用户级出题思考模式覆盖(手动/自动出题共用)
 
+    mode 由调用方经 model_slots 解析(槽位行 > 旧列 > follow)。
     follow(默认)保持出题模型配置自身的思考开关不动;on/off 强制开/关:
     - 思考模式出题更慢但可能质量更高;部分模型思考模式下工具调用
       会写成文本而非结构化通道,导致出题工具循环失效,此时可强制关
     - 仅支持思考模式的模型(catalog thinking=only)强制关无效:
       build_thinking_extras 对该类模型始终强附思考参数,这里记日志后跳过
     """
-    mode = getattr(settings_row, "thinking_mode_for_practice", None)
     if mode not in (THINKING_MODE_OFF, THINKING_MODE_ON):
         return  # follow / 未知值(如测试 mock)→ 保持模型配置原样
     meta = getattr(client, "model_meta", None) or {}
@@ -1620,7 +1622,13 @@ def generate_questions_for_task(
     settings_row = db.query(PracticeSettings).filter(
         PracticeSettings.user_id == user_id
     ).first()
-    _apply_thinking_mode(client, settings_row)
+    _apply_thinking_mode(
+        client,
+        model_slots.get_slot_thinking_mode(
+            db, user_id, model_slots.SLOT_PRACTICE_GENERATE,
+            legacy_value=getattr(settings_row, "thinking_mode_for_practice", None),
+        ),
+    )
 
     # 用户学习主题词表(仅启用主题参与分类与出题):
     # 停用主题的 finding 出题前被过滤,只停新增、不动存量。

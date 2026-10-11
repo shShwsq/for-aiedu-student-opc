@@ -7,12 +7,17 @@
  * - 验证权限:agent2 是否能自行调用工具验证(实验性)
  * - 验证授权模式:验证动作的默认授权模式(直接执行 / 逐动作授权)
  * - AI助手确认策略
+ * - 任务默认审查模型:任务没选模型时检查助手/内置助手用的默认模型
+ *   (存在模型槽位表,与上面的策略同一次点击一起保存)
  */
 import { computed, onMounted, ref } from 'vue'
 
 import BaseSelect from '@/components/BaseSelect.vue'
 import HelpPopover from '@/components/HelpPopover.vue'
+import ModelSlotSelect from '@/components/ModelSlotSelect.vue'
 import { getPreferences, saveAgentPolicy } from '@/api/memory'
+import { getModelSlots, saveModelSlots } from '@/api/model_slots'
+import { ensureLlmConfigsLoaded, llmConfigs } from '@/composables/useLlmConfigOptions'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 import { extractErrorMessage } from '@/utils/error'
 import type { SaveAgentPolicyRequest } from '@/types/memory'
@@ -45,6 +50,8 @@ const policyAllowReference = ref(DEFAULT_POLICY.allow_reference_check)
 const policyVerifierAuthMode = ref<'direct' | 'per_action'>(DEFAULT_POLICY.verifier_auth_mode_default)
 /** AI助手确认策略默认模式(任务级 _executor_command_confirm 可覆盖) */
 const policyExecutorCommandConfirm = ref<'always_approve' | 'per_command'>(DEFAULT_POLICY.executor_command_confirm_default)
+/** 任务默认审查模型配置 id(空串=未指定,回退环境默认;存在模型槽位表) */
+const policyReviewModelId = ref('')
 
 /** 验证授权模式选项(对齐 BaseSelect {value,label} 结构) */
 const verifierAuthModeOptions = computed(() => [
@@ -66,6 +73,7 @@ const originalPolicy = ref({
   allowReference: DEFAULT_POLICY.allow_reference_check,
   verifierAuthMode: DEFAULT_POLICY.verifier_auth_mode_default,
   executorCommandConfirm: DEFAULT_POLICY.executor_command_confirm_default,
+  reviewModelId: '',
 })
 
 /** agent 策略是否有未保存改动 */
@@ -76,7 +84,8 @@ const policyDirty = computed(() => {
     policyAllowVerify.value !== originalPolicy.value.allowVerify ||
     policyAllowReference.value !== originalPolicy.value.allowReference ||
     policyVerifierAuthMode.value !== originalPolicy.value.verifierAuthMode ||
-    policyExecutorCommandConfirm.value !== originalPolicy.value.executorCommandConfirm
+    policyExecutorCommandConfirm.value !== originalPolicy.value.executorCommandConfirm ||
+    policyReviewModelId.value !== originalPolicy.value.reviewModelId
   )
 })
 
@@ -91,6 +100,8 @@ function resetPolicyToDefault(): void {
   policyAllowReference.value = DEFAULT_POLICY.allow_reference_check
   policyVerifierAuthMode.value = DEFAULT_POLICY.verifier_auth_mode_default
   policyExecutorCommandConfirm.value = DEFAULT_POLICY.executor_command_confirm_default
+  // 审查模型的系统默认就是「未指定→用环境默认模型」
+  policyReviewModelId.value = ''
 }
 
 // ============================================================
@@ -114,35 +125,55 @@ function showToast(msg: string, type: 'success' | 'error'): void {
 async function loadPolicy(): Promise<void> {
   loading.value = true
   loadError.value = ''
-  try {
-    const data = await getPreferences()
-    updatedAt.value = data.updated_at ?? null
-    const policy = data.agent_policy
-    policyAgent2Enabled.value = policy?.agent2_enabled ?? DEFAULT_POLICY.agent2_enabled
-    policyExtractKp.value = policy?.extract_knowledge_points ?? DEFAULT_POLICY.extract_knowledge_points
-    policyAllowVerify.value = policy?.allow_verify ?? DEFAULT_POLICY.allow_verify
-    policyAllowReference.value = policy?.allow_reference_check ?? DEFAULT_POLICY.allow_reference_check
-    policyVerifierAuthMode.value = policy?.verifier_auth_mode_default ?? DEFAULT_POLICY.verifier_auth_mode_default
-    policyExecutorCommandConfirm.value = policy?.executor_command_confirm_default ?? DEFAULT_POLICY.executor_command_confirm_default
-    // 同步原始值(脏检查基准)
-    originalPolicy.value = {
-      agent2Enabled: policyAgent2Enabled.value,
-      extractKp: policyExtractKp.value,
-      allowVerify: policyAllowVerify.value,
-      allowReference: policyAllowReference.value,
-      verifierAuthMode: policyVerifierAuthMode.value,
-      executorCommandConfirm: policyExecutorCommandConfirm.value,
-    }
-  } catch (err) {
-    loadError.value = extractErrorMessage(err)
-  } finally {
+  // 两个读取并行:策略在 /memory/preferences,模型分配在 /models/defaults(槽位表)
+  const [prefRes, slotsRes] = await Promise.allSettled([
+    getPreferences(),
+    getModelSlots(),
+    ensureLlmConfigsLoaded(),
+  ] as const)
+  if (prefRes.status === 'rejected') {
+    loadError.value = extractErrorMessage(prefRes.reason)
     loading.value = false
+    return
+  }
+  const data = prefRes.value
+  // 槽位读取失败不阻断策略页:当下按「未指定」展示,不写回(保存时由差异判定决定发不发)
+  const reviewSlot =
+    slotsRes.status === 'fulfilled'
+      ? slotsRes.value.slots.find((s) => s.slot === 'review_default')
+      : undefined
+  const reviewModelId = reviewSlot?.llm_config_id ?? ''
+  updatedAt.value = data.updated_at ?? null
+  const policy = data.agent_policy
+  policyAgent2Enabled.value = policy?.agent2_enabled ?? DEFAULT_POLICY.agent2_enabled
+  policyExtractKp.value = policy?.extract_knowledge_points ?? DEFAULT_POLICY.extract_knowledge_points
+  policyAllowVerify.value = policy?.allow_verify ?? DEFAULT_POLICY.allow_verify
+  policyAllowReference.value = policy?.allow_reference_check ?? DEFAULT_POLICY.allow_reference_check
+  policyVerifierAuthMode.value = policy?.verifier_auth_mode_default ?? DEFAULT_POLICY.verifier_auth_mode_default
+  policyExecutorCommandConfirm.value = policy?.executor_command_confirm_default ?? DEFAULT_POLICY.executor_command_confirm_default
+  policyReviewModelId.value = reviewModelId
+  // 同步原始值(脏检查基准)
+  originalPolicy.value = snapshotPolicy()
+  loading.value = false
+}
+
+/** 当前表单值快照(脏检查基准写入用) */
+function snapshotPolicy() {
+  return {
+    agent2Enabled: policyAgent2Enabled.value,
+    extractKp: policyExtractKp.value,
+    allowVerify: policyAllowVerify.value,
+    allowReference: policyAllowReference.value,
+    verifierAuthMode: policyVerifierAuthMode.value,
+    executorCommandConfirm: policyExecutorCommandConfirm.value,
+    reviewModelId: policyReviewModelId.value,
   }
 }
 
 async function handleSave(): Promise<boolean> {
   if (!policyDirty.value || saving.value) return false
   saving.value = true
+  const reviewChanged = policyReviewModelId.value !== originalPolicy.value.reviewModelId
   try {
     const body: SaveAgentPolicyRequest = {
       agent2_enabled: policyAgent2Enabled.value,
@@ -164,17 +195,20 @@ async function handleSave(): Promise<boolean> {
       policyVerifierAuthMode.value = policy.verifier_auth_mode_default
       policyExecutorCommandConfirm.value = policy.executor_command_confirm_default
     }
-    originalPolicy.value = {
-      agent2Enabled: policyAgent2Enabled.value,
-      extractKp: policyExtractKp.value,
-      allowVerify: policyAllowVerify.value,
-      allowReference: policyAllowReference.value,
-      verifierAuthMode: policyVerifierAuthMode.value,
-      executorCommandConfirm: policyExecutorCommandConfirm.value,
+    // 任务默认审查模型落在模型槽位表(另一个端点),同一次点击一起提交;
+    // 未改动则不发请求(不会把读取失败时的空值当成「用户选了跟随默认」刷掉真值)
+    if (reviewChanged) {
+      const slots = await saveModelSlots({
+        slots: { review_default: { llm_config_id: policyReviewModelId.value } },
+      })
+      const saved = slots.slots.find((s) => s.slot === 'review_default')?.llm_config_id ?? ''
+      policyReviewModelId.value = saved
     }
+    originalPolicy.value = snapshotPolicy()
     showToast('智能体策略已保存', 'success')
     return true
   } catch (err) {
+    // 任一步失败都保留脏态(不更新 originalPolicy),用户可直接重试
     showToast(extractErrorMessage(err), 'error')
     return false
   } finally {
@@ -210,6 +244,8 @@ const FIELD_HELP: Record<string, string> = {
     '仅在开启「自行验证」时生效。逐动作授权:每个验证动作(HTTP 请求 / PoC 脚本)执行前弹窗让用户确认;直接执行:验证动作自动执行不弹窗。此为用户级默认,任务创建或运行时可单独覆盖。',
   executor_command_confirm:
     '控制 AI助手(内置执行器 / Qoder / DeepSeek / Codex)执行危险命令时是否弹窗确认。自动批准:所有命令直接执行不弹窗(速度快,适合可信任务);逐命令确认:每个危险命令执行前弹窗让用户批准(更安全,防容器破坏/资源耗尽)。此为用户级默认,任务创建时可单独覆盖。注意:Codex CLI 受非交互模式限制,仅支持自动批准,选择「逐命令确认」时会降级并警告。',
+  review_model:
+    '提交任务时没选模型的情况下,检查助手(评估)与内置 AI助手(执行)默认用哪个模型;任务自带模型仍然优先。选「跟随系统默认」则用环境变量里配的模型。外部 CLI 执行器(Qoder / DeepSeek / Codex)不受这里影响,它们的模型在「CLI 设置」里配。各处任务的默认模型汇总见「模型设置 > 任务模型默认」。',
 }
 
 // 字段帮助气泡:统一走共享组件 HelpPopover(正文由下方各字段的插槽供给)
@@ -313,6 +349,22 @@ onMounted(loadPolicy)
           aria-label="AI助手确认策略"
         />
       </label>
+
+      <!-- 任务默认审查模型(存 model_slot_defaults,随本表单一起保存) -->
+      <div class="policy-field policy-field-review-model">
+        <div class="field-head">
+          <span class="policy-label">任务默认审查模型</span>
+          <HelpPopover max-width="min(380px, 86vw)">{{ FIELD_HELP.review_model }}</HelpPopover>
+        </div>
+        <ModelSlotSelect
+          :model-value="policyReviewModelId"
+          :configs="llmConfigs"
+          empty-label="跟随系统默认"
+          select-label="任务默认审查模型"
+          :disabled="saving"
+          @update:model-value="policyReviewModelId = $event"
+        />
+      </div>
 
       <!-- 操作区 -->
       <div class="policy-actions">
@@ -614,6 +666,12 @@ input.switch:disabled {
 
 .policy-field-command-confirm {
   max-width: 360px;
+  margin-bottom: var(--space-2);
+}
+
+/* 任务默认审查模型:同样不给整幅宽度(避免下拉占满一行后看不出是个选项) */
+.policy-field-review-model {
+  max-width: 420px;
   margin-bottom: var(--space-2);
 }
 

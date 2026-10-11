@@ -93,6 +93,7 @@ async def lifespan(app: FastAPI):
     from app.models import practice  # noqa: F401  # 练习模块全新表,随 create_all 建表
     from app.models import domain_event_log  # noqa: F401  # 领域事件审计日志,随 create_all 建表
     from app.models import memory_settings  # noqa: F401  # 记忆生成设置 1:1 表,随 create_all 建表
+    from app.models import model_slot  # noqa: F401  # 模型槽位默认(1:N),随 create_all 建表
     # 审查项(证据驱动可信审查):review_items 表须晚于 practice_questions 的
     # source_review_item_id 外键迁移(create_all 建缺失表,须先注册 audit)
     from app.models import audit  # noqa: F401
@@ -138,6 +139,11 @@ async def lifespan(app: FastAPI):
     from app.models.practice import migrate_practice_drop_explain_with_questions_column
 
     migrate_practice_drop_explain_with_questions_column()
+    # 模型槽位收敛:practice_settings / memory_settings 上的模型列拷入 model_slot_defaults
+    # (须晚于上面的补列迁移与 create_all;旧列保留不删,只作新表无行时的读取兜底)
+    from app.models.model_slot import migrate_model_slot_defaults
+
+    migrate_model_slot_defaults()
     # 迁移用户级 agent_policy:user_preferences.agent_policy JSONB → agent_policies 独立表
     # (拷数据后删旧列;必须晚于 migrate_user_preference_columns,新表已由 create_all 建好)
     from app.models.agent_policy import (

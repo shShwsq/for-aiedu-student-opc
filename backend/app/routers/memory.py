@@ -30,13 +30,11 @@ from app.models.agent_policy import AgentPolicy
 from app.models.memory_settings import MemorySettings
 from app.models.practice import (
     DEFAULT_GENERATE_CONCURRENCY,
-    DEFAULT_THINKING_MODE,
     MAX_GENERATE_CONCURRENCY,
     PracticeSettings,
 )
 from app.models.project import Project
 from app.models.user import User
-from app.models.user_llm_config import UserLLMConfig
 from app.models.user_memory import UserMemory
 from app.models.user_preference import UserPreference
 from app.prompts.memory_curator import (
@@ -57,6 +55,15 @@ from app.schemas.memory import (
     StructureDefaultsOut,
     UserMemoryOut,
     UserPreferenceOut,
+)
+from app.services.model_slots import (
+    SLOT_MEMORY_CURATOR,
+    SLOT_PRACTICE_EXPLAIN,
+    SLOT_PRACTICE_GENERATE,
+    get_slot_config_id,
+    get_slot_thinking_mode,
+    set_slot,
+    user_llm_config_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,40 +120,23 @@ def save_practice_settings(
     讲解模型 / 出题并发度)
 
     存于 practice_settings 独立表(1:1),get_or_create:无行时自动创建。
-    restore_workspace_for_practice / default_llm_config_id /
-    force_default_llm / thinking_mode_for_practice /
-    explain_llm_config_id /
-    generate_concurrency 可选:传 None 表示不修改;
-    *_llm_config_id 传空串表示清空。
+    restore_workspace_for_practice / force_default_llm / generate_concurrency
+    可选:传 None 表示不修改。
+
+    模型字段(default_llm_config_id / thinking_mode_for_practice / explain_llm_config_id)
+    **写穿到 model_slot_defaults 表**(槽位 practice_generate / practice_explain),
+    不再写 practice_settings 的旧列;旧列只作新表无行时的读取兜底。
+    语义不变:*_llm_config_id 传 None=不修改、空串=清空;响应仍同一套字段名
+    (由 _build_preference_out 从槽位表投影),因此练习设置面板与旧客户端零改动。
     (learning_topic 已移除:出题主题按发现内容自动匹配;
      generate_explanation_with_questions 已废弃:知识点讲解改为仅看板按需生成)
     """
-    # 默认出题模型归属校验:必须是当前用户已保存的 LLM 配置
-    if req.default_llm_config_id:
-        cfg_row = (
-            db.query(UserLLMConfig)
-            .filter(UserLLMConfig.user_id == current_user.id)
-            .first()
-        )
-        ids = {c.get("id") for c in (cfg_row.llm_configs or [])} if cfg_row else set()
-        if req.default_llm_config_id not in ids:
-            raise HTTPException(
-                status_code=400,
-                detail="出题模型配置不存在或不属于当前用户",
-            )
-    # 讲解专用模型同样要归属校验(它是「轻任务另挂快模型」的入口)
-    if req.explain_llm_config_id:
-        cfg_row = (
-            db.query(UserLLMConfig)
-            .filter(UserLLMConfig.user_id == current_user.id)
-            .first()
-        )
-        ids = {c.get("id") for c in (cfg_row.llm_configs or [])} if cfg_row else set()
-        if req.explain_llm_config_id not in ids:
-            raise HTTPException(
-                status_code=400,
-                detail="讲解模型配置不存在或不属于当前用户",
-            )
+    # 模型归属校验:出题/讲解都必须是当前用户已保存的 LLM 配置
+    _ensure_owned_configs(
+        db, current_user.id,
+        (req.default_llm_config_id, "出题模型"),
+        (req.explain_llm_config_id, "讲解模型"),
+    )
     row = (
         db.query(PracticeSettings)
         .filter(PracticeSettings.user_id == current_user.id)
@@ -162,29 +152,38 @@ def save_practice_settings(
         row.auto_generate_practice = req.auto_generate_practice
     if req.restore_workspace_for_practice is not None:
         row.restore_workspace_for_practice = req.restore_workspace_for_practice
-    if req.default_llm_config_id is not None:
-        row.default_llm_config_id = req.default_llm_config_id or None
     if req.force_default_llm is not None:
         row.force_default_llm = req.force_default_llm
-    if req.thinking_mode_for_practice is not None:
-        row.thinking_mode_for_practice = req.thinking_mode_for_practice
-    if req.explain_llm_config_id is not None:
-        row.explain_llm_config_id = req.explain_llm_config_id or None
     if req.generate_concurrency is not None:
         row.generate_concurrency = max(
             1, min(int(req.generate_concurrency), MAX_GENERATE_CONCURRENCY)
         )
+    # 模型分配写穿到槽位表(一次调用写两侧:autoflush 关闭时分两次会建出重复行)
+    if req.default_llm_config_id is not None or req.thinking_mode_for_practice is not None:
+        set_slot(
+            db, current_user.id, SLOT_PRACTICE_GENERATE,
+            llm_config_id=req.default_llm_config_id,
+            thinking_mode=req.thinking_mode_for_practice,
+        )
+    if req.explain_llm_config_id is not None:
+        set_slot(
+            db, current_user.id, SLOT_PRACTICE_EXPLAIN,
+            llm_config_id=req.explain_llm_config_id,
+        )
     db.commit()
     db.refresh(row)
+    # 日志打“生效值”(新表优先，旧列已不再写)，否则排障时会对着没动的旧列猜
+    effective_default = get_slot_config_id(db, current_user.id, SLOT_PRACTICE_GENERATE)
     logger.info(
         "用户 %s 更新练习设置: auto_generate_practice=%s "
-        "restore_workspace=%s default_llm_config_id=%s force_default_llm=%s "
-        "thinking_mode=%s explain_llm_config_id=%s concurrency=%s",
+        "restore_workspace=%s 出题模型槽位=%s force_default_llm=%s "
+        "thinking_mode=%s 讲解模型槽位=%s concurrency=%s",
         current_user.id, req.auto_generate_practice,
         req.restore_workspace_for_practice,
-        row.default_llm_config_id, row.force_default_llm,
-        row.thinking_mode_for_practice,
-        row.explain_llm_config_id, row.generate_concurrency,
+        effective_default, row.force_default_llm,
+        get_slot_thinking_mode(db, current_user.id, SLOT_PRACTICE_GENERATE),
+        get_slot_config_id(db, current_user.id, SLOT_PRACTICE_EXPLAIN),
+        row.generate_concurrency,
     )
     return _build_preference_out(db, current_user.id, settings_row=row)
 
@@ -230,20 +229,13 @@ def save_memory_settings(
     存于 memory_settings 独立表(1:1),get_or_create:无行时自动创建。
     curator_llm_config_id 传 None=不修改,空串=清空(回退 env 默认);传值需属于当前用户
     已保存的 LLM 配置。thinking_mode / structure_mode / inject_max_chars 传 None=不修改。
+
+    模型与思考模式(curator_llm_config_id / thinking_mode)**写穿到槽位表**
+    (slot=memory_curator),不再写 memory_settings 旧列;响应由 _memory_settings_out
+    从槽位表投影,字段名与语义不变。
     """
     # 记忆模型归属校验:必须是当前用户已保存的 LLM 配置
-    if req.curator_llm_config_id:
-        cfg_row = (
-            db.query(UserLLMConfig)
-            .filter(UserLLMConfig.user_id == current_user.id)
-            .first()
-        )
-        ids = {c.get("id") for c in (cfg_row.llm_configs or [])} if cfg_row else set()
-        if req.curator_llm_config_id not in ids:
-            raise HTTPException(
-                status_code=400,
-                detail="记忆模型配置不存在或不属于当前用户",
-            )
+    _ensure_owned_configs(db, current_user.id, (req.curator_llm_config_id, "记忆模型"))
     row = (
         db.query(MemorySettings)
         .filter(MemorySettings.user_id == current_user.id)
@@ -260,10 +252,6 @@ def save_memory_settings(
         db.add(row)
     else:
         row.memory_enabled = req.memory_enabled
-    if req.curator_llm_config_id is not None:
-        row.curator_llm_config_id = req.curator_llm_config_id or None
-    if req.thinking_mode is not None:
-        row.thinking_mode = req.thinking_mode
     if req.structure_mode is not None:
         row.structure_mode = req.structure_mode
     if req.inject_max_chars is not None:
@@ -276,12 +264,22 @@ def save_memory_settings(
         row.global_categories = _normalize_categories(
             req.global_categories, DEFAULT_GLOBAL_CATEGORY_DEFS,
         )
+    # 归纳模型与思考模式写穿到槽位表(一次调用写两侧)
+    if req.curator_llm_config_id is not None or req.thinking_mode is not None:
+        set_slot(
+            db, current_user.id, SLOT_MEMORY_CURATOR,
+            llm_config_id=req.curator_llm_config_id,
+            thinking_mode=req.thinking_mode,
+        )
     db.commit()
     db.refresh(row)
     logger.info(
-        "用户 %s 更新记忆设置: enabled=%s curator_llm=%s structure=%s thinking=%s inject_max=%s",
-        current_user.id, row.memory_enabled, row.curator_llm_config_id,
-        row.structure_mode, row.thinking_mode, row.inject_max_chars,
+        "用户 %s 更新记忆设置: enabled=%s 归纳模型槽位=%s structure=%s thinking=%s inject_max=%s",
+        current_user.id, row.memory_enabled,
+        get_slot_config_id(db, current_user.id, SLOT_MEMORY_CURATOR),
+        row.structure_mode,
+        get_slot_thinking_mode(db, current_user.id, SLOT_MEMORY_CURATOR),
+        row.inject_max_chars,
     )
     return _build_preference_out(db, current_user.id)
 
@@ -298,22 +296,36 @@ def get_structure_defaults(
     return StructureDefaultsOut()
 
 
-def _memory_settings_out(row: MemorySettings | None) -> MemorySettingsOut:
+def _memory_settings_out(
+    db: Session, row: MemorySettings | None, user_id,
+) -> MemorySettingsOut:
     """MemorySettings 行 → MemorySettingsOut。
 
     - 无行 → 全默认(类别为内置种子)。
     - 存量行但类别列为空(早期仅保存开关时落库的空列)→ 回退内置默认,
       保证前端始终能看到系统默认类别。
     - default_* 始终为内置种子(供前端对照与恢复)。
+    - curator_llm_config_id / thinking_mode **从槽位表投影**(旧列只作无行时兜底),
+      字段名不变所以记忆设置面板零改动。
     """
+    curator_llm = get_slot_config_id(
+        db, user_id, SLOT_MEMORY_CURATOR,
+        legacy_value=getattr(row, "curator_llm_config_id", None),
+    )
+    curator_thinking = get_slot_thinking_mode(
+        db, user_id, SLOT_MEMORY_CURATOR,
+        legacy_value=getattr(row, "thinking_mode", None),
+    )
     if row is None:
-        return MemorySettingsOut()
+        return MemorySettingsOut(
+            curator_llm_config_id=curator_llm, thinking_mode=curator_thinking,
+        )
     pcats = _cat_defs(row.project_categories, DEFAULT_PROJECT_CATEGORY_DEFS)
     gcats = _cat_defs(row.global_categories, DEFAULT_GLOBAL_CATEGORY_DEFS)
     return MemorySettingsOut(
         memory_enabled=row.memory_enabled,
-        curator_llm_config_id=row.curator_llm_config_id,
-        thinking_mode=row.thinking_mode,
+        curator_llm_config_id=curator_llm,
+        thinking_mode=curator_thinking,
         structure_mode=row.structure_mode,
         project_categories=pcats,
         global_categories=gcats,
@@ -488,18 +500,40 @@ def delete_project(
 # ============================================================
 
 
+def _ensure_owned_configs(db: Session, user_id, *pairs) -> None:
+    """校验传入的 (配置 id, 展示名) 都属于当前用户已保存的 LLM 配置
+
+    空值(未传/清空)不校验;命中失败直接 400。
+    归属集合口径与 GET /models/configs 同源(model_slots.user_llm_config_ids)。
+    """
+    wanted = [(cid, label) for cid, label in pairs if cid]
+    if not wanted:
+        return
+    owned = user_llm_config_ids(db, user_id)
+    for cid, label in wanted:
+        if cid not in owned:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label}配置不存在或不属于当前用户",
+            )
+
+
 def _build_preference_out(
     db: Session, user_id,
     pref_row: UserPreference | None = None,
     settings_row: PracticeSettings | None = None,
 ) -> UserPreferenceOut:
-    """组装 UserPreferenceOut(数据跨三表:user_preferences + agent_policies + practice_settings)
+    """组装 UserPreferenceOut(数据来自三张表:user_preferences + agent_policies + practice_settings)
 
     - user_profile 来自 user_preferences(可能无行)
     - agent_policy 来自 agent_policies 独立表(可能无行 → None,前端用系统默认)
     - auto_generate_practice / restore_workspace_for_practice /
-      default_llm_config_id / force_default_llm / thinking_mode_for_practice
-      来自 practice_settings 独立表(可能无行 → 用默认值)
+      force_default_llm / generate_concurrency 来自 practice_settings 独立表
+      (可能无行 → 用默认值)
+    - 模型分配(default_llm_config_id / thinking_mode_for_practice /
+      explain_llm_config_id 与 memory_settings 里的归纳模型)来自
+      model_slot_defaults 槽位表(旧列只作无行时兜底);字段名与语义保持不变,
+      所以 TaskCreateView / 练习与记忆面板等消费方无需改动
     - updated_at 取各行中较新的(哪边最后保存,就算最后更新)
     """
     if pref_row is None:
@@ -538,24 +572,26 @@ def _build_preference_out(
         restore_workspace_for_practice=(
             settings_row.restore_workspace_for_practice if settings_row else False
         ),
-        default_llm_config_id=(
-            settings_row.default_llm_config_id if settings_row else None
+        default_llm_config_id=get_slot_config_id(
+            db, user_id, SLOT_PRACTICE_GENERATE,
+            legacy_value=getattr(settings_row, "default_llm_config_id", None),
         ),
         force_default_llm=(
             settings_row.force_default_llm if settings_row else False
         ),
-        thinking_mode_for_practice=(
-            settings_row.thinking_mode_for_practice
-            if settings_row else DEFAULT_THINKING_MODE
+        thinking_mode_for_practice=get_slot_thinking_mode(
+            db, user_id, SLOT_PRACTICE_GENERATE,
+            legacy_value=getattr(settings_row, "thinking_mode_for_practice", None),
         ),
-        explain_llm_config_id=(
-            settings_row.explain_llm_config_id if settings_row else None
+        explain_llm_config_id=get_slot_config_id(
+            db, user_id, SLOT_PRACTICE_EXPLAIN,
+            legacy_value=getattr(settings_row, "explain_llm_config_id", None),
         ),
         generate_concurrency=(
             settings_row.generate_concurrency
             if settings_row else DEFAULT_GENERATE_CONCURRENCY
         ),
-        memory_settings=_memory_settings_out(memory_row),
+        memory_settings=_memory_settings_out(db, memory_row, user_id),
         updated_at=updated_at,
     )
 
@@ -614,7 +650,10 @@ def _regen_memory_summary(db: Session, user_id, memory_content: str) -> str:
             else 2000
         )
         structured = not (settings_row and settings_row.structure_mode == "freeform")
-        thinking_mode = settings_row.thinking_mode if settings_row else DEFAULT_THINKING_MODE
+        thinking_mode = get_slot_thinking_mode(
+            db, user_id, SLOT_MEMORY_CURATOR,
+            legacy_value=getattr(settings_row, "thinking_mode", None),
+        )
         try:
             llm, _src = resolve_memory_llm_client(db, user_id)
         except Exception:

@@ -6,6 +6,8 @@
 - GET  /models/catalog        厂商与模型清单(无需登录,前端选厂商用)
 - GET  /models/configs        当前用户已保存的配置列表(鉴权)
 - PUT  /models/configs        保存配置列表(整体替换,鉴权)
+- GET  /models/defaults       各任务(模型槽位)的默认模型分配(鉴权,只读聚合)
+- PUT  /models/defaults       写入可配槽位(仅注册表 writable 项,鉴权)
 - POST /models/llm/test       测试指定 LLM 配置连通性(按 config_id)
 - POST /models/embedding/test 测试指定 Embedding 配置连通性(按 config_id)
 
@@ -30,6 +32,20 @@ from app.schemas.model_configs import (
     TestRequest,
     TestResponse,
     UserModelsResponse,
+)
+from app.schemas.model_slots import (
+    ModelSlotInfoRowOut,
+    ModelSlotOut,
+    ModelSlotsResponse,
+    SaveModelSlotsRequest,
+)
+from app.services.model_slots import (
+    INFO_ROWS,
+    env_default_model,
+    set_slot,
+    slot_def,
+    slot_views,
+    user_llm_config_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +103,70 @@ def save_models(
     llm_out = [_to_llm_out(c) for c in cfg.llm_configs]
     emb_out = [_to_embedding_out(c) for c in cfg.embedding_configs]
     return UserModelsResponse(llm_configs=llm_out, embedding_configs=emb_out)
+
+
+# ============================================================
+# 任务模型默认(模型槽位聚合页:只读展示 + 可配槽位写入)
+# ============================================================
+
+
+@router.get("/defaults", response_model=ModelSlotsResponse)
+def get_model_defaults(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ModelSlotsResponse:
+    """各任务的默认模型分配(一次返回全部槽位 + 只读说明行)
+
+    聚合页本身只读:编辑发生在归属面板(练习设置 / 记忆设置 / 智能体策略),
+    那些端点写穿到同一张表,因此这里看到的是同一个真相。
+    """
+    return _slots_response(db, current_user.id)
+
+
+@router.put("/defaults", response_model=ModelSlotsResponse)
+def save_model_defaults(
+    req: SaveModelSlotsRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ModelSlotsResponse:
+    """写入可配槽位(部分写:`None`=不修改,空串=清空回退环境默认)
+
+    白名单:只有注册表标 `writable` 的槽位能走这里,其余槽位归归属面板端点
+    (否则同一个字段会出现两个写入口,谁后写谁赢)。
+    归属校验:`llm_config_id` 必须是当前用户已保存的 LLM 配置(与练习/记忆设置同源)。
+    """
+    owned = user_llm_config_ids(db, current_user.id)
+    for slot_id, item in req.slots.items():
+        d = slot_def(slot_id)
+        if d is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"未知模型槽位: {slot_id}",
+            )
+        if not d.writable:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"「{d.label}」请在 {d.edit_path} 修改",
+            )
+        if item.thinking_mode is not None and not d.has_thinking_mode:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"「{d.label}」不支持思考模式设置",
+            )
+        if item.llm_config_id and item.llm_config_id not in owned:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"「{d.label}」模型配置不存在或不属于当前用户",
+            )
+        # 一次调用写两侧:set_slot 内部 get_or_create,分两次会因 autoflush 关闭而建出重复行
+        set_slot(
+            db, current_user.id, slot_id,
+            llm_config_id=item.llm_config_id,
+            thinking_mode=item.thinking_mode,
+        )
+    db.commit()
+    logger.info("用户 %s 更新模型槽位默认: %s", current_user.id, list(req.slots))
+    return _slots_response(db, current_user.id)
 
 
 @router.post("/llm/test", response_model=TestResponse)
@@ -172,6 +252,18 @@ def test_embedding(
 def _get_or_none(db: Session, user_id) -> UserLLMConfig | None:
     """按 user_id 查 UserLLMConfig(可能不存在)"""
     return db.query(UserLLMConfig).filter(UserLLMConfig.user_id == user_id).first()
+
+
+def _slots_response(db: Session, user_id) -> ModelSlotsResponse:
+    """槽位视图 → API 响应(GET/PUT /models/defaults 共用一份组装)"""
+    return ModelSlotsResponse(
+        slots=[ModelSlotOut(**v) for v in slot_views(db, user_id)],
+        info_rows=[
+            ModelSlotInfoRowOut(id=r.id, label=r.label, description=r.description)
+            for r in INFO_ROWS
+        ],
+        env_default_model=env_default_model(),
+    )
 
 
 def _find_config(configs: list[dict], config_id: str) -> dict | None:

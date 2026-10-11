@@ -691,9 +691,9 @@ react_agent 维护跨轮 plan 状态:
 | `/tasks/:id` | TaskDetailView | 任务详情(SSE 实时流 + 对话 + 报告) |
 | `/settings` | settings/SettingsLayout | 设置页外壳(嵌套路由父组件):AppHeader + 历史任务侧栏 + 左侧**两级设置目录** + 右侧 RouterView;空路径重定向 `/settings/account` |
 | `/settings/account` | settings/AccountSettingsPanel | 账号设置(改密码 / 邮箱验证 / Git 平台绑定 GitHub+Gitee / 删除账号) |
-| `/settings/models` | settings/ModelSettingsPanel | LLM 模型配置(多厂商列表式管理) |
+| `/settings/models` | settings/ModelSettingsPanel | 模型设置容器(二级目录 `childMode='switch'`,同页两块 v-show 互切):`#configs` 模型清单(多厂商 LLM / Embedding 配置管理)+ `#defaults` 任务模型默认(各处任务默认模型的只读汇总 + 编辑深链);无 hash 落 `configs`,旧 `/models` 重定向与既有链接不受影响 |
 | `/settings/cli` | settings/CliSettingsPanel | 外部 CLI 凭据配置(按 registry 动态列出 agent 类型;二级目录 `childMode='switch'`,与面板内 tab 栏双向同步) |
-| `/settings/policy` | settings/AgentPolicyPanel | 智能体策略(检查助手启用 / 验证授权模式 / 引用复核开关 / CLI 命令确认模式;原“协作轮次”设置已随后台审查移除) |
+| `/settings/policy` | settings/AgentPolicyPanel | 智能体策略(检查助手启用 / 验证授权模式 / 引用复核开关 / CLI 命令确认模式 / 任务默认审查模型;原“协作轮次”设置已随后台审查移除) |
 | `/settings/practice` | settings/PracticeSettingsPanel | 练习设置(出题偏好 / 学习主题管理 / 数据管理;二级目录 `childMode='anchor'`,同页锚点 + scrollspy;练习功能开关关闭时隐藏入口) |
 | `/practice` | PracticeView | 自适应练习(出题生成 / 练习会话 / 题库管理 / 错题回顾 / 练习记录;左侧目录锚点 + 常驻操作头布局) |
 | `/practice/history` | 重定向 `/practice#history` | 旧练习记录路径,保书签兼容(历史会话 + 每周正确率趋势已内嵌为练习首页「历史记录」段) |
@@ -710,7 +710,7 @@ react_agent 维护跨轮 plan 状态:
 
 路由守卫:受保护路由未登录跳 `/login?redirect=...`;已登录访问 `/login` 跳首页;页面刷新时自动 `fetchMe` 恢复会话。
 
-> 两级目录实现拆分:`data/settingsNav.ts`(目录模型 `SETTINGS_NAV`,一级/二级声明式)与 `utils/settingsNav.ts`(激活态工具函数 `isNavItemActive` / `resolveActiveChildId` / `resolveNavChildren`),SettingsLayout 同时引用两者。二级项统一用 URL hash 表达(不新增路由记录);展开态是路由的纯函数(无本地展开状态);高亮走计算出的 is-active而非 `router-link-active`(Vue Router 只比 path、忽略 hash)。
+> 两级目录实现拆分:`data/settingsNav.ts`(目录模型 `SETTINGS_NAV`,一级/二级声明式)与 `utils/settingsNav.ts`(激活态工具函数 `isNavItemActive` / `resolveActiveChildId` / `resolveNavChildren`),SettingsLayout 同时引用两者。二级项统一用 URL hash 表达(不新增路由记录);展开态是路由的纯函数(无本地展开状态);高亮走计算出的 is-active而非 `router-link-active`(Vue Router 只比 path、忽略 hash)。拆二级的一级项:模型设置(`configs`/`defaults`,静态两项 switch)、CLI 设置(按 registry 动态 switch)、练习设置(三段 anchor);账户/智能体策略/记忆设置仍为单层。
 
 ### 9.9 验证智能体(verifier_agent,实验性)
 
@@ -785,9 +785,9 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - **迷你工具循环**:generator 内置轻量循环(read_file / search_code / find_files,`MAX_TOOL_ROUNDS=6`,结果截断 3000 字符)增强出题质量,不复用重型 react_agent
 - **工作区恢复**:沙箱过期后支持重新 clone 仓库。**两条路径不同语义**:出题侧自动恢复受用户级开关 `restore_workspace_for_practice` 控制(默认关闭,避免意外拉取大仓库);做题页的“重新拉取代码”为用户主动触发,不受该开关限制,且走“发起 job + 轮询状态”的异步链路(见 §9.6)
 
-**出题模型三级解析**(`generator.resolve_llm_client`):`task.llm_config_id`(任务级)> `practice_settings.default_llm_config_id`(用户级默认)> env 默认(`LLM_PROVIDER` / `LLM_MODEL`),任一级缺失或失效逐级回退。
+**出题模型三级解析**(`generator.resolve_llm_client`):`task.llm_config_id`(任务级)> `practice_generate` 槽位默认(存 `model_slot_defaults`,旧列 `practice_settings.default_llm_config_id` 只作新表无行时的兜底)> env 默认(`LLM_PROVIDER` / `LLM_MODEL`),任一级缺失或失效逐级回退。
 
-**思考模式覆盖**:`practice_settings.thinking_mode_for_practice` 三态(follow=跟随模型配置 / on=强制开 / off=强制关),出题前应用到 `client.enable_thinking`;catalog 中 thinking=only 的模型强制关被忽略并记日志。
+**思考模式覆盖**:`practice_generate` 槽位的 `thinking_mode`(旧列 `practice_settings.thinking_mode_for_practice` 仅作兜底)三态(follow=跟随模型配置 / on=强制开 / off=强制关),出题前应用到 `client.enable_thinking`;catalog 中 thinking=only 的模型强制关被忽略并记日志。
 
 **出题质量关卡**(两级,全部被拦时带质量反馈重试 1 次后丢弃该 finding):
 - **关卡 1 退化题拦截**(始终启用,纯规则零成本):叙述式判断题(「某同学做了某判断,该判断是否正确」式虚构人物叙事,答案由句式泄露)与判断题措辞泄露(题干含「仅凭 / 就想当然 / 便断定」等,答案恒为"错误")
@@ -839,5 +839,29 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - **CLI 崩溃/流中断兜底**:SSE 流在收到 JSON-RPC 最终响应前结束(如 Node OOM 崩溃)时,bridge 关流前推 `event: stream_error`(含原因:cli_exit / stdout_eof / read_error),后端 `ACPClient._rpc` 抛 `ACPStreamAborted`;`prompt()` 捕获后与挂死超时同款善后——cancel + 置 `last_prompt_truncated` + 用已累积输出收尾,summary 标注"本轮输出不完整"让 agent2 知情,不再把崩溃当作正常完成
 - **异步子 Agent 提前收尾的结果回收**:Qoder 的 `Agent` 工具是 fire-and-forget —— 工具调用立刻回 "Async agent launched…background" 回执并被标 completed,子 Agent 的结果只能从**下一轮**回流,而模型常在它们未回报时就 `end_turn`,平台据此显示"已完成"(平台行为没错,是 CLI/模型提前收尾)。`run_acp_agent` 收尾时以"本轮派生过后台子 Agent"为主判据(executor 白名单 `ACP_ASYNC_AGENT_TYPES` + 首轮未被兜底截断 + **最后一次派生回执之后**的收尾文本还没交付实质结果 —— 派生之前写的正文与是否提前收尾无关,不参与判定),在同一活跃 ACP session 上带退避补发续轮 prompt(`ACP_ASYNC_AGENT_MAX_CONTINUE` 次),让 CLI 把已完成结果注入下一轮产出报告。判定"回收完成"不只看文本口吻:续轮被 idle/流中断兜底截断(`prompt()` 吞异常返回 `{}`,残留可能只是半份报告)、`stopReason` 非 `end_turn`、达次数上限都算"仍不完整";拿到实质内容(≥ `ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS`)或连续两次输出重复则**停止补发**(再问只会让同一份报告重复堆进 summary)但仍标可能不完整 —— 既不谎报回收成功,也不把结果堆叠。仍不完整时 summary 追加"可稍后追问"注记让 agent2 知情。会话记录(`build_session_record` 的 truncated 口径)排在回收之后写,续轮被截断的轮次不推进记录,否则下一轮恢复不回放缺失尾巴
 - **LLM 限流退避**:`LLM_RATE_LIMIT_MAX_RETRIES`(默认 3),429 时指数退避 + 抖动重试,厂商返回 Retry-After 时优先采用
+
+### 9.19 模型槽位(任务默认模型分配)
+
+一处会调 LLM 的任务就是一个「槽位(slot)」,行存 `model_slot_defaults(user_id, slot, llm_config_id, thinking_mode)`,UNIQUE(user_id, slot)。目的:把原本散在 `practice_settings` / `memory_settings` 列上的模型选择收敛成一张表 + 一条解析链,并给“任务默认审查模型”这种以前根本没入口的位直开配置能力。
+
+**槽位注册表**(`backend/app/services/model_slots.py` 的 `MODEL_SLOTS`,新增一处任务只加一条声明 + 一个 slot 常量):
+
+| slot | 展示名 | 解析链(逐级回退) | 编辑入口 |
+|------|--------|------------------|----------|
+| `review_default` | 任务默认审查模型 | `task.llm_config_id` > 本槽位 > env | `/settings/policy`(唯一允许 `PUT /models/defaults` 写的槽位) |
+| `practice_generate` | 默认出题模型 | 开 `force_default_llm` 时本槽位优先,否则 `task.llm_config_id` > 本槽位 > env | `/settings/practice#generation` |
+| `practice_explain` | 知识点讲解模型 | 本槽位 > `practice_generate` > env | `/settings/practice#generation` |
+| `memory_curator` | 记忆归纳模型 | 本槽位 > env | `/settings/memory` |
+
+**单一真相与只读汇总**:`/settings/models#defaults`(`ModelDefaultsSection.vue`)只展示不编辑,每行带归属面板深链 —— **一个字段只有一个写入口**,避免两处可写导致后写覆盖与跨面板陈旧。`force_default_llm` / `generate_concurrency` / 自动出题开关仍留在 `practice_settings`(它们是出题行为,不是模型分配)。
+
+**API**(`backend/app/routers/model_configs.py`,均鉴权):`GET /models/defaults`(一次返回全部槽位 + 只读说明行 AI 润色 / Embedding / 外部 CLI + 环境默认模型名;每行带 `source` 与 `stale`)、`PUT /models/defaults`(部分写:`None`=不修改、空串=清空;白名单校验 `writable`,配置 id 做归属校验)。
+
+**解析收敛**:`resolve_slot_client` / `resolve_client_for_task` 取代原先四份重复实现(`orchestrator._build_llm_client`、`generator._client_from_config_id`、`memory_summarize` 内联、`prompt_polish` 无),任务级与用户级都失配时静默回退 env(记日志不抛异常,匿名任务跳过槽位)。
+
+**旧列与旧 API 字段保留**:`migrate_model_slot_defaults()` 启动时把旧列拷入新表(`ON CONFLICT ... WHERE llm_config_id IS NULL`,重跑不会把用户在新表上的选择刷回旧值);旧列**不删**,仅在新表无行时作读取兜底。`PUT /memory/preferences/practice` 与 `/memory_settings` **写穿**到槽位表,`GET /memory/preferences` 的同名字段改由槽位表投影 —— 因此练习设置/记忆设置面板与 TaskCreateView 等消费方零改动。
+
+**已知不做**(聚合页仅列为只读说明):`AI 润色`固定走环境默认模型并强制关思考(`POST /tasks/polish_prompt` 无鉴权依赖,要按用户配模型得先改端点);`Embedding` 仅存配置与测连通性,尚无消费方(不做一个不生效的开关);外部 CLI 模型在「CLI 设置」与任务高级设置里配,不属同一命名空间。
+
 
 

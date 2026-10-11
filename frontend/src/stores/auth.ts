@@ -14,6 +14,7 @@ import { computed, ref } from 'vue'
 
 import * as authApi from '@/api/auth'
 import { clearTokens, getAccessToken, setTokens } from '@/api/client'
+import { invalidateLlmConfigs } from '@/composables/useLlmConfigOptions'
 import type { GitProvider } from '@/types/git_provider'
 import type { User } from '@/types/auth'
 
@@ -65,11 +66,14 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  /** 登出:清空 token + user */
+  /** 登出:清空 token + user + 模型配置缓存 */
   function logout(): void {
     clearTokens()
     user.value = null
     hasToken.value = false
+    // 模型列表是模块级缓存(按用户私有):不清会让下一个登录者在同一标签页里
+    // 看到上一个账号的模型名(归属校验会拒掉选择,但展示本身就是泄露面)
+    invalidateLlmConfigs()
   }
 
   return {

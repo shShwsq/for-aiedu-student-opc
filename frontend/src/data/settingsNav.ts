@@ -2,7 +2,7 @@
  * 设置页目录模型(一级 + 二级)
  *
  * 一级项与路由表(/settings/* 子路由)一一对应;二级项统一用 URL hash 表达
- * (`/settings/cli#qoder_cli`、`/settings/practice#learning-topics`),
+ * (`/settings/cli#qoder_cli`、`/settings/models#defaults`、`/settings/practice#learning-topics`),
  * 不新增路由记录,因此既有守卫(练习功能开关)与旧路径重定向(/cli 等)不受影响。
  *
  * 二级目录有两种语义(childMode):
@@ -45,14 +45,31 @@ export interface SettingsNavItem {
 export const PRACTICE_SECTION_IDS = ['generation', 'learning-topics', 'data'] as const
 
 /**
+ * 模型设置二级视图 id(与 ModelSettingsPanel 容器里 v-show 的两块一致)
+ *
+ * 'configs' 排首位:无 hash 时 resolveActiveChildId 回退第一项,因此既有书签
+ * 与各面板「可先到模型设置中添加」的链接仍落在模型清单。
+ */
+export const MODEL_SECTION_IDS = ['configs', 'defaults'] as const
+
+/**
  * 设置页目录(顺序即渲染顺序)
  *
- * 账户/模型/智能体策略是单表单或单列表,不拆二级;智能体策略还有 dirty 离页确认,
+ * 账户/智能体策略是单表单,不拆二级;智能体策略还有 dirty 离页确认,
  * 同路由 hash 切换不会触发弹窗,是保持一层结构的额外理由。
+ * 模型设置拆两块(模型清单 / 任务模型默认),后者是各处任务默认模型的只读汇总。
  */
 export const SETTINGS_NAV: SettingsNavItem[] = [
   { path: '/settings/account', label: '账户设置' },
-  { path: '/settings/models', label: '模型设置' },
+  {
+    path: '/settings/models',
+    label: '模型设置',
+    children: [
+      { id: MODEL_SECTION_IDS[0], label: '模型清单' },
+      { id: MODEL_SECTION_IDS[1], label: '任务模型默认' },
+    ],
+    childMode: 'switch',
+  },
   {
     path: '/settings/cli',
     label: 'CLI 设置',

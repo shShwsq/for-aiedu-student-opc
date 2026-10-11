@@ -17,6 +17,7 @@ import { computed, onMounted, ref } from 'vue'
 
 import BaseSelect from '@/components/BaseSelect.vue'
 import { getMyModels } from '@/api/model_configs'
+import { getModelSlots } from '@/api/model_slots'
 import { updateTaskRuntimeConfig } from '@/api/task'
 import { extractErrorMessage } from '@/utils/error'
 import type { LLMConfigItemOut } from '@/types/model_configs'
@@ -40,6 +41,8 @@ const saving = ref(false)
 /** 用户已保存的 LLM 配置列表(为空表示未配置,展示引导文案) */
 const llmConfigs = ref<LLMConfigItemOut[]>([])
 const loadingModels = ref(true)
+/** 用户级「任务默认审查模型」展示名(未设则空,此时“默认”就是环境变量) */
+const reviewDefaultLabel = ref('')
 
 /** 任务是否使用内置执行器(CLI 执行器 react 模型自管,选择器禁用) */
 const isBuiltin = computed(() => (props.task.executor ?? 'builtin') === 'builtin')
@@ -50,9 +53,14 @@ function modelLabel(cfg: LLMConfigItemOut): string {
   return cfg.has_api_key ? name : `${name}(未配置 Key)`
 }
 
-/** agent2 评估模型选项(空=回退 env 默认) */
+/** agent2 评估模型选项(空=不指定本任务,用用户默认审查模型;没设则环境变量) */
 const llmConfigOptions = computed(() => [
-  { value: '', label: '默认模型(环境变量)' },
+  {
+    value: '',
+    label: reviewDefaultLabel.value
+      ? `默认模型（${reviewDefaultLabel.value}）`
+      : '默认模型(环境变量)',
+  },
   ...llmConfigs.value.map((cfg) => ({ value: cfg.id, label: modelLabel(cfg) })),
 ])
 
@@ -62,10 +70,17 @@ const reactLlmConfigOptions = computed(() => [
   ...llmConfigs.value.map((cfg) => ({ value: cfg.id, label: modelLabel(cfg) })),
 ])
 
-/** 初始化:拉模型列表 */
+/** 初始化:拉模型列表与默认审查模型(后者失败不影响面板可用) */
 async function init(): Promise<void> {
-  const models = await getMyModels().catch(() => null)
+  const [models, slots] = await Promise.all([
+    getMyModels().catch(() => null),
+    getModelSlots().catch(() => null),
+  ])
   llmConfigs.value = models?.llm_configs ?? []
+  const review = slots?.slots.find((s) => s.slot === 'review_default')
+  // 只在确实命中已存配置时展示名字:配置被删时后端回退环境默认,不能谎报
+  reviewDefaultLabel.value =
+    review && review.source === 'slot' ? review.config_label : ''
   loadingModels.value = false
 }
 

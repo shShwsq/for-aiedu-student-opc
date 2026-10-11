@@ -28,13 +28,11 @@ from app.models.memory_settings import (
     MemorySettings,
 )
 from app.models.practice import (
-    THINKING_MODE_FOLLOW,
     THINKING_MODE_OFF,
     THINKING_MODE_ON,
 )
 from app.models.project import Project
 from app.models.task import Conversation, Task
-from app.models.user_llm_config import UserLLMConfig
 from app.models.user_memory import UserMemory
 from app.prompts.memory_curator import (
     DEFAULT_GLOBAL_CATEGORY_DEFS,
@@ -46,6 +44,7 @@ from app.prompts.memory_curator import (
     categories_titles,
     render_categories_with_desc,
 )
+from app.services import model_slots
 from app.services.repo_url import normalize_repo_url
 
 logger = logging.getLogger(__name__)
@@ -75,36 +74,18 @@ def load_memory_settings(db: Session, user_id) -> MemorySettings | None:
 
 
 def resolve_memory_llm_client(db: Session, user_id) -> tuple[LLMClient, str]:
-    """解析记忆归纳/精简专用模型:MemorySettings.curator_llm_config_id > env 默认。
+    """解析记忆归纳/精简专用模型:记忆归纳槽位默认 > env 默认。
 
+    实现收敛到 model_slots(所有槽位共用一条解析链);本函数只做名称适配。
     独立于任务自带模型(不借用 task.llm_config_id):归纳是轻量任务,适合选便宜快的模型。
-    返回 (client, source):source ∈ {"memory","env"}(日志/展示用)。
+    返回 (client, source):source ∈ {model_slots.SOURCE_SLOT, SOURCE_ENV}(日志/展示用)。
     """
-    cfg_id: str | None = None
-    if user_id is not None:
-        try:
-            cfg_row = (
-                db.query(UserLLMConfig)
-                .filter(UserLLMConfig.user_id == user_id)
-                .first()
-            )
-            if cfg_row is not None:
-                settings_row = load_memory_settings(db, user_id)
-                cfg_id = settings_row.curator_llm_config_id if settings_row else None
-                if cfg_id:
-                    target = next(
-                        (c for c in (cfg_row.llm_configs or []) if c.get("id") == cfg_id),
-                        None,
-                    )
-                    if target is not None:
-                        return LLMClient.from_config_dict(target), "memory"
-                    logger.warning(
-                        "[user=%s] 未找到记忆模型配置 id=%s,回退 env 默认",
-                        user_id, cfg_id,
-                    )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("加载记忆模型配置失败,回退 env 默认: %s", e)
-    return LLMClient(), "env"
+    settings_row = load_memory_settings(db, user_id)
+    return model_slots.resolve_slot_client(
+        db, user_id, model_slots.SLOT_MEMORY_CURATOR,
+        legacy_value=getattr(settings_row, "curator_llm_config_id", None),
+        label="记忆归纳",
+    )
 
 
 def _chat(llm: LLMClient, prompt: str, thinking_mode: str, max_tokens: int = 2048) -> str:
@@ -154,7 +135,10 @@ def summarize_and_save_memory(
             settings_row.structure_mode if settings_row
             else DEFAULT_MEMORY_STRUCTURE_MODE
         )
-        thinking_mode = settings_row.thinking_mode if settings_row else THINKING_MODE_FOLLOW
+        thinking_mode = model_slots.get_slot_thinking_mode(
+            db, task.user_id, model_slots.SLOT_MEMORY_CURATOR,
+            legacy_value=getattr(settings_row, "thinking_mode", None),
+        )
         inject_max = (
             settings_row.inject_max_chars if settings_row and settings_row.inject_max_chars
             else DEFAULT_MEMORY_INJECT_MAX_CHARS

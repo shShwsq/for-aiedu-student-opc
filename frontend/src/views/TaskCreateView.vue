@@ -26,6 +26,7 @@ import BrandLogo from '@/components/BrandLogo.vue'
 import { createTask, getScenarios, polishPrompt } from '@/api/task'
 import { uploadTaskFile, type UploadResult } from '@/api/uploads'
 import { getMyModels } from '@/api/model_configs'
+import { getModelSlots } from '@/api/model_slots'
 import { getAgentConfigs } from '@/api/agent_configs'
 import {
   getGitProviderStatus,
@@ -92,6 +93,13 @@ const selectedLlmConfigId = ref('')
  */
 const selectedReactLlmConfigId = ref('')
 const loadingModels = ref(true)
+/**
+ * 用户级「任务默认审查模型」(智能体策略里设的,读自 /models/defaults)
+ *
+ * 非空时:默认选项标签里直接把模型名带出来(避免选了“默认”却不知道默认是哪个),
+ * 并把提交页的默认选中项预填为它。
+ */
+const reviewSlotDefault = ref<{ id: string; label: string } | null>(null)
 
 // ---- 执行器选择(内置 + 用户已配置且启用的 agent) ----
 
@@ -903,9 +911,21 @@ function modelLabel(cfg: LLMConfigItemOut): string {
 
 // ---- BaseSelect 选项(computed,适配 {value,label} 结构) ----
 
+/**
+ * 「默认」选项的标签
+ *
+ * 用户设了「任务默认审查模型」时把名字带出来:此时“默认”不再是环境变量里那个看不见的模型,
+ * 而是他刚在智能体策略里选定的那一个。
+ */
+const defaultModelOptionLabel = computed(() => {
+  const base = useAgentExecutor.value ? '默认评估模型' : '默认模型'
+  const preset = reviewSlotDefault.value
+  return preset ? `${base}（${preset.label}）` : base
+})
+
 /** agent2 评估模型选项 */
 const llmConfigOptions = computed(() => [
-  { value: '', label: useAgentExecutor.value ? '默认评估模型' : '默认模型' },
+  { value: '', label: defaultModelOptionLabel.value },
   ...llmConfigs.value.map((cfg) => ({ value: cfg.id, label: modelLabel(cfg) })),
 ])
 
@@ -927,7 +947,7 @@ onMounted(async () => {
   try {
     // 并行拉取场景、模型、各 git provider 状态、技能、agent 配置
     // git provider 状态静默失败:未绑定不影响任务提交
-    const [scenarioList, models, ghStatus, giteeStatus, skills, agentCfgs, prefs] = await Promise.all([
+    const [scenarioList, models, ghStatus, giteeStatus, skills, agentCfgs, prefs, slotInfo] = await Promise.all([
       getScenarios(),
       getMyModels().catch(() => null),
       getGitProviderStatus('github').catch(() => null),
@@ -935,6 +955,7 @@ onMounted(async () => {
       getSkills().catch(() => null as SkillSummary[] | null), // 静默失败,无 skill 不阻塞提交
       getAgentConfigs().catch(() => null), // 静默失败,无 agent 配置不影响提交
       getPreferences().catch(() => null), // 静默失败:未配置/未登录时用系统默认策略
+      getModelSlots().catch(() => null), // 静默失败:没拿到就按「未设默认模型」展示
     ])
     // 用户级默认策略(智能体策略设置页保存的):填充为高级设置表单初始值,
     // 并同步为提交时的比较基准(未配置时表单保持系统默认,行为不变)
@@ -965,11 +986,23 @@ onMounted(async () => {
     if (scenarioList.length > 0) {
       selectedScenario.value = scenarioList[0].id
     }
+    // 用户级默认审查模型(智能体策略页保存的槽位):命中已存配置才采纳,
+    // 配置已被删除时后端会回退环境默认,这里就不拿它做预填/标签
+    const reviewSlot = slotInfo?.slots.find((s) => s.slot === 'review_default')
+    if (reviewSlot?.llm_config_id && reviewSlot.source === 'slot') {
+      reviewSlotDefault.value = {
+        id: reviewSlot.llm_config_id,
+        label: reviewSlot.config_label || reviewSlot.llm_config_id,
+      }
+    }
     if (models && models.llm_configs.length > 0) {
       llmConfigs.value = models.llm_configs
-      // 默认选第一个已配置 Key 的,否则选第一个
+      // 默认选中:用户设定的默认审查模型 > 第一个已配置 Key 的 > 第一个
       const firstWithKey = models.llm_configs.find((c) => c.has_api_key)
-      selectedLlmConfigId.value = (firstWithKey ?? models.llm_configs[0]).id
+      const preset = reviewSlotDefault.value
+        ? models.llm_configs.find((c) => c.id === reviewSlotDefault.value?.id)
+        : undefined
+      selectedLlmConfigId.value = (preset ?? firstWithKey ?? models.llm_configs[0]).id
     }
     // 记录各 provider 绑定状态(用于决定走下拉选择还是纯输入框)
     if (ghStatus) providerStatus.value.github = { bound: ghStatus.bound }

@@ -1453,6 +1453,7 @@ def test_resolve_generate_model_info_sources(monkeypatch):
 
 # ============================================================
 # 出题思考模式覆盖(_apply_thinking_mode)
+# 入参为已解析的模式字符串(model_slots.get_slot_thinking_mode 的产出)
 # ============================================================
 
 
@@ -1466,7 +1467,8 @@ def _thinking_client(meta=None, enable_thinking=True):
 
 
 def _pref_mode(mode):
-    return SimpleNamespace(thinking_mode_for_practice=mode)
+    """槽位解析后的思考模式(旧版传 practice_settings 行,现在传模式字符串)"""
+    return mode
 
 
 def test_thinking_mode_follow_keeps_config():

@@ -79,6 +79,7 @@ from app.review_stop import (
     should_stop as _review_should_stop,
 )
 from app.security import decrypt_secret
+from app.services import model_slots
 from app.tools import sandbox_tools
 from app.tools.schema import set_current_git_tokens, set_current_task
 from app.agent_policy import resolve_agent_policy
@@ -292,13 +293,17 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
     scenario_id = task.scenario
 
     # 阶段 6:加载 LLM 配置
-    # - llm_client:agent2 评估用(来自 task.llm_config_id)
+    # - llm_client:agent2 评估用(来自 task.llm_config_id,未指定时回退「任务默认审查模型」槽位)
     # - react_client:内置 react_agent 用(来自 task.react_llm_config_id,空时回退到 llm_config_id)
     #   外部 CLI 执行器忽略 react_client(模型由 CLI 自管)
-    llm_client = _build_llm_client(db, task.user_id, task.llm_config_id)
+    llm_client = _build_llm_client(
+        db, task.user_id, task.llm_config_id,
+        fallback_slot=model_slots.SLOT_REVIEW_DEFAULT,
+    )
     react_client, react_client_source = _build_react_llm_client(db, task)
     logger.info(
-        f"[task={task.id}] LLM 配置:agent2=task.llm_config_id,"
+        f"[task={task.id}] LLM 配置:agent2={getattr(llm_client, 'model', None) or 'env 默认'}"
+        f"(来源={'task.llm_config_id' if task.llm_config_id else 'review_default 槽位/env'}),"
         f"react_agent 来源={react_client_source}, executor={task.executor}"
     )
 
@@ -1222,36 +1227,55 @@ def _build_llm_client(
     llm_config_id: str | None = None,
     *,
     label: str = "llm_config_id",
+    fallback_slot: str | None = None,
 ) -> LLMClient | None:
     """按 user_id + llm_config_id 加载用户保存的 LLM 配置
 
-    - user_id 为空(匿名任务)或 llm_config_id 为空 → 返回 None,agent 回退到 env 默认
+    - user_id 为空(匿名任务)且无 fallback_slot → 返回 None,agent 回退到 env 默认
     - 找到指定配置 → 返回 LLMClient.from_config_dict(...)
-    - 找不到配置 id 或构造失败 → 记日志并回退到 None
+    - 未传 id / 找不到配置 id / 构造失败 → 依次试 fallback_slot 的槽位默认
+      (见 app/services/model_slots.py),仍未命中 → 记日志并回退 None
 
     label 仅用于日志区分(agent2 / react_agent)。
     """
-    if user_id is None or not llm_config_id:
+    if user_id is None:
         return None
-    try:
-        cfg = db.query(UserLLMConfig).filter(UserLLMConfig.user_id == user_id).first()
-        if cfg is None:
-            return None
-        # 从配置列表中按 id 查找
-        target = None
-        for c in cfg.llm_configs:
-            if c.get("id") == llm_config_id:
-                target = c
-                break
-        if target is None:
-            logger.warning(
-                f"[user={user_id}] 未找到 {label}={llm_config_id},回退到 env 默认"
-            )
-            return None
-        return LLMClient.from_config_dict(target)
-    except Exception as e:
-        logger.warning(f"[user={user_id}] 加载用户 LLM 配置失败({label}),回退到 env 默认: {e}")
+    if llm_config_id:
+        try:
+            cfg = db.query(UserLLMConfig).filter(UserLLMConfig.user_id == user_id).first()
+            if cfg is None:
+                logger.warning(
+                    f"[user={user_id}] 用户未保存任何模型配置({label}={llm_config_id})"
+                )
+                return _slot_default(db, user_id, fallback_slot, label)
+            # 从配置列表中按 id 查找
+            target = None
+            for c in cfg.llm_configs:
+                if c.get("id") == llm_config_id:
+                    target = c
+                    break
+            if target is None:
+                logger.warning(
+                    f"[user={user_id}] 未找到 {label}={llm_config_id},尝试槽位默认"
+                )
+                return _slot_default(db, user_id, fallback_slot, label)
+            return LLMClient.from_config_dict(target)
+        except Exception as e:
+            logger.warning(f"[user={user_id}] 加载用户 LLM 配置失败({label}): {e}")
+            return _slot_default(db, user_id, fallback_slot, label)
+    return _slot_default(db, user_id, fallback_slot, label)
+
+
+def _slot_default(
+    db: Session, user_id, slot: str | None, label: str,
+) -> LLMClient | None:
+    """取槽位默认客户端;没配/未命中返回 None(调用方回退 env 默认)"""
+    if not slot:
         return None
+    client, source = model_slots.resolve_slot_client(db, user_id, slot, label=label)
+    if source != model_slots.SOURCE_SLOT:
+        return None
+    return client
 
 
 def _build_react_llm_client(
@@ -1261,7 +1285,8 @@ def _build_react_llm_client(
     """构造内置 react_agent 使用的 LLMClient
 
     仅 executor=builtin 时调用方有意义(外部 CLI 忽略 client)。
-    优先级:task.react_llm_config_id → task.llm_config_id(回退) → None(env 默认)
+    优先级:task.react_llm_config_id → task.llm_config_id(回退) → 任务默认审查模型槽位
+            → None(env 默认)
 
     返回 (client, source_label):
         source_label 取值 "react_llm_config_id" / "llm_config_id" / "env_default",
@@ -1270,13 +1295,15 @@ def _build_react_llm_client(
     react_id = task.react_llm_config_id
     if react_id:
         client = _build_llm_client(
-            db, task.user_id, react_id, label="react_llm_config_id"
+            db, task.user_id, react_id, label="react_llm_config_id",
+            fallback_slot=model_slots.SLOT_REVIEW_DEFAULT,
         )
         # 即使 client 为 None(未找到/加载失败)也认为用的是 react_llm_config_id 槽位
         return client, "react_llm_config_id"
-    # 回退到 agent2 的配置
+    # 回退到 agent2 的配置(再为空时走同一个任务默认审查模型槽位)
     client = _build_llm_client(
-        db, task.user_id, task.llm_config_id, label="llm_config_id(fallback)"
+        db, task.user_id, task.llm_config_id, label="llm_config_id(fallback)",
+        fallback_slot=model_slots.SLOT_REVIEW_DEFAULT,
     )
     return client, "llm_config_id"
 

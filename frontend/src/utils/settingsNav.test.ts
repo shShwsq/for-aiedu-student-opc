@@ -8,9 +8,14 @@
  */
 import { describe, expect, it } from 'vitest'
 
-import { PRACTICE_SECTION_IDS, SETTINGS_NAV } from '@/data/settingsNav'
+import {
+  MODEL_SECTION_IDS,
+  PRACTICE_SECTION_IDS,
+  SETTINGS_NAV,
+} from '@/data/settingsNav'
 import type { AgentTypeMeta } from '@/types/agent_configs'
 import { isNavItemActive, resolveActiveChildId, resolveNavChildren } from './settingsNav'
+import { editTarget } from './modelSlots'
 
 function agentMeta(agent_type: string, display_name: string): AgentTypeMeta {
   return { agent_type, display_name } as AgentTypeMeta
@@ -19,6 +24,7 @@ function agentMeta(agent_type: string, display_name: string): AgentTypeMeta {
 const cliItem = SETTINGS_NAV.find((item) => item.path === '/settings/cli')!
 const practiceItem = SETTINGS_NAV.find((item) => item.path === '/settings/practice')!
 const accountItem = SETTINGS_NAV.find((item) => item.path === '/settings/account')!
+const modelsItem = SETTINGS_NAV.find((item) => item.path === '/settings/models')!
 
 const AGENTS = [
   agentMeta('qoder_cli', 'Qoder CLI'),
@@ -88,6 +94,30 @@ describe('SETTINGS_NAV 数据自检', () => {
     const children = resolveNavChildren(practiceItem, [])
     expect(children.map((child) => child.id)).toEqual([...PRACTICE_SECTION_IDS])
     expect(children.map((child) => child.id)).toContain('learning-topics')
+  })
+
+  it('模型设置两段 id 与容器里 v-show 的两块一致,且默认落在模型清单', () => {
+    const children = resolveNavChildren(modelsItem, [])
+    expect(children.map((child) => child.id)).toEqual([...MODEL_SECTION_IDS])
+    expect(children.map((child) => child.label)).toEqual(['模型清单', '任务模型默认'])
+    // 无 hash(旧书签与 /models 重定向)仍进模型清单:子项须把 configs 排首位
+    expect(resolveActiveChildId(modelsItem, children, '/settings/models', undefined))
+      .toBe('configs')
+    expect(resolveActiveChildId(modelsItem, children, '/settings/models', '#defaults'))
+      .toBe('defaults')
+  })
+
+  it('模型槽位的编辑深链落在存在的一级项上', () => {
+    // 后端 model_slots 回传的 edit_path 指错会静默跳到设置页首页,这里把住一级路由
+    const paths = SETTINGS_NAV.map((item) => item.path)
+    const targets = [
+      '/settings/practice#generation',
+      '/settings/memory',
+      '/settings/policy',
+    ]
+    for (const target of targets) {
+      expect(paths).toContain(editTarget(target).path)
+    }
   })
 
   it('每个有二级目录的一级项都声明了 childMode', () => {

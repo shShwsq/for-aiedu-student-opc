@@ -22,8 +22,8 @@ import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } fr
 import { useRoute, useRouter } from 'vue-router'
 
 import HelpPopover from '@/components/HelpPopover.vue'
+import ModelSlotSelect from '@/components/ModelSlotSelect.vue'
 import { getPreferences, savePracticeSettings } from '@/api/memory'
-import { getMyModels } from '@/api/model_configs'
 import {
   clearPracticeRecords,
   createLearningTopic,
@@ -31,10 +31,10 @@ import {
   listLearningTopics,
   updateLearningTopic,
 } from '@/api/practice'
+import { ensureLlmConfigsLoaded, llmConfigs } from '@/composables/useLlmConfigOptions'
 import { matchHashSectionId, settingsScrollRootKey, useSectionNav } from '@/composables/useSectionNav'
 import { PRACTICE_SECTION_IDS } from '@/data/settingsNav'
 import { extractErrorMessage } from '@/utils/error'
-import type { LLMConfigItemOut } from '@/types/model_configs'
 import type { PracticeThinkingMode, SavePracticeSettingsRequest } from '@/types/memory'
 import type { LearningTopicDef } from '@/types/practice'
 
@@ -64,8 +64,7 @@ const forceDefaultLlm = ref(false)
 const explainModelId = ref('')
 /** 出题并发度(1=串行;2/4=并行逐条 finding) */
 const generateConcurrency = ref(1)
-/** 用户已保存的 LLM 配置列表(默认出题模型下拉选项来源) */
-const llmConfigs = ref<LLMConfigItemOut[]>([])
+// 默认出题/讲解模型的下拉选项走共享缓存 useLlmConfigOptions(多处面板共用一份)
 
 /** 保存或清空中:统一禁用全部交互 */
 const busy = computed(() => saving.value || clearing.value)
@@ -238,12 +237,9 @@ async function load(): Promise<void> {
   } finally {
     loading.value = false
   }
-  try {
-    const models = await getMyModels()
-    llmConfigs.value = models.llm_configs
-  } catch {
+  ensureLlmConfigsLoaded().catch(() => {
     // 静默失败,下拉只展示「跟随系统默认」
-  }
+  })
   loadTopics()
 }
 
@@ -345,8 +341,7 @@ async function patchPracticeSettings(
   }
 }
 
-async function selectExplainModel(event: Event): Promise<void> {
-  const value = (event.target as HTMLSelectElement).value
+async function selectExplainModel(value: string): Promise<void> {
   if (value === explainModelId.value) return
   await patchPracticeSettings(
     { explain_llm_config_id: value },
@@ -365,8 +360,7 @@ async function selectConcurrency(raw: string): Promise<void> {
   )
 }
 
-async function selectModel(event: Event): Promise<void> {
-  const value = (event.target as HTMLSelectElement).value
+async function selectModel(value: string): Promise<void> {
   if (busy.value || value === defaultModelId.value) return
   saving.value = true
   try {
@@ -568,21 +562,14 @@ onBeforeUnmount(() => {
             任务自带模型配置时优先用任务配置,选「跟随系统默认」则用环境配置。
           </HelpPopover>
         </div>
-        <select
-          class="model-select"
-          aria-label="默认出题模型"
-          :value="defaultModelId"
+        <ModelSlotSelect
+          :model-value="defaultModelId"
+          :configs="llmConfigs"
+          empty-label="跟随系统默认"
+          select-label="默认出题模型"
           :disabled="busy"
           @change="selectModel"
-        >
-          <option value="">跟随系统默认</option>
-          <option v-for="cfg in llmConfigs" :key="cfg.id" :value="cfg.id">
-            {{ cfg.name }}({{ cfg.provider }} / {{ cfg.model }})
-          </option>
-        </select>
-        <span v-if="!llmConfigs.length" class="model-hint">
-          暂无已保存的模型配置,可先到「模型设置」中添加
-        </span>
+        />
 
         <!-- 始终用默认出题模型 -->
         <div class="force-default-row">
@@ -622,21 +609,14 @@ onBeforeUnmount(() => {
             讲解不需要出题那个代价(思考类模型出题要上百秒一条),可以单独挂个快模型。
           </HelpPopover>
         </div>
-        <select
-          class="model-select"
-          aria-label="讲解专用模型"
-          :value="explainModelId"
+        <ModelSlotSelect
+          :model-value="explainModelId"
+          :configs="llmConfigs"
+          empty-label="沿用出题模型"
+          select-label="讲解专用模型"
           :disabled="busy"
           @change="selectExplainModel"
-        >
-          <option value="">沿用出题模型</option>
-          <option v-for="cfg in llmConfigs" :key="cfg.id" :value="cfg.id">
-            {{ cfg.name }}({{ cfg.provider }} / {{ cfg.model }})
-          </option>
-        </select>
-        <span v-if="!llmConfigs.length" class="model-hint">
-          暂无已保存的模型配置,可先到「模型设置」中添加
-        </span>
+        />
       </div>
 
       <div class="setting-block">
@@ -1103,38 +1083,7 @@ onBeforeUnmount(() => {
   color: var(--color-text-secondary);
 }
 
-/* ---- 默认出题模型 ---- */
-.model-select {
-  width: 100%;
-  height: 38px;
-  padding: 0 var(--space-3);
-  font-size: var(--fs-sm);
-  color: var(--color-text);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition: border-color var(--transition-fast);
-}
-
-.model-select:hover:not(:disabled) {
-  border-color: var(--color-border-strong);
-}
-
-.model-select:focus {
-  outline: none;
-  border-color: var(--color-primary);
-}
-
-.model-select:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.model-hint {
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-}
+/* 模型下拉的样式随共享件 ModelSlotSelect 走,本面板不再自带 */
 
 /* 同一设置块内的二级标题(如「讲解专用模型」) */
 .setting-block .sub-title {

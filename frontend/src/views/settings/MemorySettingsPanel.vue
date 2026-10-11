@@ -15,10 +15,10 @@
 import { computed, onMounted, ref } from 'vue'
 
 import HelpPopover from '@/components/HelpPopover.vue'
+import ModelSlotSelect from '@/components/ModelSlotSelect.vue'
 import { getPreferences, getStructureDefaults, saveMemorySettings } from '@/api/memory'
-import { getMyModels } from '@/api/model_configs'
+import { ensureLlmConfigsLoaded, llmConfigs } from '@/composables/useLlmConfigOptions'
 import { extractErrorMessage } from '@/utils/error'
-import type { LLMConfigItemOut } from '@/types/model_configs'
 import type {
   MemoryCategoryDef,
   MemoryStructureMode,
@@ -49,8 +49,7 @@ const globalCats = ref<MemoryCategoryDef[]>([])
 /** 系统默认类别(一次性拉取;供对照展示与「恢复系统默认」) */
 const defaultProjectCats = ref<MemoryCategoryDef[]>([])
 const defaultGlobalCats = ref<MemoryCategoryDef[]>([])
-/** 用户已保存的 LLM 配置列表(下拉选项来源) */
-const llmConfigs = ref<LLMConfigItemOut[]>([])
+// 归纳模型下拉选项走共享缓存 useLlmConfigOptions(多处面板共用一份)
 
 /** 顶部居中 toast */
 const toast = ref<{ msg: string; type: 'success' | 'error' } | null>(null)
@@ -101,12 +100,9 @@ async function load(): Promise<void> {
   } finally {
     loading.value = false
   }
-  try {
-    const models = await getMyModels()
-    llmConfigs.value = models.llm_configs
-  } catch {
+  ensureLlmConfigsLoaded().catch(() => {
     // 静默失败,下拉只展示「跟随系统默认」
-  }
+  })
   try {
     const defs = await getStructureDefaults()
     defaultProjectCats.value = defs.project_categories.map((c) => ({ ...c }))
@@ -176,8 +172,7 @@ async function selectThinking(mode: PracticeThinkingMode): Promise<void> {
   }
 }
 
-async function selectModel(event: Event): Promise<void> {
-  const value = (event.target as HTMLSelectElement).value
+async function selectModel(value: string): Promise<void> {
   if (busy.value || value === curatorModelId.value) return
   const prev = curatorModelId.value
   curatorModelId.value = value
@@ -446,21 +441,14 @@ onMounted(load)
             选「跟随系统默认」则用环境配置的模型。
           </HelpPopover>
         </div>
-        <select
-          class="model-select"
-          aria-label="记忆归纳模型"
-          :value="curatorModelId"
+        <ModelSlotSelect
+          :model-value="curatorModelId"
+          :configs="llmConfigs"
+          empty-label="跟随系统默认"
+          select-label="记忆归纳模型"
           :disabled="busy"
           @change="selectModel"
-        >
-          <option value="">跟随系统默认</option>
-          <option v-for="cfg in llmConfigs" :key="cfg.id" :value="cfg.id">
-            {{ cfg.name }}({{ cfg.provider }} / {{ cfg.model }})
-          </option>
-        </select>
-        <span v-if="!llmConfigs.length" class="model-hint">
-          暂无已保存的模型配置,可先到「模型设置」中添加
-        </span>
+        />
       </div>
 
       <!-- 思考模式 -->
@@ -742,38 +730,7 @@ onMounted(load)
   color: var(--color-text-secondary);
 }
 
-/* ---- 模型下拉 ---- */
-.model-select {
-  width: 100%;
-  height: 38px;
-  padding: 0 var(--space-3);
-  font-size: var(--fs-sm);
-  color: var(--color-text);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition: border-color var(--transition-fast);
-}
-
-.model-select:hover:not(:disabled) {
-  border-color: var(--color-border-strong);
-}
-
-.model-select:focus {
-  outline: none;
-  border-color: var(--color-primary);
-}
-
-.model-select:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.model-hint {
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-}
+/* 模型下拉的样式随共享件 ModelSlotSelect 走,本面板不再自带 */
 
 /* ---- 数字输入 ---- */
 .number-input {
