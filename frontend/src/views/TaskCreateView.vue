@@ -1567,8 +1567,8 @@ onUnmounted(() => {
                   fill="currentColor"
                   aria-hidden="true"
                 >
-                  <path d="M10 6q0 7 7 7-7 0-7 7 0-7-7-7 7 0 7-7Z" />
-                  <path d="M18 2q0 4 4 4-4 0-4 4 0-4-4-4 4 0 4-4Z" />
+                  <path d="M10 4q0 10 10 10-10 0-10 10 0-10-10-10 10 0 10-10Z" />
+                  <path d="M19 3q0 4 4 4-4 0-4 4 0-4-4-4 4 0 4-4Z" />
                 </svg>
               </button>
             </div>
