@@ -363,6 +363,7 @@ export type SSEEventType =
   | 'clone_progress'
   | 'plan'
   | 'verify_action'
+  | 'verify_action_resolved'
   | 'command_confirm'
   | 'agent1_done'
   | 'review_done'
@@ -604,6 +605,25 @@ export interface VerifyActionRequest {
   action_id: string
   /** true=同意执行,false=拒绝 */
   approved: boolean
+  /**
+   * 授权范围:'once'(默认,只批这一个动作)/ 'task'(本任务后续验证动作不再弹窗)。
+   * 只在 approved=true 时生效。一次 PoC 序列动辄七八个动作,逐个确认会把人
+   * 逼向完全没有把关的 direct 模式;自动放行的动作仍逐条落库,侧栏看得到。
+   */
+  scope?: 'once' | 'task'
+}
+
+/**
+ * verify_action_resolved 事件 data(待授权动作已失效)
+ *
+ * 授权等待有上限(后端 VERIFY_AUTH_TIMEOUT_SECONDS),且「终止检查」会立即唤醒
+ * 等待线程。这两种情况下后端已清掉 pending 动作,若不告诉前端,弹窗会挂在
+ * 页面上等一个再也不会有人答复的决议,点下去只会有一个报错。
+ */
+export interface VerifyActionResolvedEventData {
+  action_id: string
+  /** timeout=未在时限内应答 / review_stopped=用户终止检查 / resolved=任务收尾 */
+  reason: string
 }
 
 /** 验证动作授权响应 */

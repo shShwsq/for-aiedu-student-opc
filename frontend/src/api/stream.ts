@@ -35,6 +35,7 @@ import type {
   UserMessagePendingEventData,
   UserMessageWithdrawnEventData,
   VerifyActionEventData,
+  VerifyActionResolvedEventData,
 } from '@/types/task'
 
 /** 事件回调接口 */
@@ -59,6 +60,11 @@ export interface StreamCallbacks {
   onPlan?: (data: PlanEventData) => void
   /** 动态验证动作授权(verifier_agent per_action 模式,每个 HTTP/PoC 动作需用户确认) */
   onVerifyAction?: (data: VerifyActionEventData) => void
+  /**
+   * 待授权的验证动作已失效(授权超时 / 用户终止检查 / 任务收尾):
+   * 后端不再等这个决议了,前端据此收起弹窗,不留一个点了只会报错的僵尸弹窗
+   */
+  onVerifyActionResolved?: (data: VerifyActionResolvedEventData) => void
   /** 危险命令确认(local 模式安全策略,LLM 执行危险命令时需用户确认) */
   onCommandConfirm?: (data: CommandConfirmEventData) => void
   /**
@@ -162,6 +168,9 @@ export function subscribeTaskStream(
             break
           case 'verify_action':
             callbacks.onVerifyAction?.(data as unknown as VerifyActionEventData)
+            break
+          case 'verify_action_resolved':
+            callbacks.onVerifyActionResolved?.(data as unknown as VerifyActionResolvedEventData)
             break
           case 'command_confirm':
             callbacks.onCommandConfirm?.(data as unknown as CommandConfirmEventData)

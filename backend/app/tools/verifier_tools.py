@@ -1,4 +1,4 @@
-"""verifier_agent 专用工具:http_request
+"""verifier_agent 专用工具:http_request + 结论申报工具定义
 
 向任务配置的 test_env_url 发送 HTTP 请求,用于动态验证 react_agent 发现的安全问题。
 
@@ -15,7 +15,9 @@
 - per_action 授权模式:每次调用前经 user_interaction 阻塞等用户确认
 
 run_python_code 复用 sandbox_tools(与 react_agent 共享沙箱会话),
-不在此文件重新声明,由 verifier_agent 直接从 sandbox_tools 导入。
+不在此文件重新实现,由 verifier_agent 直接从 sandbox_tools 导入;
+`VERIFIER_EMIT_TOOL_DEFINITIONS` 里的 `submit_verification` 只申报结论(无副作用),
+执行与校验在 verifier_agent 循环内完成。
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import json
 import logging
 import shlex
 import subprocess
+import sys
 import time
 import uuid
 from typing import Any
@@ -216,9 +219,11 @@ def _execute_in_sandbox(
 
     if mode == "local":
         # local 模式:本地 subprocess 执行
+        # 用 sys.executable 而不是写死 "python":写死会在 Windows 上打到
+        # Microsoft Store 的 python 别名(弹商店/报退出码 9009),多解释器环境也会跑错版本
         try:
             result = subprocess.run(
-                ["python", script_abs],
+                [sys.executable, script_abs],
                 capture_output=True,
                 text=True,
                 timeout=timeout_total,
@@ -360,9 +365,14 @@ VERIFIER_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "run_python_code",
             "description": (
                 "在沙箱里执行 Python 代码,返回 stdout/stderr/exit_code。"
-                "用于构造复杂 PoC 脚本(如生成签名、编码 payload、解析响应)。"
+                "用于构造复杂 PoC 脚本(生成签名、编码 payload、解析响应),也用于"
+                "需要多步状态的真发请求(登录态、签名序列、对比多个响应)——"
+                "沙箱本就能访问测试环境(http_request 就是在同一沙箱里跑 Python urllib),"
+                "自己写请求请用标准库 urllib(第三方包 requests/httpx 不保证预装)。"
+                "单发的请求仍优先 http_request:它把 URL 锁定在 test_env_url、"
+                "并自动注入登录身份凭证(你看不到 token 明文)。"
                 "复用 react_agent 的沙箱会话,可 read_file 仓库代码辅助构造 PoC。"
-                "网络访问依赖沙箱配置(默认禁外网,HTTP 探测用 http_request)。单次超时 60s。"
+                "单次超时 60s。"
             ),
             "parameters": {
                 "type": "object",
@@ -371,6 +381,59 @@ VERIFIER_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "timeout": {"type": "integer", "description": "超时秒数,默认 60,上限 120"},
                 },
                 "required": ["code"],
+            },
+        },
+    },
+]
+
+# 结论申报工具(无副作用:不弹窗授权、不进沙箱,只在本轮内累结果)
+# 为何需要:此前台账只记"验证跑没跑成",模型散文总结里的"无法确认/环境不可达"
+# 也被当成成功条目,只要引用它就把审查项抬到「已动态验证」。
+# 现在要拿到那一档,必须通过本工具申报过定论(confirmed / not_confirmed)。
+VERIFIER_EMIT_TOOL_DEFINITIONS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_verification",
+            "description": (
+                "申报验证结论(输出总结前必须调用一次)。"
+                "每个验证目标给一条结论:confirmed=真的触发成功了;"
+                "not_confirmed=试过且确认不成立/误报;inconclusive=发了请求但响应看不出差异;"
+                "unreachable=环境/端点不可达;not_authorized=动作未获授权根本没执行。"
+                "没把握就如实写未定论档位——不要猜。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "description": "逐个验证目标的结论(与传入的验证目标一一对应)",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "target": {
+                                    "type": "string",
+                                    "description": "验证目标描述(写具体位置/事,如 src/api/users.py 第 42 行 SQL 注入)",
+                                },
+                                "result": {
+                                    "type": "string",
+                                    "enum": [
+                                        "confirmed", "not_confirmed",
+                                        "inconclusive", "unreachable", "not_authorized",
+                                    ],
+                                    "description": "该目标的结论",
+                                },
+                                "evidence": {
+                                    "type": "string",
+                                    "description": "关键证据(HTTP 状态码 + 响应片段等,不超 300 字)",
+                                },
+                            },
+                            "required": ["target", "result"],
+                        },
+                    },
+                    "note": {"type": "string", "description": "整体补充说明(可选)"},
+                },
+                "required": ["targets"],
             },
         },
     },

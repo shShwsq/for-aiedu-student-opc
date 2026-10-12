@@ -6,7 +6,7 @@
 """
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -303,6 +303,10 @@ class VerifyActionRequest(BaseModel):
 
     action_id: str
     approved: bool
+    # "once"(默认)= 只批这一个动作;"task" = 本任务后续验证动作不再弹窗。
+    # 只在 approved=True 时生效(用户不同意时不该隐式放行后面的动作)。
+    # 一次 PoC 序列动辄七八个动作,逐个点"同意"实际会把用户逼向无把关的 direct。
+    scope: Literal["once", "task"] = "once"
 
 
 class VerifyActionResponse(BaseModel):

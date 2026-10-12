@@ -55,10 +55,10 @@
 
 | 角色 | 职责 | 是否调工具 | 模型来源 |
 |------|------|-----------|---------|
-| **agent2(检查助手)** | **幕后质检 + 学习点提炼**:核查 agent1 的产出(读真实源码核实/PoC/引用复核),审查完成时提炼重点与知识点(results,3-8 条精选,含 learning_note),确属缺失且无法自查的方向给建议追问(suggestions,用户点击后触发 resume);核查过程与知识点经核查与结果侧栏呈现,不进主对话流 | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=100`,允许长时间后台跑;超出窗口的旧回传由 `_trim_agent2_tool_history` 压成一行摘要,证据台账不裁);可选经 verifier_agent 生成 PoC 验证(单轮上限 `MAX_VERIFY_CALLS=3`);引用复核 `check_reference`(后端安全抓取,单轮上限 `MAX_REFERENCE_CALLS=3`,`allow_reference_check` 默认开);整轮另有挂钟硬时限 `settings.AGENT2_REVIEW_MAX_SECONDS` | `task.llm_config_id` |
+| **agent2(检查助手)** | **幕后质检 + 学习点提炼**:核查 agent1 的产出(读真实源码核实/PoC/引用复核),审查完成时提炼重点与知识点(results,3-8 条精选,含 learning_note),确属缺失且无法自查的方向给建议追问(suggestions,用户点击后触发 resume);核查过程与知识点经核查与结果侧栏呈现,不进主对话流 | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=100`,允许长时间后台跑;超出窗口的旧回传由 `_trim_agent2_tool_history` 压成一行摘要,证据台账不裁);可选经 verifier_agent 生成 PoC 验证(单轮额度按审查计划联动:`MIN_VERIFY_CALLS=3` 至 `settings.AGENT2_MAX_VERIFY_CALLS=8`,另受 `VERIFY_AUTH_TIMEOUT_SECONDS` 逐动作授权等待上限约束);引用复核 `check_reference`(后端安全抓取,单轮上限 `MAX_REFERENCE_CALLS=3`,`allow_reference_check` 默认开);整轮另有挂钟硬时限 `settings.AGENT2_REVIEW_MAX_SECONDS` | `task.llm_config_id` |
 | **内置 react_agent(agent1)** | ReAct 循环执行代码分析(clone / search / read / semgrep 等) | 是,调用沙箱工具 | `task.react_llm_config_id`(空时回退 `llm_config_id`) |
 | **ExternalCLIAgent(agent1)** | 沙箱内启动外部 CLI,通过 ACP 协议通信 | 是,由 CLI 自主调工具 | CLI 自管(凭证经环境变量注入) |
-| **verifier_agent**(实验性) | 在沙箱里跑 PoC / HTTP 请求动态验证 agent1 的发现 | 是,独立工具集(`http_request` + `run_python_code`) | `task.llm_config_id`(复用 agent2 的 LLMClient) |
+| **verifier_agent**(实验性) | 在沙箱里跑 PoC / HTTP 请求动态验证 agent1 的发现 | 是,独立工具集(`http_request` + `run_python_code` + `submit_verification` 结论申报) | `task.llm_config_id`(复用 agent2 的 LLMClient) |
 
 ### 1.2 协作流程(后台审查版)
 
@@ -99,7 +99,7 @@
 ### 2.1 核心特征
 
 - **幕后质检定位**:agent1 是面向用户的台前回答者(其每轮 summary 即主界面用户看到的回答);agent2 的核查过程(核查与结果侧栏「核查过程」段,即 Agent2Panel)、审查结果(「审查结果」段)与知识点(「重点与知识点」段)分呈在同一侧栏,建议追问方向落在「概览」段,主对话流只显示用户与 agent1 的对话。"敢不敢上线"不再是硬性产出,仅当用户意图涉及上线/采用决策时在 reasoning 附判断
-- **职责顺序(核查优先、建议追问兜底)**:①核实发现(只读工具读真实源码核对,单轮上限 `MAX_READ_TOOL_CALLS=100`)→ ②动态 PoC 验证(经 verifier_agent,单轮上限 `MAX_VERIFY_CALLS=3`,需测试环境)→ ③引用复核(`check_reference`,单轮上限 `MAX_REFERENCE_CALLS=3`)→ ④提炼重点与知识点 → ⑤(兜底)建议追问方向;凡能自查的绝不建议
+- **职责顺序(核查优先、建议追问兜底)**:①核实发现(只读工具读真实源码核对,单轮上限 `MAX_READ_TOOL_CALLS=100`)→ ②动态 PoC 验证(经 verifier_agent,单轮额度按计划项联动 3–8,需测试环境)→ ③引用复核(`check_reference`,单轮上限 `MAX_REFERENCE_CALLS=3`)→ ④提炼重点与知识点 → ⑤(兜底)建议追问方向;凡能自查的绝不建议
 - **两类产物、即时发射(证据驱动可信审查)**:核查过程不再"末尾一次性大 JSON",而是用四个发射工具即时结构化落库——`submit_review_plan`(审查计划,后端给每条补稳定 id P1/P2… 并在回执里返回)、`submit_review_item`(**审查项**,落 `ReviewItem` 表,**按核实结果三分档**:已核实成立 confirmed / 已核实不成立 none·false_positive / 待核实 suspected·pending·missing·partial;旧口径把没取到证的 suspected 也算"发现风险",已纠正)、`submit_knowledge_point`(**知识点**,落 `Result` 表,含 `learning_note`/`practice_worthy`/`source_review_item_id` 回指派生审查项)、`submit_suggestion`(建议追问)。**审查项回答"代码有没有问题、多可信",知识点回答"该记住什么"**,分型但同源。审查项字段:`review_target`(待核实对象)/`conclusion`(审查结论)/`follow_up`(可追问内容)/`plan_item_id`(对账用);提示词带**用户可读性硬约束**(正文禁写 `E9`/`call_ref`/`fail-closed`/`领域基线` 等内部标识,取证引用只进 `evidence`)。审查项带证据者由后端 `app/agents/evidence.py` 核验证据引用(`evidence.*.call_ref` 指向本轮 `_evidence_ref` 台账)后**派生置信度**(verified/source_confirmed/reference_corroborated/assertion_only),**模型不自报 confidence**。不支持结构发射的模型回退旧"末尾大 JSON"路径(covered/missing/reasoning/suggestions/results/grouping),整轮无解析才判失败
 - **题目与知识点生成**:任务完成后由 orchestrator 调用 practice 服务(实现位于 `app/services/practice/`)生成练习题与知识点,选题优先覆盖 practice_worthy 标记的知识点
 - **审查维度自定**：无预定义覆盖度清单，agent2 每次评估时根据用户意图自行确定应覆盖的审查维度（3-5 条为宜，取证额度已充足、宁可每条深查而不拉长清单），跨轮保持维度 id 稳定
@@ -825,7 +825,7 @@ bridge 监听 `ACP_BRIDGE_PORT=8088`，凭证经环境变量注入，CLI 子进�
 
 ### 5.1 定位与触发
 
-agent2 在评估覆盖度后,若用户开启了「允许自行验证」(`allow_verify=true`),可调用独立的 `verifier_agent` 在已部署测试环境动态验证 agent1 的发现(如确认 SQL 注入是否真实可利用、IDOR 是否可访问他人资源)。
+agent2 在后台审查中（规划先行、核查到哪发射到哪），若用户开启了「允许自行验证」(`allow_verify=true`)，可调用独立的 `verifier_agent` 在已部署测试环境动态验证 agent1 的发现（如确认 SQL 注入是否真实可利用、IDOR 是否可访问他人资源）。
 
 **对用户透明**：前端不暴露 `verifier_agent` 字样,SSE 事件 `role=agent2` + `verify=true`,UI 显示「正在验证」而非「正在评估」。
 
@@ -836,16 +836,22 @@ agent2 在评估覆盖度后,若用户开启了「允许自行验证」(`allow_v
 - **独立 LLM 调用**：用 agent2 的 `LLMClient`（`task.llm_config_id`），与 agent1 模型解耦
 - **工具集**（不复用 agent1 工具表，独立 `backend/app/tools/verifier_tools.py`）：
   - `http_request`：向 `test_env_url` 发 HTTP 请求（GET/POST/PUT/DELETE + headers + body），**在沙箱里执行**（用 urllib 标准库，不依赖 httpx/requests），URL base 锁定为任务配置，后端服务器 IP 不暴露给测试环境。支持 `auth_profile` 选择登录身份
-  - `run_python_code`：在沙箱执行 Python（与 agent1 共享沙箱，可 `read_file` 仓库代码）
+  - `run_python_code`：在沙箱执行 Python（与 agent1 共享沙箱，可 `read_file` 仓库代码）。**沙箱本就能访问测试环境**（`http_request` 就是在同一沙箱里跑 Python urllib），所以多步状态的 PoC（登录拿态 → 算签名 → 比对两个身份的响应）可以直接写 Python 用标准库 urllib 发请求；单发请求仍优先 `http_request`（URL 锁定 + 凭证自动注入，LLM 拿不到 token 明文）
+  - `submit_verification`：**结论申报**（`VERIFIER_EMIT_TOOL_DEFINITIONS`），无副作用、不进沙箱、不需授权，逐目标给 `confirmed / not_confirmed / inconclusive / unreachable / not_authorized`。结论只走这条结构化通道（正文里的 `[验证结论] outcome=…` 行仅作兜底）
+- **单轮验证额度**：`_verify_budget()` 按审查计划里 `planned_evidence="verify"` 的条目数联动（下限 3，上限 `settings.AGENT2_MAX_VERIFY_CALLS=8`），触顶时把**实际额度**回灌给模型；对账用同一口径区分"额度用尽/没排到"
 
 ### 5.3 授权模式（`task.params._verifier.auth_mode`）
 
 | 模式 | 行为 | 适用场景 |
 |------|------|---------|
-| `per_action`（默认） | 每个 `http_request` / `run_python_code` 调用前推送 `verify_action` SSE 事件 → 前端弹窗 `VerifyActionDialog` 让用户确认 → 阻塞等待（`user_interaction.request_verify_authorization`） | 生产 / 测试环境隔离不彻底，需人工把关 |
+| `per_action`（默认） | 每个 `http_request` / `run_python_code` 调用前推送 `verify_action` SSE 事件 → 前端弹窗 `VerifyActionDialog` 让用户确认 → 阻塞等待（`user_interaction.request_verify_authorization`），**等待有上限**：`settings.VERIFY_AUTH_TIMEOUT_SECONDS` 与本轮审查硬时限取小值 | 生产 / 测试环境隔离不彻底，需人工把关 |
 | `direct` | 不弹窗，直接执行 | 测试环境完全隔离，可信 |
 
 用户可在「智能体策略」页设默认模式（`verifier_auth_mode_default`），任务创建时可覆盖。
+
+**弹窗的三个决议**：同意 / **同意且本任务后续自动允许**（`POST /tasks/{id}/verify_action` 传 `scope="task"` → `submit_verify_authorization(remember=True)` → 同 task 之后的动作不再弹窗，但仍逐条落库进侧栏）/ 不同意。一次 PoC 序列动辄七八个动作，逐动作确认会把用户逼向彻底没有把关的 `direct`，所以补中间那一档。
+
+**阻塞点必须能被叫醒**（曾经的挂死成因）：授权等待发生在工具执行**内部**，而审查的硬时限（`AGENT2_REVIEW_MAX_SECONDS`）与「终止检查」标志只在循环边界检查。因此：`wait_for_authorization(timeout=…)` 有上限，超时推 `verify_action_resolved`（前端收起弹窗）且本轮后续动作不再弹窗；`POST /tasks/{id}/review/stop` 会立即 `clear_pending_verify_action(reason="review_stopped")` 唤醒等待线程；verifier 另外拿到 `abort_check`，收到信号当轮就收手并回报 `outcome=aborted`。
 
 ### 5.4 登录 token（`task.params._verifier.auth_tokens`）
 
@@ -867,15 +873,22 @@ list of `{label, header_name, header_value}`：
 | 工具结果 | `conversation(role=agent2, type=tool_result, verify=true)` | 是（超 5000 字符截断；runtime 统一落库，tool_call_id 与 tool_call 配对） |
 | 思考完成 | （隐含 phase=end） | `role=agent2, type=thinking, content="[验证结果] ..."`，落库即推 `conversation` 事件（无 `stream_conv_id`，前端按 reasoning/content 文本对账退役实时卡片） |
 
-### 5.6 输出
+### 5.6 输出与置信口径
 
-验证完成后输出自然语言总结：
+先调 `submit_verification` 申报结论，再输出自然语言总结：
 
-- 每个验证目标的结论：已确认可利用 / 无法确认 / 确认为误报
+- 每个验证目标的结论：已确认可利用 / 已核实不成立（误报）/ 未定论
 - 关键证据：HTTP 状态码、响应内容片段
 - 建议：是否提升 / 降低严重级别
 
-系统提示强调「不要对生产环境造成破坏性影响」「优先用最小化的 PoC（如 `' OR 1=1--` 比 `DROP TABLE` 更合适）」。
+结论档位决定审查项能不能拿到「已动态验证」置信档（口径集中在 `app/agents/verification_outcome.py`）：
+
+- **定论 = `confirmed` 或 `not_confirmed`**。被 PoC 驳回的发现同样算"过了动态验证"（归"已核实不成立"）
+- `inconclusive` / `unreachable` / `not_authorized` / `unknown`（未申报）只算"试过了"：**不抬档也不判 mismatch**，置信按源码取证/引用档走
+- 一批目标聚合取**最弱一环**（引用号是"一次 verify"的粒度，只抬其中一条会让其余连坐），所以计划里声明要跑 PoC 的条目应与实际额度相称
+- 此前只记 `verify_ok`（不以 `[验证失败` 开头）就把"环境不可达/用户没授权/跑了但没看出差异"也算作已验证——这就是"置信档含义从验出结论漂成试过了"的修正
+
+系统提示强调「不要对生产环境造成破坏性影响」「优先用最小化的 PoC（如 `' OR 1=1--` 比 `DROP TABLE` 更合适）」，并明说没把握就如实写 `inconclusive`，不要为了让结论好看而猜 `confirmed`。
 
 ### 5.7 安全设计
 
@@ -1012,7 +1025,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 
 ### 8.1 职责分离
 
-- **agent2 不直接执行审查**：只做核查与提炼；可用只读核查工具（`read_file` / `list_files` / `find_files` / `search_code`，单轮上限 `MAX_READ_TOOL_CALLS=12`）核对 agent1 的发现，可选经 verifier_agent 生成 PoC 验证（单轮上限 `MAX_VERIFY_CALLS=3`），但不执行写操作，避免与 agent1 职责重叠
+- **agent2 不直接执行审查**：只做核查与提炼；可用只读核查工具（`read_file` / `list_files` / `find_files` / `search_code`，单轮上限 `MAX_READ_TOOL_CALLS=100`）核对 agent1 的发现，可选经 verifier_agent 生成 PoC 验证（单轮额度按审查计划联动 3–8），但不执行写操作，避免与 agent1 职责重叠
 - **react_agent 不管理 task 状态**：只跑一轮返回结果，由 orchestrator 控制 task 状态
 - **结构化结果由 agent2 整理**：react_agent 只输出自然语言 summary，`results + grouping` 由 agent2 审查完成时输出
 - **执行器抽象**：orchestrator 通过 `get_executor(task)` 拿 provider，无需关心底层是内置 LLM 循环还是外部 CLI 协议
@@ -1030,8 +1043,8 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 - **agent1（内置 react_agent）循环检测**：连续相同调用 + 滑动窗口低多样性检测，强制转入总结
 - **无协作总轮次死循环**：初始运行 agent1 只跑 1 轮，agent2 后台审查单次完成；多轮由用户 resume 驱动，每次 resume = agent1 一轮 + 一次审查，不存在自动多轮循环（原 `max_rounds` / `MAX_RESUME_ROUNDS` 已移除）
 - **MAX_ITERATIONS=30**：单轮 ReAct 迭代上限
-- **MAX_READ_TOOL_CALLS=12**：agent2 单次评估只读核查工具调用上限
-- **MAX_VERIFY_CALLS=3**：agent2 单次评估 verifier_agent 调用上限
+- **MAX_READ_TOOL_CALLS=100**：agent2 单次审查只读核查工具调用上限（四个只读工具共享；旧值 12 会让 8 条计划项摊不到一次深查）
+- **MIN_VERIFY_CALLS=3 / settings.AGENT2_MAX_VERIFY_CALLS=8**：agent2 单次审查动态验证额度下限/上限，实际额度由 `_verify_budget()` 按计划里 `planned_evidence=verify` 的条目数联动
 - **MAX_REFERENCE_CALLS=3**：agent2 单次评估引用复核调用上限(每次抓取最长 15s,收敛上限控串行阻塞)
 - **verifier MAX_ITERATIONS=10**：验证 ReAct 迭代上限
 

@@ -160,6 +160,17 @@ class Settings(BaseSettings):
     # 设为 0 关闭硬时限(只靠用户终止与额度上限)
     AGENT2_REVIEW_MAX_SECONDS: int = 3600
 
+    # ---- 动态验证(PoC verifier)额度与授权 ----
+    # 单轮审查里调用动态验证的次数上限(下限固定 3,实际额度按审查计划里
+    # 声明 planned_evidence=verify 的条目数联动)。每次验证内部最多 10 轮工具
+    # 迭代且逐动作可能弹授权,所以要留一个硬上限防单轮审查被拖死。
+    # 设为 0 = 回落到旧行为(固定 3 次)
+    AGENT2_MAX_VERIFY_CALLS: int = 8
+    # per_action 模式下等用户授权的最长秒数(0 = 无限等,旧行为——用户不点弹窗
+    # 会把整轮后台审查挂死在工具执行内部,「终止检查」与上面的硬时限都叫不醒它)。
+    # 超时按"未授权"处理:动作不执行,结论规规矩矩退回待核实。
+    VERIFY_AUTH_TIMEOUT_SECONDS: int = 300
+
     # ---- 引用复核(check_reference,agent2 用)----
     # 场景命中且任务级 _agent_policy 未显式设置 allow_verify 时,自动开启
     # PoC 验证开关(实际跑 PoC 仍需任务配 test_env_url)。逗号分隔场景 id。

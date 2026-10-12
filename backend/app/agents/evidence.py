@@ -17,6 +17,8 @@ import json
 import re
 from typing import Any
 
+from app.agents.verification_outcome import DEFINITIVE_OUTCOMES, OUTCOME_UNKNOWN
+
 # ============================================================
 # 置信档位(取最高一档成立;score 为该档基线)
 # ============================================================
@@ -155,13 +157,21 @@ class EvidenceRecorder:
         }
         return self._inject_json_ref(result_str, eref)
 
-    def record_verify(self, text: str, *, verify_ok: bool, call_id: str | None = None,
+    def record_verify(self, text: str, *, verify_ok: bool, outcome: str | None = None,
+                      call_id: str | None = None,
                       args_brief: str = "") -> str:
-        """verify 动态验证结果(natural-language)入台账,末尾追加 [evidence_ref=E#]"""
+        """verify 动态验证结果(natural-language)入台账,末尾追加 [evidence_ref=E#]
+
+        `verify_ok` 只说"这次验证跑成了(没异常)",**不能支撑「已动态验证」档**;
+        真正定论的是 `outcome`(见 verification_outcome.py):只有 confirmed /
+        not_confirmed 这两档算定论。环境不可达、用户未授权、跑了但没看出差异
+        都是"试过了",拿源码/引用档就好。
+        """
         eref = self._next_ref()
         self.ledger[eref] = {
             "kind": "verify", "call_id": call_id, "args_brief": args_brief,
             "body": text, "verify_ok": bool(verify_ok),
+            "outcome": outcome or OUTCOME_UNKNOWN,
         }
         return f"{text}\n[evidence_ref={eref}]"
 
@@ -190,11 +200,14 @@ def score_review_item(
     缺口/无证据者返回 None(confidence 不写)。
 
     返回:
-        {tier, label, score, evidence_validated, evidence_mismatch, note}
+        {tier, label, score, evidence_validated, evidence_mismatch,
+         verification_outcome, note}
     校验规则:
       ① 非空 call_ref 必须命中台账,否则 evidence_mismatch;
       ② source.call_ref 指向 read/search 时对 quote 做归一化宽松子串匹配,不吻合 → mismatch;
-      ③ verified=True 仅当指向成功 verify 台账(无 verify 环境时不采信但不判 mismatch);
+      ③ verified=True 仅当指向"跑成且定论"(outcome 为 confirmed|not_confirmed)的
+        verify 台账;跑成了但未定论(不可达/未授权/未申报)不抬档也不判 mismatch,
+        指向跑失败的台账才判 mismatch(无 verify 环境时不采信也不判 mismatch);
       ④ ref_ok = ref_status=ok 且 authority∈{authoritative,credible} 且 call_ref 指向 reference 台账。
     取最高一档成立;多一类佐证 +0.03(封顶 <1.0);mismatch 压到 assertion_only,
     但"false_positive 且 source_ok"例外保底 source_confirmed(误报剔除也要证据)。
@@ -208,6 +221,8 @@ def score_review_item(
 
     mismatch = False
     source_ok = ref_ok = verified_ok = False
+    verify_inconclusive = False
+    verification_outcome: str | None = None
 
     # ① source(仅在有工作区时可核验;无 repo 缺 source 不判 mismatch)
     if has_repo and (source.get("file_path") or source.get("quote")):
@@ -240,7 +255,9 @@ def score_review_item(
         ):
             ref_ok = True
 
-    # ③ verification → verified_ok(仅当指向成功 verify 台账)
+    # ③ verification → verified_ok(仅当指向"跑出定论"的台账)
+    #   跑成了但结论未定论(环境不可达/未授权/没申报)不判 mismatch——
+    #   那是"试过但没验出来",不是"谎报引用";但不能拿它换「已动态验证」档。
     if verification.get("verified") is True:
         cref = verification.get("call_ref")
         entry = _lookup(ledger, cref)
@@ -248,10 +265,17 @@ def score_review_item(
             verified_ok = False  # 无 verify 环境:优雅降级,不判 mismatch
         elif cref and entry is None:
             mismatch = True
-        elif entry is not None and entry.get("kind") == "verify" and entry.get("verify_ok"):
-            verified_ok = True
+        elif entry is not None and entry.get("kind") == "verify":
+            outcome = entry.get("outcome") or OUTCOME_UNKNOWN
+            verification_outcome = outcome
+            if entry.get("verify_ok") and outcome in DEFINITIVE_OUTCOMES:
+                verified_ok = True
+            elif not entry.get("verify_ok"):
+                mismatch = True  # 声称 verified 却指向一条跑失败的验证
+            else:
+                verify_inconclusive = True
         else:
-            mismatch = True  # 声称 verified 却指向非成功/非 verify 台账
+            mismatch = True  # 声称 verified 却指向非 verify 台账
 
     # 选档:mismatch 压到 assertion_only(false_positive + source_ok 例外保底)
     if mismatch:
@@ -275,13 +299,20 @@ def score_review_item(
         score = min(_SCORE_CAP, score + _CORROBORATION_BONUS * (corroborations - 1))
 
     validated = (not mismatch) and (source_ok or ref_ok or verified_ok)
+    if mismatch:
+        note = "引用未核验通过,置信下调为仅断言"
+    elif verify_inconclusive:
+        note = f"动态验证未定论({verification_outcome}),置信按其余证据"
+    else:
+        note = None
     return {
         "tier": tier,
         "label": TIER_LABELS[tier],
         "score": round(score, 3),
         "evidence_validated": bool(validated),
         "evidence_mismatch": bool(mismatch),
-        "note": "引用未核验通过,置信下调为仅断言" if mismatch else None,
+        "verification_outcome": verification_outcome,
+        "note": note,
     }
 
 

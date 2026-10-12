@@ -517,6 +517,30 @@ watch(
 /** 测试环境 URL(已部署的应用地址,如 http://localhost:3000) */
 const testEnvUrl = ref('')
 /**
+ * 测试环境地址是否指向 loopback(localhost / 127.x / ::1)。
+ *
+ * 为何要提醒:沙箱模式下 PoC 脚本在沙箱容器里执行,那里的 localhost 是容器自身,
+ * 按这个提示填的地址等于对着空端口打 PoC——验证永远报"环境不可达",审查项全部
+ * 退回待核实,看上去像"检查助手什么也没验出来"。local 模式(脚本就在宿主机跑)则没事。
+ * 前端拿不到当前 SANDBOX_MODE,所以只做提醒、不拦提交(用户可能正是 local 模式)。
+ */
+const testEnvUrlPointsAtLoopback = computed(() => {
+  const raw = testEnvUrl.value.trim()
+  if (!raw) return false
+  try {
+    const host = new URL(raw).hostname.toLowerCase().replace(/^\[|\]$/g, '')
+    return (
+      host === 'localhost'
+      || host === '0.0.0.0'
+      || host === '::1'
+      || host.startsWith('127.')
+    )
+  } catch {
+    // 还不像合法 URL 时按前缀粗判,提醒文案不会造成误伤
+    return /^(https?:\/\/)?(localhost|127\.|\[?::1)/i.test(raw)
+  }
+})
+/**
  * 验证授权模式:
  * - "direct":验证动作直接执行不弹窗
  * - "per_action":每个 HTTP 请求/PoC 运行前弹窗授权
@@ -1400,9 +1424,15 @@ onUnmounted(() => {
                                   v-model.trim="testEnvUrl"
                                   type="url"
                                   class="policy-input"
-                                  placeholder="http://localhost:3000(已部署的应用地址)"
+                                  placeholder="应用地址,如 http://192.168.1.20:3000(沙箱模式下 localhost 指容器自身)"
                                 />
                                 <span class="policy-hint">检查助手将在此环境动态验证安全发现</span>
+                                <p v-if="testEnvUrlPointsAtLoopback" class="policy-warn">
+                                  这个地址指向本机 loopback。若后端跑在沙箱模式,PoC 是在沙箱容器里
+                                  执行的——那里的 localhost 是容器自身,验证会一直"环境不可达"。
+                                  请改成沙箱能访问到的地址(宿主机局域网 IP,或 host.docker.internal);
+                                  后端若是 local 模式(无沙箱),填 localhost 正常。
+                                </p>
                               </label>
 
                             <label class="policy-field">
@@ -2973,6 +3003,16 @@ onUnmounted(() => {
 .policy-hint {
   font-size: var(--fs-xs);
   color: var(--color-text-muted);
+}
+
+/* 配置能提交但大概率白跑的提醒(比 hint 抢眼神,又不当作错误) */
+.policy-warn {
+  margin: 0;
+  padding: var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--color-warning);
+  background: var(--color-warning-light);
+  border-radius: var(--radius-sm);
 }
 
 .policy-toggle-row {

@@ -3,7 +3,8 @@
 覆盖 score_review_item 的核心判读:
 - call_ref 命中 + quote 吻合 → source_confirmed
 - call_ref 不在台账 → evidence_mismatch + 压到 assertion_only
-- verify 成功台账 + verified=True → verified
+- verify 跑成且**定论**(confirmed / not_confirmed)+ verified=True → verified
+- verify 跑成但未定论(不可达/未授权/未申报)→ 不抬档也不判 mismatch
 - has_repo=False 缺 source → 不判 mismatch
 - false_positive + source_ok → 至少 source_confirmed(mismatch 例外保底)
 - 无 evidence → confidence None
@@ -67,16 +68,56 @@ def test_quote_mismatch_presses_to_assertion():
 def test_verified_tier_needs_success_verify_ledger():
     ledger = {
         "E1": {"kind": "read", "body": _read_body()},
-        "E3": {"kind": "verify", "body": "PoC 成功:返回了全部用户", "verify_ok": True},
+        "E3": {"kind": "verify", "body": "PoC 成功:返回了全部用户",
+               "verify_ok": True, "outcome": "confirmed"},
     }
     ev = {
-        "source": {"file_path": "src/api/users.py", "quote": "cursor.execute(sql)", "call_ref": "E1"},
+        "source": {"file_path": "src/api/users.py", "line": "42",
+                   "quote": "cursor.execute(sql)", "call_ref": "E1"},
         "verification": {"method": "poc", "verified": True, "poc_evidence": "...", "call_ref": "E3"},
     }
     out = score_review_item(ev, "confirmed", ledger, has_repo=True, verify_available=True)
     assert out["tier"] == TIER_VERIFIED
     # verified + source 两类佐证 → 基线 + 0.03
     assert out["score"] == round(0.92 + 0.03, 3)
+
+
+def test_not_confirmed_is_definitive_too():
+    # 被 PoC 驳回同样算"过了动态验证":不判 mismatch,给 verified 档
+    ledger = {"E2": {"kind": "verify", "body": "正常参数也能拿到全量数据,未看出越权差异",
+                     "verify_ok": True, "outcome": "not_confirmed"}}
+    ev = {"verification": {"verified": True, "call_ref": "E2"}}
+    out = score_review_item(ev, "false_positive", ledger, has_repo=False, verify_available=True)
+    assert out["tier"] == TIER_VERIFIED
+    assert out["evidence_mismatch"] is False
+    assert out["verification_outcome"] == "not_confirmed"
+
+
+def test_inconclusive_verify_does_not_earn_verified_tier():
+    # 回归:此前台账只看"跑没跑成",环境不可达/没定论/未申报也被抬到「已动态验证」
+    for outcome in ("inconclusive", "unreachable", "not_authorized", "unknown"):
+        ledger = {
+            "E1": {"kind": "read", "body": _read_body()},
+            "E3": {"kind": "verify", "body": "看不出差异", "verify_ok": True, "outcome": outcome},
+        }
+        ev = {
+            "source": {"file_path": "src/api/users.py", "quote": "cursor.execute(sql)",
+                       "call_ref": "E1"},
+            "verification": {"verified": True, "call_ref": "E3"},
+        }
+        out = score_review_item(ev, "confirmed", ledger, has_repo=True, verify_available=True)
+        assert out["tier"] == TIER_SOURCE, outcome  # 按其余证据定档,不白送
+        assert out["evidence_mismatch"] is False, outcome  # "试过了"不等于谎报引用
+        assert out["note"] and "未定论" in out["note"], outcome
+
+
+def test_missing_outcome_key_fails_closed():
+    # 台账里没有 outcome 字段(旧形状/手工拼的)—> 按 unknown 处理,不抬档
+    ledger = {"E3": {"kind": "verify", "body": "PoC 成功", "verify_ok": True}}
+    ev = {"verification": {"verified": True, "call_ref": "E3"}}
+    out = score_review_item(ev, "confirmed", ledger, has_repo=False, verify_available=True)
+    assert out["tier"] == TIER_ASSERTION
+    assert out["verification_outcome"] == "unknown"
 
 
 def test_verify_unavailable_does_not_mismatch():
@@ -171,10 +212,18 @@ def test_recorder_assigns_refs_and_injects_into_json():
 
 def test_recorder_verify_appends_text_marker():
     rec = EvidenceRecorder()
-    out = rec.record_verify("PoC 成功", verify_ok=True)
+    out = rec.record_verify("PoC 成功", verify_ok=True, outcome="confirmed")
     assert "[evidence_ref=E1]" in out
     assert rec.ledger["E1"]["kind"] == "verify"
     assert rec.ledger["E1"]["verify_ok"] is True
+    assert rec.ledger["E1"]["outcome"] == "confirmed"
+
+
+def test_recorder_verify_without_outcome_is_unknown():
+    # 不报结论就是未定论(fail-closed),不能让"跑了"冒充"验出来了"
+    rec = EvidenceRecorder()
+    rec.record_verify("看不出差异", verify_ok=True)
+    assert rec.ledger["E1"]["outcome"] == "unknown"
 
 
 def test_recorder_reference_kind():

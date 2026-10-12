@@ -57,6 +57,9 @@ EventType = Literal[
     "review_plan_update",  # agent2 审查计划发射/修订(覆盖式,侧栏计划卡)
     "review_item_add",  # agent2 逐条审查项即时落库(侧栏审查结果区实时增长)
     "knowledge_point_add",  # agent2 逐条知识点即时落库(侧栏知识点区实时增长)
+    "verify_action",  # 动态验证动作待授权(verifier per_action 模式,前端弹窗)
+    "verify_action_resolved",  # 待授权验证动作已失效(超时/任务收尾),前端收起弹窗
+    "command_confirm",  # local 模式危险命令待确认(前端弹窗)
     "done", "error",
     "clone_progress",  # 仓库克隆进度(local 模式 Popen 流式解析 git stderr)
 ]

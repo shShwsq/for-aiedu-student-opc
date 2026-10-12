@@ -7,7 +7,10 @@
  *
  * 对用户透明:不出现 verifier_agent 字样,只显示"验证动作需要授权"。
  *
- * 用户选择后通过 @approve / @reject 事件通知父组件,由父组件调 API 提交决议。
+ * 用户选择后通过 @approve / @approve-all / @reject 事件通知父组件,由父组件调 API 提交决议。
+ * approve-all = "本次同意且本任务后续动作自动允许":一次 PoC 序列动辄七八个动作,
+ * 逐个确认会把人逼向完全不弹窗的 direct 模式(那才真的没有人工把关);自动放行的
+ * 动作仍逐条落库进侧栏,事后看得见跑了什么。
  */
 import { computed } from 'vue'
 import type { VerifyActionEventData } from '@/types/task'
@@ -24,6 +27,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   /** 用户同意执行该动作 */
   (e: 'approve', actionId: string): void
+  /** 用户同意该动作,且本任务后续验证动作不再弹窗 */
+  (e: 'approve-all', actionId: string): void
   /** 用户拒绝执行该动作 */
   (e: 'reject', actionId: string): void
 }>()
@@ -51,6 +56,11 @@ const formattedHeaders = computed(() => {
 function handleApprove(): void {
   if (!props.action?.action_id || props.submitting) return
   emit('approve', props.action.action_id)
+}
+
+function handleApproveAll(): void {
+  if (!props.action?.action_id || props.submitting) return
+  emit('approve-all', props.action.action_id)
 }
 
 function handleReject(): void {
@@ -141,7 +151,7 @@ function handleReject(): void {
           </div>
 
           <footer class="dialog-footer">
-            <span class="footer-hint">拒绝后智能体会收到反馈并跳过此动作</span>
+            <span class="footer-hint">拒绝后智能体会收到反馈并跳过此动作;授权等待有时限,超时按未执行处理</span>
             <div class="footer-actions">
               <button
                 class="btn btn-secondary"
@@ -149,12 +159,18 @@ function handleReject(): void {
                 @click="handleReject"
               >拒绝</button>
               <button
+                class="btn btn-ghost"
+                :disabled="submitting"
+                title="本任务后续验证动作不再弹窗(仍会逐条落库,侧栏可回看)"
+                @click="handleApproveAll"
+              >同意,后续自动允许</button>
+              <button
                 class="btn btn-primary"
                 :disabled="submitting"
                 @click="handleApprove"
               >
                 <span v-if="submitting" class="btn-spinner" />
-                {{ submitting ? '提交中...' : '同意执行' }}
+                {{ submitting ? '提交中...' : '仅同意这一次' }}
               </button>
             </div>
           </footer>
@@ -397,6 +413,18 @@ function handleReject(): void {
 
 .btn-secondary:hover:not(:disabled) {
   border-color: var(--color-border-strong);
+  color: var(--color-text);
+}
+
+/* 第三个选项:"同意且后续自动允许"——不抢主按钮的视觉权重,但要比次按钮可读 */
+.btn-ghost {
+  background: transparent;
+  color: var(--color-text-secondary);
+  border-color: var(--color-border);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--color-surface-alt);
   color: var(--color-text);
 }
 

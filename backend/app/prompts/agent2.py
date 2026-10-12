@@ -127,8 +127,11 @@ _VERIFY_TOOL_DEFINITION: dict[str, Any] = {
         "description": (
             "在已部署的测试环境动态验证 agent1 发现的安全问题是否真实可利用。"
             "传入需要验证的安全发现描述,系统会自动构造 PoC 发送到测试环境验证。"
-            "验证完成后你会收到验证结果(已确认/未确认/误报 + 证据),据此调整质检结论。"
+            "验证完成后你会收到验证结果 + 一行结论档位(outcome),据此调整质检结论。"
             "适用于:静态分析疑似但不确定的漏洞、需要实际触发确认的注入/认证绕过等。"
+            "**一次调用可以带多个相关发现**(它们共用一个验证思路与一个 PoC 序列),"
+            "按发现逐条写进描述;额度按你计划里声明要跑 PoC 的条目数联动,"
+            "不要把不相干的发现挤进同一次调用。"
         ),
         "parameters": {
             "type": "object",
@@ -460,7 +463,7 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
 **证据台账**:每当你调用取证工具(read_file/search_code/verify/check_reference),系统会在结果里
 附带一个 `_evidence_ref`(如 E1)或末尾 `[evidence_ref=E1]`;把它就近填进审查项 `evidence.*.call_ref`,
 后端据此核验"这条结论是否真的取过证"。工具只作发射/取证,不替你判定结论 true/false——
-真正的可信来自你**实际跑过的取证**(verify 跑 PoC、grep 命中真实代码),绝不把自填的
+真正的可信来自你**实际跑过的取证**(verify 跑出定论、grep 命中真实代码),绝不把自填的
 `verified=true` 当证据。
 
 **兼容**:若你所用的模型不支持结构化工具发射,仍可在结束时输出一个总结 JSON
@@ -493,7 +496,14 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
 ## 动态验证(可选,有 verify 工具时)
 如果任务配置了测试环境,你可以调用 `verify` 工具动态验证 agent1 发现的安全问题:
 - **对静态分析疑似但不确定的漏洞,优先 verify 发送 PoC 到测试环境确认**
-- 验证结果会作为 tool_result 返回给你,据此在 results 中标注"已确认可利用"或"误报"
+- 返回结果末尾带一行 `[验证结论] outcome=…`。**只有定论档位**
+  (`confirmed`=真触发成功了 / `not_confirmed`=试过且确认不成立)才把该审查项
+  支撑到「已动态验证」档;`inconclusive` / `unreachable` / `not_authorized` / `unknown`
+  只意味着"试过了但没验出来",系统不会抬信,也不代表问题不成立。
+- 因此 `evidence.verification.verified=true` 只用在定论档位上;未定论时不要把
+  call_ref 填进 verification 段(它不会帮你,反而拖低可读性),改按源码取证写
+  `evidence.source`,并在 `conclusion` 里用"发过 PoC 但未看出差异"这种说法。
+- 用户不同意或授权超时的动作同样不算"不成立",写待核实语气
 - 不要对每个发现都验证,只验证关键的、不确定的;已明确的问题不需要验证
 - **没有测试环境时**,不得臆造验证结论,在对应 result 的 metadata 标注
   `verified: "pending"`、`verify_method: "static"`(仅静态分析,待动态确认)

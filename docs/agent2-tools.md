@@ -12,23 +12,25 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 
 工具分**取证**与**发射**两族:
 
-- **取证工具(当前已实现)**:三类共 6 个可调用函数(其中 `verify` 内部再委派 2 个子工具),见 §1–§3;
+- **取证工具(当前已实现)**:三类共 6 个可调用函数(其中 `verify` 内部再委派 2 个子工具 + 1 个结论申报工具),见 §1–§3;
 - **发射/输出工具(后端已落地,UI/出题接入中)**:`submit_review_plan`(审查规划,先行且可修订)/ `submit_review_item`(审查项,按核实结果三分档)/ `submit_knowledge_point`(知识点)/ `submit_suggestion`,是"证据驱动的可信审查"改造的**四个即时发射原语**,见 §4。
 
 下表为**取证工具**(§1–§3):
 
 | 类别 | 工具 | 用途 | 启用条件 | 单轮上限 |
 |---|---|---|---|---|
-| 只读取证 | `read_file` | 读真实源码核对说法/行号/上下文 | `repo_path` 存在 | 共用 12 |
-| 只读取证 | `list_files` | 核对声称检查过的文件是否真实存在 | `repo_path` 存在 | 共用 12 |
-| 只读取证 | `find_files` | 按文件名 glob 递归定位文件 | `repo_path` 存在 | 共用 12 |
-| 只读取证 | `search_code` | 按内容正则搜索代码 | `repo_path` 存在 | 共用 12 |
-| 动态验证 | `verify` | 对疑似漏洞生成 PoC 到测试环境实触发 | verifier_enabled + test_env_url + allow_verify | 3 |
+| 只读取证 | `read_file` | 读真实源码核对说法/行号/上下文 | `repo_path` 存在 | 共用 100 |
+| 只读取证 | `list_files` | 核对声称检查过的文件是否真实存在 | `repo_path` 存在 | 共用 100 |
+| 只读取证 | `find_files` | 按文件名 glob 递归定位文件 | `repo_path` 存在 | 共用 100 |
+| 只读取证 | `search_code` | 按内容正则搜索代码 | `repo_path` 存在 | 共用 100 |
+| 动态验证 | `verify` | 对疑似漏洞生成 PoC 到测试环境实触发 | verifier_enabled + test_env_url + allow_verify | 按计划联动(3–8) |
 | 引用复核 | `check_reference` | 核对 agent1 引用的外部 URL 真实性与权威性 | allow_reference_check(默认 True) | 3 |
 
-上限常量定义于 [agent2.py L92-100](../backend/app/agents/agent2.py#L92-L100):`MAX_READ_TOOL_CALLS=12`、`MAX_VERIFY_CALLS=3`、`MAX_REFERENCE_CALLS=3`。四个只读工具**共享** 12 次额度(`read_tool_count` 计数)。
+额度定义于 `app/agents/agent2.py`:`MAX_READ_TOOL_CALLS=100`、`MIN_VERIFY_CALLS=3`(上限 `settings.AGENT2_MAX_VERIFY_CALLS=8`)、`MAX_REFERENCE_CALLS=3`。四个只读工具**共享** 100 次额度(`read_tool_count` 计数);`verify` 额度由 `_verify_budget()` 按审查计划里 `planned_evidence="verify"` 的条目数现算(`min(cap, planned + 1)`,下限 3)。
 
-工具组装见 [agent2.py L355-375](../backend/app/agents/agent2.py#L355-L375):按启用条件把工具定义拼进 `tools` 传给 LLM;不满足条件的工具不进本轮调用面。
+> 额度不是拍出来的:只读取证从 12 提到 100 是因为实测 8 条计划项摊 12 次(人均 1.5 次)直接把 3 条结论压成了无证据的 suspected;验证额度沿用同一道算术。配套护栏:`MAX_LIVE_TOOL_RESULTS=40`(旧回传压成一行摘要)、`settings.AGENT2_REVIEW_MAX_SECONDS`(挂钟硬时限)、`settings.VERIFY_AUTH_TIMEOUT_SECONDS`(逐动作授权等待上限)。
+
+工具组装见 `run_agent2()` 内 `tools` 拼接段:按启用条件把工具定义拼进 `tools` 传给 LLM;不满足条件的工具不进本轮调用面。
 
 ---
 
@@ -82,27 +84,33 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 
 ## 2. 动态验证工具 `verify`
 
-**执行入口**:[agent2.py 主循环 verify 分支 L542-612](../backend/app/agents/agent2.py#L542-L612) → 委派 [`run_verifier_agent()`](../backend/app/agents/verifier_agent.py#L55-L73)。
+**执行入口**:`run_agent2()` 主循环的 verify 分支 → 委派 [`run_verifier_agent()`](../backend/app/agents/verifier_agent.py)。
 
-**启用条件**(三者同时满足,见 [agent2.py L357-362](../backend/app/agents/agent2.py#L357-L362)):
+**启用条件**(三者同时满足,见 `run_agent2()` 内 `verify_enabled` 判定):
 `task.verifier_enabled` **且** `task.test_env_url` 非空 **且** `agent_policy.allow_verify=True`。
 缺任一条件则本轮不提供 `verify` 工具,agent2 不得臆造验证结论(在对应结论 metadata 标 `verified:"pending"`、`verify_method:"static"`)。
 
 **参数**:
-- `verification_request`(必填):待验证的安全发现描述,应含漏洞类型、代码位置、攻击思路(如"验证 `src/api/users.py` 第 42 行 SQL 注入:username 未参数化直接拼进 SQL,尝试 `' OR 1=1--`")。
+- `verification_request`(必填):待验证的安全发现描述,应含漏洞类型、代码位置、攻击思路(如"验证 `src/api/users.py` 第 42 行 SQL 注入:username 未参数化直接拼进 SQL,尝试 `' OR 1=1--`")。一次调用可带多个**共用同一验证思路**的相关发现,按条写进描述。
+
+**额度**:`_verify_budget()` 按本轮审查计划里 `planned_evidence="verify"` 的条目数现算(`min(cap, planned + 1)`,下限 `MIN_VERIFY_CALLS=3`,上限 `settings.AGENT2_MAX_VERIFY_CALLS=8`)。触顶时跳过并把**实际额度**回灌给模型;规划对账用同一个口径(`emit_state["verify_budget"]`)区分"额度用尽/没排到"。
 
 **verifier_agent 内部子工具**(agent2 不直接看到,由 verifier 自主调用):
-- `http_request`:向 `test_env_url` 发 GET/POST/PUT/DELETE + headers + body(沙箱内 urllib 执行,不暴露后端服务器 IP)。
-- `run_python_code`:复用 react_agent 的任务沙箱执行 Python,可读已克隆仓库辅助构造 PoC。
-- verifier 独立 ReAct 循环,`MAX_VERIFIER_ITERATIONS=10`;完成时把**自然语言验证总结**作为 `tool_result` 回灌给 agent2。
+- `http_request`:向 `test_env_url` 发 GET/POST/PUT/DELETE + headers + body(沙箱内 urllib 执行,不暴露后端服务器 IP)。URL base 锁定为任务配置(防 SSRF/防篡改),`auth_profile` 按身份 label 注入凭证头(LLM 看不到 token 明文)。
+- `run_python_code`:复用 react_agent 的任务沙箱执行 Python,可读已克隆仓库辅助构造 PoC。沙箱**能**访问测试环境(http_request 就是在同一沙箱里跑 Python urllib),多步状态的流程(登录拿态 → 算签名 → 比对两个身份的响应)可直接写 Python 用标准库 urllib 发请求(第三方包不保证预装);单发请求仍优先 `http_request`。
+- `submit_verification`:**申报逐个目标的结论**(无副作用、不弹窗授权),`result ∈ {confirmed, not_confirmed, inconclusive, unreachable, not_authorized}`。申报完才输出总结。
+- verifier 独立 ReAct 循环,`MAX_VERIFIER_ITERATIONS=10`;完成时把**自然语言验证总结**作为 `tool_result` 回灌给 agent2,末尾附一行 `[验证结论] outcome=…`。
+
+**结论语义与置信档(关键)**:证据台账(`EvidenceRecorder.record_verify`)同时记 `verify_ok`(这次验证跑成了/没异常)与 `outcome`(到底验出了什么)。**`score_review_item` 只把"跑成且定论"的台账当 verified**——定论 = `confirmed`(真触发成功)或 `not_confirmed`(试过且确实不成立,被 PoC 驳回同样算过了动态验证)。`inconclusive` / `unreachable` / `not_authorized` / `unknown`(未申报)不抬档也不判 mismatch("试过了"不等于谎报引用),置信按源码/引用档走。聚合取**最弱一环**:一批目标里只要一条没定论,整批就不认定论(引用号是"一次 verify"的粒度,抬档会连坐)。
 
 **授权模式**(`task.verifier_auth_mode`):
 - `direct`:所有动作直接执行;
-- `per_action`:每个 `http_request`/`run_python_code` 前弹窗阻塞等用户确认(前端可拒绝,拒绝返回 `[用户拒绝执行此动作]`)。
+- `per_action`:每个 `http_request`/`run_python_code` 前弹窗阻塞等用户确认。三个决议:**同意** / **同意且本任务后续自动允许**(`scope="task"`,之后不再弹窗;动作仍经 `record_conversation` 逐条落库进侧栏) / **不同意**(回灌 `[用户拒绝执行此动作]`)。
+- **等待有上限**:`settings.VERIFY_AUTH_TIMEOUT_SECONDS`(默认 300s)与本轮审查硬时限取小值。超时按未授权处理、推 `verify_action_resolved` 让前端收起弹窗,且本轮后续动作不再逐个弹窗;「终止检查」会立即唤醒等待线程(那一下阻塞在工具执行内部,硬时限与终止标志都只在循环边界检查,不唤醒就叫不醒)。
 
-**结果语义**:文本形式返回"已确认 / 未确认 / 误报 + 证据摘要";agent2 据此在对应 result 标 `verified:true/false`、`verify_method:"poc"`、`poc_evidence`。
+**回灌给 agent2 的形状**:`verification_request` 的验证总结正文 + `[验证结论] outcome=…` + `[evidence_ref=E#]`。agent2 只在**定论**时把 `evidence.verification.verified=true` 与该 `call_ref` 一起写进审查项;未定论时不填 verification 段(写了也不会抬档),在 `conclusion` 里用"发过 PoC 但未看出差异"这种说法。
 
-**并行降级**:若本轮审查已被新一轮执行取代(`superseded_check()` 为真),跳过 `verify`(PoC 与新轮 agent1 抢同一沙箱端口/进程且文件正被改动),对应发现退回 `verified:"pending"` + `verify_method:"static"`(见 [agent2.py L552-569](../backend/app/agents/agent2.py#L552-L569))。
+**并行降级**:若本轮审查已被新一轮执行取代(`superseded_check()` 为真),跳过 `verify`(PoC 与新轮 agent1 抢同一沙箱端口/进程且文件正被改动),对应发现退回 `verified:"pending"` + `verify_method:"static"`。verifier 自己也拿到 `abort_check`,收到信号立即收手并回报 `outcome=aborted`。
 
 ---
 

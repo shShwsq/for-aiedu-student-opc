@@ -95,6 +95,7 @@ import type {
   TaskStatus,
   ThinkingDeltaEventData,
   VerifyActionEventData,
+  VerifyActionResolvedEventData,
   CommandConfirmEventData,
 } from '@/types/task'
 import type { TaskArtifact } from '@/types/taskArtifact'
@@ -528,6 +529,8 @@ const planPerRound = reactive<Map<number, PlanStep[]>>(new Map())
 // verifier_agent 在 per_action 模式下,每次执行 http_request / run_python_code 前
 // 推送 verify_action 事件,前端弹出 VerifyActionDialog 让用户确认/拒绝。
 // 对用户透明:不出现 verifier_agent 字样,只显示"验证动作需要授权"。
+// 等待有上限(后端 VERIFY_AUTH_TIMEOUT_SECONDS)且「终止检查」会立即唤醒它,
+// 那两种情况下后端推 verify_action_resolved,前端据此收起弹窗。
 const verifyActionOpen = ref(false)
 const verifyActionData = ref<VerifyActionEventData | null>(null)
 const submittingVerifyAction = ref(false)
@@ -571,21 +574,28 @@ function openVerifyActionDialog(action: VerifyActionEventData): void {
   verifyActionOpen.value = true
 }
 
-/** 用户同意执行验证动作 */
-async function handleApproveVerifyAction(actionId: string): Promise<void> {
+/**
+ * 提交验证动作授权决议(同意 / 不同意 × 仅这一次 / 后续自动允许 共用一条链)
+ *
+ * accepted=false 代表后端已经没有这个待授权动作(已答复/超时/任务收尾),
+ * 顺手收起弹窗——否则它会挂在页面上等一个再也不会有人答复的决议。
+ */
+async function submitVerifyResolution(
+  actionId: string, approved: boolean, scope: 'once' | 'task' = 'once',
+): Promise<void> {
   if (!task.value?.id || submittingVerifyAction.value) return
   submittingVerifyAction.value = true
   try {
     const resp = await submitVerifyAction(String(task.value.id), {
       action_id: actionId,
-      approved: true,
+      approved,
+      scope,
     })
-    if (resp.accepted) {
-      verifyActionOpen.value = false
-      verifyActionData.value = null
-    } else {
+    if (!resp.accepted) {
       error.value = resp.message || '授权提交失败,任务可能已结束'
     }
+    // 无论后端是否还认这个决议,本地都已经答复过了,弹窗不该再挂着
+    closeVerifyActionDialog()
   } catch (err) {
     error.value = extractErrorMessage(err)
   } finally {
@@ -593,25 +603,40 @@ async function handleApproveVerifyAction(actionId: string): Promise<void> {
   }
 }
 
-/** 用户拒绝执行验证动作 */
-async function handleRejectVerifyAction(actionId: string): Promise<void> {
-  if (!task.value?.id || submittingVerifyAction.value) return
-  submittingVerifyAction.value = true
-  try {
-    const resp = await submitVerifyAction(String(task.value.id), {
-      action_id: actionId,
-      approved: false,
-    })
-    if (resp.accepted) {
-      verifyActionOpen.value = false
-      verifyActionData.value = null
-    } else {
-      error.value = resp.message || '授权提交失败,任务可能已结束'
-    }
-  } catch (err) {
-    error.value = extractErrorMessage(err)
-  } finally {
-    submittingVerifyAction.value = false
+/** 收起验证动作弹窗 */
+function closeVerifyActionDialog(): void {
+  verifyActionOpen.value = false
+  verifyActionData.value = null
+}
+
+/** 用户同意执行验证动作(仅此一次) */
+function handleApproveVerifyAction(actionId: string): Promise<void> {
+  return submitVerifyResolution(actionId, true, 'once')
+}
+
+/**
+ * 用户同意本动作且本任务后续验证动作自动允许
+ * 一次 PoC 序列动辄七八个动作,逐个确认会把人逼向完全不弹窗的 direct 模式;
+ * 自动放行的动作仍逐条落库进侧栏,事后看得见跑了什么。
+ */
+function handleApproveAllVerifyAction(actionId: string): Promise<void> {
+  return submitVerifyResolution(actionId, true, 'task')
+}
+
+/** 用户不同意执行验证动作 */
+function handleRejectVerifyAction(actionId: string): Promise<void> {
+  return submitVerifyResolution(actionId, false)
+}
+
+/**
+ * 待授权动作已失效(授权超时 / 用户终止检查 / 任务收尾):收起当前弹窗
+ * 只对得上号的 action_id 动手,避免一条陈旧事件把刚弹出来的新决议关掉。
+ */
+function handleVerifyActionResolved(data: VerifyActionResolvedEventData): void {
+  if (verifyActionData.value?.action_id !== data.action_id) return
+  closeVerifyActionDialog()
+  if (data.reason === 'timeout') {
+    error.value = '验证动作授权超时,已按未执行处理(检查助手仍在继续)'
   }
 }
 
@@ -980,6 +1005,10 @@ function connectSSE(taskId: string): void {
     onVerifyAction: (data: VerifyActionEventData) => {
       // 动态验证动作需要授权(per_action 模式):弹出 VerifyActionDialog
       openVerifyActionDialog(data)
+    },
+    onVerifyActionResolved: (data: VerifyActionResolvedEventData) => {
+      // 授权超时/终止检查/任务收尾:后端已不等这个决议了,收起弹窗
+      handleVerifyActionResolved(data)
     },
     onCommandConfirm: (data) => {
       commandConfirmData.value = data
@@ -3577,6 +3606,14 @@ const showKnowledgeToolbar = computed<boolean>(() => {
             >
               {{ task.verifier_auth_mode === 'direct' ? '模式:直接执行' : '模式:逐动作授权' }}
             </button>
+            <!-- 逐动作授权下告诉用户:不点弹窗不会把检查挂死 -->
+            <p
+              v-if="task.verifier_enabled && task.verifier_auth_mode !== 'direct'"
+              class="verifier-hint"
+            >
+              每个验证动作要你确认;没人应答时授权会超时并按未执行处理(弹窗自动收起)。
+              可以在弹窗里选「同意,后续自动允许」免去逐个确认。
+            </p>
             <div
               v-if="task.verifier_enabled && task.verifier_auth_tokens && task.verifier_auth_tokens.length > 0"
               class="verifier-tokens"
@@ -3890,6 +3927,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
       :action="verifyActionData"
       :submitting="submittingVerifyAction"
       @approve="handleApproveVerifyAction"
+      @approve-all="handleApproveAllVerifyAction"
       @reject="handleRejectVerifyAction"
     />
 
@@ -4676,6 +4714,14 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+}
+
+/* 授权超时与"后续自动允许"的说明(不影响操作,只避免用户担心挂死) */
+.verifier-hint {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  line-height: 1.5;
 }
 
 .verifier-title {

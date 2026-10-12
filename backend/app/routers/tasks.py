@@ -427,6 +427,9 @@ def submit_task_verify_action(
     唤醒阻塞等待的 verifier_agent 后台线程:
     - approved=true:继续执行该 HTTP/PoC 动作
     - approved=false:跳过该动作,verifier_agent 收到"用户拒绝"反馈
+    - scope=task(仅与 approved=true 叠加):本任务后续验证动作不再弹窗,直接放行
+      (动作仍逐条落库进侧栏,用户看得到跑了什么;一次 PoC 序列动辄七八个动作,
+      逐个确认实际会把用户逼向没有任何把关的 direct 模式)
 
     返回 accepted=false 表示当前无待授权动作(可能已答复或任务已结束)。
     """
@@ -443,7 +446,9 @@ def submit_task_verify_action(
             message=f"任务已结束({task.status.value}),无法提交授权",
         )
 
-    ok = submit_verify_authorization(task_id, req.action_id, req.approved)
+    ok = submit_verify_authorization(
+        task_id, req.action_id, req.approved, remember=req.scope == "task"
+    )
     if not ok:
         return VerifyActionResponse(
             accepted=False,
@@ -1163,6 +1168,10 @@ def stop_task_review_endpoint(
         )
 
     stopped_round = request_review_stop(task.id)
+    # 立即唤醒可能卡在"等用户授权验证动作"上的审查线程:那一下阻塞发生在工具
+    # 执行内部,而终止标志只在循环边界检查 —— 不清这个阻塞点,「终止检查」在
+    # 弹窗没人点的任务上根本按不动(要等到授权时限耗尽才退出)。
+    clear_pending_verify_action(task.id, reason="review_stopped")
     # 写之前复核终态:上面的"仅 running 可终止"检查到这里之间存在窗口 —— 审查
     # 线程可能刚提交 done/failed(甚至已注销登记,使 stopped_round 为 None)。
     # 此时写 stopped 会把刚完成的审查成果标成"已终止"(知识点已落库、临时结果

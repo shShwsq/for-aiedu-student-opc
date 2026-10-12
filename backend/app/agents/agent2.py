@@ -66,6 +66,9 @@ from app.models.task import Conversation, Result, Task
 # 证据台账 + 置信度派生(纯函数,见 app/agents/evidence.py)
 from app.agents.evidence import EvidenceRecorder, derive_confidence_column, score_review_item
 
+# 动态验证结论档位(只认"定论"给「已动态验证」档,见 verification_outcome.py)
+from app.agents.verification_outcome import OUTCOME_UNKNOWN, outcome_note, parse_outcome_line
+
 # 审查项模型(三分档判读口径 + 枚举白名单集中管理)
 from app.models.audit import (
     ReviewItem,
@@ -120,8 +123,14 @@ UA_EVAL_MAX_TOKENS = 16384
 # 护栏(_trim_agent2_tool_history)与硬时限(AGENT2_REVIEW_MAX_SECONDS)防跑飞。
 MAX_READ_TOOL_CALLS = 100
 
-# 单次评估中最多调用 verifier_agent 的次数(防止无限验证)
-MAX_VERIFY_CALLS = 3
+# 单次评估中调用 verifier_agent 的额度下限(=旧固定值 3,保留兼容导入)
+# 不再是一个死数:旧值 3 与只读额度 100 严重不配——8 条计划项里哪怕一半声明
+# planned_evidence=verify,3 次额度也只能让 3 项拿到定论,其余被压在源码/引用档
+# (与当初只读额度太薄导致一堆 suspected 是同一道算术题)。按"计划里打算跑 PoC
+# 的条目数 + 1"联动,上限由 settings.AGENT2_MAX_VERIFY_CALLS 兜(默认 8)。
+MIN_VERIFY_CALLS = 3
+# 历史别名(外部若有导入兼容;新代码用 _verify_budget 取本轮实际额度)
+MAX_VERIFY_CALLS = MIN_VERIFY_CALLS
 
 # 单次评估中最多调用引用复核的次数(每次抓取最长 15s,串行阻塞,
 # 上限收敛为 3 控制单轮评估最坏时长)
@@ -510,6 +519,8 @@ def run_agent2(
         "plan": None,           # 最近一次 submit_review_plan(覆盖式修订,items 已补 id)
         # 取证额度用量(规划对账靠它区分未核实项是"额度用尽"还是"没排到")
         "tool_counts": {"read": 0, "verify": 0, "reference": 0},
+        # 本轮验证额度(按计划项现算,供对账判"额度是否触顶"用同一个口径)
+        "verify_budget": MIN_VERIFY_CALLS,
     }
     # 被审 agent1 对话 id 集(校验 submit_review_item.agent1_ref 归属;空集=不校验)
     agent1_conv_ids: set[UUID] = set()
@@ -837,11 +848,19 @@ def run_agent2(
                 })
                 continue
 
-            if verify_count >= MAX_VERIFY_CALLS:
+            # 本轮实际验证额度:每次现算(计划可以反复修订,额度跟着最新计划走)
+            verify_budget = _verify_budget(emit_state)
+            emit_state["verify_budget"] = verify_budget
+
+            if verify_count >= verify_budget:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"] or f"call_{tc['index']}",
-                    "content": f"已达验证次数上限({MAX_VERIFY_CALLS}),跳过本次验证。",
+                    "content": (
+                        f"已达验证次数额度({verify_budget},按计划里声明要跑 PoC 的条目数联动),"
+                        "跳过本次验证。请把对应发现写"
+                        "成待核实类结论,不要臆造验证结果。"
+                    ),
                 })
                 continue
 
@@ -850,23 +869,39 @@ def run_agent2(
 
             # 调用 verifier_agent 执行动态验证
             logger.info(
-                f"[task={task_id}] agent2 调用 verify(第 {verify_count} 次),"
+                f"[task={task_id}] agent2 调用 verify(第 {verify_count}/{verify_budget} 次),"
                 f"目标: {verification_request[:200]}"
             )
+            # 结论不靠拆自然语言:verifier 把结构化结论写回 outcome_box,
+            # 正文里的 outcome= 行只作兜底(都没 → unknown,fail-closed 不抬档)
+            outcome_box: dict[str, Any] = {}
             try:
                 from app.agents.verifier_agent import run_verifier_agent
                 verify_result = run_verifier_agent(
-                    task, db, verification_request, client, round_idx
+                    task, db, verification_request, client, round_idx,
+                    outcome_out=outcome_box,
+                    # 审查被终止/被新一轮取代时让 verifier 立即收手:否则它会
+                    # 继续逐个动作弹授权,而终止标志只在循环边界检查
+                    abort_check=lambda: bool(_stop_reason_now()),
+                    deadline_monotonic=(
+                        loop_started + review_max_seconds if review_max_seconds > 0 else None
+                    ),
+                )
+                outcome_v = str(
+                    outcome_box.get("outcome")
+                    or parse_outcome_line(verify_result)
+                    or OUTCOME_UNKNOWN
                 )
                 # 领域事件:一次动态验证完成(成功路径)
                 emit(
                     VERIFIER_COMPLETED, task_id,
                     round_idx=round_idx, attempt=verify_count, success=True,
-                    request=verification_request[:200],
+                    request=verification_request[:200], outcome=outcome_v,
                 )
             except Exception as e:
                 logger.exception(f"[task={task_id}] verifier_agent 执行失败")
                 verify_result = f"[验证失败: {e}]"
+                outcome_v = OUTCOME_UNKNOWN
                 # 领域事件:一次动态验证失败(异常路径)
                 emit(
                     VERIFIER_COMPLETED, task_id,
@@ -874,13 +909,15 @@ def run_agent2(
                     request=verification_request[:200], error=str(e)[:300],
                 )
 
+            ran_ok = not str(verify_result).startswith(("[验证失败", "[验证中止"))
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc["id"] or f"call_{tc['index']}",
                 "content": evidence.record_verify(
-                    verify_result,
-                    # verify 成功判据:非"验证失败"前缀(verifier 总结为自然语言文本)
-                    verify_ok=not str(verify_result).startswith("[验证失败"),
+                    f"{verify_result}\n{outcome_note(outcome_v)}",
+                    # verify_ok 只记"没跑挂";定论与否看 outcome(台账体里两个字段都在)
+                    verify_ok=ran_ok,
+                    outcome=outcome_v,
                     args_brief=f"verify:{verification_request[:120]}",
                 ),
             })
@@ -1630,12 +1667,39 @@ def _reconcile_plan(
     return matched, unverified
 
 
+def _verify_budget(state: dict[str, Any]) -> int:
+    """本轮可用的 verify 次数:与"计划里声明要跑 PoC 的条目数"联动。
+
+    为什么不能是一个死数:动态验证是单轮最贵、也最能抬升置信的取证手段,
+    旧值 3 让一份 8 项的审查里只能有 3 项拿到定论,剩下的明明计划了 PoC
+    却只能退回源码/引用档——看着像助手"不愿核实",实际是额度不够。
+    下限沿用旧值(计划很少时不白送额度),上限由 settings 兜住
+    (每次 verify 内部最多 10 轮工具迭代 + 逐动作授权,必须防单轮审查被拖死)。
+    留 +1 余量给审查中途冒出的新疑点(计划里不会预先声明它)。
+    """
+    from app.config import settings as _cfg
+
+    planned = sum(
+        1 for it in ((state.get("plan") or {}).get("items") or [])
+        if isinstance(it, dict) and it.get("planned_evidence") == "verify"
+    )
+    cap = int(getattr(_cfg, "AGENT2_MAX_VERIFY_CALLS", 0) or 0)
+    if cap <= 0:
+        cap = MIN_VERIFY_CALLS
+    return max(MIN_VERIFY_CALLS, min(cap, planned + 1))
+
+
 def _budget_exhausted(state: dict[str, Any]) -> bool:
-    """本轮是否有取证额度触顶(未核实项的 reason 靠它区分"额度用尽/没排到")"""
+    """本轮是否有取证额度触顶(未核实项的 reason 靠它区分"额度用尽/没排到")
+
+    verify 用本轮实际额度(`_verify_budget` 现算的结果),不用常量下限——
+    否则计划声明了 6 项 PoC、跑到 6 次收手时,对账会把"额度用尽"误报成"没排到"。
+    """
     counts = state.get("tool_counts") or {}
+    verify_limit = state.get("verify_budget") or MAX_VERIFY_CALLS
     return bool(
         counts.get("read", 0) >= MAX_READ_TOOL_CALLS
-        or counts.get("verify", 0) >= MAX_VERIFY_CALLS
+        or counts.get("verify", 0) >= verify_limit
         or counts.get("reference", 0) >= MAX_REFERENCE_CALLS
     )
 
