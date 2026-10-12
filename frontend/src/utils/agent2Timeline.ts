@@ -27,6 +27,7 @@
  */
 
 import { buildToolSegments } from './toolSummary'
+import { SUGGESTION_CONV_TYPES } from './agent2Suggestions'
 
 /** 落库对话记录的最小字段面(types/task.Conversation 满足此接口) */
 export interface Agent2ConvBase {
@@ -77,8 +78,15 @@ const SEQ_GAP = 1000
 /** 流式卡片插在"它之后那批工具"之前 */
 const STREAM_OFFSET = 500
 
-/** 不进轮组时间轴的 type(追问建议由面板独立区块渲染) */
-const EXCLUDED_TYPES = new Set(['suggestions'])
+/**
+ * 不进轮组时间轴的 type(两组追问建议由「概览」的独立卡片区块渲染)。
+ *
+ * 清单与提取函数同源(见 utils/agent2Suggestions.ts),新增建议类 type 不必回来补:
+ * 漏一条就会落进 `other` 兜底条目,把记录的原始 JSON 直接铺给侧栏用户。
+ * 排除发生在 round 下标自增之后(见 buildAgent2Rounds 第一遍),所以不影响
+ * 其余条目的 seq 基准与实时卡片的插位。
+ */
+const EXCLUDED_TYPES = new Set<string>(SUGGESTION_CONV_TYPES)
 
 /** 工具类 type(单独走配对渲染,其余按结论/思考类成行) */
 const TOOL_TYPES = new Set(['tool_call', 'tool_result'])

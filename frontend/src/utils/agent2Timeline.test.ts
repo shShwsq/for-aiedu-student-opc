@@ -8,7 +8,8 @@
  * 4. 孤儿 tool_result 与未知 type 走兜底条目,不丢内容;
  * 5. seq 的下标基准含 agent1/user 消息(与 TaskDetailView 的 convCountPerRound
  *    同基准),否则实时卡片 insertSeq 会错位;
- * 6. suggestions 不进轮组(由面板独立区块渲染)。
+ * 6. 两类追问建议(suggestions / followup_suggestions)都不进轮组(由「概览」
+ *    独立区块渲染),且排除不影响 seq 基准。
  */
 import { describe, expect, it } from 'vitest'
 
@@ -163,6 +164,44 @@ describe('buildAgent2Rounds', () => {
     expect(rounds.map((r) => r.round_idx)).toEqual([1, 2])
     expect(kinds(rounds[0])).toEqual(['thinking:r1_th'])
     expect(kinds(rounds[1])).toEqual(['thinking:r2_th', 'stream:r2_live'])
+  })
+
+  it('探索建议 followup_suggestions 同样不进轮组(否则原始 JSON 会铺给侧栏用户)', () => {
+    const rounds = buildAgent2Rounds(
+      [
+        mkConv({ id: 'th1', round_idx: 1 }),
+        mkConv({
+          id: 'fu1',
+          round_idx: 1,
+          type: 'followup_suggestions',
+          content: '{"suggestions":["再看架构分层"],"source":"explore"}',
+        }),
+      ],
+      [],
+    )
+    expect(kinds(rounds[0])).toEqual(['thinking:th1'])
+
+    // 整轮只有建议记录时(单 agent 模式只落这一条):不凭空多出一个轮组
+    const onlySuggestion = buildAgent2Rounds(
+      [mkConv({ id: 'fu2', round_idx: 1, type: 'followup_suggestions', content: '{}' })],
+      [],
+    )
+    expect(onlySuggestion).toEqual([])
+  })
+
+  it('排除建议类记录仍占 round 下标(seq 基准与主对话流一致,实时卡片不错位)', () => {
+    const rounds = buildAgent2Rounds(
+      [
+        mkConv({ id: 'sg', round_idx: 1, type: 'suggestions', content: '{}' }),
+        mkConv({ id: 'fu', round_idx: 1, type: 'followup_suggestions', content: '{}' }),
+        mkConv({ id: 'tc', round_idx: 1, type: 'tool_call' }),
+        mkConv({ id: 'tr', round_idx: 1, type: 'tool_result', tool_call_id: 'tc' }),
+      ],
+      [mkStream({ conv_id: 'live', round_idx: 1, insertSeq: 4 })],
+    )
+    // sg/fu 虽然不进时间轴,仍计入下标:tool call 落在下标 2(seq 2000),
+    // 实时卡片 insertSeq=4 → 3500,仍在工具行之后
+    expect(rounds[0].entries.map((e) => e.seq)).toEqual([2000, 3500])
   })
 
   it('实时卡片与同名落库记录同时存在时不去重(宁可短暂重复也不吞思考)', () => {

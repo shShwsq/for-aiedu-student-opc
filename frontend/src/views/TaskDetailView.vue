@@ -60,7 +60,7 @@ import { ensureFeaturesLoaded, practiceEnabled } from '@/composables/useFeatures
 import { buildStorageKey, useResizableSidebar } from '@/composables/useResizableSidebar'
 import { useAuthStore } from '@/stores/auth'
 import { listArtifacts } from '@/api/taskArtifacts'
-import { extractExploreSuggestions, extractSuggestions } from '@/utils/agent2Suggestions'
+import { extractExploreSuggestions, extractSuggestions, isSuggestionConv } from '@/utils/agent2Suggestions'
 import { clientLog } from '@/utils/clientLog'
 import { extractErrorMessage } from '@/utils/error'
 import { parseDiffFileSegments } from '@/utils/diffFiles'
@@ -279,10 +279,17 @@ const exploreSuggestions = computed<string[]>(() =>
   extractExploreSuggestions(task.value?.conversations),
 )
 
-/** 追问按钮防重复(点击后本组件发消息,新一轮审查开始才解锁) */
+/** 两组建议的总条数:rail 角标与「建议刚到达」提示共用(漏算探索组会恒显 0) */
+const suggestionTotalCount = computed<number>(
+  () => suggestions.value.length + exploreSuggestions.value.length,
+)
+
+/** 追问按钮防重复(点击后本组件发消息,发送成功即解锁,见 handleMessageSent) */
 const diggingSuggestion = ref<string | null>(null)
 
-// 新一轮审查开始(resume 追问/追加消息)→ 解除追问按钮的防重复锁
+// 审查状态变化(新一轮审查开始 / 老审查收尾)→ 解除追问按钮的防重复锁。
+// 只是补位:单 agent 模式(检查助手关闭)后端全程不写 review_status,
+// 始终为 null → null 不触发本 watch,锁靠 handleMessageSent 显式解开。
 watch(
   () => task.value?.review_status,
   () => { diggingSuggestion.value = null },
@@ -312,7 +319,7 @@ const activeSectionCount = computed<number>(() => {
 
 /** rail 各段角标数值(核查过程走呼吸点,恒为 0) */
 const sectionBadge = computed<Record<SidebarSectionKey, number>>(() => ({
-  overview: suggestions.value.length,
+  overview: suggestionTotalCount.value,
   process: 0,
   findings: reviewItems.value.length,
   knowledge: task.value?.results.length ?? 0,
@@ -2401,11 +2408,17 @@ const isRunning = computed(
 const isPaused = computed(() => task.value?.status === 'paused')
 
 // ---- 检查助手侧栏面板(阶段重构:agent2 过程输出全部移入右侧栏)----
-/** 检查助手是否有活动内容(历史消息或流式思考/审查状态);无则隐藏面板(单 agent 模式/未开始) */
+/**
+ * 检查助手是否有活动内容(历史消息或流式思考/审查状态);无则隐藏面板。
+ *
+ * 建议类记录要排除:它是给「概览」用的数据契约,核查过程段对它没有任何可展示
+ * 内容。单 agent 模式(检查助手关闭)本来整段隐藏,而探索追问推荐也落库为
+ * role=agent2 —— 不排除会凭空点亮一个空面板(或按 `other` 兜底铺出原始 JSON)。
+ */
 const hasAgent2Activity = computed(
   () =>
     !!task.value?.review_status ||
-    !!task.value?.conversations?.some((c) => c.role === 'agent2') ||
+    !!task.value?.conversations?.some((c) => c.role === 'agent2' && !isSuggestionConv(c)) ||
     [...streamingItems.values()].some((s) => s.role === 'agent2'),
 )
 /** 检查助手核查进行中(呼吸点仅在其核查阶段亮,agent1 执行时不亮) */
@@ -2421,8 +2434,8 @@ const isAgent2Running = computed(
 // rail 重构后**不再自动抢切段 + 弹栏**:只点亮对应段按钮的提示环与角标,
 // 开不开由用户决定(自动弹开会打断主对话流,窄屏下还会盖住抽屉)。
 watch(
-  [() => task.value?.review_status, () => task.value?.status, () => suggestions.value.length],
-  ([reviewStatus, status, suggestionCount], prev) => {
+  [() => task.value?.review_status, () => task.value?.status, () => suggestionTotalCount.value],
+  ([reviewStatus, status, totalSuggestions], prev) => {
     if (reviewStatus === 'running') attentionSection.value = 'process'
     else if (
       reviewStatus === 'done' || reviewStatus === 'failed' || reviewStatus === 'stopped'
@@ -2436,7 +2449,7 @@ watch(
       attentionSection.value = null
     }
     // 建议追问刚到达(0 → 正)且看的不是概览:提示去概览(建议卡在那)
-    if (suggestionCount > 0 && !prev?.[2] && activeSection.value !== 'overview') {
+    if (totalSuggestions > 0 && !prev?.[2] && activeSection.value !== 'overview') {
       attentionSection.value = 'overview'
     }
     // 提示的段已经展开:提示环无意义,直接清掉
@@ -2640,8 +2653,13 @@ function truncateInput(s: string, max = 40): string {
  *   补播无缝衔接;上一轮已收尾时后端已 reset,重连接收新事件)。
  * - running / paused 态:SSE 已连接,conversation 事件由 onConversation 自动接收,
  *   无需额外处理。
+ *
+ * 两种状态都解除追问防重复锁:发送成功即意味着新一轮已开始,锁若继续
+ * 挂住会把两组建议按钮一起置灰。不能只靠 review_status 的 watch 解锁——
+ * 单 agent 模式后端全程不写该字段(null → null 不触发),点一次就锁到刷新。
  */
 function handleMessageSent(_resp: SendMessageResponse): void {
+  diggingSuggestion.value = null
   if (task.value?.status === 'completed') {
     // 后端端点已把状态同步改为 RUNNING,本地同步 + 重连 SSE
     task.value.status = 'running'
@@ -2723,8 +2741,8 @@ async function handleSuggestionDig(text: string): Promise<void> {
   } catch (err) {
     error.value = extractErrorMessage(err)
   } finally {
-    // 发送成功:锁到新一轮审查开始(review_status 变化时解锁,见上方 watch);
-    // 被拒 / 异常:立即解锁,否则追问按钮会一直灰着无法重试
+    // 发送成功:锁由 handleMessageSent 解开(见其注释);被拒 / 异常:立即解锁,
+    // 否则追问按钮会一直灰着无法重试
     if (!accepted) diggingSuggestion.value = null
   }
 }
@@ -3530,15 +3548,17 @@ const showKnowledgeToolbar = computed<boolean>(() => {
               <span class="review-interim-hint">检查助手核查中</span>
             </p>
             <!-- 建议卡在「概览」段:从这里给一条跳转,别让用户找不到追问入口。
-                 文案不带「· 去概览」(按钮上不重复说目标段),去向放到 title 里 -->
+                 文案不带「· 去概览」(按钮上不重复说目标段),去向放到 title 里。
+                 按两组总数计:审查没发现缺口(常态)而只有探索建议时,这条入口
+                 原本会整条消失,追问链就断了 -->
             <button
-              v-if="suggestions.length > 0"
+              v-if="suggestionTotalCount > 0"
               type="button"
               class="sidebar-jump"
               title="到「概览」段查看建议追问方向"
               @click="selectSection('overview')"
             >
-              {{ suggestions.length }} 条建议追问
+              {{ suggestionTotalCount }} 条建议追问
             </button>
             <div v-for="bucket in REVIEW_BUCKET_ORDER" :key="bucket.key" class="review-bucket">
               <template v-if="reviewBuckets[bucket.key].length">

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { extractExploreSuggestions, extractSuggestions } from './agent2Suggestions'
+import {
+  SUGGESTION_CONV_TYPES,
+  extractExploreSuggestions,
+  extractSuggestions,
+  isSuggestionConv,
+} from './agent2Suggestions'
 import type { Conversation } from '@/types/task'
 
 /** 只填必要字段的 agent2 suggestions 记录 */
@@ -73,6 +78,27 @@ describe('extractSuggestions', () => {
       suggestionConv({ suggestions: ['  带空白  ', '', '   ', 42, null, { x: 1 }, '真建议'] }),
     ]
     expect(extractSuggestions(convs)).toEqual(['  带空白  ', '真建议'])
+  })
+})
+
+describe('isSuggestionConv(时间轴排除 / 面板可见性 / 角标共用的判定)', () => {
+  it('两类建议 type 都在清单里(新增 type 只改这一处)', () => {
+    expect([...SUGGESTION_CONV_TYPES]).toEqual(['suggestions', 'followup_suggestions'])
+  })
+
+  it('agent2 的两类建议记录都判 true', () => {
+    expect(isSuggestionConv(suggestionConv({ suggestions: ['缺口'] }))).toBe(true)
+    expect(
+      isSuggestionConv(suggestionConv({ suggestions: ['探索'] }, { type: 'followup_suggestions' })),
+    ).toBe(true)
+  })
+
+  it('非 agent2 角色 / 非建议 type 都判 false(审查过程不能误排)', () => {
+    expect(isSuggestionConv({ role: 'user', type: 'suggestions' })).toBe(false)
+    expect(isSuggestionConv({ role: 'agent1', type: 'thinking' })).toBe(false)
+    expect(isSuggestionConv({ role: 'agent2', type: 'review' })).toBe(false)
+    expect(isSuggestionConv({ role: 'agent2', type: 'tool_call' })).toBe(false)
+    expect(isSuggestionConv({})).toBe(false)
   })
 })
 

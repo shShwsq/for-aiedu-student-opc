@@ -432,15 +432,11 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
             # scope,下方 end-scope 看到活跃流不推 done,SSE 不断线)
             _auto_resume_leftover_messages(task, db, task_id_str)
 
-            # 探索性追问推荐(单 agent 模式对齐双 agent:仅"你可能还想深入
-            # 了解"一组;无 agent2 缺口建议)。必须在推 done 前,才能经实时
-            # conversation 事件到达前端;仅最新流执行。失败静默。
+            # 探索性追问推荐:关闭检查助手时只有这一组(无 agent2 缺口建议)。
+            # 仅最新流执行(有遗留消息已接新轮时交给新轮产出,不留老建议占位);
+            # 必须在推 done 前(见 helper 注释)。
             if _is_latest_generation(task.id, flow_gen):
-                try:
-                    from app.services.followup_recommender import recommend_followups
-                    recommend_followups(task, db, len(react_summaries))
-                except Exception as fu_err:  # noqa: BLE001 - 兜底再包一层,绝不影响收尾
-                    logger.warning(f"[task={task.id}] 探索性追问推荐失败(忽略): {fu_err}")
+                _followup_recommendations_safely(task, db, len(react_summaries))
 
             # 事件活跃期收尾:推 done + 关总线(仅当无并行流;
             # 判定与推送在 _end_event_scope 锁内原子完成,消除竞态)
@@ -483,7 +479,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
 
             return  # 单 agent 模式结束,finally 块仍会执行清理
 
-        # ---------- 双 agent 模式:agent1 单轮 → 任务完成 → 后台审查 ----------
+        # ---------- 启用检查助手:agent1 单轮 → 任务完成 → 后台审查 ----------
         # 初始运行只有 1 轮 agent1(协作循环已移除,多轮由用户 resume 驱动)
         # 暂停检查点:agent1 执行前(react_agent 内部还有细粒度检查点)
         wait_if_paused(task.id)
@@ -725,6 +721,24 @@ def _precompress_history_safely(
         precompress_history_for_next_round(db, task.id, completed_round_idx, client)
     except Exception as e:
         logger.warning(f"[task={task.id}] 预压缩历史失败(忽略): {e}")
+
+
+def _followup_recommendations_safely(task: Task, db: Session, round_idx: int) -> None:
+    """探索性追问推荐("你可能还想深入了解"):收尾期的安全调用
+
+    与 agent2 的「建议追问方向(经核查的真实缺口)」分工不同,本组只做跨维度
+    探索,因此不依赖检查助手:启用时由 _run_background_review 收尾调用,关闭
+    (单 agent 模式)时由单 agent 初始轮 / resume 轮收尾调用——三路共用本函数。
+
+    必须在推 done 关闭事件总线**之前**调用:产出的 conversation 事件才能经实时
+    SSE 到达前端(落库同时保证刷新/快照可见)。失败静默:服务层内部已兜底,
+    这里再包一层防导入/签名异常 —— 一次可选的轻调用不得影响任务收尾。
+    """
+    try:
+        from app.services.followup_recommender import recommend_followups
+        recommend_followups(task, db, round_idx)
+    except Exception as fu_err:  # noqa: BLE001 - 兜底再包一层,绝不影响收尾
+        logger.warning(f"[task={task.id}] 探索性追问推荐失败(忽略): {fu_err}")
 
 
 def _round_has_tool_calls(db: Session, task_id, round_idx: int) -> bool:
@@ -1208,15 +1222,10 @@ def _run_background_review(
             # 通知前端审查结束(侧栏 badge 更新 + 拉取最终结果)。
             publish(task.id, "review_done", {"review_status": task.review_status})
 
-            # 探索性追问推荐("你可能还想深入了解"):必须在推 done 关闭事件总线
-            # 之前调用,产出的 conversation 事件才能经实时 SSE 到达前端(落库同时
-            # 保证刷新/快照可见)。失败静默;用户终止检查时整体跳过(与下游链一致)。
+            # 探索性追问推荐("你可能还想深入了解"):用户终止检查时整体跳过
+            # (与下游链一致);必须在推 done 前(见 helper 注释)。
             if not review_stopped:
-                try:
-                    from app.services.followup_recommender import recommend_followups
-                    recommend_followups(task, db, round_idx)
-                except Exception as fu_err:  # noqa: BLE001 - 兜底再包一层,绝不影响收尾
-                    logger.warning(f"[task={task.id}] 探索性追问推荐失败(忽略): {fu_err}")
+                _followup_recommendations_safely(task, db, round_idx)
         # done/finish 由 _end_event_scope 统一判定:并行流(用户追问已启动
         # 新一轮 agent1/resume)仍在跑时保持总线打开,由最后活跃流收尾
         # (被取代也必须调:注销自身 scope,否则总线永久悬挂)
@@ -2182,7 +2191,7 @@ def resume_audit_with_message(
         # plan 状态持久化(供下一次 resume 续接)
         _save_plan_to_task(task, db, current_plan)
 
-        # ===== 轮次类型判定:纯对话轮(仅双 agent 模式)跳过审查与重下游 =====
+        # ===== 轮次类型判定:纯对话轮(启用检查助手时)跳过审查与重下游 =====
         # 本轮无任何工具调用 → agent1 回答完全来自历史上下文,无新证据可审;
         # 保留既有整理结果与审查状态,不触发练习题/记忆归纳。
         # 单 agent 模式本就无审查链,保持原行为(结果替换为 summary)
@@ -2436,6 +2445,13 @@ def _finish_resume(
     # 遗留用户消息自动续轮(先于终止 end-scope:有遗留时新流注册 scope,
     # 下方 end-scope 看到活跃流不推 done,SSE 不断线)
     _auto_resume_leftover_messages(task, db, str(task.id))
+
+    # 探索性追问推荐:与单 agent 初始轮同构(缺这一步时,第 2 轮起前端按
+    # last-wins 取到的仍是上一轮的老建议,与当前对话脱节)。仅最新流执行
+    # (遗留消息已接新轮时交给新轮产出);必须在推 done 前(见 helper 注释)。
+    if _is_latest_generation(task.id, flow_gen):
+        _followup_recommendations_safely(task, db, round_idx)
+
     # 事件活跃期收尾:推 done + 关总线(仅当无并行流)
     _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
 

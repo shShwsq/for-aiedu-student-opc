@@ -16,6 +16,26 @@ interface SuggestionsPayload {
 }
 
 /**
+ * 建议类对话的 type 清单(唯一来源)。
+ *
+ * 它们都不是「核查过程」,而是给「概览」两组建议卡渲染的数据契约,因此
+ * 除了本模块的提取函数,还有两处按这份清单判定:
+ * - utils/agent2Timeline.ts:排除后不进核查时间轴(否则落进 `other` 兜底,
+ *   把原始 JSON 直接铺给用户);
+ * - views/TaskDetailView.vue:侧栏可见性与 rail 角标。
+ * 新增建议类 type 只需改这里,不会再漏掉某一处。
+ */
+export const SUGGESTION_CONV_TYPES = ['suggestions', 'followup_suggestions'] as const
+
+export type SuggestionConvType = (typeof SUGGESTION_CONV_TYPES)[number]
+
+/** 是否建议类对话记录(时间轴排除 / 面板可见性 / 角标共用同一判定) */
+export function isSuggestionConv(c: { role?: string; type?: string }): boolean {
+  if (c.role !== 'agent2') return false
+  return (SUGGESTION_CONV_TYPES as readonly string[]).includes(c.type ?? '')
+}
+
+/**
  * 从指定 type 的 agent2 记录里取最新一条,解析文本清单(0-N 条)。
  *
  * 容错口径(全部静默返回空数组,不打扰用户):
@@ -26,7 +46,7 @@ interface SuggestionsPayload {
  */
 function pickLatestByType(
   conversations: Conversation[] | undefined | null,
-  type: string,
+  type: SuggestionConvType,
 ): string[] {
   let latest: Conversation | null = null
   for (const c of conversations ?? []) {

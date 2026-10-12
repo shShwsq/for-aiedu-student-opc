@@ -217,7 +217,7 @@ RoundGroup { roundIdx, segments, planSteps }
 
 ```
 ┌─────┐
-│ (i) 3│  概览       角标 = 建议追问条数
+│ (i) 3│  概览       角标 = 两组建议追问条数(缺口 + 探索)
 │ (⌕) ●│  核查过程   呼吸点 = review_status running
 │ (⛨) 5│  审查结果   角标 = reviewItems.length
 │ (▤) 8│  重点与知识点 角标 = task.results.length
@@ -300,13 +300,22 @@ RoundGroup { roundIdx, segments, planSteps }
    SSE plan 事件与历史对话提取(`<plan>` 块 / TodoList tool_call),
    随运行实时更新(`latestPlanSteps`)。
 4. **动态验证**(配置了测试环境 URL 时):开关、授权模式切换、登录凭证(脱敏);不出现 verifier_agent 字样。
-5. **建议追问方向**(`SuggestionCards`,审查完成后有建议时):原内联在 Agent2Panel 底部,
-   现随分段重构上移到概览——核查段只留过程,概览承担"现状 + 下一步"。
-   取**最新一条** `type=suggestions` 记录解析(`utils/agent2Suggestions.extractSuggestions`,
-   纯函数可单测;非法 JSON / 非数组 / 空白项均静默回空),每条一个「追问」按钮;
-   点击后把建议原文当用户消息发出走 resume 链路(`handleSuggestionDig`)。
-   **防重复锁 `diggingSuggestion` 上移到本视图**:发送成功保持锁定到新一轮审查开始
-   (`watch(review_status)` 解锁);被拒 / 异常时 `finally` 立即解锁(旧实现只靠
+5. **建议追问方向**(两组 `SuggestionCards`,有建议时):原内联在 Agent2Panel 底部,
+   现随分段重构上移到概览——核查段只留过程,概览承担"现状 + 下一步"。两组同形
+   (`content` 均为 `{"suggestions":[...]}`),仅按 type 分流,type 清单的唯一来源是
+   `utils/agent2Suggestions.SUGGESTION_CONV_TYPES`(新增一类不必挨个改消费点):
+   - **检查助手发现的缺口** `type=suggestions` —— 经核查确认的真实缺口;
+   - **你可能还想深入了解** `type=followup_suggestions` —— 后台推荐器产出的
+     **跨维度探索**(`app/services/followup_recommender.py`,不经核查、推测性,
+     关闭检查助手时也有这一组)。
+   两个提取函数(`extractSuggestions` / `extractExploreSuggestions`)均取**最新一条**
+   同类型记录(整块覆盖语义;非法 JSON / 非数组 / 空白项静默回空),每条一个「追问」
+   按钮;两类记录都**不进「核查过程」时间轴、也不点亮该段**(`isSuggestionConv`):
+   否则一条 JSON 会在单 agent 模式凭空弹出一个核查面板,还把内部数据契约铺给用户。
+   点击后把建议原文当用户消息发出走 resume 链路(`handleSuggestionDig`);
+   **防重复锁 `diggingSuggestion` 由 `handleMessageSent` 在发送成功时显式解除**——
+   不能只靠 `watch(review_status)`:单 agent 模式后端全程不写该字段(null → null
+   不触发),点一次就锁到刷新;被拒 / 异常时 `finally` 也立即解锁(旧实现只靠
    review_status 解锁,发送失败后按钮会一直灰着无法重试)。
 #### 段 2:核查过程
 

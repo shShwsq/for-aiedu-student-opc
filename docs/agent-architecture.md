@@ -202,6 +202,7 @@ def run_agent2(
 
 - `type=review`：审查结论卡（content 精简显示,reasoning 含已覆盖/未覆盖/判断,供刷新页面回看 + 跨轮记忆加载）
 - `type=suggestions`：建议追问方向(JSON,前端渲染成卡片+追问按钮)
+- `type=followup_suggestions`：**后台探索性追问推荐**(“你可能还想深入了解”,JSON,与 suggestions 分两组)。**不经 agent2 核查** —— 由 `app/services/followup_recommender.py` 基于 user + agent1 对话单轮轻调用产出,因此**不依赖检查助手**:三条收尾路径各产一条(后台审查收尾 / 单 agent 初始轮 / 单 agent resume 轮),且必须在推 `done` 之前(否则总线已关,`conversation` 事件被丢弃,只能等刷新);超预算时留最新几轮、整块丢最老,并带硬时限(失败/超时都静默,不影响任务收尾)。前端侧它与 `suggestions` 同形同处理,仅按 type 分流(见下与 `utils/agent2Suggestions.ts`)
 - `type=summary`：最终总结卡(侧栏 summaries 分组)
 - `type=thinking`（`_record_agent2_thinking`,与上面三条职责不同）：真实思考链,**每次流式调用一条**(content 为空,reasoning 为该次 reasoning_content),落库即推 `conversation` 事件供侧栏 Agent2Panel 还原;动态验证的 `role=agent2, type=thinking`(content 带 `[验证结果]` 前缀)同机制。主对话流不展示 agent2 的 thinking(`isAgent2Followup` 只放行真追问 evaluation)
 

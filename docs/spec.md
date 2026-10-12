@@ -262,7 +262,7 @@ Conversation(对话)
   - task_id
   - round_idx: 协作轮次(从 1 起;存量数据可能含 round 0 的旧版初始评估)
   - role: user / agent1 / agent2 / system
-  - type: 现行流程产出 question(首轮提问)/ message(运行中补充与追问)/ thinking / tool_call / tool_result / summary / review(agent2 后台审查结论)/ suggestions(建议追问方向)/ error,另有 history_compress(跨轮历史压缩缓存,不外显)
+  - type: 现行流程产出 question(首轮提问)/ message(运行中补充与追问)/ thinking / tool_call / tool_result / summary / review(agent2 后台审查结论)/ suggestions(建议追问方向)/ followup_suggestions(后台探索性追问推荐,不经 agent2,见 `app/services/followup_recommender.py`)/ error,另有 history_compress(跨轮历史压缩缓存,不外显)
     存量旧任务可能含 `evaluation`(旧版逐轮协作评估)/ `followup`(旧版 agent2 追问)/ `answer`(旧版澄清提问的回答):新流程不再产生,导出报告的对话轨迹已不再处理这些类型(仅 agent2 跨轮自记忆与 react_agent 历史注入仍按 review/evaluation 两代兼容读取存量数据)
   - content: 消息内容
   - reasoning: 思考链(仅 type=thinking 有,模型 reasoning_content)
