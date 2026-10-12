@@ -1561,8 +1561,8 @@ onUnmounted(() => {
                 <span v-if="polishing" class="polish-spinner" aria-hidden="true" />
                 <svg
                   v-else
-                  width="16"
-                  height="16"
+                  width="28"
+                  height="28"
                   viewBox="0 0 24 24"
                   fill="currentColor"
                   aria-hidden="true"
@@ -2116,8 +2116,6 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 28px;
   padding: 0;
   flex-shrink: 0;
   margin-left: auto;
@@ -2142,9 +2140,9 @@ onUnmounted(() => {
 }
 
 .polish-spinner {
-  width: 12px;
-  height: 12px;
-  border: 2px solid currentColor;
+  width: 20px;
+  height: 20px;
+  border: 3px solid currentColor;
   border-top-color: transparent;
   border-radius: 50%;
   animation: polish-spin 0.7s linear infinite;
