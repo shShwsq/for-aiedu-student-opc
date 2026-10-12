@@ -1306,6 +1306,12 @@ async function openTaskFile(taskId: string, filePath: string, line?: number): Pr
   }
 }
 
+/** 预览里点工作区相对链接:在当前任务工作树内打开该文件(复用 openTaskFile 的展开/选中/回退) */
+function onPreviewOpenLink(relPath: string): void {
+  if (!selectedTaskId.value) return
+  void openTaskFile(selectedTaskId.value, relPath)
+}
+
 defineExpose({ openTaskFile })
 </script>
 
@@ -2041,6 +2047,7 @@ defineExpose({ openTaskFile })
           :filename="selectedFilePath"
           :start-line="fileStartLine"
           placeholder="(空文件)"
+          @open-link="onPreviewOpenLink"
         />
       </div>
     </section>

@@ -751,6 +751,13 @@ async function initTask(): Promise<void> {
   drawerItem.value = null
   // 新任务重新允许提示环计算(上一任务的 attention 与本任务无关)
   attentionSection.value = null
+  // 非法任务 id 先拦下(如误进的 /tasks/README.md):否则拿非 UUID 的 id 请求
+  // /api/tasks/{id} 会把后端 Pydantic 校验原文("Input should be a valid UUID…")抛进界面
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(taskId)) {
+    error.value = '链接无效:这不是一个合法的任务 ID。'
+    loading.value = false
+    return
+  }
   try {
     // 拉任务快照(场景降级后不再需要单独拉 /scenarios:结果分组/meta
     // 从 task.params._grouping 和 results 的 metadata keys 推断)

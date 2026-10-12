@@ -31,6 +31,7 @@ import {
 import { languages } from '@codemirror/language-data'
 
 import { renderMarkdown } from '@/utils/markdown'
+import { classifyPreviewLink } from '@/utils/markdownLinks'
 
 const props = withDefaults(
   defineProps<{
@@ -46,7 +47,13 @@ const props = withDefaults(
   { placeholder: '' },
 )
 
+const emit = defineEmits<{
+  /** 预览里点击了指向工作区其它文件的链接:path 为已解析的工作区相对路径,交父组件在应用内打开 */
+  (e: 'open-link', path: string): void
+}>()
+
 const hostRef = ref<HTMLDivElement | null>(null)
+const previewRef = ref<HTMLDivElement | null>(null)
 const view = shallowRef<EditorView | null>(null)
 
 // ============================================================
@@ -227,6 +234,41 @@ function switchMode(next: 'code' | 'preview'): void {
 }
 
 // ============================================================
+// 预览区链接点击:拦下浏览器默认跳转,分类处置
+// ------------------------------------------------------------
+// Markdown 相对链接会被渲染成 <a href="...">;若放任默认行为,浏览器按当前 SPA URL
+// (/tasks/{uuid})解析它并整页跳转,落进 /tasks/:id 用非 UUID 的 id 请求后端。
+// 故一律 preventDefault,再按 classifyPreviewLink 的判定分流(逻辑集中在 utils/markdownLinks)。
+// ============================================================
+/** 预览正文点击委托:命中 <a> 即拦下默认跳转(含 ctrl/中键,否则新标签会复现同样坏 URL) */
+function onPreviewClick(e: MouseEvent): void {
+  const anchor = (e.target as HTMLElement | null)?.closest?.('a') as HTMLAnchorElement | null
+  if (!anchor) return
+  const href = anchor.getAttribute('href') ?? ''
+  e.preventDefault()
+  const action = classifyPreviewLink(props.filename ?? '', href)
+  switch (action.kind) {
+    case 'external':
+      // 绝对外链:新标签打开,不离开当前工作树
+      window.open(action.url, '_blank', 'noopener,noreferrer')
+      break
+    case 'anchor': {
+      // 页内锚点:在预览容器内平滑滚动(marked 未生成标题 id 时静默无操作)
+      const el = previewRef.value?.querySelector(`#${CSS.escape(action.id)}`)
+      el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      break
+    }
+    case 'workspace':
+      // 工作区相对链接:交父组件在应用内打开
+      emit('open-link', action.path)
+      break
+    case 'ignore':
+    default:
+      break
+  }
+}
+
+// ============================================================
 // 定位(供父组件加载完内容后调用)
 // ============================================================
 /** 把真实行区间高亮并滚动到中间;行号换算成当前页文档行号,越界自动夹取 */
@@ -282,8 +324,8 @@ defineExpose({ focusRange, clearHighlight })
     <!-- 源码视图:只读 CodeMirror(始终在 DOM,v-show 控制显隐以保留状态) -->
     <div v-show="mode === 'code'" ref="hostRef" class="fcv-cm" />
 
-    <!-- Markdown 预览视图 -->
-    <div v-if="mode === 'preview'" class="fcv-preview">
+    <!-- Markdown 预览视图(链接点击由 onPreviewClick 拦下,避免相对链接整页跳出 SPA) -->
+    <div v-if="mode === 'preview'" ref="previewRef" class="fcv-preview" @click="onPreviewClick">
       <div v-if="previewHtml" class="markdown-body" v-html="previewHtml" />
       <div v-else class="fcv-preview-empty">暂无内容</div>
     </div>
