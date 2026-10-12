@@ -88,6 +88,7 @@ from app.event_bus import publish
 from app.models.task import Conversation, Task
 from app.models.task_artifact import TaskArtifact
 from app.models.user_agent_config import UserAgentConfig
+from app.pause_controller import is_paused
 from app.perf import perf_log
 # CLI prompt 文案资产与上传检测(纯函数),集中管理于 app/prompts/
 from app.prompts.executor import (
@@ -428,10 +429,21 @@ def _async_agent_collect_results(
                 [{"type": "text", "text": _ASYNC_AGENT_CONTINUE_PROMPT}],
                 on_event=collector,
                 idle_probe=lambda: collector.has_active_tools,
+                # 续轮期间用户暂停同样能 cancel 停住(避免续轮又跑长且不可停)
+                pause_probe=lambda: is_paused(task.id),
             )
         except (httpx.HTTPError, ConnectionError) as e:
             logger.warning(
                 f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次连接异常(停止续轮): {e}"
+            )
+            ctx["still_pending"] = True
+            return
+
+        # 被用户暂停中断:prompt() 已 cancel 返回空结果,停止续轮(结果不完整)。
+        # 不依赖异常传播(prompt() 内部把 ACPPromptPaused 吞掉置标志),同 truncated 纪律。
+        if getattr(client, "last_prompt_paused", False):
+            logger.info(
+                f"[task={task.id}] {agent_type} 续轮回收第 {attempt} 次命中用户暂停,停止续轮"
             )
             ctx["still_pending"] = True
             return
@@ -678,6 +690,15 @@ class ACPStreamAborted(RuntimeError):
     """
 
 
+class ACPPromptPaused(Exception):
+    """session/prompt 期间用户按下暂停:由 pause_probe 命中抛出
+
+    与 PromptIdleTimeout/ACPStreamAborted 不同,这是用户主动中断而非异常。
+    prompt() 捕获后发 session/cancel 停 CLI 生成,置 last_prompt_paused(区别于
+    last_prompt_truncated:半截输出按"不完整"收尾,但语义是用户暂停),返回空结果。
+    """
+
+
 # ============================================================
 # ACP HTTP 客户端
 # ============================================================
@@ -718,6 +739,10 @@ class ACPClient:
         # 最近一次 prompt 是否被 idle 兜底提前终止(截断原因)。
         # 非 None 时调用方应用已累积输出收尾本轮,并在 summary 里标注。
         self.last_prompt_truncated: str | None = None
+        # 最近一次 prompt 是否被用户暂停主动中断。True 时调用方用已累积输出
+        # 收尾本轮并标注"已被暂停中断",且不得进异步子 Agent 续轮回收(轮已作废)。
+        # 与 last_prompt_truncated 互斥:暂停置此标志,不置 truncated。
+        self.last_prompt_paused: bool = False
         # read timeout=None:session/prompt 可能长时间流式输出
         self._client = httpx.Client(
             timeout=httpx.Timeout(connect=10, read=None, write=30, pool=30),
@@ -735,6 +760,7 @@ class ACPClient:
         on_event=None,
         timeout: httpx.Timeout | float | None = None,
         idle_probe: Callable[[], bool] | None = None,
+        pause_probe: Callable[[], bool] | None = None,
     ) -> dict:
         """发送 JSON-RPC 请求,可选流式处理通知,返回最终响应 result
 
@@ -748,6 +774,9 @@ class ACPClient:
         (read=None 无限等待)。测试场景应传有限值,避免模型无响应时卡死。
         idle_probe: 返回当前是否有活动工具的回调。非 None 时启用 idle
         看门狗(挂死兜底),超时抛 PromptIdleTimeout;None 不启用。
+        pause_probe: 返回当前任务是否被用户暂停的回调。非 None 时在
+        每个通知分发前与看门狗轮询点检查,命中抛 ACPPromptPaused(由
+        prompt() 兜底:cancel + 置 last_prompt_paused + 返回空结果);None 不启用。
         """
         request_id = request.get("id")
         method = request.get("method", "?")
@@ -790,8 +819,9 @@ class ACPClient:
 
             # idle 看门狗:idle_probe 非 None 时把阻塞读挪到后台线程,
             # 主线程按 _IDLE_POLL_SECONDS 检查无数据 idle 时长(挂死兜底)
+            # pause_probe 一并下传看门狗:CLI 静默期也能按轮询粒度响应暂停
             lines = (
-                self._iter_lines_with_watchdog(response, idle_probe)
+                self._iter_lines_with_watchdog(response, idle_probe, pause_probe)
                 if idle_probe is not None
                 else response.iter_lines()
             )
@@ -875,6 +905,10 @@ class ACPClient:
 
                 # 通知(有 method,无 id 或 id 不匹配)
                 if on_event and "method" in msg:
+                    # 暂停检查点(活跃流):每条通知分发前查一次,命中即抛
+                    # (CLI 持续吐 token 时也能下一条即停)
+                    if pause_probe is not None and pause_probe():
+                        raise ACPPromptPaused()
                     on_event(msg)
 
         if final_result is None:
@@ -896,6 +930,7 @@ class ACPClient:
         self,
         response,
         idle_probe: Callable[[], bool],
+        pause_probe: Callable[[], bool] | None = None,
     ) -> Generator[str, None, None]:
         """带 idle 检测的 SSE 行读取(读线程 + queue,主线程定期检查)
 
@@ -909,6 +944,9 @@ class ACPClient:
         否则用 ACP_IDLE_TIMEOUT_OUTPUT_SECONDS;对应配置为 0 则不检查。
 
         超时抛 PromptIdleTimeout(由 prompt() 捕获善后)。
+        pause_probe 非 None 时:在每次轮询空转(CLI 静默期)检查一次,
+        命中抛 ACPPromptPaused(由 prompt() 兜底 cancel 停 CLI 生成)。
+        注:活跃流期(CLI 持续吐通知)由 _rpc 的 on_event 分发处检查,二者互补。
         """
         line_q: queue.Queue = queue.Queue()
 
@@ -930,6 +968,9 @@ class ACPClient:
             try:
                 kind, payload = line_q.get(timeout=_IDLE_POLL_SECONDS)
             except queue.Empty:
+                # 暂停检查点(静默期):CLI 长时间无输出时按轮询粒度响应暂停
+                if pause_probe is not None and pause_probe():
+                    raise ACPPromptPaused()
                 idle_secs = time.monotonic() - last_activity
                 tool_active = bool(idle_probe())
                 threshold = (
@@ -1119,6 +1160,7 @@ class ACPClient:
         on_event=None,
         timeout: httpx.Timeout | float | None = None,
         idle_probe: Callable[[], bool] | None = None,
+        pause_probe: Callable[[], bool] | None = None,
     ) -> dict:
         """发送 prompt,流式处理通知,返回最终结果
 
@@ -1132,8 +1174,12 @@ class ACPClient:
         同时置 last_prompt_truncated(调用方用已累积输出收尾,不 fail 任务)。
         流异常终止(ACPStreamAborted,CLI 崩溃/连接中断)同样走截断兜底:
         cancel(CLI 已死时无害)→ 置 last_prompt_truncated → 返回空结果。
+        pause_probe: 返回当前任务是否被用户暂停的回调。命中(ACPPromptPaused)
+        时走真中断兜底:cancel(停 CLI 生成)→ 置 last_prompt_paused → 返回空结果
+        (不置 last_prompt_truncated:语义不同,调用方据此跳过续轮回收并按"暂停中断"收尾)。
         """
         self.last_prompt_truncated = None
+        self.last_prompt_paused = False
         try:
             return self._rpc({
                 "jsonrpc": "2.0",
@@ -1143,7 +1189,18 @@ class ACPClient:
                     "prompt": prompt,
                 },
                 "id": self._next_id(),
-            }, on_event=on_event, timeout=timeout, idle_probe=idle_probe)
+            }, on_event=on_event, timeout=timeout, idle_probe=idle_probe,
+                pause_probe=pause_probe)
+        except ACPPromptPaused:
+            # 用户暂停真中断:记录现场 → cancel 停 CLI 生成 → 置暂停标记 →
+            # 返回空结果,由调用方用 collector 已累积输出收尾本轮(标注"不完整")。
+            # 不置 last_prompt_truncated:暂停是用户主动,与挂死/崩溃区分。
+            logger.info("[acp] prompt 命中用户暂停,已发 session/cancel 中断本轮生成")
+            if self.recorder:
+                self.recorder.record_raw("paused by user", kind="meta")
+            self.cancel(session_id)
+            self.last_prompt_paused = True
+            return {}
         except PromptIdleTimeout as e:
             # 挂死兜底:记录现场 → cancel CLI(避免沙箱内残留失控进程)→
             # 返回空结果,由调用方用 collector 已累积的输出收尾本轮
@@ -3853,6 +3910,9 @@ def run_acp_agent(
                         on_event=collector,
                         # 挂死兜底:按活动工具状态分级 idle 超时(见 PromptIdleTimeout)
                         idle_probe=lambda: collector.has_active_tools,
+                        # 真中断兜底:用户暂停时 prompt() 发 session/cancel 停 CLI 生成
+                        # (见 ACPPromptPaused);活跃流期下一条通知即断,静默期 ≤5s 响应
+                        pause_probe=lambda: is_paused(task.id),
                     )
                     # 本轮 prompt 已送达:记录注入段指纹与"session 有上下文"标记,
                     # 供同 session 下一轮去重与回放判定(业务错误异常不会走到这里,
@@ -3867,8 +3927,13 @@ def run_acp_agent(
                     # 报告堆叠防护仍由 _async_agent_collect_results 内部的实质阈值/指纹完成。
                     # 实测(qwen3.8-flash):同 session 补发一条 session/prompt,
                     # CLI 会把已完成的后台子 Agent 结果注入下一轮并产出完整报告。
-                    need_recover, skip_reason = _should_recover_async_agent(
-                        collector, client, agent_type
+                    need_recover, skip_reason = (
+                        # 用户暂停已 cancel 本轮生成:轮次作废,绝不进异步续轮回收
+                        # (被取消的输出不可信,且回收会再发长 prompt 与暂停语义冲突)
+                        (False, "paused by user") if client.last_prompt_paused
+                        else _should_recover_async_agent(
+                            collector, client, agent_type
+                        )
                     )
                     _launches = _collector_async_launches(collector)
                     if need_recover:
@@ -3916,7 +3981,9 @@ def run_acp_agent(
                         injected_context_hash=ctx_hash,
                         round_idx=round_idx,
                         restore_method=restore_method_used,
-                        truncated=bool(client.last_prompt_truncated),
+                        truncated=bool(
+                            client.last_prompt_truncated or client.last_prompt_paused
+                        ),
                     )
                     if _session_record is not None:
                         save_session_record(db, task, _session_record)
@@ -3988,6 +4055,34 @@ def run_acp_agent(
             f"\n\n[系统注记:本轮执行提前终止({trunc_reason}),"
             "以上为终止前已输出的内容,可能不完整]"
         )
+
+    # 用户暂停真中断(prompt() 已发 session/cancel 停掉 CLI 生成):
+    # 标注本轮不完整 + 置 _round_paused_interrupt 供编排层冻结流水线
+    # (半截结果不自动进 agent2 审查;恢复后走既有收尾链路)。
+    if client.last_prompt_paused:
+        logger.warning(
+            f"[task={task.id}] {agent_type} 第 {round_idx} 轮被用户暂停中断,"
+            f"用已累积输出({len(collector.content_full)}字符)收尾"
+        )
+        publish(task.id, "thinking_delta", {
+            "conv_id": collector.current_conv_id,
+            "round_idx": round_idx,
+            "role": "agent1",
+            "phase": "error",
+            "delta": "[本轮已被暂停中断]",
+            "iteration": collector.iteration,
+        })
+        summary += (
+            "\n\n[系统注记:本轮执行已被用户暂停中断(已发 session/cancel 停住生成),"
+            "以上为中断前已输出的内容,可能不完整;可点“恢复”对本轮已产出部分收尾,"
+            "或追问让助手在同一会话继续]"
+        )
+        try:
+            task.params = {**(task.params or {}), "_round_paused_interrupt": True}
+            db.commit()
+        except Exception as e:
+            logger.warning(f"[task={task.id}] 写入暂停中断标志失败(忽略): {e}")
+            _safe_rollback(db)
 
     # 异步子 Agent 续轮回收后的状态标注(C:状态诚实,避免裸显"已完成")
     _launches = _collector_async_launches(collector)
@@ -4070,7 +4165,11 @@ def run_acp_agent(
             concl_map[str(round_idx)] = {
                 "conv_id": _concl_conv_id,
                 "chars": int(collector.last_thinking_content_len),
-                "complete": _unrecovered == 0 and not client.last_prompt_truncated,
+                "complete": (
+                    _unrecovered == 0
+                    and not client.last_prompt_truncated
+                    and not client.last_prompt_paused
+                ),
                 "async_pending": _unrecovered,
                 "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             }

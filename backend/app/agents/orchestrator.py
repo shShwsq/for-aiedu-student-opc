@@ -507,6 +507,14 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
         # plan 状态持久化(resume 跨轮续接)
         _save_plan_to_task(task, db, current_plan)
 
+        # ---- 暂停真中断:agent1(CLI/ACP)本轮被 session/cancel 中断 ----
+        # 本轮结果是半截的,不在本线程直接推进"完成 + 审查":阻塞在暂停门控,
+        # 等用户恢复(pause 端点已置 Event 放行)后再对已产出部分收尾。
+        # 只阻塞不回写 status/current_stage(PAUSED 由端点在其会话落库,回写会覆盖)。
+        if _consume_paused_interrupt_flag(task, db):
+            logger.info(f"[task={task.id}] agent1 本轮被暂停中断,阻塞等待恢复后再收尾")
+            wait_if_paused(task.id)
+
         # ===== 轮次类型判定:纯对话轮(如问候/纯问答)跳过审查与重下游 =====
         # 本轮无任何工具调用 → agent1 未触碰工作区,无新证据可审;
         # 保留既有结果与审查状态(首轮即对话则任务无结果,回答在对话流)
@@ -675,6 +683,30 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
 # 存量 monkeypatch/外部脚本可能按旧名取用;新代码一律使用 run_pipeline_audit,
 # 兼容期结束后可整体删除本行
 run_dual_agent_audit = run_pipeline_audit
+
+
+def _consume_paused_interrupt_flag(task: Task, db: Session) -> bool:
+    """读取并清除本轮"被暂停中断"标志,返回本轮是否被暂停中断。
+
+    标志由 acp_base 在 CLI/ACP 轮被 session/cancel 真中断时写入
+    (`task.params["_round_paused_interrupt"]=True`)。builtin react_agent
+    不写此标志,故其任务恒返回 False(行为无变化)。
+
+    仅当标志为真才改写 task.params 并 commit:只脏 params 列,不触碰
+    status/current_stage(暂停端点已在其会话把状态落 PAUSED,回写会覆盖)。
+    消费后清除,避免影响下一轮。
+    """
+    params = task.params or {}
+    if not params.get("_round_paused_interrupt"):
+        return False
+    new_params = {**params}
+    new_params.pop("_round_paused_interrupt", None)
+    task.params = new_params
+    try:
+        db.commit()
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 清除暂停中断标志失败(忽略): {e}")
+    return True
 
 
 def _save_plan_to_task(task: Task, db: Session, plan: list[dict]) -> None:
@@ -2190,6 +2222,15 @@ def resume_audit_with_message(
         react_summaries.append({"round": start_round_idx, "summary": summary})
         # plan 状态持久化(供下一次 resume 续接)
         _save_plan_to_task(task, db, current_plan)
+
+        # ---- 暂停真中断:agent1(CLI/ACP)本轮被 session/cancel 中断 ----
+        # 同初始运行路径:阻塞在暂停门控等恢复,不对半截结果直接进完成/审查;
+        # 只阻塞不回写 status/current_stage(PAUSED 由 pause 端点落库)。
+        if _consume_paused_interrupt_flag(task, db):
+            logger.info(
+                f"[task={task.id}] resume:agent1 本轮被暂停中断,阻塞等待恢复后再收尾"
+            )
+            wait_if_paused(task.id)
 
         # ===== 轮次类型判定:纯对话轮(启用检查助手时)跳过审查与重下游 =====
         # 本轮无任何工具调用 → agent1 回答完全来自历史上下文,无新证据可审;

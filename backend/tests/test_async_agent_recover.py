@@ -246,13 +246,15 @@ class _StubCollector:
 class _Resp:
     """一次续轮 prompt 的结果,按 ACPClient.prompt() 的真实契约模拟:
     正常 → 返回 {"stopReason": ...};被兜底截断 → 置 last_prompt_truncated
-    并返回 {}(截断前流出的文本仍留在 collector 里)。
+    并返回 {}(截断前流出的文本仍留在 collector 里);被暂停 → 置
+    last_prompt_paused 并返回 {}(语义与截断互斥)。
     """
 
-    def __init__(self, text="", *, truncated=None, stop_reason="end_turn"):
+    def __init__(self, text="", *, truncated=None, stop_reason="end_turn", paused=False):
         self.text = text
         self.truncated = truncated
         self.stop_reason = stop_reason
+        self.paused = paused
 
 
 class _StubClient:
@@ -264,17 +266,19 @@ class _StubClient:
         self._i = 0
         self.calls = 0
         self.last_prompt_truncated = None
+        self.last_prompt_paused = False
 
-    def prompt(self, sid, msgs, on_event=None, idle_probe=None):
+    def prompt(self, sid, msgs, on_event=None, idle_probe=None, pause_probe=None):
         item = self._responses[min(self._i, len(self._responses) - 1)]
         self._i += 1
         self.calls += 1
         if isinstance(item, BaseException):
             raise item
-        # prompt() 每次调用都会重置截断标记,只反映本次调用的结果
+        # prompt() 每次调用都会重置截断/暂停标记,只反映本次调用的结果
         self.last_prompt_truncated = item.truncated
+        self.last_prompt_paused = item.paused
         self._collector.content_full += item.text
-        if item.truncated:
+        if item.paused or item.truncated:
             return {}
         return {"stopReason": item.stop_reason}
 
@@ -338,6 +342,18 @@ def test_continue_stops_on_connection_error(_fast_settings):
     ctx = _collect(col, client)
     assert client.calls == 1
     assert ctx["still_pending"] is True
+
+
+def test_continue_stops_on_pause(_fast_settings):
+    """续轮期间用户暂停:prompt() 已 cancel 返回 {} 并置 last_prompt_paused
+    → 停止续轮(不依赖异常传播),结果按不完整标注"""
+    col = _StubCollector("等待子任务返回")
+    client = _StubClient(col, [_Resp("半截报告", paused=True), _Resp("不该被消费")])
+    ctx = _collect(col, client)
+    assert client.calls == 1  # 命中暂停即停,不再补发
+    assert ctx["still_pending"] is True
+    assert client.last_prompt_paused is True
+    assert client.last_prompt_truncated is None  # 暂停与截断互斥
 
 
 def test_truncated_continuation_is_not_marked_complete(_fast_settings):

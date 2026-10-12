@@ -3,6 +3,11 @@
 场景:agent 在 ReAct 循环的迭代边界、工具调用前,调用 wait_if_paused()。
 若用户已按下暂停,该调用阻塞,直到用户按下恢复按钮(set Event)。
 
+CLI/ACP 执行器(agent1 走 Qoder/DeepSeek/Codex)不阻塞在 wait_if_paused:
+其流式循环把 `is_paused()` 作为 pause_probe 传入,命中即向 CLI 发 session/cancel
+真中断生成(见 acp_base.ACPPromptPaused),执行轮结束后由编排层在轮后
+wait_if_paused 门控冻结,等恢复再对半截结果收尾。
+
 设计:
 - 每个 task 对应一个 _PauseState,内含一个 threading.Event
 - Event.set()  = 运行中(默认)
