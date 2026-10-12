@@ -56,10 +56,10 @@ def test_review_prompt_has_four_emit_tools_and_planning():
         "submit_knowledge_point", "submit_suggestion",
     ):
         assert name in AGENT2_REVIEW_PROMPT
-    # 规划先行(必须含 requirement/baseline,否则漏审)
+    # 规划先行(origin 收敛为 agent1 的结论/改动产出两类)
     assert "规划先行" in AGENT2_REVIEW_PROMPT
-    assert "user_requirement" in AGENT2_REVIEW_PROMPT
-    assert "domain_baseline" in AGENT2_REVIEW_PROMPT
+    assert "agent1_claim" in AGENT2_REVIEW_PROMPT
+    assert "agent1_action" in AGENT2_REVIEW_PROMPT
     # 置信后端派生,模型不自报
     assert "不要自报" in AGENT2_REVIEW_PROMPT
     assert "confidence" in AGENT2_REVIEW_PROMPT
@@ -148,11 +148,34 @@ def test_review_prompt_ship_conclusion_is_conditional():
 
 
 def test_review_prompt_has_suggestions_contract():
-    """建议追问契约:只报经核查的真实缺口(能自查的不列建议)、最多 3 条。"""
+    """建议追问契约:agent1 未覆盖/需补查闭环即转追问(不自行补查)、最多 3 条。"""
     assert "submit_suggestion" in AGENT2_REVIEW_PROMPT
     assert "最多 3 条" in AGENT2_REVIEW_PROMPT
-    assert "经核查确认的真实缺口" in AGENT2_REVIEW_PROMPT
-    assert "你能自己核查确认的,一律不列建议" in AGENT2_REVIEW_PROMPT
+    assert "需实际执行/补查才能闭环的真实缺口" in AGENT2_REVIEW_PROMPT
+    assert "不要自拟成已核实审查项" in AGENT2_REVIEW_PROMPT
+
+
+def test_review_prompt_role_is_review_only_gaps_route_back():
+    """职责收敛:agent2 只复核 agent1 的产出与覆盖度,agent1 没查的不自行补查、转追问交回。
+
+    回归点:实测核查计划出现"agent1 只审了后端→由 agent2 自拟前端已核实条目"这类
+    越界补查;新规则要求覆盖度缺口交回 agent1(走 suggestions),agent2 不开新战场取证。
+    """
+    assert "你只复核 agent1 的产出与覆盖度" in AGENT2_REVIEW_PROMPT
+    assert "不自行开新战场取证" in AGENT2_REVIEW_PROMPT
+    # origin 收敛:来源只留 agent1 的结论/改动产出(旧的 requirement/baseline 驱动补查已移除)
+    assert "user_requirement" not in AGENT2_REVIEW_PROMPT
+    assert "domain_baseline" not in AGENT2_REVIEW_PROMPT
+    assert "否则会漏掉 agent1 根本没碰的领域" not in AGENT2_REVIEW_PROMPT
+    # 两个发射工具的 origin 枚举都收到 2 类
+    plan_origin_enum = _SUBMIT_REVIEW_PLAN_TOOL["function"]["parameters"]["properties"]["items"]["items"]["properties"]["origin"]["enum"]
+    item_origin_enum = _SUBMIT_REVIEW_ITEM_TOOL["function"]["parameters"]["properties"]["origin"]["enum"]
+    assert set(plan_origin_enum) == {"agent1_claim", "agent1_action"}
+    assert set(item_origin_enum) == {"agent1_claim", "agent1_action"}
+    # submit_suggestion 描述放宽到"agent1 未覆盖"(不再限"无法自查")
+    suggestion_desc = _SUBMIT_SUGGESTION_TOOL["function"]["description"]
+    assert "agent1 未覆盖" in suggestion_desc
+    assert "确属缺失且无法自查" not in suggestion_desc
 
 
 def test_review_prompt_no_round_or_followup_semantics():
@@ -190,7 +213,7 @@ def test_review_prompt_has_architecture_but_delegates_scope_broadening():
     """代码审查维度仍含「架构设计」,但不再要求 agent2 主动拓宽过窄的用户范围。
 
     跨维度探索性追问已从 agent2 移出(改为后台推荐器单独产出 followup_suggestions),
-    agent2 的 suggestions 只报经核查确认的真实缺口。
+    agent2 的 suggestions 只报 agent1 未覆盖、需补查才能闭环的真实缺口。
     """
     assert "架构设计" in AGENT2_REVIEW_PROMPT
     assert "主动拓宽过窄的用户范围" not in AGENT2_REVIEW_PROMPT

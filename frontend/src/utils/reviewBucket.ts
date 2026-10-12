@@ -30,15 +30,17 @@ export const REVIEW_BUCKET_ORDER: { key: ReviewBucket; label: string }[] = [
   { key: 'pending_verify', label: '待核实' },
 ]
 
-/** origin 的用户可读标签(旧版直接把 agent1_claim 这类枚举丢给用户) */
-export const ORIGIN_LABELS: Record<ReviewOrigin, string> = {
+/** origin 的用户可读标签(旧版直接把 agent1_claim 这类枚举丢给用户)
+ * agent2 只复核 agent1 产出,现只产生 agent1_claim/agent1_action 两类;后两项是 legacy,
+ * 历史行仍可能带,保留映射以免旧任务报告露出英文枚举。*/
+export const ORIGIN_LABELS: Record<string, string> = {
   agent1_claim: 'AI助手 的结论',
-  agent1_action: 'AI助手 的执行动作',
+  agent1_action: 'AI助手 的改动/生成物',
   user_requirement: '你的要求',
   domain_baseline: '领域经验',
 }
 
-export function originLabel(origin: ReviewOrigin | undefined | null): string {
+export function originLabel(origin: ReviewOrigin | string | undefined | null): string {
   if (!origin) return '—'
   return ORIGIN_LABELS[origin] ?? origin
 }

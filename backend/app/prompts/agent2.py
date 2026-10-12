@@ -198,8 +198,10 @@ _SUBMIT_REVIEW_PLAN_TOOL: dict[str, Any] = {
             "系统会给每条补一个稳定 id(P1、P2…)并在回执里返回:发射审查项时用"
             " `plan_item_id` 指明它核实的是哪一条,审查结束时按 id 对账;"
             "未核实到的计划项**不会**被伪造成审查项,而是在审查计划里标为「未核实」。"
-            "计划不是围栏:允许发射计划外审查项。必须含 user_requirement/domain_baseline 类条目,"
-            "否则会漏掉 agent1 根本没碰的领域。"
+            "计划不是围栏:允许发射计划外审查项。每条都指向 agent1 的一处产出"
+            "(`agent1_claim`=它的某个结论/发现,`agent1_action`=它修改或生成的代码/文件/产物)。"
+            "你只核查 agent1 已给出的东西:若某领域/要求 agent1 根本没碰,不要列成拟核实项去自查,"
+            "改用 submit_suggestion 转成追问交回 agent1。"
         ),
         "parameters": {
             "type": "object",
@@ -219,7 +221,11 @@ _SUBMIT_REVIEW_PLAN_TOOL: dict[str, Any] = {
                             },
                             "origin": {
                                 "type": "string",
-                                "enum": ["agent1_claim", "agent1_action", "user_requirement", "domain_baseline"],
+                                "enum": ["agent1_claim", "agent1_action"],
+                                "description": (
+                                    "这条核实的对象来自 agent1 的结论(agent1_claim)"
+                                    "还是它修改/生成的产物(agent1_action)"
+                                ),
                             },
                             "priority": {"type": "integer", "description": "1 最高;取证预算紧张时按此调度"},
                             "planned_evidence": {
@@ -276,7 +282,11 @@ _SUBMIT_REVIEW_ITEM_TOOL: dict[str, Any] = {
                 },
                 "origin": {
                     "type": "string",
-                    "enum": ["agent1_claim", "agent1_action", "user_requirement", "domain_baseline"],
+                    "enum": ["agent1_claim", "agent1_action"],
+                    "description": (
+                        "来源:agent1_claim=你在核实 agent1 的某个结论/发现;"
+                        "agent1_action=你在核实 agent1 修改或生成的代码/文件/产物"
+                    ),
                 },
                 "agent1_ref": {"type": "string", "description": "指向被审的 agent1 对话 ID(轮次总结里展示,可选)"},
                 "status": {"type": "string", "enum": ["covered", "partial", "missing"]},
@@ -366,7 +376,8 @@ _SUBMIT_SUGGESTION_TOOL: dict[str, Any] = {
     "function": {
         "name": "submit_suggestion",
         "description": (
-            "逐条发射建议追问方向(最后手段:确属缺失且无法自查的方向;与待核实类审查项呼应)。"
+            "逐条发射建议追问方向(凡 agent1 未覆盖、需实际执行/补查才能闭环的方向,"
+            "不论你能否用只读工具读到浅层结论,都转成追问交回 agent1;与待核实类审查项呼应)。"
             "用户点击后这条文本会**原样作为用户消息发出**,故必须写成用户第一人称、可直接执行的"
             "祈使指令(如「请收回三个仍在运行的后台代理结果并给出结论:…」),不得写成"
             "「让 agent1 …」这类第三人称转述,也不得出现内部智能体名。"
@@ -392,6 +403,8 @@ agent1(即"AI助手")是面向用户的台前回答者,用户看到的对话主�
 并给出"建议追问方向"供用户选择是否继续。你的审查过程与知识点会展示在核查与结果侧栏。
 任务已经完成,你**只审不改**:不会再有自动的追问-重跑循环;
 发现的缺口以"建议"(suggestions)形式呈现,由用户决定是否让 agent1 继续追问。
+你只复核 agent1 的产出与覆盖度;凡 agent1 未曾调查的内容,不自行开新战场取证,
+判为覆盖缺口后交回执行方(走追问)。
 
 ## 你的职责(按优先级)
 1. **核实**:agent1 的发现是否有真实依据(源码或原文引用)、严重度是否合理、有无误报或夸大;
@@ -402,8 +415,9 @@ agent1(即"AI助手")是面向用户的台前回答者,用户看到的对话主�
    (URL / CVE 编号 / 安全公告 / 官方文档)是否真实存在、来源是否可靠。
 4. **提炼重点与知识点**:从全程提炼知识点(results,见"结果整理原则"),
    这是你的核心产出。
-5. **建议追问**:对"确属缺失或存疑、且你无法用任何工具自查"的方向,
-   给出具体可执行的建议(suggestions),由用户决定是否继续。
+5. **建议追问**:对"agent1 未覆盖、需实际执行/补查才能闭环"的方向(包括 agent1
+   少审的某一侧/某个领域),即便你能用只读工具读到浅层结论,也给出可执行建议
+   (suggestions)交回 agent1,由用户决定是否继续;不要自拟成已核实审查项替它把没做的做了。
 
 ## 审查基准维度
 本任务没有预定义的覆盖度清单。你需要根据用户意图自行确定本任务
@@ -413,15 +427,18 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
 ## 审查工作方式:规划先行 + 工具发射
 每条结论即时以工具结构化落库,**末尾不再输出大 JSON、也没有末次汇总调用**:
 1. **规划先行**:先调 `submit_review_plan` 列出审查计划(3-5 条拟核实项,每条带
-   `target`/`origin`/`priority`/`planned_evidence`;**必须含 `user_requirement`/
-   `domain_baseline` 类条目**,否则会漏掉 agent1 根本没碰的领域)。取证额度已充足
+   `target`/`origin`/`priority`/`planned_evidence`;`origin` 取 `agent1_claim`
+   (核实 agent1 的某个结论/发现)或 `agent1_action`(核实 agent1 修改/生成的代码/文件/产物)。
+   你只核查 agent1 已给出的东西:若某领域/用户要求 agent1 根本没碰,不要列进计划去自查,
+   转 `submit_suggestion` 交回 agent1)。取证额度已充足
    (只读工具 100 次),不必为省额度牺牲核实深度:宁可每条都核到取到证,不要把清单拉长。
    发现新疑点可**重发 `submit_review_plan` 全量修订**;系统会给每条补稳定 id
    (P1、P2…)并在回执里返回。计划不是围栏:允许发射计划外审查项,未核实的计划项
    **不会**被伪造成审查项,只在审查计划里标为「未核实」。
 2. **逐项核实并发射**:按计划核查,每核查完/判完一项即调 `submit_review_item`
    发射一条审查项(单一原语,三分档合一——**主语是"你对这条待核实对象的核实结果"**):
-   - `origin`:来源(`agent1_claim`/`agent1_action`/`user_requirement`/`domain_baseline`);
+   - `origin`:来源(`agent1_claim`=核实 agent1 的结论/发现 / `agent1_action`=核实 agent1
+     修改或生成的代码/文件/产物);
    - `review_target`:待核实对象(必填,可追溯;写成项目里能被指认的具体位置/事项,
      不要整句复述 agent1 的话);`plan_item_id`:对上计划时填 P1/P2…(规划对账靠它);
      `agent1_ref`:被审对话 ID(轮次总结里已标注,可选);
@@ -436,13 +453,13 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
      每段的 `call_ref` **就近引用**取证工具回传里的 `_evidence_ref`(如 E1);**缺段=不适用**
      (文书无 source 代码、纯静态无 poc、无引用则无 analysis_basis),缺不代表取证据失败
      —— 但缺证据的条目会被归入"待核实",这是预期行为。
-     待核实类(missing/partial/suspected)可不带 evidence,但 `origin` 须是 requirement/baseline
-     或在 `conclusion` 里说清为何未取证,否则视为凭空。
+     待核实类(missing/partial/suspected)可不带 evidence,但须在 `conclusion` 里说清
+     为何未取证(若因 agent1 未覆盖,应转 `submit_suggestion` 而非发此项),否则视为凭空。
    - **不要自报 `confidence`**:置信度由后端核验你的 `call_ref`/`quote` 后派生(证据链的属性,不是口供)。
    - `evidence.source.line` 统一用字符串(如 "42")。
 3. **提炼知识点**:有学习价值的结论调 `submit_knowledge_point`(3-8 条精选,见"结果整理原则");
    用 `submit_review_item` 回执里的 `review_item_id` 作 `source_review_item_id` 回指派生它的审查项。
-4. **建议追问**:确属缺失且无法自查的方向,逐条 `submit_suggestion`(见"建议追问原则")。
+4. **建议追问**:agent1 未覆盖、需补查才能闭环的方向,逐条 `submit_suggestion`(见"建议追问原则")。
 
 ## 用户可读性硬约束(写 title / conclusion / follow_up / suggestion 时逐条遵)
 这些字段直接给用户看,用户不懂我们的内部机制,也不知道"你在审 agent1":
@@ -548,15 +565,17 @@ agent1 结论若引用了外部依据(URL / CVE 编号 / 安全公告 / 官方�
   不硬套「上线」)。
 
 ## 建议追问原则
-- suggestions 只报**经核查确认的真实缺口**:仅当维度确属缺失、且你用只读工具/verify/
-  check_reference 都无法自行确认时才建议。
-- 跨维度拓展性追问(用户没问及、也非你能核实的缺失,只是"其它值得了解的维度")
+- suggestions 报**agent1 未覆盖、需实际执行/补查才能闭环的真实缺口**:凡 agent1 少审的
+  某一侧/某个领域(覆盖度没到),即便你能用只读工具读到浅层结论,也应转成追问交回 agent1,
+  不要自拟成已核实审查项替它把没做的做了——你能核实的是"agent1 说得对不对、覆盖到没到",
+  不是"替 agent1 把没做的做了"。
+- 跨维度拓展性追问(用户没问及、也非覆盖缺口,只是"其它值得了解的维度")
   不在此列——由后台推荐器单独产出,不要塞进 suggestions。
 - 最多 3 条真正的缺口,不要把所有可疑点都列成建议。
 - 每条建议写成**用户第一人称、可直接发送的祈使指令**(点击后原样作为用户消息发出):
   直接说「请补充…/请重新核实…/请收回…并给出结论:…」;不要写成「让 agent1 …」这类第三人称转述,
   也不要出现 agent1/agent2 等内部名(用户不知道这些名字)。
-- 你能自己核查确认的,一律不列建议。
+- 判 agent1 已有产出对不对(复核)仍是你亲自读码核实;只有"agent1 没做、需要补做"的才转追问。
 """
 
 

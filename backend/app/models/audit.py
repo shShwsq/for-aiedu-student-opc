@@ -44,22 +44,25 @@ from app.models.task import Task
 # 三分档判读口径(集中一处:常量 + 谓词,前端/导出/统计复用)
 # ============================================================
 
-# origin 来源(审查项派生自哪些输入,须含 requirement/baseline 否则漏审)
+# origin 来源:agent2 只复核 agent1 的产出——分"AI 的结论"(agent1_claim)与
+# "AI 修改/生成的东西"(agent1_action:代码/文件/产物)两类。
+# 旧版曾有 user_requirement/domain_baseline,用来逼 agent2 去补查 agent1 没碰的领域;
+# 职责收敛后 agent1 未查的一律转追问、agent2 不再自查,故从可发射枚举中移除。
 ORIGIN_AGENT1_CLAIM = "agent1_claim"
 ORIGIN_AGENT1_ACTION = "agent1_action"
+# legacy:agent2 不再产生,仅历史行仍可能带(不在 VALID_ORIGINS 里,新发射会被 clamp 掉)
 ORIGIN_USER_REQUIREMENT = "user_requirement"
 ORIGIN_DOMAIN_BASELINE = "domain_baseline"
 VALID_ORIGINS = frozenset({
     ORIGIN_AGENT1_CLAIM,
     ORIGIN_AGENT1_ACTION,
-    ORIGIN_USER_REQUIREMENT,
-    ORIGIN_DOMAIN_BASELINE,
 })
 
 # origin 的用户可读标签(报告导出/统计用;前端同名单份在 utils/reviewBucket)
+# 后两项是 legacy:agent2 已不再产生,仅为历史行显示兜底(免让报告露出英文枚举)。
 ORIGIN_LABELS: dict[str, str] = {
     ORIGIN_AGENT1_CLAIM: "AI助手 的结论",
-    ORIGIN_AGENT1_ACTION: "AI助手 的执行动作",
+    ORIGIN_AGENT1_ACTION: "AI助手 的改动/生成物",
     ORIGIN_USER_REQUIREMENT: "你的要求",
     ORIGIN_DOMAIN_BASELINE: "领域经验",
 }
@@ -139,9 +142,9 @@ class ReviewItem(Base):
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     # 审查结论(分析过程,可引用原始证据)——旧列名 description
     conclusion: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # 待核实对象:agent1 的某条具体结论/动作,或用户的一条要求(必填)
+    # 待核实对象:agent1 的某条具体结论或它修改/生成的产物(必填)
     review_target: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # 来源:agent1_claim / agent1_action / user_requirement / domain_baseline
+    # 来源:agent1_claim(结论/发现) / agent1_action(改动/生成物)
     origin: Mapped[str] = mapped_column(String(24), nullable=False, default=ORIGIN_AGENT1_CLAIM)
     # 指向被审的 agent1 对话(可追溯,可空;后端校验属本任务 agent1 对话)
     agent1_ref: Mapped[uuid.UUID | None] = mapped_column(

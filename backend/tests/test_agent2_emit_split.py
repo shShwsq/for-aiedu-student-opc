@@ -92,7 +92,7 @@ def test_three_states_emit_and_counts(monkeypatch):
         "status": "covered", "verdict": "none",
     })
     pending = _tc("submit_review_item", {
-        "title": "并发存疑", "review_target": "并发安全", "origin": "domain_baseline",
+        "title": "并发存疑", "review_target": "并发安全", "origin": "agent1_claim",
         "status": "partial", "verdict": "suspected",
     })
     result, events, db, _task = _driver(
@@ -178,7 +178,7 @@ def test_plan_reconciliation_by_plan_item_id(monkeypatch):
     plan = _tc("submit_review_plan", {"items": [
         {"target": "users.py SQL 注入", "origin": "agent1_claim", "priority": 1},
         {"target": "auth 越权", "origin": "agent1_claim", "priority": 2},
-        {"target": "并发安全(未碰)", "origin": "domain_baseline", "priority": 3},
+        {"target": "并发安全(未核)", "origin": "agent1_action", "priority": 3},
     ]})
     # 两条发射都靠 id 对上账(review_target 写法与计划 target 完全不同句)
     a = _tc("submit_review_item", {
@@ -194,7 +194,7 @@ def test_plan_reconciliation_by_plan_item_id(monkeypatch):
     review = result["_review"]
     assert review["plan"]["planned"] == 3
     assert review["plan"]["executed"] == 2
-    assert [u["target"] for u in review["plan"]["unverified"]] == ["并发安全(未碰)"]
+    assert [u["target"] for u in review["plan"]["unverified"]] == ["并发安全(未核)"]
     assert review["plan"]["unverified"][0]["id"] == "P3"
     assert review["plan"]["unverified"][0]["reason"] == "not_reached"
     # 计数只算真发射的 2 条——旧版会把未匹配的计划项伪造成 missing 审查项

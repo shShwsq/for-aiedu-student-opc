@@ -136,7 +136,9 @@ export interface TaskResult {
  * (旧口径 risk/cleared/gap 把"agent1 说有漏洞且我未取证"也算发现风险,现纠正为待核实)
  */
 export type ReviewBucket = 'established' | 'not_established' | 'pending_verify'
-export type ReviewOrigin = 'agent1_claim' | 'agent1_action' | 'user_requirement' | 'domain_baseline'
+// agent2 只复核 agent1 的产出:来源分"结论"(agent1_claim)与"改动/生成物"(agent1_action)两类。
+// (旧版 user_requirement/domain_baseline 已废弃——agent2 不再产生,仅历史行可能带,标签保留供显示)
+export type ReviewOrigin = 'agent1_claim' | 'agent1_action'
 export type ReviewStatusState = 'covered' | 'partial' | 'missing'
 export type ReviewVerdict = 'confirmed' | 'suspected' | 'false_positive' | 'none' | 'pending'
 export type ReviewSeverity = 'high' | 'medium' | 'low' | 'info'

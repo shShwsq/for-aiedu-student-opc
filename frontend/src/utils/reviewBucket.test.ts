@@ -74,9 +74,10 @@ describe('bucketizeReviewItems', () => {
 })
 
 describe('originLabel', () => {
-  it('四类来源都有中文标签(不再把 agent1_claim 直铺给用户)', () => {
+  it('agent1 两类来源有中文标签,legacy 两类仍保留供历史行显示', () => {
     expect(originLabel('agent1_claim')).toBe('AI助手 的结论')
-    expect(originLabel('agent1_action')).toBe('AI助手 的执行动作')
+    expect(originLabel('agent1_action')).toBe('AI助手 的改动/生成物')
+    // legacy:agent2 不再产生,但旧任务行可能带,不露英文枚举
     expect(originLabel('user_requirement')).toBe('你的要求')
     expect(originLabel('domain_baseline')).toBe('领域经验')
   })
