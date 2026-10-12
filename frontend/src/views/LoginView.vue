@@ -125,7 +125,7 @@ function handleOAuth(provider: GitProvider): void {
           <BrandLogo :size="44" />
         </div>
         <h1>SecondLook</h1>
-        <p class="subtitle">双智能体协作系统</p>
+        <p class="subtitle">AI助手 执行 + 检查助手 后台质检</p>
       </div>
 
       <!-- Tab 切换 -->

@@ -62,7 +62,7 @@ export interface StreamCallbacks {
   /** 危险命令确认(local 模式安全策略,LLM 执行危险命令时需用户确认) */
   onCommandConfirm?: (data: CommandConfirmEventData) => void
   /**
-   * agent1 结束即任务完成(双 agent 模式):主界面收尾展示临时结果,
+   * agent1 结束即任务完成(启用检查助手时):主界面收尾展示临时结果,
    * 后台审查继续,审查事件(conversation/thinking_delta)继续送达侧栏
    */
   onAgent1Done?: (data: Agent1DoneEventData) => void

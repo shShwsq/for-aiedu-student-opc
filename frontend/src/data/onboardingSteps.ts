@@ -57,8 +57,10 @@ export interface OnboardingStep {
  * - v6: 该布局改为常驻竖向分段 rail + 按需展开(概览/核查过程/审查结果/
  *       重点与知识点),原「结果」段拆成两段,建议追问方向移入概览;
  *       activateTab 改名 activateSection,且程序化展开段(收起时目标不在 DOM)。
+ * - v7: 欢迎步骤文案取消"双智能体协作"说法,对齐现行流水线
+ *       (AI助手 单轮执行 + 检查助手 后台质检,多轮由用户驱动)。
  */
-export const ONBOARDING_VERSION = 6
+export const ONBOARDING_VERSION = 7
 
 /**
  * 全部引导步骤(按路由分组,组内按顺序播放)。
@@ -82,7 +84,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     placement: 'bottom',
     title: '欢迎使用 SecondLook',
     content:
-      '这是一个双智能体协作系统:AI助手 负责调用工具执行任务,检查助手 负责质检审查结果、必要时追问补全。下面用 30 秒带你认识主要入口。',
+      '这是一个「AI助手 执行 + 检查助手 后台质检」系统:AI助手 负责调用工具执行任务,跑完即完成;检查助手 随后在后台核查产出,并把无法自查的缺口整理成建议追问方向。下面用 30 秒带你认识主要入口。',
   },
   {
     id: 'home-cta',

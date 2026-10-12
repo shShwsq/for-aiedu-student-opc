@@ -233,7 +233,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="SecondLook",
-    description="双智能体协作系统",
+    description="「AI助手 执行 + 检查助手 后台质检」的智能体任务平台(代码 / 文书 / 通用任务)",
     version="0.2.0",
     lifespan=lifespan,
 )

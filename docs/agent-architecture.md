@@ -1,16 +1,16 @@
-# 双智能体架构与上下文传递逻辑
+# 智能体架构(执行 + 后台质检)与上下文传递逻辑
 
-本文档整理 `backend/app/agents/` 目录下 agent2（质检智能体,前端显示「检查助手」）、agent1（前端显示「AI助手」,内置实现为 `react_agent`）、外部 CLI agent（Qoder / DeepSeek Harness / Codex）的代码逻辑、协作流程与上下文传递机制，并覆盖智能体策略（`agent_policy.py`）、交付物上传链路（uploads → orchestrator）与工作区变更捕获（`workspace_diff.py`）。
+本文档整理 `backend/app/agents/` 目录下 agent2（质检智能体,前端显示「检查助手」）、agent1（前端显示「AI助手」,内置实现为 `react_agent`）、外部 CLI agent（Qoder / DeepSeek Harness / Codex）的代码逻辑、执行与质检流程与上下文传递机制，并覆盖智能体策略（`agent_policy.py`）、交付物上传链路（uploads → orchestrator）与工作区变更捕获（`workspace_diff.py`）。
 
 > 命名约定:agent1 = AI助手(内置实现 react_agent.py,或外部 CLI 执行器);agent2 = 质检智能体(「检查助手」)。Conversation 落库与 SSE 事件的 `role` 取值即为 `agent1` / `agent2`。下文代码细节中 `react_agent` 指内置实现模块。
 
-> 阅读前置：`docs/spec.md`（产品定义）、`backend/app/agents/orchestrator.py`（协作编排）。
+> 阅读前置：`docs/spec.md`（产品定义）、`backend/app/agents/orchestrator.py`（执行 + 后台质检编排）。
 
 ---
 
 ## 1. 架构总览
 
-系统采用 **agent1(执行)+ agent2(质检)双智能体协作** 模型，由 `orchestrator.run_dual_agent_audit` 编排：
+系统采用 **agent1(执行)+ agent2(后台质检)串行流水线** 模型，由 `orchestrator.run_dual_agent_audit` 编排（函数名为历史标识：原「双智能体协作循环」已移除，agent2 单次后台审查不向 agent1 发问，多轮由用户 resume 驱动；关闭 agent2 即单 agent 模式）：
 
 ```
 用户意图
@@ -1038,7 +1038,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | [prompts/verifier.py](../backend/app/prompts/verifier.py) | verifier 文本资产：VERIFIER_SYSTEM_PROMPT + 登录身份动态注入段 |
 | [prompts/memory_curator.py](../backend/app/prompts/memory_curator.py) | 记忆归纳/精简模板 + 记忆类别枚举 |
 | [prompts/practice.py](../backend/app/prompts/practice.py) | 练习出题文本资产：4 主题 head / 工具说明段 / 通用规则 / build_system_prompt / 主题分类器 / 出题模板 |
-| [orchestrator.py](../backend/app/agents/orchestrator.py) | 双智能体协作编排（agent1 单轮 + 后台审查 + resume） |
+| [orchestrator.py](../backend/app/agents/orchestrator.py) | 执行 + 后台质检编排（agent1 单轮 + 后台审查 + resume） |
 | [runtime/llm_stream.py](../backend/app/agents/runtime/llm_stream.py) | 共享运行时：统一流式 LLM 调用 + 跨 chunk 工具累积 + 文本 tool_call 兜底解析（§8.6） |
 | [runtime/conversation.py](../backend/app/agents/runtime/conversation.py) | 共享运行时：统一对话落库 + SSE 推送（tool_call_id 配对 + extra_payload） |
 | [runtime/tool_intent.py](../backend/app/agents/runtime/tool_intent.py) | 共享运行时：工具意图生成单一注册表（prefix 支持） |

@@ -1,6 +1,6 @@
 """任务路由
 
-阶段 4:双智能体协作(agent2 + react_agent)
+阶段 4:引入 agent2(现行为 agent1 单轮执行 + agent2 后台审查流水线)
 阶段 7:异步化 + SSE 实时流
 
 端点:
@@ -216,7 +216,7 @@ def create_task(
     """提交任务
 
     阶段 7:异步化。立即创建 task 记录并返回 task_id,
-    后台线程执行双智能体协作。前端通过 SSE 端点实时观看进度。
+    后台线程执行「AI助手 执行 + 检查助手 后台质检」流水线。前端通过 SSE 端点实时观看进度。
 
     支持两种提交方式:
     - 通用:scenario + user_input + params
@@ -2125,7 +2125,7 @@ def stream_task_events(
 
 
 def _run_task_in_background(task_id: str) -> None:
-    """后台线程执行双智能体协作
+    """后台线程执行「AI助手 执行 + 检查助手 后台质检」流水线
 
     用独立的 DB session(线程安全),执行完毕后关闭。
     """

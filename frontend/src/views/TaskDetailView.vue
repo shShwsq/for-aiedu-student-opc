@@ -750,7 +750,7 @@ async function initTask(): Promise<void> {
     }
 
     // 2. 若任务仍在进行(含暂停态),连接 SSE 接收实时事件
-    //    双 agent 模式:任务 COMPLETED 但后台审查未结束(review_status=running)
+    //    启用检查助手时:任务 COMPLETED 但后台审查未结束(review_status=running)
     //    时事件总线仍打开,刷新页面后同样需要重连接收审查事件
     if (
       task.value &&

@@ -1,4 +1,4 @@
-"""agent2:质检智能体(检查助手,SecondLook 双 agent 架构核心)
+"""agent2:质检智能体(检查助手,SecondLook 后台质检核心)
 
 角色:幕后质检者 + 学习点提炼者。agent1(即"AI助手")是面向
 用户的台前回答者(其每轮总结即用户看到的回答);agent2 负责在 agent1

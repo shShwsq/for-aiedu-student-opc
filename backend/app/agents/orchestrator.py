@@ -1,6 +1,7 @@
-"""双智能体编排器(agent2 后台审查版)
+"""编排器:AI助手 执行 + 检查助手 后台质检(agent2 后台审查版)
 
-驱动 react_agent + agent2 协作(审查后台化后的新流程):
+驱动 react_agent + agent2 流水衔接(审查后台化后的新流程;两环节串行,
+多轮由用户 resume 驱动,agent2 不向 agent1 发问;原"双智能体协作循环"已移除):
 1. react_agent 按用户意图执行一轮(含 clone),输出自然语言总结
 2. agent1 summary 作为临时结果落库,任务即标记 COMPLETED(推 agent1_done,
    事件总线保持打开)—— 用户感知的"任务完成"以 agent1 结束为准
@@ -265,12 +266,16 @@ def _run_resume_in_background(
 
 
 def run_dual_agent_audit(task: Task, db: Session) -> None:
-    """执行双智能体协作审计"""
+    """执行「AI助手 执行 + 检查助手 后台质检」流水线
+
+    函数名中的 dual_agent 为历史标识(协作循环已移除,现为串行流水线),
+    调用方与测试面广,保留不改名。
+    """
     task_id_str = str(task.id)
 
     # 先解析 agent 策略(agent2 启停、验证权限等):
     # 启动阶段文案必须在推送前由 agent2 启停决定,
-    # 否则单 agent 模式会先闪现"双智能体协作启动"误导前端
+    # 否则单 agent 模式(未启检查助手)会先闪现误导性的启动阶段文案
     # 合并用户级默认(agent_policies 表)+ 任务级覆盖(task.params["_agent_policy"])
     agent_policy = resolve_agent_policy(task, db)
     logger.info(f"[task={task.id}] agent_policy: {agent_policy}")
@@ -587,7 +592,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         )
 
     except Exception as e:
-        logger.exception(f"[task={task.id}] 双智能体协作失败")
+        logger.exception(f"[task={task.id}] 任务流水线执行失败")
         # 错误详情增强:消息为空时补异常类型名,避免 UI 显示"未知错误"
         err_detail = _err_detail(e)
         task.status = TaskStatus.FAILED

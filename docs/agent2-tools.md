@@ -2,7 +2,7 @@
 
 > 说明对象:`backend/app/agents/agent2.py` 在后台审查中可调用的工具,及其定义、启用条件、参数、返回与语义。
 > 工具**文本定义**集中于 [app/prompts/agent2.py](../backend/app/prompts/agent2.py);**执行逻辑**在 [app/agents/agent2.py](../backend/app/agents/agent2.py);**底层实现**在 `backend/app/tools/` 与 `backend/app/agents/verifier_agent.py`。
-> 阅读前置:`docs/agent-architecture.md`(双智能体架构)、`docs/spec.md` §3(核心流程)。
+> 阅读前置:`docs/agent-architecture.md`(执行 + 后台质检架构)、`docs/spec.md` §3(核心流程)。
 
 ---
 
