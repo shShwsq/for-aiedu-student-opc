@@ -45,7 +45,7 @@ defineEmits<{
 </template>
 
 <style scoped>
-/* 段标题与同栏「任务清单 / 审查结果」一致(fs-base + semibold) */
+/* 区块容器:标题在上,卡片纵向平铺 */
 .suggestion-section {
   display: flex;
   flex-direction: column;

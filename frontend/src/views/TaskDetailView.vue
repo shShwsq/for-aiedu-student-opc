@@ -6,7 +6,7 @@
  * 1. 主区协作对话流:按 round_idx 分组,展示 agent2 与 agent1 的来回
  * 2. 右侧「核查与结果」:常驻竖向 rail(概览 / 核查过程 / 审查结果 /
  *    重点与知识点),点 rail 按钮展开对应段面板(rail 即折叠态);
- *    概览含当前阶段/任务清单/动态验证/建议追问方向
+ *    概览含当前阶段/对话模型/任务清单/动态验证/建议追问方向
  *
  * 实时更新:SSE 接收每条对话/状态变更 + thinking_delta(流式 token 增量)。
  * 初始加载 GET /tasks/{id} 拿快照(补历史),然后 SSE 接收增量。
@@ -3394,7 +3394,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
         role="region"
         :aria-label="activeSectionLabel"
       >
-        <!-- 段: 概览(阶段 + 任务清单 + 动态验证 + 建议追问方向) -->
+        <!-- 段: 概览(阶段 + 对话模型 + 任务清单 + 动态验证 + 建议追问方向) -->
         <div v-show="activeSection === 'overview'" class="sidebar-panel">
           <section
             v-if="(isRunning && task.current_stage) || task.error_message"
@@ -3408,6 +3408,15 @@ const showKnowledgeToolbar = computed<boolean>(() => {
               {{ task.error_message }}
             </div>
           </section>
+      
+          <!-- 对话模型(与输入框上方「运行时设置」同一个组件的 panel 形态:
+               选项/解析口径/保存链路共用,两处入口不会显示不同的值) -->
+          <TaskRuntimeSettings
+            v-if="task"
+            variant="panel"
+            :task="task"
+            @saved="handleRuntimeConfigSaved"
+          />
       
           <section v-if="latestPlanSteps.length > 0" class="plan-section">
             <h2 class="plan-section-title">
