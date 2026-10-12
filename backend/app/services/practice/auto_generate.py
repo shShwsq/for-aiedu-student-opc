@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 
 from app.models.practice import PracticeSettings, Question
 from app.models.task import Result, Task
-from app.models.audit import ReviewItem  # 触发门控:存在审查项即视为有结构化素材
 from app.services.practice import jobs as gen_jobs
 from app.services.practice.generator import (
     PracticeGenerateCancelled,
@@ -28,13 +27,14 @@ logger = logging.getLogger(__name__)
 def _has_structured_findings(db: Session, task_id) -> bool:
     """任务是否具备"结构化素材"以触发自动出题。
 
-    证据驱动可信审查后的判定:① 存在 ReviewItem(审查项),或 ② Results 中存在
-    带非空元信息的知识点(兼容单 agent/老任务)。任一成立即触发。
+    判据必须与 generator 实际取材口径一致:_select_findings 只从 results 取素材,
+    所以「有结构化素材」等价于「存在带非空元信息的 Result(知识点)」。
+
+    这里一度还认 ReviewItem(审查项),但审查项不落 results、不进出题素材:
+    而关闭「提炼知识点」时 agent2 照常发射 submit_review_item(只剔除了
+    submit_knowledge_point),于是门恒为真 → conversation_fallback 永远是 False,
+    设计好的对话降级分支被完全短路。
     """
-    # ① 审查项非空
-    if db.query(ReviewItem.id).filter(ReviewItem.task_id == task_id).first():
-        return True
-    # ② 知识点带元信息(旧语义保留)
     results = db.query(Result.metadata_).filter(Result.task_id == task_id).all()
     for (meta,) in results:
         if meta and isinstance(meta, dict) and any(
@@ -83,8 +83,8 @@ def auto_generate_practice_for_task(task: Task, db: Session) -> int:
         logger.info("[task=%s] 该任务已有练习题,跳过自动生成", task.id)
         return 0
 
-    # 4) 素材:优先结构化发现;无结构化发现(单 agent / 未提炼知识点)时降级为「基于对话出题」。
-    # generator 会从 user↔agent1 对话提炼伪发现;对话也无可提炼内容时自然产 0 题。
+    # 4) 素材:优先结构化发现;无结构化发现(单 agent / 关闭知识点提炼)时降级为「基于对话出题」。
+    # generator 会从 user↔agent1 对话提炼伪发现;对话也无可提炼内容时退回用现有 Result 出题。
     conversation_fallback = not _has_structured_findings(db, task.id)
     if conversation_fallback:
         logger.info("[task=%s] 无结构化审计发现,降级为基于对话自动出题", task.id)

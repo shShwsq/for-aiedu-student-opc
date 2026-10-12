@@ -774,7 +774,7 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 | `sm2.py` | SM-2 遗忘曲线:答对 quality=4、答错 quality=1;EF 更新与间隔序列(1 → 6 → 前值×EF,下限 1.3),首次作答创建状态记录 |
 | `difficulty.py` | 难度评估(LLM 初评 1-5 + 作答后微调)与用户能力估计(冷启动 2.5,后为最近 10 次答对题难度的加权均值) |
 | `selector.py` | 综合选题:score = 3.0×到期紧迫度 + 2.0×薄弱度 + 1.5×难度匹配 + 0.5×新颖度 + 随机抖动;约束:同知识点 ≤60%、复习题占比 ≥50%、冷启动取难度 ≤2 新题 |
-| `auto_generate.py` | 任务完成自动出题(受用户级偏好 `auto_generate_practice` 控制) |
+| `auto_generate.py` | 任务完成自动出题(开关:任务级 `_practice.auto_generate` > 用户级 `auto_generate_practice` > 默认开);素材门控见下 |
 | `jobs.py` | 出题异步 job(后台线程,进度经 SSE 推送) |
 
 **四主题提示词(出题时自动匹配)**:网络安全 / 架构设计 / 通用代码能力 / 合同文书。主题不再是用户级设置,而是出题时逐 finding 自动匹配(规则先行:文书审核场景→contract、metadata 带 CWE→security;其余一次批量送 LLM 分类,失败降级 security)。不同主题仅影响 system prompt,生成流程不变;题目落库时 `Question.learning_topic` 记录实际采用主题。
@@ -785,7 +785,11 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - **迷你工具循环**:generator 内置轻量循环(read_file / search_code / find_files,`MAX_TOOL_ROUNDS=6`,结果截断 3000 字符)增强出题质量,不复用重型 react_agent
 - **工作区恢复**:沙箱过期后支持重新 clone 仓库。**两条路径不同语义**:出题侧自动恢复受用户级开关 `restore_workspace_for_practice` 控制(默认关闭,避免意外拉取大仓库);做题页的“重新拉取代码”为用户主动触发,不受该开关限制,且走“发起 job + 轮询状态”的异步链路(见 §9.6)
 
-**出题模型三级解析**(`generator.resolve_llm_client`):`task.llm_config_id`(任务级)> `practice_generate` 槽位默认(存 `model_slot_defaults`,旧列 `practice_settings.default_llm_config_id` 只作新表无行时的兜底)> env 默认(`LLM_PROVIDER` / `LLM_MODEL`),任一级缺失或失效逐级回退。
+**出题素材门控(自动与手动两条路径共用 `_has_structured_findings`)**:判据必须与 generator 实际取材口径一致 —— `_select_findings` **只从 `results` 取素材**,所以「有结构化素材」等价于「存在带非空元信息的 Result(知识点)」;成立时据其出题,否则传 `conversation_fallback=True` 改从 user↔agent1 对话提炼伪发现(对话也提不出东西时退回用现有 Result,不掏空素材)。
+
+**不要把 `ReviewItem` 加回这条门控**:审查项不落 `results`、不进出题素材。关掉知识点提炼时 agent2 仍照常发射 `submit_review_item`(只剔除 `submit_knowledge_point`),一旦按审查项存在与否判定,门恒为真 → 对话降级分支被完全短路(曾经的真实缺陷)。`ReviewItem` 只用于回溯出题来源(`Question.source_review_item_id`)。
+
+**出题模型三级解析**(`generator.resolve_llm_client`):`task.llm_config_id`(任务级)> `practice_generate` 槽位默认(存 `model_slot_defaults`,旧列 `practice_settings.default_llm_config_id` 只在槽位行没做过模型决定时兜底,见 §9.19)> env 默认(`LLM_PROVIDER` / `LLM_MODEL`),任一级缺失或失效逐级回退。
 
 **思考模式覆盖**:`practice_generate` 槽位的 `thinking_mode`(旧列 `practice_settings.thinking_mode_for_practice` 仅作兜底)三态(follow=跟随模型配置 / on=强制开 / off=强制关),出题前应用到 `client.enable_thinking`;catalog 中 thinking=only 的模型强制关被忽略并记日志。
 
@@ -857,9 +861,13 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 
 **API**(`backend/app/routers/model_configs.py`,均鉴权):`GET /models/defaults`(一次返回全部槽位 + 只读说明行 AI 润色 / Embedding / 外部 CLI + 环境默认模型名;每行带 `source` 与 `stale`)、`PUT /models/defaults`(部分写:`None`=不修改、空串=清空;白名单校验 `writable`,配置 id 做归属校验)。
 
+`llm_config_id` 列是**三态**,不能只当「有值 / NULL」两态看:非空字符串 = 生效的配置 id;空串 `''` = 用户显式清空过(解析链回退 env);NULL = 这行还没做过模型决定(只为思考模式建的行,或迁移还没跑)—— 只有这一种才回退旧列。清空若写成 NULL,会被下面的启动迁移当成「还没交接」而每次重启刷回旧值,导致存量用户在 UI 上永远取消不掉该设置。
+
 **解析收敛**:`resolve_slot_client` / `resolve_client_for_task` 取代原先四份重复实现(`orchestrator._build_llm_client`、`generator._client_from_config_id`、`memory_summarize` 内联、`prompt_polish` 无),任务级与用户级都失配时静默回退 env(记日志不抛异常,匿名任务跳过槽位)。
 
-**旧列与旧 API 字段保留**:`migrate_model_slot_defaults()` 启动时把旧列拷入新表(`ON CONFLICT ... WHERE llm_config_id IS NULL`,重跑不会把用户在新表上的选择刷回旧值);旧列**不删**,仅在新表无行时作读取兜底。`PUT /memory/preferences/practice` 与 `/memory_settings` **写穿**到槽位表,`GET /memory/preferences` 的同名字段改由槽位表投影 —— 因此练习设置/记忆设置面板与 TaskCreateView 等消费方零改动。
+**旧列与旧 API 字段保留**:`migrate_model_slot_defaults()` 启动时把旧列拷入新表(`ON CONFLICT ... DO UPDATE ... WHERE llm_config_id IS NULL`:重跑既不会把用户在新表上的选择刷回旧值,也不会复活已清空的槽位 —— 后者因为清空存的是 `''` 而不是 NULL,条件不成立);旧列**不删**,仅在槽位行没做过模型决定(NULL)时作读取兜底 —— 因此迁移没跑的老用户设置仍生效。`PUT /memory/preferences/practice` 与 `/memory_settings` **写穿**到槽位表,`GET /memory/preferences` 的同名字段改由槽位表投影 —— 因此练习设置/记忆设置面板与 TaskCreateView 等消费方零改动。
+
+注:旧列在改造前已有值的用户,若之前尝试过「清空」并被迁移刷回,库里现存的是旧值;读路径修复后需再点一次清空(无法与「从未设置」区分,故不做自动回洗)。
 
 **已知不做**(聚合页仅列为只读说明):`AI 润色`固定走环境默认模型并强制关思考(`POST /tasks/polish_prompt` 无鉴权依赖,要按用户配模型得先改端点);`Embedding` 仅存配置与测连通性,尚无消费方(不做一个不生效的开关);外部 CLI 模型在「CLI 设置」与任务高级设置里配,不属同一命名空间。
 

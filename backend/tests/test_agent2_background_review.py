@@ -12,6 +12,7 @@
 - suggestions 落库契约(前端解析 type=suggestions 渲染追问卡片)
 - 临时结果助手 _replace_interim_results:按轮清理后落单条
 - 用户终止检查:保留临时结果 + review_status=stopped + 跳过审查下游链
+- 关闭提炼知识点:审查成功时临时结果定稿为「未提炼知识点」,不停在「整理中」
 """
 import json
 import uuid
@@ -71,7 +72,10 @@ def _patch_env(monkeypatch, executor, ua_side_effect):
     monkeypatch.setattr(orchestrator, "resolve_agent_policy",
                         lambda *a, **k: {"agent2_enabled": True})
     monkeypatch.setattr(orchestrator, "perf_log", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator, "_build_llm_client", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(
+        orchestrator, "_resolve_llm_client",
+        lambda *a, **k: (MagicMock(), orchestrator.CLIENT_FROM_TASK_CONFIG),
+    )
     monkeypatch.setattr(orchestrator, "_build_react_llm_client",
                         lambda *a, **k: (MagicMock(), None))
     monkeypatch.setattr(orchestrator, "_load_git_tokens", lambda *a, **k: {})
@@ -751,6 +755,112 @@ def test_review_stopped_keeps_interim_and_skips_downstream(monkeypatch):
     ), updates
     # 终止后下游链整体不跑(记忆归纳 + 自动出题)
     assert downstream == []
+
+
+# ============================================================
+# 关闭提炼知识点(review_status=done 但本轮无知识点可替换临时结果)
+# ============================================================
+
+
+def _assert_interim_title_finalized(db, expected_title: str):
+    updates = db.query.return_value.filter.return_value.update.call_args_list
+    assert any(
+        (call.args[0] or {}).get("title") == expected_title for call in updates
+    ), updates
+    # 也不再挂着「整理中」这条临时标题
+    assert not any(
+        (call.args[0] or {}).get("title") == "执行结果(检查助手整理中)"
+        for call in updates
+    ), updates
+
+
+def test_extract_kp_off_finalizes_interim_title(monkeypatch):
+    """关闭提炼 + 审查成功(非发射路径):不删本轮临时结果,但标题必须定稿。
+
+    初版缺陷:临时标题只有「被知识点替换」和「检查已终止」两条出口,而关闭提炼后
+    两条都走不到 —— badge 已是「检查完成」,结果卡却永远写着「检查助手整理中」。"""
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+    db = MagicMock()
+    # agent2 被提示不要在总结 JSON 里输出 results
+    reviewed = _mk_review_result(results=[])
+
+    _patch_env(monkeypatch, executor, lambda *a, **k: reviewed)
+    monkeypatch.setattr(
+        orchestrator, "resolve_agent_policy",
+        lambda *a, **k: {"agent2_enabled": True, "extract_knowledge_points": False},
+    )
+    rec = _EventRecorder(monkeypatch)
+
+    orchestrator.run_dual_agent_audit(task, db)
+
+    # 关闭提炼后“本轮无知识点”属预期,不能因此判审查失败
+    assert task.review_status == "done"
+    assert rec.events("review_done")[0][2] == {"review_status": "done"}
+    # 不删不写:全链路只删过一次(临时结果落库前的本轮清理)
+    assert db.query.return_value.filter.return_value.delete.call_count == 1
+    assert len([
+        c.args[0] for c in db.add.call_args_list if isinstance(c.args[0], Result)
+    ]) == 1  # 仅 agent1 summary 那条临时结果
+    _assert_interim_title_finalized(db, "执行结果(未提炼知识点)")
+    # current_stage 也说明未提炼(旧行为下这里会说“整理出 0 个”)
+    assert "未提炼知识点" in task.current_stage
+
+
+def test_extract_kp_off_finalizes_interim_title_on_emit_path(monkeypatch):
+    """发射路径同样有这个洞:知识点落库才清理临时结果,关闭提炼后永远不发。
+
+    同时验证文案: kp_count 恒为 0 时不应报“0 个知识点”。"""
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+    db = MagicMock()
+    reviewed = _mk_review_result(
+        results=[], _emitted=True, item_count=3, kp_count=0, suggestions=[],
+    )
+
+    _patch_env(monkeypatch, executor, lambda *a, **k: reviewed)
+    monkeypatch.setattr(
+        orchestrator, "resolve_agent_policy",
+        lambda *a, **k: {"agent2_enabled": True, "extract_knowledge_points": False},
+    )
+    _EventRecorder(monkeypatch)
+
+    orchestrator.run_dual_agent_audit(task, db)
+
+    assert task.review_status == "done"
+    _assert_interim_title_finalized(db, "执行结果(未提炼知识点)")
+    assert task.current_stage == "任务完成,检查助手发射 3 条审查项(未提炼知识点)"
+    assert "0 个知识点" not in task.current_stage
+
+
+def test_extract_kp_on_still_replaces_interim_results(monkeypatch):
+    """反向守卫:提炼开着时旧行为不变 —— 删本轮临时结果并写入知识点,
+    不得把标题定稿成「未提炼知识点」。"""
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+    db = MagicMock()
+
+    _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
+    rec = _EventRecorder(monkeypatch)
+
+    orchestrator.run_dual_agent_audit(task, db)
+
+    assert task.review_status == "done"
+    assert rec.events("review_done")[0][2] == {"review_status": "done"}
+    # 替换 = 两次全删(临时落库时 1 次 + 审查完成时 1 次)
+    assert db.query.return_value.filter.return_value.delete.call_count == 2
+    added = [
+        c.args[0] for c in db.add.call_args_list if isinstance(c.args[0], Result)
+    ]
+    assert [r.title for r in added[1:]] == ["知识点1", "知识点2"]
+    # 没有任何标题改写(走的是删行重建,不是 update)
+    assert db.query.return_value.filter.return_value.update.call_args_list == []
 
 
 def test_background_review_registers_round_and_stop_check(monkeypatch):

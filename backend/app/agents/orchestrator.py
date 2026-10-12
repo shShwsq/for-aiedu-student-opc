@@ -92,6 +92,13 @@ logger = logging.getLogger(__name__)
 # 审查失败/终止时保留。单独提到常量:终止收尾需按它定位行改写标题,
 # 字面量散落两处会改不到(与前端 task-detail-view-structure 的描述一致)
 INTERIM_RESULT_TITLE = "执行结果(检查助手整理中)"
+# 临时 Result 的两条定稿出口(都走不到时标题会永远写着「整理中」):
+# - 用户中途终止:本轮本就没产出
+STOPPED_RESULT_TITLE = "执行结果(检查已终止)"
+# - 关闭「提炼重点与知识点」且审查成功:本轮不会有知识点来替换临时结果
+#   (发射路径的清理也挂在首个知识点落库上),既不能留「整理中」(等不到替换),
+#   也不该用「检查已终止」(用户没终止)。括号内说明与非发射路径的 current_stage 同口径
+UNEXTRACTED_RESULT_TITLE = "执行结果(未提炼知识点)"
 
 
 # ============================================================
@@ -296,14 +303,15 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
     # - llm_client:agent2 评估用(来自 task.llm_config_id,未指定时回退「任务默认审查模型」槽位)
     # - react_client:内置 react_agent 用(来自 task.react_llm_config_id,空时回退到 llm_config_id)
     #   外部 CLI 执行器忽略 react_client(模型由 CLI 自管)
-    llm_client = _build_llm_client(
+    # 日志报实际命中来源:带的 id 已被删时真正用的是槽位默认,报成原字段会排障跑错
+    llm_client, llm_client_source = _resolve_llm_client(
         db, task.user_id, task.llm_config_id,
         fallback_slot=model_slots.SLOT_REVIEW_DEFAULT,
     )
     react_client, react_client_source = _build_react_llm_client(db, task)
     logger.info(
         f"[task={task.id}] LLM 配置:agent2={getattr(llm_client, 'model', None) or 'env 默认'}"
-        f"(来源={'task.llm_config_id' if task.llm_config_id else 'review_default 槽位/env'}),"
+        f"(来源={_client_source_label(llm_client_source, 'task.llm_config_id')}), "
         f"react_agent 来源={react_client_source}, executor={task.executor}"
     )
 
@@ -826,12 +834,14 @@ def _replace_interim_results(
     return len(interim)
 
 
-def _mark_interim_review_stopped(db: Session, task: Task, round_idx: int) -> None:
-    """终止检查后把本轮临时 Result 的"整理中"标题改正
+def _finalize_interim_result_title(
+    db: Session, task: Task, round_idx: int, title: str,
+) -> None:
+    """把本轮仍是临时结果(`INTERIM_RESULT_TITLE`)的 Result 改成定稿标题
 
-    知识点只在审查结束时一次性产出,中途终止意味着本轮没有可替换的整理结果,
-    留下的仍是 agent1 summary 临时结果 —— 标题写着"检查助手整理中",不改正会
-    永远误导用户(审查失败路径保留原样:失败可能是暂时的,用户会重试)。
+    知识点只在审查结束时一次性产出并替换临时结果,终止 / 关闭提炼两条路都不会有
+    替换,留下的仍是 agent1 summary 临时结果 —— 标题写着"检查助手整理中",不改正
+    会永远误导用户(审查失败路径保留原样:失败可能是暂时的,用户会重试)。
     只改本轮且标题仍是临时结果的那几条:并行轮次的临时结果属于另一条流。
     """
     try:
@@ -839,15 +849,18 @@ def _mark_interim_review_stopped(db: Session, task: Task, round_idx: int) -> Non
             Result.task_id == task.id,
             Result.round_idx == round_idx,
             Result.title == INTERIM_RESULT_TITLE,
-        ).update(
-            {"title": "执行结果(检查已终止)"}, synchronize_session=False
-        )
+        ).update({"title": title}, synchronize_session=False)
         db.commit()
     except Exception as e:
         db.rollback()
         logger.warning(
-            f"[task={task.id}] 改写终止后的临时结果标题失败(忽略): {e}"
+            f"[task={task.id}] 改写临时结果标题为「{title}」失败(忽略): {e}"
         )
+
+
+def _mark_interim_review_stopped(db: Session, task: Task, round_idx: int) -> None:
+    """终止检查后把本轮临时 Result 的"整理中"标题改正为「检查已终止」"""
+    _finalize_interim_result_title(db, task, round_idx, STOPPED_RESULT_TITLE)
 
 
 def _auto_resume_leftover_messages(task: Task, db: Session, task_id_str: str) -> bool:
@@ -1084,9 +1097,13 @@ def _run_background_review(
                 kp_count = int(ua_result.get("kp_count") or 0)
                 if not _superseded():
                     task.review_status = "done"
+                    # 关闭提炼时 kp_count 恒为 0:报「0 个知识点」会被读成审查没做完,
+                    # 改成与非发射路径同口径的「未提炼知识点」说明
                     task.current_stage = (
                         f"任务完成,检查助手发射 {item_count} 条审查项、"
                         f"{kp_count} 个知识点"
+                        if _extract_enabled else
+                        f"任务完成,检查助手发射 {item_count} 条审查项(未提炼知识点)"
                     )
                 logger.info(
                     f"[task={task.id}] 后台审查完成(结构化发射),"
@@ -1133,6 +1150,15 @@ def _run_background_review(
                     f"[task={task.id}] 后台审查完成,"
                     f"整理 {len(structured_results)} 个结构化结果,"
                     f"{len(ua_result.get('suggestions') or [])} 条建议"
+                )
+
+            # 关闭提炼时本轮不会有知识点来替换临时 Result(非发射路径不删不写,
+            # 发射路径的清理又挂在首个知识点落库上):不在此定稿标题,结果卡会
+            # 在 badge 已显示「检查完成」的同时永远停在「检查助手整理中」。
+            # 与终止路径同样不受世代门控影响:只改本轮仍挂临时标题的那几条。
+            if not _extract_enabled:
+                _finalize_interim_result_title(
+                    db, task, round_idx, UNEXTRACTED_RESULT_TITLE,
                 )
 
         # 世代门控:被新流取代时跳过 badge 更新与 review_done 事件
@@ -1221,25 +1247,35 @@ def _publish_status(task: Task) -> None:
     })
 
 
-def _build_llm_client(
+# _resolve_llm_client 的来源标签:报告「实际用了哪一级的模型」,不是「调用点传了哪个字段」
+CLIENT_FROM_TASK_CONFIG = "task_config"   # 任务自带的配置 id 命中
+CLIENT_FROM_SLOT = "slot"                 # 落到用户级模型槽位兜底
+CLIENT_FROM_ENV = "env_default"           # 都没命中,由 agent 侧构 env 默认
+
+
+def _resolve_llm_client(
     db: Session,
     user_id,
     llm_config_id: str | None = None,
     *,
     label: str = "llm_config_id",
     fallback_slot: str | None = None,
-) -> LLMClient | None:
-    """按 user_id + llm_config_id 加载用户保存的 LLM 配置
+) -> tuple[LLMClient | None, str]:
+    """按 user_id + llm_config_id 加载用户保存的 LLM 配置,并报告实际命中来源
 
-    - user_id 为空(匿名任务)且无 fallback_slot → 返回 None,agent 回退到 env 默认
-    - 找到指定配置 → 返回 LLMClient.from_config_dict(...)
+    返回 (client, source),source ∈ {task_config, slot, env_default}。
+    「传了哪个字段」与「最终用了哪一级的模型」不是一回事:任务带的 id 已被删/加载
+    失败时会落到槽位兜底,日志仍报原字段会把排障引向错误方向。
+
+    - user_id 为空(匿名任务)且无 fallback_slot → (None, env_default),agent 回退到 env 默认
+    - 找到指定配置 → (LLMClient.from_config_dict(...), task_config)
     - 未传 id / 找不到配置 id / 构造失败 → 依次试 fallback_slot 的槽位默认
-      (见 app/services/model_slots.py),仍未命中 → 记日志并回退 None
+      (见 app/services/model_slots.py),仍未命中 → 记日志并回退 (None, env_default)
 
     label 仅用于日志区分(agent2 / react_agent)。
     """
     if user_id is None:
-        return None
+        return None, CLIENT_FROM_ENV
     if llm_config_id:
         try:
             cfg = db.query(UserLLMConfig).filter(UserLLMConfig.user_id == user_id).first()
@@ -1259,23 +1295,38 @@ def _build_llm_client(
                     f"[user={user_id}] 未找到 {label}={llm_config_id},尝试槽位默认"
                 )
                 return _slot_default(db, user_id, fallback_slot, label)
-            return LLMClient.from_config_dict(target)
+            return LLMClient.from_config_dict(target), CLIENT_FROM_TASK_CONFIG
         except Exception as e:
             logger.warning(f"[user={user_id}] 加载用户 LLM 配置失败({label}): {e}")
             return _slot_default(db, user_id, fallback_slot, label)
     return _slot_default(db, user_id, fallback_slot, label)
 
 
+def _build_llm_client(
+    db: Session,
+    user_id,
+    llm_config_id: str | None = None,
+    *,
+    label: str = "llm_config_id",
+    fallback_slot: str | None = None,
+) -> LLMClient | None:
+    """只要客户端的调用点用这个(来源不关心时);语义同 _resolve_llm_client"""
+    client, _source = _resolve_llm_client(
+        db, user_id, llm_config_id, label=label, fallback_slot=fallback_slot,
+    )
+    return client
+
+
 def _slot_default(
     db: Session, user_id, slot: str | None, label: str,
-) -> LLMClient | None:
-    """取槽位默认客户端;没配/未命中返回 None(调用方回退 env 默认)"""
+) -> tuple[LLMClient | None, str]:
+    """取槽位默认客户端;没配/未命中返回 (None, env_default) 让调用方回退 env"""
     if not slot:
-        return None
+        return None, CLIENT_FROM_ENV
     client, source = model_slots.resolve_slot_client(db, user_id, slot, label=label)
     if source != model_slots.SOURCE_SLOT:
-        return None
-    return client
+        return None, CLIENT_FROM_ENV
+    return client, CLIENT_FROM_SLOT
 
 
 def _build_react_llm_client(
@@ -1288,24 +1339,33 @@ def _build_react_llm_client(
     优先级:task.react_llm_config_id → task.llm_config_id(回退) → 任务默认审查模型槽位
             → None(env 默认)
 
-    返回 (client, source_label):
-        source_label 取值 "react_llm_config_id" / "llm_config_id" / "env_default",
-        仅供日志记录用。
+    返回 (client, source_label):报的是**实际命中那一级的模型**(供日志),
+    取 "task.react_llm_config_id" / "task.llm_config_id" / "review_default 槽位" /
+    "env 默认" —— 旧实现只要传过 react_id 就固定报 "react_llm_config_id",
+    槽位兜底时会让人对着没生效的字段排障。
     """
     react_id = task.react_llm_config_id
     if react_id:
-        client = _build_llm_client(
+        client, source = _resolve_llm_client(
             db, task.user_id, react_id, label="react_llm_config_id",
             fallback_slot=model_slots.SLOT_REVIEW_DEFAULT,
         )
-        # 即使 client 为 None(未找到/加载失败)也认为用的是 react_llm_config_id 槽位
-        return client, "react_llm_config_id"
+        return client, _client_source_label(source, "task.react_llm_config_id")
     # 回退到 agent2 的配置(再为空时走同一个任务默认审查模型槽位)
-    client = _build_llm_client(
+    client, source = _resolve_llm_client(
         db, task.user_id, task.llm_config_id, label="llm_config_id(fallback)",
         fallback_slot=model_slots.SLOT_REVIEW_DEFAULT,
     )
-    return client, "llm_config_id"
+    return client, _client_source_label(source, "task.llm_config_id")
+
+
+def _client_source_label(source: str, task_field: str) -> str:
+    """来源枚举 → 日志文案:槽位/env 兜底要说清,不能沿用它报上来的任务字段"""
+    if source == CLIENT_FROM_SLOT:
+        return "review_default 槽位"
+    if source == CLIENT_FROM_ENV:
+        return "env 默认"
+    return task_field
 
 
 def _load_git_tokens(db: Session, user_id) -> dict[str, str]:

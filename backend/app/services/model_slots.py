@@ -13,9 +13,12 @@ practice.generator / memory_summarize 里的四份「按 config id 造 LLMClient
   才拿得到任务对象与开关,本模块不猜优先级
 
 写入约定(与既有设置端点一致):`None`=本次不修改,空串 `""`=清空(回退 env)。
-过渡期兜底:新表无行时读取旧列值(practice_settings / memory_settings 上的模型列,
-已被 migrate_model_slot_defaults 拷入本表且不再被写入);调用方手里已有那行时
-可用 legacy_value 省一次查询。旧列下线后 `legacy_for` 与相关分支一并删除。
+清空在行上落成空串标记而不是 NULL(见 `CLEARED`):启动迁移只在目标行
+`llm_config_id IS NULL` 时用旧列覆盖,写 NULL 会让每次重启把用户刚清掉的模型刷回来。
+过渡期兜底:槽位行没做过模型决定(NULL)时才读旧列值(practice_settings /
+memory_settings 上的模型列,已被 migrate_model_slot_defaults 拷入本表且不再被写入);
+调用方手里已有那行时可用 legacy_value 省一次查询。旧列下线后 `legacy_for`
+与相关分支一并删除。
 """
 from __future__ import annotations
 
@@ -42,6 +45,13 @@ logger = logging.getLogger(__name__)
 
 # 「未传」与「显式传 None」要区分开(前者表示让本模块自己去取旧列)
 _MISSING = object()
+
+# 槽位行上「用户显式清空过模型」的标记:llm_config_id 存空串而不是 NULL。
+# 为什么不能用 NULL 表示清空:迁移的 `ON CONFLICT ... DO UPDATE ... WHERE
+# llm_config_id IS NULL` 把 NULL 当成「这行还没从旧列交接完」的判据,于是下一次
+# 重启又用旧列值把清空过的槽位填回去 —— 用户在 UI 上永远取消不掉这个设置。
+# 空串两边都满足:不是 NULL(迁移不动它),也不是合法配置 id(读路径视为未设置)。
+CLEARED = ""
 
 # 解析来源标识(日志与前端展示共用口径)
 SOURCE_SLOT = "slot"        # 命中用户级槽位默认
@@ -229,12 +239,21 @@ def _legacy_row(db: Session, model, user_id):
 def get_slot_config_id(
     db: Session, user_id, slot: str, *, legacy_value=_MISSING,
 ) -> str | None:
-    """槽位配置的 id:新表行优先,无行时回退旧列值(过渡期兜底)
+    """槽位配置的 id:新表行优先,行上没做过模型决定时才回退旧列值
+
+    行上的三种值含义不同,不能混:
+    - 非空字符串 = 用户选的或迁移拷来的配置 id → 以它为准
+    - 空串 `CLEARED` = 用户显式清空过 → 不回退旧列,返回 None(解析链落到 env 默认)
+    - NULL = 这行没做过模型决定(只为思考模式建的行 / 迁移还没跑)→ 继续回退旧列,
+      保住「迁移没跑时用户旧设置仍生效」这条安全网
 
     legacy_value 由已持有归属表行的调用方传入,省一次查询;不传则本函数自取。
     """
     row = get_slot_row(db, user_id, slot)
-    config_id = _clean_id(getattr(row, "llm_config_id", None)) if row else None
+    raw = getattr(row, "llm_config_id", None) if row is not None else None
+    if raw == CLEARED:
+        return None
+    config_id = _clean_id(raw)
     if config_id:
         return config_id
     if legacy_value is not _MISSING:
@@ -341,6 +360,7 @@ def set_slot(
 
     不 commit:与既有设置端点一样由调用方在同一事务里提交。
     行不存在且两侧都不写时不凭空建行(返回 None)。
+    清空写成 `CLEARED` 空串标记而不是 NULL(见常量注释),否则会被启动迁移刷回旧列。
     """
     if user_id is None:
         return None
@@ -350,8 +370,12 @@ def set_slot(
             return None
         row = ModelSlotDefault(user_id=user_id, slot=slot)
         db.add(row)
+        # autoflush 关闭:不 flush 的话同一事务内第二次 set_slot 同一槽位仍读不到这行,
+        # 会再建一行并在 commit 时撞 uq_model_slot_user_slot。建行后立刻 flush 一次,
+        # 把原先只写在调用点注释里的「一次调用写两侧」升级成代码保证。
+        db.flush()
     if llm_config_id is not None:
-        row.llm_config_id = llm_config_id or None
+        row.llm_config_id = llm_config_id or CLEARED
     if thinking_mode is not None and thinking_mode in THINKING_MODES:
         row.thinking_mode = thinking_mode
     return row

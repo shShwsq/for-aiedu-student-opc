@@ -106,6 +106,7 @@ class FakeSession:
     与真实库的已知差异(测试里不要依赖这些):
     - 列默认值/UUID 主键在 flush 时才生效,故 add() 里手工补 thinking_mode 默认
     - 不做唯一约束校验
+    - flush() 只计数不真写库(用例只关心 set_slot 有没有在建行后刷一次)
     """
 
     def __init__(self, llm_configs=None, slots=None, settings_rows=None):
@@ -124,6 +125,7 @@ class FakeSession:
                 thinking_mode=(values[1] if len(values) > 1 else "follow"),
             ))
         self.commits = 0
+        self.flushes = 0
 
     def query(self, model):
         return _FakeQuery(model, self.store)
@@ -136,6 +138,9 @@ class FakeSession:
 
     def commit(self):
         self.commits += 1
+
+    def flush(self):
+        self.flushes += 1
 
     def refresh(self, obj):  # pragma: no cover - 替身无需刷新
         return None
@@ -187,7 +192,8 @@ def test_resolve_no_row_uses_legacy_column(no_llm):
 
 
 def test_row_without_id_still_falls_back_to_legacy_column(no_llm):
-    """槽位行存在但没分配模型:配置 id 仍回退旧列;思考模式以新表为准"""
+    """槽位行为 NULL(没做过模型决定,如只为思考模式建的行):配置 id 仍回退旧列;
+    思考模式以新表为准。注意这与「已清空」不同 —— 见下一条。"""
     db = FakeSession(
         llm_configs=[CFG_B], slots={SLOT_MEMORY_CURATOR: (None, "on")},
     )
@@ -197,6 +203,28 @@ def test_row_without_id_still_falls_back_to_legacy_column(no_llm):
     assert model_slots.get_slot_thinking_mode(
         db, "u1", SLOT_MEMORY_CURATOR, legacy_value="follow",
     ) == "on"
+
+
+def test_cleared_slot_marker_wins_over_legacy_column(no_llm):
+    """清空过的槽位(行上存 '')不再回退旧列,整条解析链落到 env 默认。
+
+    初版缺陷:清空写成 NULL,读路径与启动迁移都把 NULL 当成「没设置」,
+    结果存量用户点「跟随系统默认」后当场弹回、重启后又长回来。"""
+    db = FakeSession(
+        llm_configs=[CFG_B],
+        slots={SLOT_MEMORY_CURATOR: (model_slots.CLEARED, "follow")},
+    )
+    assert model_slots.get_slot_config_id(
+        db, "u1", SLOT_MEMORY_CURATOR, legacy_value="cfg-b",
+    ) is None
+    client, source = model_slots.resolve_slot_client(
+        db, "u1", SLOT_MEMORY_CURATOR, legacy_value="cfg-b",
+    )
+    assert source == model_slots.SOURCE_ENV
+    assert client.model == "env-default"
+    # 聚合页也不能把旧列值当成生效值(否则「本次将使用」与实际不一致)
+    view = {v["slot"]: v for v in model_slots.slot_views(db, "u1")}[SLOT_MEMORY_CURATOR]
+    assert view["llm_config_id"] is None and view["source"] == "env"
 
 
 def test_resolve_anonymous_uses_env(no_llm):
@@ -290,6 +318,49 @@ def test_orchestrator_build_client_chain(no_llm, monkeypatch):
     ) is None
 
 
+def test_react_client_source_reports_the_tier_actually_used(no_llm, monkeypatch):
+    """排障日志的来源必须是「实际用了哪一级」。
+
+    旧实现只要任务带过 react_llm_config_id 就固定报那个字段,而该 id 已被删时
+    真正生效的是槽位默认 —— 对着错误的字段排障会找不到原因。"""
+    import app.agents.orchestrator as orchestrator
+
+    monkeypatch.setattr(orchestrator, "LLMClient", _FakeLLM)
+    from app.agents.orchestrator import CLIENT_FROM_SLOT, _build_react_llm_client
+
+    db = FakeSession(
+        llm_configs=[CFG_A, CFG_B],
+        slots={SLOT_REVIEW_DEFAULT: ("cfg-b", "follow")},
+    )
+
+    def _task(react_id, llm_id=None):
+        return SimpleNamespace(
+            id="t1", user_id="u1",
+            react_llm_config_id=react_id, llm_config_id=llm_id,
+        )
+
+    # 1) 任务自带 id 命中:报字段名
+    client, label = _build_react_llm_client(db, _task("cfg-a"))
+    assert client.model == "qwen-max" and label == "task.react_llm_config_id"
+    # 2) 自带 id 已被删:实际走的是槽位默认,不能再报原字段
+    client, label = _build_react_llm_client(db, _task("gone"))
+    assert client.model == "glm-4" and label == "review_default 槽位"
+    # 3) 没带 react id 但带了 llm_config_id:报回退字段名
+    client, label = _build_react_llm_client(db, _task(None, "cfg-a"))
+    assert client.model == "qwen-max" and label == "task.llm_config_id"
+    # 4) 两边都没配但槽位有默认:报槽位
+    client, label = _build_react_llm_client(db, _task(None, None))
+    assert client.model == "glm-4" and label == "review_default 槽位"
+    # 5) 全都没命中:报 env
+    empty = FakeSession(llm_configs=[CFG_A])
+    client, label = _build_react_llm_client(empty, _task(None, None))
+    assert client is None and label == "env 默认"
+    # 来源枚举与文案分层一致(枚举供其他调用方复用)
+    assert orchestrator._resolve_llm_client(
+        db, "u1", "gone", fallback_slot=SLOT_REVIEW_DEFAULT,
+    )[1] == CLIENT_FROM_SLOT
+
+
 def test_set_slot_semantics(no_llm):
     """get_or_create + None=不修改 / 空串=清空 / 脏思考模式忽略 / 不凭空建行"""
     db = FakeSession()
@@ -307,13 +378,29 @@ def test_set_slot_semantics(no_llm):
     assert row.llm_config_id == "cfg-a"
     assert row.thinking_mode == "on"
 
-    # 空串=清空回退 env
+    # 空串=清空回退 env:落成 CLEARED 标记而不是 NULL(NULL 会被启动迁移当成
+    # 「还没从旧列交接完」而刷回旧值)
     model_slots.set_slot(db, user_id, SLOT_REVIEW_DEFAULT, llm_config_id="")
-    assert row.llm_config_id is None
+    assert row.llm_config_id == model_slots.CLEARED
+    assert row.llm_config_id is not None
     # 始终同一行(get_or_create 没建成第二行)
     assert len([r for r in db.store["slots"] if r.slot == SLOT_REVIEW_DEFAULT]) == 1
     # 匿名用户不建行
     assert model_slots.set_slot(db, None, SLOT_REVIEW_DEFAULT, llm_config_id="cfg-a") is None
+
+
+def test_set_slot_flushes_after_creating_row(no_llm):
+    """autoflush 关闭:新建行后必须 flush 一次,否则同事务内重复调用会撞唯一约束"""
+    db = FakeSession()
+    assert db.flushes == 0
+    model_slots.set_slot(db, db.user_id, SLOT_PRACTICE_GENERATE, llm_config_id="cfg-a")
+    assert db.flushes == 1  # 建行后刷一次
+    # 行已存时不再多刷(只改已有行不需要 flush)
+    model_slots.set_slot(db, db.user_id, SLOT_PRACTICE_GENERATE, thinking_mode="on")
+    assert db.flushes == 1
+    # 不建行也不刷(两侧都没写)
+    model_slots.set_slot(db, db.user_id, SLOT_MEMORY_CURATOR)
+    assert db.flushes == 1
 
 
 # ============================================================
@@ -570,6 +657,42 @@ def test_migrate_copies_legacy_columns_and_is_idempotent(db_ready, factory, monk
     assert rows[SLOT_PRACTICE_GENERATE].llm_config_id == "cfg-b"
     # 每槽位仍只有一行(迁移重跑不翻倍);practice_explain 旧列为空 → 不建行
     assert len(rows) == 2
+
+
+def test_migrate_does_not_resurrect_a_cleared_slot(db_ready, factory, monkeypatch):
+    """存量用户清空槽位的完整回归链(旧实现写 NULL 时这两步都中招):
+    ① PUT 响应不得回显旧列值(否则前端下拉当场弹回)
+    ② 重启重跑迁移不得把旧列值刷回来(否则「取消设置」永远失败)
+    """
+    user = _seed_user(factory)
+    db = factory()
+    db.add(PracticeSettings(
+        user_id=user.id, default_llm_config_id="cfg-a", thinking_mode_for_practice="on",
+    ))
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr("app.database.engine", db_ready)
+    migrate_model_slot_defaults()  # 旧列值交接进新表(存量用户起点)
+
+    client = _api_client(factory, user, memory_router)
+    r = client.put("/memory/preferences/practice", json={
+        "auto_generate_practice": True, "default_llm_config_id": "",
+    })
+    assert r.status_code == 200
+    assert r.json()["default_llm_config_id"] is None
+
+    migrate_model_slot_defaults()  # 模拟一次重启
+
+    rows = _slots_of(factory, user.id)
+    assert rows[SLOT_PRACTICE_GENERATE].llm_config_id == model_slots.CLEARED
+    db = factory()
+    # 旧列原样保留(新表是唯一写入口),但读路径已不再看它
+    assert db.query(PracticeSettings).filter_by(
+        user_id=user.id,
+    ).first().default_llm_config_id == "cfg-a"
+    assert model_slots.get_slot_config_id(db, user.id, SLOT_PRACTICE_GENERATE) is None
+    db.close()
 
 
 def test_migrate_skips_users_with_nothing_set(db_ready, factory, monkeypatch):

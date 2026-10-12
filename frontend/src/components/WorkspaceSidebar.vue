@@ -52,7 +52,9 @@ const auth = useAuthStore()
  * - min/max 给内容留呼吸(窄了代码换行、宽了顶穿主对话流);
  * - maxViewportRatio=0.5 与右侧核查面板同档,单栏最多半屏;另有常驻 .workspace-sidebar
  *   (280px)同在这条 flex 行里,合计占位再叠加,靠比例上限 + 主区 flex 兵分当缓冲;
- * - narrowMax=640 对齐下面 @media(≤60…40 侧栏转覆盖抽屉,拖一个浮层无意义→隐藏手柄、宽度交 CSS);
+ * - narrowMax=640 必须与下面两个 @media (max-width: 640px) 同断点(侧栏转覆盖抽屉、
+ *   文件面板改由 CSS 定宽):isNarrow 时隐藏手柄、不下发内联宽度,宽度归 CSS 管;
+ *   两边取值不一致会让 JS 判断与实际样式错位(见 useResizableSidebar 文件头约定);
  * - 按「用户 email + 槽位」记忆到 localStorage(email 未就位则不读写,刷新回默认 480)。
  */
 const {
@@ -2788,6 +2790,17 @@ defineExpose({ openTaskFile })
   overflow: hidden;
   background: var(--color-bg);
   border-right: 1px solid var(--color-border);
+}
+
+/* 手机窄屏(≤640):isNarrow 已不再下发内联宽度,这里必须接住定宽 ——
+   否则面板退回上面的 480px 固定值,在小屏上占到 75%+ 宽度并把主对话流挤出去
+   (此断点与 useResizableSidebar 的 narrowMax 同源,两边要一起改) */
+@media (max-width: 640px) {
+  .file-panel {
+    width: 100%;
+    max-width: 100%;
+    border-right: none;
+  }
 }
 
 /* 右缘调宽手柄:左停靠,往右拖变宽。热区贴边 6px,悬停/聚焦染主色提示可拖 */

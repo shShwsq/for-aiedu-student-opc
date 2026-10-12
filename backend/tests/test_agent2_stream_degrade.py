@@ -183,7 +183,10 @@ def _mk_resume_task():
 
 def _patch_resume_env(monkeypatch, executor, ua_side_effect):
     """屏蔽 resume 链路的副作用,只测降级分流。"""
-    monkeypatch.setattr(orchestrator, "_build_llm_client", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(
+        orchestrator, "_resolve_llm_client",
+        lambda *a, **k: (MagicMock(), orchestrator.CLIENT_FROM_TASK_CONFIG),
+    )
     monkeypatch.setattr(
         orchestrator, "_build_react_llm_client",
         lambda *a, **k: (MagicMock(), None),
@@ -326,7 +329,10 @@ def _patch_dual_env(monkeypatch, executor, ua_side_effect):
     monkeypatch.setattr(orchestrator, "resolve_agent_policy",
                         lambda *a, **k: {"agent2_enabled": True})
     monkeypatch.setattr(orchestrator, "perf_log", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator, "_build_llm_client", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(
+        orchestrator, "_resolve_llm_client",
+        lambda *a, **k: (MagicMock(), orchestrator.CLIENT_FROM_TASK_CONFIG),
+    )
     monkeypatch.setattr(orchestrator, "_build_react_llm_client",
                         lambda *a, **k: (MagicMock(), None))
     monkeypatch.setattr(orchestrator, "_load_git_tokens", lambda *a, **k: {})

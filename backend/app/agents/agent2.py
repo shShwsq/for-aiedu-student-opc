@@ -341,11 +341,18 @@ def run_agent2(
 
     # 是否提炼重点与知识点(agent 能力开关;默认开)
     extract_kp = bool((agent_policy or {}).get("extract_knowledge_points", True))
-    _topic_keys, _default_topic, _topic_prompt = _agent2_learning_topics(db, user_id)
-    if extract_kp and _topic_prompt:
+    if extract_kp:
         # 归类知识点需学习主题词表:注入词表 + 校验集交给发射处(非法/缺失回落 default)
-        system_prompt = system_prompt + "\n\n" + _topic_prompt
-    elif not extract_kp:
+        _topic_keys, _default_topic, _topic_prompt = _agent2_learning_topics(db, user_id)
+        if _topic_prompt:
+            system_prompt = system_prompt + "\n\n" + _topic_prompt
+    else:
+        # 关闭提炼:工具已剔除 submit_knowledge_point(且发射处有一道早退守卫),
+        # 主题词表只服务于知识点归类 —— 不再白跑一次 ensure_user_topics 播种。
+        # 取发射处自身的默认值,避免隐式把未校验的 key 当成合法主题。
+        from app.models.practice import DEFAULT_LEARNING_TOPIC
+
+        _topic_keys, _default_topic = None, DEFAULT_LEARNING_TOPIC
         system_prompt = system_prompt + (
             "\n\n## 本轮不提炼知识点\n用户已关闭「重点与知识点」提炼:只做核查/验证/复核,"
             "不要调用 submit_knowledge_point,也不要在总结 JSON 里输出 results(留空)。"

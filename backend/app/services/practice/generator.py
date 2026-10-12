@@ -909,12 +909,33 @@ def _merge_kp_languages(kp: KnowledgePoint, languages: list[str] | None) -> None
         kp.languages = merged + added
 
 
+def _normalize_knowledge_key(value) -> str:
+    """知识点 key 归一:只折 CWE 这一族(cwe-89 / 89 / CWE-89 → CWE-89),其余原样
+
+    看板知识点按 key 精确去重(见 _get_or_create_knowledge_point 的 SELECT),
+    所以「CWE-89」与「cwe-89」会裂成两张卡。非 CWE 的短标识(如
+    hardcoded_secrets)不能大小写折叠:那是人可读的标签,改成全大写反而更糟。
+    """
+    key = str(value or "").strip()[:64]
+    if not key:
+        return ""
+    upper = key.upper()
+    if upper.startswith("CWE-"):
+        tail = key[4:].strip()
+        # CWE 编号就是数字;非数字后缀(LLM 自由发挥)保留原样,不强改
+        return f"CWE-{tail.upper()}" if tail.isdigit() else key
+    if key.isdigit():
+        return f"CWE-{key}"
+    return key
+
+
 def _get_or_create_knowledge_point(
     db: Session, user_id, key: str, name: str, languages: list[str] | None = None,
     learning_topic: str = DEFAULT_LEARNING_TOPIC,
     cache: dict[str, "KnowledgePoint"] | None = None,
 ) -> KnowledgePoint:
-    key = (key or "").strip() or "general"
+    # 归一在取/建行的入口做:主关联与 extras、以及后续新调用方共用同一个 key 口径
+    key = _normalize_knowledge_key(key) or "general"
     if cache is not None and key in cache:
         # 本轮已取过该知识点:只做语言标签并集,省掉一次 SELECT
         # (一次 10 finding 的 job 会反复命中 CWE-89 这类高频知识点)
@@ -988,18 +1009,23 @@ def _normalize_raw_question(raw: Any, finding_meta: dict) -> dict | None:
         difficulty = 3.0
 
     # knowledge_key 优先用 finding 元信息里的 CWE(比 LLM 输出可靠)
-    cwe = str(finding_meta.get("cwe") or "").strip().upper()
-    if cwe and not cwe.startswith("CWE-") and cwe.isdigit():
-        cwe = f"CWE-{cwe}"
-    knowledge_key = cwe or str(raw.get("knowledge_key") or "").strip() or "general"
+    knowledge_key = (
+        _normalize_knowledge_key(finding_meta.get("cwe"))
+        or _normalize_knowledge_key(raw.get("knowledge_key"))
+        or "general"
+    )
 
     # 可选多知识点打标签:LLM 可在 knowledge_keys 里给出该题额外涉及的知识点 key
     # (主关联仍是 knowledge_key;extras 排除主 key 后写 question_knowledge_points)
+    # 与主 key 同口径归一,否则「cwe-89」与「CWE-89」会在看板上裂成两张卡;
+    # 去重按大小写不敏感比(保留首个写法),避开同一题里「xss/XSS」手两份
     extra_keys: list[str] = []
+    seen_keys = {knowledge_key.lower()}
     if isinstance(raw.get("knowledge_keys"), list):
         for x in raw["knowledge_keys"]:
-            s = str(x).strip()[:64]
-            if s and s != knowledge_key and s not in extra_keys:
+            s = _normalize_knowledge_key(x)
+            if s and s.lower() not in seen_keys:
+                seen_keys.add(s.lower())
                 extra_keys.append(s)
 
     code_snippet = raw.get("code_snippet")
@@ -1697,10 +1723,14 @@ def generate_questions_for_task(
     findings = _select_findings(db, task, max_findings)
     # 对话降级:无结构化发现且允许降级时,改从 user↔agent1 对话提炼伪发现
     if conversation_fallback and not _findings_have_structure(findings):
-        findings = collect_conversation_findings(
+        conv_findings = collect_conversation_findings(
             db, task, client, topic_defs,
             limit=min(max_findings, DIALOG_MAX_FINDINGS),
         )
+        # 对话太短/提炼失败时不要把素材直接掏空:未结构化的 Result(典型是
+        # 关闭知识点提炼后留下的执行结果 summary)仍是可用线索,比 0 题好
+        if conv_findings:
+            findings = conv_findings
     total_findings = len(findings)
 
     # 主题自动匹配:规则先行 + LLM 批量兜底(每任务至多一次分类调用)

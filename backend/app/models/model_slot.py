@@ -11,7 +11,9 @@ explain_llm_config_id、memory_settings.curator_llm_config_id 三个业务表列
 - UNIQUE(user_id, slot):每用户每槽位一行,首次保存 get_or_create
 - llm_config_id 存 UserLLMConfig.llm_configs 里某条配置的 id(UUID 字符串),
   **不加外键**:配置列表整体是 JSONB,删除配置时由解析链回退 env(见 model_slots)
-- llm_config_id = None 表示「未指定」,解析链回退 env 默认
+- llm_config_id 三态(别混用,否则会掉进「清空后重启又长回来」的坑):
+  非空字符串=生效的配置 id;''=用户显式清空过(解析链回退 env,迁移不覆盖);
+  NULL=这行还没做过模型决定(只为思考模式建的行,或迁移还没跑)→ 读路径继续兜底旧列
 - thinking_mode 为该槽位的思考模式覆盖(follow/on/off),默认 follow
 
 迁移:老数据在 practice_settings / memory_settings 的列上,
@@ -60,7 +62,8 @@ class ModelSlotDefault(Base):
     )
     # 槽位标识,取值见 SLOT_* 常量
     slot: Mapped[str] = mapped_column(String(48), nullable=False)
-    # 该槽位默认使用的模型配置 id(UserLLMConfig.llm_configs 中某条;None=未指定,回退 env)
+    # 该槽位默认使用的模型配置 id(UserLLMConfig.llm_configs 中某条)
+    # 三态:非空=配置 id;''=已清空(回退 env 且不被迁移刷回);NULL=没做过决定(兜底旧列)
     llm_config_id: Mapped[str | None] = mapped_column(
         String(36), nullable=True, default=None
     )
@@ -90,6 +93,8 @@ def migrate_model_slot_defaults() -> None:
     - 新表不存在(理论不会发生,建表在前)或无候选行 → 直接返回
     - 逐行 INSERT ... ON CONFLICT (user_id, slot) DO UPDATE,且只在目标行
       llm_config_id IS NULL 时覆盖:重跑不会把用户在新表上的选择刷回旧值
+    - 这里的 IS NULL 同时是「清空不会被复活」的保护:用户清空过的行存的是空串
+      ``''``而不是 NULL,条件不成立,所以下次重启不会把旧列值填回去
     - 无模型且思考模式为默认 follow 的行不拷(等价于「未设置」,不产生空行)
     """
     import logging

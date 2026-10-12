@@ -340,6 +340,10 @@ RoundGroup { roundIdx, segments, planSteps }
    提示与出题入口:提示随 review_status 分流,running →「检查助手整理中」
    (呼吸点,完成后自动更新),stopped →「检查已终止」(静止中性点:临时结果
    就是最终结果,不再等知识点替换;failed 不在这里另开提示,核查过程段 badge「检查失败」已说明)。
+   卡片自己的标题(`result-header > h4` 直接渲染 `r.title`,无前端映射)同样只有
+   三条出口:被知识点替换 / 「执行结果(检查已终止)」/ 关闭提炼时定稿为
+   「执行结果(未提炼知识点)」 —— done 却没改标题就是 bug(侧栏 badge 已「检查完成」
+   而卡片还写着「整理中」)。
    入口为练习题(`practice-generate-btn`,待确认候选题计数时文案换成「确认练习题(N)」)
    与出题进度跳转(`gen-progress-entry`,与前者互斥),它们作用于知识点,因此跟知识点段走,
    不在审查结果段。三者全部不成立时(`showKnowledgeToolbar`)整行不渲染。

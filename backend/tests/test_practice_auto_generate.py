@@ -6,6 +6,7 @@
 - 开关关闭跳过(任务级 _practice.auto_generate > 用户级 > 默认开)
 - 同一任务已有题目(任意状态)跳过
 - 无结构化 finding(纯摘要/空)→降级为基于对话出题(conversation_fallback=True 传给生成器)
+- 只有审查项、results 全无元信息(关闭知识点提炼的典型形状)→仍降级为对话出题
 - metadata 含任意非空值(含非安全场景的通用键)→据结构化发现出题(不降级)
 - 命中守卫后调 generator(带进度/事件回调),返回生成数
 - 生成过程创建 source=auto 的 job 追踪(练习页侧栏可见)
@@ -19,19 +20,15 @@ from app.services.practice.auto_generate import auto_generate_practice_for_task
 
 
 def _mock_db(pref_row=None, existing_question=None, result_metas=None,
-             result_count=2, review_items=None):
+             result_count=2):
     """按 auto_generate 内的 query 顺序注入:
-    1) PracticeSettings 2) Question.id 3) ReviewItem.id(_has_structured_findings ①)
-    4) Result.metadata_(②) 5) count(Result.id)(job 追踪的 set_total 用)
-
-    review_items 非 None 视为存在审查项(触发门控 ①)。
+    1) PracticeSettings 2) Question.id 3) Result.metadata_(_has_structured_findings)
+    4) count(Result.id)(job 追踪的 set_total 用)
     """
     q_pref = MagicMock()
     q_pref.filter.return_value.first.return_value = pref_row
     q_question = MagicMock()
     q_question.filter.return_value.first.return_value = existing_question
-    q_review = MagicMock()
-    q_review.filter.return_value.first.return_value = review_items
     q_result = MagicMock()
     q_result.filter.return_value.all.return_value = [
         (m,) for m in (result_metas or [])
@@ -39,7 +36,7 @@ def _mock_db(pref_row=None, existing_question=None, result_metas=None,
     q_count = MagicMock()
     q_count.filter.return_value.scalar.return_value = result_count
     db = MagicMock()
-    db.query.side_effect = [q_pref, q_question, q_review, q_result, q_count]
+    db.query.side_effect = [q_pref, q_question, q_result, q_count]
     return db
 
 
@@ -124,19 +121,73 @@ def test_generate_with_generic_meta():
         gen.assert_called_once()
 
 
-def test_generate_when_review_items_present():
-    q_pref = MagicMock(); q_pref.filter.return_value.first.return_value = None
-    q_question = MagicMock(); q_question.filter.return_value.first.return_value = None
-    q_review = MagicMock(); q_review.filter.return_value.first.return_value = (uuid4(),)
-    q_count = MagicMock(); q_count.filter.return_value.scalar.return_value = 2
+def _db_dispatch_by_target(result_metas, review_items=True):
+    """按查询目标分发(不依赖调用顺序)的会话替身:库里有审查项但 results 无元信息。
+
+    为什么不用顺序 side_effect:新门控根本不查 review_items,把审查项返回值按顺序
+    注进去会错喂给下一条查询,反而测不出「审查项被错误地当作出题素材判据」。
+    分发键用真实表达式算出来(实测 str(ReviewItem.id) 是 "ReviewItem.id" 而不是
+    表名,写死字面量会默默落进兜底分支,变成假阳性通过)。
+    """
+    from app.models.audit import ReviewItem
+    from app.models.practice import Question
+    from app.models.task import Result
+
+    kinds = {
+        str(ReviewItem.id): "review_item",
+        str(Result.metadata_): "result_meta",
+        str(Question.id): "question",
+    }
+    review_item_target = str(ReviewItem.id)
+
+    def _query(target):
+        q = MagicMock()
+        kind = kinds.get(str(target))
+        if kind == "review_item":
+            q.filter.return_value.first.return_value = (uuid4(),) if review_items else None
+        elif kind == "result_meta":
+            q.filter.return_value.all.return_value = [(m,) for m in result_metas]
+        elif str(target).startswith("count("):
+            q.filter.return_value.scalar.return_value = 2
+        else:  # PracticeSettings / Question.id
+            q.filter.return_value.first.return_value = None
+        return q
+
     db = MagicMock()
-    db.query.side_effect = [q_pref, q_question, q_review, q_count]
+    db.query.side_effect = _query
+    db.review_item_target = review_item_target
+    return db
+
+
+def test_has_structured_findings_ignores_review_items():
+    """回归:审查项不能再当成「有结构化素材」的判据。
+
+    关闭「提炼知识点」时 agent2 仍照常发射 submit_review_item(只剔除了
+    submit_knowledge_point),旧门控因此恒为真,对话降级分支永远走不到。"""
+    from app.models.audit import ReviewItem
+    from app.services.practice.auto_generate import _has_structured_findings
+
+    db = _db_dispatch_by_target([None, {"severity": "   "}], review_items=True)
+    # 前提自检:替身确实喂得出「库里有审查项」(否则旧实现也会判 False,本用例假阳性通过)
+    assert db.query(ReviewItem.id).filter.return_value.first.return_value is not None
+    db.query.reset_mock()  # 抹掉这次探针,下面的「没查过审查项表」断言才干净
+
+    assert _has_structured_findings(db, uuid4()) is False
+    # 根本没查过审查项表(而不是查了但判错)
+    queried = [str(c.args[0]) for c in db.query.call_args_list]
+    assert db.review_item_target not in queried, queried
+
+
+def test_degrade_when_only_review_items_exist():
+    """端到端:有审查项 + Results 全无元信息 → conversation_fallback=True 传到生成器。"""
+    db = _db_dispatch_by_target([None, {}], review_items=True)
     with patch(
         "app.services.practice.auto_generate.generate_questions_for_task",
         return_value=([MagicMock()], 0),
     ) as gen:
         assert auto_generate_practice_for_task(_task(), db) == 1
     gen.assert_called_once()
+    assert gen.call_args.kwargs.get("conversation_fallback") is True
 
 
 def test_generate_with_cwe_meta():

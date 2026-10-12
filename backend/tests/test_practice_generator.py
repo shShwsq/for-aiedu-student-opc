@@ -252,6 +252,62 @@ def test_numeric_cwe_prefixed():
     assert q["knowledge_key"] == "CWE-89"
 
 
+def test_normalize_knowledge_key_only_folds_cwe_family():
+    """CWE 写法归一(cwe-89 / 89 / CWE-89 同一张卡);非 CWE 短标识不动大小写。"""
+    assert gen._normalize_knowledge_key("cwe-89") == "CWE-89"
+    assert gen._normalize_knowledge_key("CWE-89") == "CWE-89"
+    assert gen._normalize_knowledge_key(" 89 ") == "CWE-89"
+    assert gen._normalize_knowledge_key("cwe-89 ") == "CWE-89"
+    # 不能把人可读的标签折成全大写
+    assert gen._normalize_knowledge_key("hardcoded_secrets") == "hardcoded_secrets"
+    # 非数字后缀(LLM 自由发挥)保留原样,不强改成 CWE-xxx
+    assert gen._normalize_knowledge_key("cwe-sql-injection") == "cwe-sql-injection"
+    assert gen._normalize_knowledge_key(None) == ""
+    assert gen._normalize_knowledge_key("   ") == ""
+
+
+def test_extra_keys_normalized_and_deduped_against_primary():
+    """extras 与主 key 同口径归一:「cwe-89」不能与「CWE-89」并存为两张看板卡。"""
+    q = _normalize_raw_question(
+        _raw(knowledge_key="CWE-89", knowledge_keys=["cwe-89", "89", "xss", " XSS "]),
+        {},
+    )
+    assert q["knowledge_key"] == "CWE-89"
+    # cwe-89 与 89 都归一成 CWE-89 → 与主 key 重合被排掉;重复项去重;空白项丢弃
+    assert q["extra_knowledge_keys"] == ["xss"]
+
+
+def test_knowledge_point_lookup_uses_normalized_key():
+    """建行入口也归一:传入小写 CWE 要能命中已有的 CWE-89 行,而不是新建一张卡。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    existing = SimpleNamespace(id="kp-1", key="CWE-89", languages=[])
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = existing
+    got = gen._get_or_create_knowledge_point(db, "u1", "cwe-89", "SQL 注入")
+    assert got is existing
+    # 查询条件里用的是归一后的 key(不新建卡)
+    values = [c.right.value for c in db.query.return_value.filter.call_args.args]
+    assert "CWE-89" in values, values
+    db.add.assert_not_called()
+
+
+def test_cache_hit_after_normalization():
+    """归一后的 key 才能稳定命中本轮缓存(否则同轮反复建卡)。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    kp = SimpleNamespace(id="kp-1", key="CWE-89", languages=[])
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = kp
+    cache: dict = {}
+    gen._get_or_create_knowledge_point(db, "u1", "CWE-89", "SQL 注入", cache=cache)
+    gen._get_or_create_knowledge_point(db, "u1", "cwe-89", "", cache=cache)
+    assert list(cache) == ["CWE-89"]
+    assert db.query.call_count == 1  # 第二次走缓存,不再查库
+
+
 def test_fallback_to_llm_key_then_general():
     assert _normalize_raw_question(_raw(), {})["knowledge_key"] == "CWE-89"  # LLM 输出
     q = _normalize_raw_question(_raw(knowledge_key="  "), {})
