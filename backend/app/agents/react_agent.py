@@ -16,12 +16,17 @@
 import json
 import logging
 import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.event_bus import publish
 from app.llm.client import LLMClient
 from app.models.task import Conversation, Task
@@ -41,6 +46,7 @@ from app.user_messages import drain_user_messages, has_pending_messages
 from app.agents.runtime.conversation import record_conversation as _add_conversation
 from app.agents.runtime.constants import MAX_HISTORY_MSG_CHARS
 from app.agents.runtime.llm_stream import (
+    ToolCallAccumulator,
     extract_text_tool_calls as _extract_text_tool_calls,
     strip_tool_call_blocks as _strip_tool_call_blocks,
     stream_llm,
@@ -315,6 +321,15 @@ def run_react_agent(
                 "round_idx": round_idx,
                 "steps": current_plan,
             })
+
+    # ---- 分面并行分支(默认关;门控不满足时 _maybe_run_parallel 返回 None,
+    #      下方串行循环完全不变) ----
+    parallel_outcome = _maybe_run_parallel(
+        task, db, round_idx, client, tools, messages, current_plan,
+        executor_command_confirm,
+    )
+    if parallel_outcome is not None:
+        return parallel_outcome
 
     for iteration in range(1, MAX_ITERATIONS + 1):
         logger.info(f"[task={task.id}] react_agent 第 {round_idx} 轮 / 迭代 {iteration}")
@@ -690,6 +705,344 @@ def run_react_agent(
 
     # 修复 4:返回本轮结束时的 plan 状态,供 orchestrator 传给下一轮
     return [], summary, current_plan
+
+
+# ============================================================
+# 分面并行(读阶段并发 / 写阶段主线程串行)
+#
+# 形状复用 practice/generator.py 已验证的 provider 闸门 + ThreadPoolExecutor,
+# 但把并行边界收得更紧:worker 只跑 LLM + 只读工具 + 内存缓冲,绝不碰共享
+# db session / publish / current_plan(全在 fan-in 主线程逐条做)。子智能体
+# 带原生身份(facet 标签),规避 ACP 侧不带身份导致的并行 chunk 交织乱码。
+# 默认由 REACT_PARALLEL_ENABLED 关闭,门控不满足时原串行循环完全不变。
+# ============================================================
+
+# 会改动工作区/沙箱物理状态的工具:并行分面一律禁用(共享工作区不可并发写)。
+# 6 个 code_review 分面本就只需读取/静态分析。
+_FACET_MUTATING_TOOLS: frozenset[str] = frozenset({
+    "clone_repo", "write_file", "run_python_code", "run_command", "str_replace_editor",
+})
+
+# 审查链路厂商级并发闸门(按 provider+model 归组,跨任务共享)
+_review_provider_gates: dict[str, tuple[int, threading.BoundedSemaphore]] = {}
+_review_provider_gates_lock = threading.Lock()
+
+
+@contextmanager
+def _review_provider_gate(client: LLMClient):
+    """限制同一厂商同时进行中的审查请求数(镜像 practice 的 _provider_gate)。
+
+    分面并行会成倍放大并发 LLM 调用,而真正卡点是厂商配额/限流(本次真凶是
+    403 free-quota)。闸门让全进程对该厂商的在途审查请求不超
+    REACT_PROVIDER_MAX_CONCURRENCY;并发度=1 时本质是透传锁(不改行为)。
+    """
+    key = (
+        f"{getattr(client, 'provider_id', '')}"
+        f"|{getattr(client, 'model', '')}"
+        f"|{getattr(client, 'base_url_override', '') or ''}"
+    )
+    limit = max(1, settings.REACT_PROVIDER_MAX_CONCURRENCY)
+    with _review_provider_gates_lock:
+        entry = _review_provider_gates.get(key)
+        if entry is None or entry[0] != limit:
+            entry = (limit, threading.BoundedSemaphore(limit))
+            _review_provider_gates[key] = entry
+    sem = entry[1]
+    sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+def _facet_readonly_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从全量工具定义里剔除会改动的工具,得到分面可用的只读子集。"""
+    return [
+        t for t in tools
+        if (t.get("function") or {}).get("name") not in _FACET_MUTATING_TOOLS
+    ]
+
+
+def _facet_allowed_tool_names(tools: list[dict[str, Any]]) -> set[str]:
+    return {(t.get("function") or {}).get("name") for t in tools} - {None}
+
+
+def _silent_stream_turn(
+    client: LLMClient,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> tuple[str, str, list[dict[str, Any]], str | None]:
+    """无副作用的流式 LLM 调用:收 chunk 但不 publish、不落库。
+
+    并行分面用它替代 stream_llm —— 后者每 token 都 publish 到同一条 SSE,
+    多路并发会交织。这里只在内存累积 reasoning/content/tool_calls,fan-in
+    时再作为带 facet 标签的完整 conversation 一次性落库+推送。LLM 调用置于
+    厂商闸门内,防并行放大并发把配额打爆。
+    """
+    reasoning = ""
+    content = ""
+    finish_reason: str | None = None
+    acc = ToolCallAccumulator()
+    with _review_provider_gate(client):
+        for chunk in client.chat_stream(
+            messages=messages, tools=tools,
+            tool_choice="auto", max_tokens=4096,
+        ):
+            if chunk.reasoning_delta:
+                reasoning += chunk.reasoning_delta
+            if chunk.content_delta:
+                content += chunk.content_delta
+            if chunk.tool_call_deltas:
+                acc.add(chunk.tool_call_deltas)
+            if chunk.finish_reason:
+                finish_reason = chunk.finish_reason
+    return reasoning, content, acc.tool_calls, finish_reason
+
+
+@dataclass
+class _FacetResult:
+    """单个分面子循环的产物(纯内存,由 fan-in 主线程负责落库)。
+
+    pending_rows: 顺序的待落库对话行 {role,type,content,reasoning?},
+        tool_call/tool_result 相邻成对(fan-in 按邻接补 tool_call_id)。
+    """
+    facet: str
+    summary: str = ""
+    pending_rows: list[dict[str, Any]] = field(default_factory=list)
+    error: str = ""
+
+
+def _run_facet_pass(
+    facet: Any,
+    base_messages: list[dict[str, Any]],
+    facet_tools: list[dict[str, Any]],
+    allowed_names: set[str],
+    client: LLMClient,
+    task: Task,
+    round_idx: int,
+    max_iter: int,
+    executor_command_confirm: str,
+) -> _FacetResult:
+    """跑一个分面的有界只读 ReAct 子循环(在 worker 线程执行,全程无共享副作用)。
+
+    与主循环同机制(LLM→只读工具→再思考直到 stop),但:独立 set_current_task
+    (ContextVar per-thread)、只读工具、无 publish/无 db、pending_rows 缓冲。
+    """
+    facet_name = getattr(facet, "name", str(facet))
+    facet_body = getattr(facet, "body", "") or ""
+    result = _FacetResult(facet=facet_name)
+    try:
+        # ContextVar 每个线程独立:ThreadPoolExecutor 不会继承主线程上下文,
+        # 必须在 worker 里显式 set(skill 工具据此只看本分面)
+        set_current_task(
+            str(task.id), task.scenario,
+            allowed_skills=[facet_name],
+            user_id=task.user_id,
+            executor_command_confirm=executor_command_confirm,
+        )
+        messages: list[dict[str, Any]] = [dict(m) for m in base_messages]
+        messages.append({
+            "role": "user",
+            "content": (
+                f"[审查分面:{facet_name}]\n"
+                f"本轮只针对该分面深入核查,不要覆盖其他维度:\n"
+                f"{facet_body}\n"
+                "只使用只读工具(list_files/read_file/search_code/find_files/"
+                "run_semgrep/run_lint/git_*/query_cve/list_dependencies 等),"
+                "定位到具体文件:行号后给出该分面的完整结论(证据+修复建议)。"
+            ),
+        })
+
+        recent_calls: list[str] = []
+        summary = ""
+        for _it in range(1, max_iter + 1):
+            reasoning, content, tool_calls, finish = _silent_stream_turn(
+                client, messages, facet_tools,
+            )
+            # Hermes 风格文本 tool_call 兜底(部分模型把调用写进正文)
+            if not tool_calls and content:
+                tool_calls = _extract_text_tool_calls(content)
+                if tool_calls:
+                    content = _strip_tool_call_blocks(content)
+            result.pending_rows.append({
+                "role": "agent1", "type": "thinking",
+                "content": content, "reasoning": reasoning,
+            })
+            messages.append({"role": "assistant", "content": content})
+
+            if not tool_calls:
+                if content:
+                    summary = content
+                break
+
+            for tc in tool_calls:
+                fn = tc["name"]
+                try:
+                    fn_args = json.loads(tc.get("arguments_str") or "{}")
+                except json.JSONDecodeError:
+                    fn_args = {}
+                recent_calls.append(f"{fn}:{json.dumps(fn_args, sort_keys=True)}")
+                intent = _build_tool_intent(fn, fn_args)
+                result.pending_rows.append({
+                    "role": "agent1", "type": "tool_call",
+                    "content": f"{intent}\n{json.dumps(fn_args, ensure_ascii=False, indent=2)}",
+                })
+                # 只读白名单硬约束:模型若仍请求改动工具,拒绝并如实告知(不执行)
+                if fn not in allowed_names:
+                    blocked = f"并行分面只允许只读工具,已禁用: {fn}"
+                    result.pending_rows.append({"role": "agent1", "type": "tool_result", "content": blocked})
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": blocked})
+                    continue
+                try:
+                    tool_out = json.dumps(execute_tool(fn, fn_args), ensure_ascii=False, default=str)
+                except Exception as e:
+                    tool_out = f"工具执行失败: {e}"
+                result.pending_rows.append({"role": "agent1", "type": "tool_result", "content": tool_out})
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": tool_out})
+
+            # 循环检测:连续 max_same 次相同调用则打破,转入总结
+            if (
+                len(recent_calls) >= MAX_SAME_CALLS
+                and len(set(recent_calls[-MAX_SAME_CALLS:])) == 1
+            ):
+                result.pending_rows.append({
+                    "role": "agent1", "type": "thinking",
+                    "content": "检测到调用循环,强制转入本分面总结", "reasoning": "",
+                })
+                messages.append({"role": "user", "content": LOOP_BREAK_PROMPT})
+                try:
+                    _r, c, _tc, _f = _silent_stream_turn(client, messages, facet_tools)
+                    if c:
+                        summary = c
+                        result.pending_rows.append({
+                            "role": "agent1", "type": "thinking",
+                            "content": c, "reasoning": _r,
+                        })
+                except Exception:
+                    pass
+                break
+        else:
+            # 跑满迭代:请模型就本分面输出总结
+            messages.append({"role": "user", "content": MAX_ITERATION_PROMPT})
+            try:
+                _r, c, _tc, _f = _silent_stream_turn(client, messages, facet_tools)
+                if c:
+                    summary = c
+                    result.pending_rows.append({
+                        "role": "agent1", "type": "thinking",
+                        "content": c, "reasoning": _r,
+                    })
+            except Exception:
+                pass
+        result.summary = summary
+    except Exception as e:  # 单分面失败不拖垮整轮
+        logger.exception(f"[task={task.id}] 分面 {facet_name} 子循环失败")
+        result.error = str(e)
+    return result
+
+
+def _resolve_facets(task: Task) -> list[Any]:
+    """可见分面集(用户隔离 ∩ allowed_skills),与内置 skill 工具同口径。"""
+    from app.skills import loader as skill_loader
+    return list(skill_loader.resolve_visible_skills(task.user_id, task.allowed_skills))
+
+
+def _parallel_gate(task: Task, followup_query: str | None) -> list[Any] | None:
+    """是否走分面并行;返回分面列表或 None(None=走原串行路径)。
+
+    门控:开关关 / 分面数 < MIN_FACETS → None。小仓库并行 bootstrap 与上下文
+    复制成本高于串行收益,故按分面数阈值降级。
+    """
+    if not getattr(settings, "REACT_PARALLEL_ENABLED", False):
+        return None
+    facets = _resolve_facets(task)
+    if len(facets) < max(2, getattr(settings, "REACT_PARALLEL_MIN_FACETS", 3)):
+        return None
+    return facets
+
+
+def _fan_in(
+    task: Task,
+    db: Session,
+    round_idx: int,
+    results: list[_FacetResult],
+) -> str:
+    """主线程串行 fan-in:按分面顺序逐条落库 pending_rows(带 facet 标签)+
+    拼接总结。tool_result 按邻接补 tool_call_id,与串行落库形状一致。
+    """
+    summaries: list[str] = []
+    for fr in results:
+        last_call_id: str | None = None
+        for row in fr.pending_rows:
+            tool_call_id = last_call_id if row["type"] == "tool_result" else None
+            conv = _add_conversation(
+                db, task, round_idx=round_idx,
+                role=row["role"], type=row["type"],
+                content=row.get("content") or "",
+                reasoning=row.get("reasoning"),
+                tool_call_id=tool_call_id,
+                extra_payload={"facet": fr.facet, "parallel": True},
+            )
+            if row["type"] == "tool_call":
+                last_call_id = str(conv.id)
+        if fr.error:
+            summaries.append(f"### {fr.facet}\n(该分面审查失败:{fr.error})")
+        else:
+            summaries.append(f"### {fr.facet}\n{fr.summary or '(本分面无明确结论)'}")
+    return "\n\n".join(summaries) if summaries else "执行完成"
+
+
+def _maybe_run_parallel(
+    task: Task,
+    db: Session,
+    round_idx: int,
+    client: LLMClient,
+    tools: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    current_plan: list[dict[str, Any]],
+    executor_command_confirm: str,
+) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]] | None:
+    """门控 + 扇出/扇入。命中并行返回 (results, summary, final_plan);
+    否则返回 None(调用方继续走原串行循环)。final_plan 沿用入参 current_plan
+    (Phase 1:分面专注只读分析,不驱动 plan 推进)。"""
+    facets = _parallel_gate(task, None)
+    if not facets:
+        return None
+
+    facet_tools = _facet_readonly_tools(tools)
+    allowed_names = _facet_allowed_tool_names(facet_tools)
+    max_workers = min(len(facets), max(1, settings.REACT_PARALLEL_MAX_CONCURRENCY))
+    max_iter = max(1, settings.REACT_FACET_MAX_ITERATIONS)
+
+    logger.info(
+        f"[task={task.id}] react_agent 分面并行启动:{len(facets)} 分面,"
+        f"max_workers={max_workers},max_iter/面={max_iter}"
+    )
+    # 扇出前暂停检查点(长工具链中也能及时响应暂停)
+    wait_if_paused(task.id)
+
+    results: list[_FacetResult] = []
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix=f"react-facet-{str(task.id)[:8]}",
+    ) as pool:
+        # 按分面顺序提交并收集,保证 fan-in 落库/展示顺序确定(与完成顺序无关)
+        futures = [
+            pool.submit(
+                _run_facet_pass, f, messages, facet_tools, allowed_names,
+                client, task, round_idx, max_iter, executor_command_confirm,
+            )
+            for f in facets
+        ]
+        for fut in futures:
+            results.append(fut.result())
+
+    summary = _fan_in(task, db, round_idx, results)
+    # fan-in 后再检查一次暂停
+    wait_if_paused(task.id)
+    # 沿用入参 current_plan 的深拷贝(Phase 1 分面不改 plan)
+    return [], summary, [dict(s) for s in (current_plan or [])]
+
 
 
 # ============================================================

@@ -81,6 +81,25 @@ class Settings(BaseSettings):
     # 防两个 job 各自 4 并行把厂商配额扫光
     PRACTICE_PROVIDER_MAX_CONCURRENCY: int = 4
 
+    # ---- 内置 react_agent 分面并行(读阶段并发 / 写阶段主线程串行) ----
+    # 把内置执行器从单条串行 ReAct 循环升级为"按 code_review 分面扇出 N 条
+    # 有界只读 ReAct 子循环 → 主线程串行 fan-in 落库/汇总"。复用出题侧
+    # 已验证的 provider 闸门 + ThreadPoolExecutor 形状,但 worker 不碰共享
+    # session/publish(只跑 LLM + 只读工具 + 内存缓冲),fan-in 在主线程逐条做。
+    # 真优势:子智能体带原生身份(ACP 侧不带身份导致并行 chunk 交织乱码)。
+    # 默认关,灰度启用(需先确认模型槽位/配额,否则并行只会更快撞 403)。
+    REACT_PARALLEL_ENABLED: bool = False
+    # 分面扇出线程数上限(实际取 min(本项, 可见分面数))
+    REACT_PARALLEL_MAX_CONCURRENCY: int = 4
+    # 可见分面数低于此阈值走原串行路径(小仓库并行反而亏:每子循环 bootstrap
+    # + 上下文复制成本高于串行收益)
+    REACT_PARALLEL_MIN_FACETS: int = 3
+    # 单个分面子循环的最大迭代次数(有界,防止某一分面跑飞拖垮整轮)
+    REACT_FACET_MAX_ITERATIONS: int = 12
+    # 审查链路同厂商(provider+model 归组)全局并发天花板,跨任务共享:
+    # 置于分面子循环的 LLM 调用外层,防并行放大并发把配额打爆(本次真凶是 403)
+    REACT_PROVIDER_MAX_CONCURRENCY: int = 4
+
     # ---- 数据统一根 ----
     # 4 个运行时数据目录(克隆/缓存/skill/上传)统一收纳在 data/ 根下,
     # gitignore/备份/卷挂载只需覆盖一处;各子目录仍可独立用 env 重定位。
@@ -383,6 +402,16 @@ class Settings(BaseSettings):
     ACP_ASYNC_AGENT_REPORTS_MAX_CHARS: int = 20000
     # 单轮最多回捞的报告文件数(按文件名序,超出只取前 N 并标注)
     ACP_ASYNC_AGENT_REPORTS_MAX_FILES: int = 8
+
+    # 预防性禁止 CLI 派生子智能体:命中白名单的 executor 在首轮 prompt 就要求
+    # "不要 fan-out,在主循环里串行完成各分面审查"。开启时同时抑制"后台子任务
+    # 结论落盘"注入段并关闭续轮回收(见 acp_base._disallow_subagents_enabled /
+    # _async_agent_autoccontinue_enabled)——三者互斥于"教子任务落盘"的旧链路。
+    # 背景:ACP 事件不带子智能体身份,并行 chunk 交织成乱码,续轮回收又有截断误判
+    # 的高危 bug,收益本就打折;止血优先让 CLI 别派生。默认关,灰度启用。
+    ACP_DISALLOW_SUBAGENTS: bool = False
+    # 生效的 agent 类型(逗号分隔);仅这些 executor 注入禁止 fan-out 段
+    ACP_DISALLOW_SUBAGENT_TYPES: str = "qoder_cli"
 
     # Qoder CLI 配置(qoder_cli executor 用,国际版)
     # qodercli 可执行文件名/路径(沙箱内 PATH 查找或绝对路径)

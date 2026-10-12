@@ -97,6 +97,7 @@ from app.prompts.executor import (
     build_cli_memory_section,
     build_cli_repo_context_section,
     build_cli_skills_section,
+    build_cli_no_subagent_section,
     build_cli_subagent_reports_section,
     build_first_round_question,
     format_plan_reminder,
@@ -203,8 +204,29 @@ _ASYNC_AGENT_CONTINUE_PROMPT = (
 )
 
 
+def _disallow_subagents_enabled(agent_type: str) -> bool:
+    """本轮 executor 是否预防性禁止派生子智能体(全局开关 + 类型白名单)。
+
+    命中时:注入"不要派生子智能体"段(见 run 链路 raw_memory 拼装),同时
+    抑制"后台子任务结论落盘"段并关闭续轮回收(两者与禁止 fan-out 语义互斥)。
+    """
+    if not getattr(settings, "ACP_DISALLOW_SUBAGENTS", False):
+        return False
+    allowed = {
+        t.strip()
+        for t in (getattr(settings, "ACP_DISALLOW_SUBAGENT_TYPES", "") or "").split(",")
+        if t.strip()
+    }
+    return agent_type in allowed
+
+
 def _async_agent_autoccontinue_enabled(agent_type: str) -> bool:
-    """本轮 executor 是否启用异步子 Agent 续轮回收(全局开关 + 类型白名单)。"""
+    """本轮 executor 是否启用异步子 Agent 续轮回收(全局开关 + 类型白名单)。
+
+    禁止 fan-out 命中时直接返回 False:从源头不再派生,也就无需不可靠的续轮回收。
+    """
+    if _disallow_subagents_enabled(agent_type):
+        return False
     if not getattr(settings, "ACP_ASYNC_AGENT_AUTOCONTINUE", False):
         return False
     allowed = {
@@ -3747,6 +3769,11 @@ def run_acp_agent(
             raw_skills = _build_cli_skills_section(task, _mem_mode, _mem_local_dir)
             if raw_skills:
                 raw_memory = raw_memory + raw_skills
+            # 禁止 fan-out 段:命中白名单时并入记忆桶一起参与去重(内容恒定)。
+            # 与下方 raw_subagent 天然互斥 —— 命中禁止时 _async_agent_autoccontinue_enabled
+            # 已返回 False,raw_subagent 保持空串,不会同时发出"禁派生"与"教落盘"两段矛盾指令。
+            if _disallow_subagents_enabled(agent_type):
+                raw_memory = raw_memory + build_cli_no_subagent_section()
             # 后台子任务结论落盘要求段:只对"会派生后台子任务"的 executor 注入(与续轮
             # 回收同一白名单),sandbox/local 路径按模式算(local 拿不到 local_dir 则空串
             # =不注入);它与 skill/记忆不同桶,单独参与去重(见 _resolve_subagent_injection)
