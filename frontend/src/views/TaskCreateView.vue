@@ -1323,6 +1323,24 @@ onUnmounted(() => {
   
                 <Teleport defer to="#settings-drawer-body">
                   <div v-show="drawerOpen && drawerSection === 'policy'" class="drawer-section-body">
+                    <!-- 分组:执行(独立于 agent2;置于检查助手之上,便于先设定命令确认策略) -->
+                    <div class="adv-group">
+                      <div class="adv-group-title">执行</div>
+
+                      <!-- AI助手确认策略(builtin 与 CLI 执行器均生效) -->
+                      <label class="policy-field">
+                        <span class="policy-label">AI助手确认策略</span>
+                        <BaseSelect
+                          v-model="policyExecutorCommandConfirm"
+                          :options="executorConfirmOptions"
+                          class="policy-select"
+                          aria-label="AI助手确认策略"
+                        />
+                        <span class="policy-hint">控制 AI助手(内置 / CLI)执行危险命令时是否弹窗确认。CLI 中 Codex 受非交互模式限制,仅支持自动批准。</span>
+                      </label>
+                    </div>
+                    <!-- /分组:执行 -->
+
                     <!-- 分组:检查助手(原 topbar 第 2 行整体移入) -->
                     <div class="adv-group">
                       <div class="adv-group-title">
@@ -1468,24 +1486,6 @@ onUnmounted(() => {
                       <span class="policy-hint">任务完成后自动生成练习题草稿(仍需预览确认)。关闭检查助手/知识点时,可降级为直接基于对话出题。</span>
                     </div>
                     <!-- /分组:练习 -->
-
-                    <!-- 分组:执行(独立于 agent2) -->
-                    <div class="adv-group">
-                      <div class="adv-group-title">执行</div>
-
-                      <!-- AI助手确认策略(builtin 与 CLI 执行器均生效) -->
-                      <label class="policy-field">
-                        <span class="policy-label">AI助手确认策略</span>
-                        <BaseSelect
-                          v-model="policyExecutorCommandConfirm"
-                          :options="executorConfirmOptions"
-                          class="policy-select"
-                          aria-label="AI助手确认策略"
-                        />
-                        <span class="policy-hint">控制 AI助手(内置 / CLI)执行危险命令时是否弹窗确认。CLI 中 Codex 受非交互模式限制,仅支持自动批准。</span>
-                      </label>
-                    </div>
-                    <!-- /分组:执行 -->
                   </div>
                 </Teleport>
             </div>
