@@ -92,6 +92,27 @@ def test_review_prompt_has_user_readability_constraints():
     assert "可追问内容" in AGENT2_REVIEW_PROMPT
 
 
+def test_review_prompt_bans_agent_names_and_requires_first_person():
+    """缺口建议/追问文本=点击即发送的用户消息:禁现 agent1/agent2 内部名,
+    须写成用户第一人称祈使指令(不得"让 agent1 …"第三人称转述)。
+
+    实测出现过的回归:面用户的建议写成「让 agent1 收回三个仍在运行的后台代理…」,
+    而前端 handleSuggestionDig 把该文本原样 sendTaskMessage 发出 → 泄露内部名且语气不对。
+    """
+    # 可读性硬约束已把 suggestion 纳入受管字段,并把 agent1/agent2 列入禁写标识
+    assert "title / conclusion / follow_up / suggestion" in AGENT2_REVIEW_PROMPT
+    assert "`agent1`/`agent2`" in AGENT2_REVIEW_PROMPT
+    # 追问/建议=点击即发送的用户消息,须第一人称祈使、禁第三人称转述
+    assert "点击即发送" in AGENT2_REVIEW_PROMPT
+    assert "第一人称" in AGENT2_REVIEW_PROMPT
+    assert "第三人称转述" in AGENT2_REVIEW_PROMPT
+    # submit_suggestion 工具描述同样要求可原样发送
+    suggestion_desc = _SUBMIT_SUGGESTION_TOOL["function"]["description"]
+    assert "原样作为用户消息" in suggestion_desc
+    assert "第一人称" in suggestion_desc
+    assert "祈使" in suggestion_desc
+
+
 def test_submit_tool_definitions_shape():
     """四个发射工具的 function.name 与关键参数就位。"""
     assert _SUBMIT_REVIEW_PLAN_TOOL["function"]["name"] == "submit_review_plan"
