@@ -1567,8 +1567,8 @@ onUnmounted(() => {
                   fill="currentColor"
                   aria-hidden="true"
                 >
-                  <path d="M10 4q0 10 10 10-10 0-10 10 0-10-10-10 10 0 10-10Z" />
-                  <path d="M19 3q0 4 4 4-4 0-4 4 0-4-4-4 4 0 4-4Z" />
+                  <path d="M11 6q0 9 9 9-9 0-9 9 0-9-9-9 9 0 9-9Z" />
+                  <path d="M19 1q0 5 5 5-5 0-5 5 0-5-5-5 5 0 5-5Z" />
                 </svg>
               </button>
             </div>
@@ -2121,17 +2121,13 @@ onUnmounted(() => {
   margin-left: auto;
   color: var(--color-text-muted);
   background: transparent;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
+  border: none;
   cursor: pointer;
-  transition:
-    color var(--transition-fast),
-    border-color var(--transition-fast);
+  transition: color var(--transition-fast);
 }
 
 .polish-btn:not(:disabled):hover {
   color: var(--color-primary);
-  border-color: var(--color-primary);
 }
 
 .polish-btn:disabled {
@@ -2140,9 +2136,9 @@ onUnmounted(() => {
 }
 
 .polish-spinner {
-  width: 20px;
-  height: 20px;
-  border: 3px solid currentColor;
+  width: 28px;
+  height: 28px;
+  border: 4px solid currentColor;
   border-top-color: transparent;
   border-radius: 50%;
   animation: polish-spin 0.7s linear infinite;
