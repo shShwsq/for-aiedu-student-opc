@@ -5,6 +5,10 @@ dist-ssr
 *.local
 .env
 
+# vue-tsc -b artifacts emitted from vite.config.ts (source is vite.config.ts)
+vite.config.js
+vite.config.d.ts
+
 # Editor
 .vscode/*
 !.vscode/extensions.json
