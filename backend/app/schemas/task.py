@@ -109,19 +109,21 @@ class ResultResponse(BaseModel):
 
 
 class ReviewItemResponse(BaseModel):
-    """审查项响应(agent2 证据驱动审查,三态合一)
+    """审查项响应(agent2 证据驱动审查,三分档)
 
-    bucket 为三态分桶(risk/cleared/gap),由模型 property 集中判读,
-    前端/导出复用同一口径不再各自分叉。
+    bucket 为三分档(established 已核实成立 / not_established 已核实不成立 /
+    pending_verify 待核实),由模型 property 集中判读,前端/导出复用同一口径不再各自分叉。
+    conclusion(审查结论)与 follow_up(可追问内容)为旧列 description/suggestion 的新名。
     """
 
     id: uuid.UUID
     round_idx: int
     title: str
-    description: str | None = None
+    conclusion: str | None = None
     review_target: str = ""
     origin: str
     agent1_ref: uuid.UUID | None = None
+    plan_item_id: str | None = None
     dimension: str | None = None
     status: str
     verdict: str | None = None
@@ -130,7 +132,7 @@ class ReviewItemResponse(BaseModel):
     confidence: dict[str, Any] | None = None
     evidence_validated: bool = False
     evidence_mismatch: bool = False
-    suggestion: str | None = None
+    follow_up: str | None = None
     bucket: str
     created_at: datetime
 

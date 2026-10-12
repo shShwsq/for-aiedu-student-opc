@@ -21,17 +21,22 @@ import {
   confidenceClass,
   confidenceLabel,
   formatConfidenceScore,
+  originLabel,
+  pendingVerifyBadge,
 } from '@/utils/reviewBucket'
 
 const props = defineProps<{
   open: boolean
   item: ReviewItem | TaskResult | null
   type: 'review' | 'result'
+  /** 正在发送的追问文本(与侧栏建议卡共用同一把防重复锁);非空时本抽屉的追问按钮置灰 */
+  digging?: string | null
 }>()
 
 const emit = defineEmits<{
   (e: 'close'): void
   (e: 'open-file', item: ReviewItem): void
+  (e: 'dig', text: string): void
 }>()
 
 // ---- Esc 键关闭 ----
@@ -58,6 +63,23 @@ watch(
 /** 判断当前展示的是否为审查项 (通过 type discriminator) */
 const isReview = computed(() => props.type === 'review')
 
+/** 待核实档的徽章(无证据时不拿"无证据·—"冒充置信度) */
+const pendingBadge = computed(() => {
+  const it = props.item as ReviewItem | null
+  return isReview.value && it ? pendingVerifyBadge(it) : null
+})
+
+/** 可追问内容(一句可直接发回 AI助手 的问句) */
+const followUp = computed(() => {
+  const it = props.item as ReviewItem | null
+  return isReview.value ? (it?.follow_up ?? '').trim() : ''
+})
+
+/** 追问发送中:本条已被点击(锁属于父组件,与侧栏建议卡同机制) */
+const diggingThis = computed(
+  () => !!props.digging && props.digging === followUp.value,
+)
+
 /** 渲染知识点 markdown */
 function renderContent(content: string | null | undefined): string {
   return renderMarkdown(content)
@@ -75,9 +97,14 @@ function renderContent(content: string | null | undefined): string {
         <!-- 头部:标题 + 关闭按钮 -->
         <header class="detail-drawer-header">
           <h3 class="detail-drawer-title">{{ item.title }}</h3>
-          <!-- 审查项:置信度徽标 -->
+          <!-- 审查项:待核实档显式标出未核实原因,其余显示置信度 -->
           <span
-            v-if="isReview"
+            v-if="isReview && pendingBadge"
+            class="conf-badge conf-assertion"
+            :title="pendingBadge.title"
+          >{{ pendingBadge.label }}</span>
+          <span
+            v-else-if="isReview"
             :class="['conf-badge', `conf-${confidenceClass((item as ReviewItem).confidence?.tier)}`]"
           >
             {{ confidenceLabel((item as ReviewItem).confidence?.tier) }}
@@ -101,9 +128,9 @@ function renderContent(content: string | null | undefined): string {
           <!-- 审查项详情 -->
           <template v-if="isReview">
             <div class="drawer-section">
-              <p class="rv-line"><strong>被核实对象:</strong>{{ (item as ReviewItem).review_target || '—' }}</p>
-              <p v-if="(item as ReviewItem).description" class="rv-line">
-                <strong>发现问题:</strong>{{ (item as ReviewItem).description }}
+              <p class="rv-line"><strong>待核实对象:</strong>{{ (item as ReviewItem).review_target || '—' }}</p>
+              <p v-if="(item as ReviewItem).conclusion" class="rv-line">
+                <strong>审查结论:</strong>{{ (item as ReviewItem).conclusion }}
               </p>
               <div
                 v-if="(item as ReviewItem).evidence?.source?.quote || (item as ReviewItem).evidence?.source?.file_path"
@@ -129,13 +156,23 @@ function renderContent(content: string | null | undefined): string {
                   · {{ (item as ReviewItem).evidence!.verification!.poc_evidence }}
                 </span>
               </p>
-              <p v-if="(item as ReviewItem).suggestion" class="rv-line">
-                <strong>建议:</strong>{{ (item as ReviewItem).suggestion }}
-              </p>
+              <div v-if="followUp" class="rv-section">
+                <strong>可追问内容:</strong>
+                <button
+                  type="button"
+                  class="rv-dig"
+                  :disabled="!!digging"
+                  :title="diggingThis
+                    ? '已提交追问,等待新一轮执行'
+                    : digging ? '上一条追问发送中' : '点击把这句作为指令发给 AI助手'"
+                  @click="emit('dig', followUp)"
+                >{{ diggingThis ? '追问中...' : '就这点追问' }}</button>
+                <p class="rv-follow-text">{{ followUp }}</p>
+              </div>
             </div>
             <!-- 元信息 -->
             <div v-if="(item as ReviewItem).severity || (item as ReviewItem).origin" class="drawer-meta">
-              <span class="origin-tag" :title="(item as ReviewItem).origin">{{ (item as ReviewItem).origin }}</span>
+              <span class="origin-tag">{{ originLabel((item as ReviewItem).origin) }}</span>
               <span v-if="(item as ReviewItem).severity" :class="['sev-tag', `sev-${(item as ReviewItem).severity}`]">
                 {{ (item as ReviewItem).severity }}
               </span>
@@ -274,6 +311,32 @@ function renderContent(content: string | null | undefined): string {
   white-space: pre-wrap;
   word-break: break-word;
   overflow-x: auto;
+}
+
+/* 可追问内容:按钮是动作,正文是内容,两者都要看得到 */
+.rv-dig {
+  margin-left: var(--space-2);
+  padding: 1px 8px;
+  font-size: var(--fs-xs);
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  border: 1px solid var(--color-primary-border);
+  border-radius: var(--radius-full, 999px);
+  cursor: pointer;
+}
+
+.rv-dig:hover {
+  filter: brightness(0.97);
+}
+
+.rv-dig:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.rv-follow-text {
+  margin: 4px 0 0;
+  font-size: var(--fs-sm);
 }
 
 .drawer-meta {

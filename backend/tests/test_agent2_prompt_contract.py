@@ -66,9 +66,30 @@ def test_review_prompt_has_four_emit_tools_and_planning():
     # 证据引用就近 call_ref
     assert "_evidence_ref" in AGENT2_REVIEW_PROMPT
     assert "call_ref" in AGENT2_REVIEW_PROMPT
-    # 单一原语三态合一 + review_target 必填可追溯
-    assert "三态合一" in AGENT2_REVIEW_PROMPT
+    # 单一原语三分档合一 + review_target(待核实对象)必填可追溯
+    assert "三分档合一" in AGENT2_REVIEW_PROMPT
+    assert "待核实对象" in AGENT2_REVIEW_PROMPT
     assert "review_target" in AGENT2_REVIEW_PROMPT
+    # 未核实的计划项不再被伪造成缺口审查项
+    assert "不会" in AGENT2_REVIEW_PROMPT and "未核实" in AGENT2_REVIEW_PROMPT
+    assert "回填为缺口" not in AGENT2_REVIEW_PROMPT
+
+
+def test_review_prompt_has_user_readability_constraints():
+    """用户可读性硬约束:正文不直铺内部标识与字段枚举(实测出现过
+    「领域基线(历史记忆)」「E9」「(target 不存在)」「agent1 断言:…」直接面用户)"""
+    assert "用户可读性硬约束" in AGENT2_REVIEW_PROMPT
+    assert "禁写内部标识" in AGENT2_REVIEW_PROMPT
+    # 取证引用号与枚举值不准进用户正文
+    for banned in ("call_ref", "fail-closed", "领域基线", "历史记忆"):
+        assert banned in AGENT2_REVIEW_PROMPT  # 作为"禁写"清单出现
+    assert "禁以「agent1 断言:" in AGENT2_REVIEW_PROMPT
+    # 三分档的用户可读名
+    for label in ("已核实成立", "已核实不成立", "待核实"):
+        assert label in AGENT2_REVIEW_PROMPT
+    # 可追问内容 = 可执行的问句(不是"建议追问:…")
+    assert "follow_up" in AGENT2_REVIEW_PROMPT
+    assert "可追问内容" in AGENT2_REVIEW_PROMPT
 
 
 def test_submit_tool_definitions_shape():
@@ -78,9 +99,18 @@ def test_submit_tool_definitions_shape():
     assert _SUBMIT_KNOWLEDGE_POINT_TOOL["function"]["name"] == "submit_knowledge_point"
     assert _SUBMIT_SUGGESTION_TOOL["function"]["name"] == "submit_suggestion"
     item_props = _SUBMIT_REVIEW_ITEM_TOOL["function"]["parameters"]["properties"]
-    assert {"review_target", "origin", "status", "verdict", "evidence"} <= set(item_props)
+    assert {
+        "review_target", "origin", "status", "verdict", "evidence",
+        "conclusion", "follow_up", "plan_item_id",
+    } <= set(item_props)
+    # 字段改名后的旧名不再是参数(suggestion 只作兼容别名留在 schema 里)
+    assert "description" not in item_props
     # submit_review_item 不含 confidence(后端派生)
     assert "confidence" not in item_props
+    # 计划项 id 由后端铸造并回灌(规划对账靠它,不再靠 target 子串匹配)
+    plan_props = _SUBMIT_REVIEW_PLAN_TOOL["function"]["parameters"]["properties"]
+    assert "items" in plan_props
+    assert "plan_item_id" in _SUBMIT_REVIEW_PLAN_TOOL["function"]["description"]
 
 
 def test_review_prompt_ship_conclusion_is_conditional():

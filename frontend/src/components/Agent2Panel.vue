@@ -35,7 +35,17 @@ import type {
   ReviewStatus,
   ReviewSummary,
 } from '@/types/task'
-import { planItemStatus } from '@/utils/reviewBucket'
+import {
+  originLabel,
+  planItemStatus,
+  planTally,
+  PLAN_STATE_LABELS,
+  summaryConfidenceTally,
+  summaryCounts,
+  summaryVerdictText,
+  unverifiedReasonLabel,
+  type PlanItemDisplayState,
+} from '@/utils/reviewBucket'
 import { renderMarkdown } from '@/utils/markdown'
 import { isThinkingExpanded } from '@/utils/thinkingExpand'
 import {
@@ -115,22 +125,52 @@ const reviewPlanItems = computed<ReviewPlanItem[] | null>(() => {
   return null
 })
 
-/** 计划对账汇总(展示"规划 N / 核实 M / 回填缺口 K") */
-const reviewPlanTally = computed(() => {
-  const plan = props.reviewSummary?.plan
-  if (plan) {
-    return { planned: plan.planned, executed: plan.executed, backfilled: plan.backfilled_gap }
-  }
-  const live = props.reviewPlanLive
-  if (live?.items?.length) {
-    const planned = live.items.length
-    const executed = live.items.filter(
-      (i) => planItemStatus(i.target, props.reviewItems) === 'done',
-    ).length
-    return { planned, executed, backfilled: planned - executed }
-  }
-  return null
-})
+/** 计划行标记(旧版只有 ✓/⚠ 两态,"还在核"与"确实未核实"看起来一样) */
+const PLAN_STATE_MARKS: Record<PlanItemDisplayState, string> = {
+  done: '✓',
+  unverified: '⚠',
+  pending: '●',
+  unknown: '○',
+}
+
+/** 单条计划项的对账态(id 命中发射项 → 已核实;收尾后以 _review.plan.unverified 为准) */
+function planStateOf(pi: ReviewPlanItem): PlanItemDisplayState {
+  return planItemStatus(pi, props.reviewItems, props.reviewSummary?.plan)
+}
+
+/** 计划行 tooltip:未核实时多说一句"为什么"(额度用尽 / 没排到取证) */
+function planStateTitle(pi: ReviewPlanItem): string {
+  const st = planStateOf(pi)
+  if (st !== 'unverified') return PLAN_STATE_LABELS[st]
+  const uv = props.reviewSummary?.plan?.unverified?.find(
+    (u) => (u.id && pi.id ? u.id === pi.id : u.target === pi.target),
+  )
+  return `${PLAN_STATE_LABELS.unverified}:${unverifiedReasonLabel(uv?.reason)}`
+}
+
+/** 计划对账汇总(展示"规划 N / 核实 M / 未核实 K";收尾前或旧快照 K 未知,不显示) */
+const reviewPlanTally = computed(() =>
+  planTally(
+    props.reviewSummary?.plan,
+    props.reviewItems,
+    props.reviewPlanLive?.items ?? null,
+  ),
+)
+
+/**
+ * 汇总面板三个数据源。
+ *
+ * 旧任务(_review.plan 无 unverified)的 counts/tally/verdict_summary 把"对账失败的伪造缺口"
+ * 算进去了,而那些假行已被启动迁移删掉 → 直接拿旧数字会顶部"共 16 项"、列表只剩 8 条。
+ * 所以旧快照的分档/置信按现存审查项现算,判定行改成口径说明(新快照照旧用后端数字)。
+ */
+const summaryCountsView = computed(() =>
+  summaryCounts(props.reviewSummary, props.reviewItems),
+)
+const summaryConfidenceView = computed(() =>
+  summaryConfidenceTally(props.reviewSummary, props.reviewItems),
+)
+const summaryVerdict = computed(() => summaryVerdictText(props.reviewSummary))
 
 /** 头部审查 badge 文案 */
 const reviewBadge = computed<{ text: string; cls: string } | null>(() => {
@@ -260,42 +300,48 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
       >{{ stoppingReview ? '终止中...' : '终止检查' }}</button>
     </h2>
 
-    <!-- 审查结论面板(task.params._review 聚合:三态计数 + 置信分布 + 总体判定) -->
-    <div v-if="reviewSummary" class="panel-review-summary">
+    <!-- 审查结论面板(task.params._review 聚合:三分档计数 + 置信分布 + 总体判定) -->
+    <div v-if="reviewSummary && summaryCountsView" class="panel-review-summary">
       <div class="prs-counts">
-        <span class="prs-risk">风险 {{ reviewSummary.counts.risk }}</span>
-        <span class="prs-cleared">已核查 {{ reviewSummary.counts.cleared }}</span>
-        <span class="prs-gap">缺口 {{ reviewSummary.counts.gap }}</span>
-        <span class="prs-total">共 {{ reviewSummary.counts.total }} 项</span>
+        <span class="prs-established">成立 {{ summaryCountsView.established }}</span>
+        <span class="prs-not-established">不成立 {{ summaryCountsView.not_established }}</span>
+        <span class="prs-pending">待核实 {{ summaryCountsView.pending_verify }}</span>
+        <span class="prs-total">共 {{ summaryCountsView.total }} 项</span>
       </div>
-      <div v-if="reviewSummary.confidence_tally" class="prs-conf">
-        <span class="conf-badge conf-verified">已验证 {{ reviewSummary.confidence_tally.verified }}</span>
-        <span class="conf-badge conf-source">源码 {{ reviewSummary.confidence_tally.source_confirmed }}</span>
-        <span class="conf-badge conf-reference">佐证 {{ reviewSummary.confidence_tally.reference_corroborated }}</span>
-        <span class="conf-badge conf-assertion">断言 {{ reviewSummary.confidence_tally.assertion_only }}</span>
+      <div v-if="summaryConfidenceView" class="prs-conf">
+        <span class="conf-badge conf-verified">已验证 {{ summaryConfidenceView.verified }}</span>
+        <span class="conf-badge conf-source">源码 {{ summaryConfidenceView.source_confirmed }}</span>
+        <span class="conf-badge conf-reference">佐证 {{ summaryConfidenceView.reference_corroborated }}</span>
+        <span class="conf-badge conf-assertion">断言 {{ summaryConfidenceView.assertion_only }}</span>
+        <span class="conf-badge conf-assertion">未取证 {{ summaryConfidenceView.no_evidence ?? 0 }}</span>
       </div>
-      <p v-if="reviewSummary.verdict_summary" class="prs-verdict">{{ reviewSummary.verdict_summary }}</p>
+      <p v-if="summaryVerdict" class="prs-verdict">{{ summaryVerdict }}</p>
     </div>
 
-    <!-- 审查计划卡(submit_review_plan + 规划对账:逐条 target/origin/优先级 + ✓/⚠) -->
+    <!-- 审查计划卡(submit_review_plan + 规划对账:逐条 target/origin/优先级 + ✓/●/⚠) -->
     <details v-if="reviewPlanItems" class="panel-review-plan" open>
       <summary>
         审查计划
         <span v-if="reviewPlanTally" class="prp-tally">
-          规划 {{ reviewPlanTally.planned }} / 核实 {{ reviewPlanTally.executed }}
-          / 回填缺口 {{ reviewPlanTally.backfilled }}
+          规划 {{ reviewPlanTally.planned }}
+          <template v-if="reviewPlanTally.executed !== null">
+            / 核实 {{ reviewPlanTally.executed }}
+          </template>
+          <template v-if="reviewPlanTally.unverified !== null">
+            / 未核实 {{ reviewPlanTally.unverified }}
+          </template>
         </span>
       </summary>
       <p v-if="reviewSummary?.plan?.note || reviewPlanLive?.note" class="prp-note">
         {{ reviewSummary?.plan?.note || reviewPlanLive?.note }}
       </p>
       <ol class="prp-list">
-        <li v-for="(pi, idx) in reviewPlanItems" :key="idx" class="prp-item">
-          <span :class="['prp-state', planItemStatus(pi.target, reviewItems) === 'done' ? 'is-done' : 'is-gap']">
-            {{ planItemStatus(pi.target, reviewItems) === 'done' ? '✓' : '⚠' }}
+        <li v-for="(pi, idx) in reviewPlanItems" :key="pi.id || idx" class="prp-item">
+          <span :class="['prp-state', `is-${planStateOf(pi)}`]" :title="planStateTitle(pi)">
+            {{ PLAN_STATE_MARKS[planStateOf(pi)] }}
           </span>
           <span class="prp-target">{{ pi.target }}</span>
-          <span class="prp-origin" :title="pi.origin">{{ pi.origin }}</span>
+          <span class="prp-origin" :title="pi.origin">{{ originLabel(pi.origin) }}</span>
         </li>
       </ol>
     </details>
@@ -653,9 +699,9 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
 /* ---- 审查结论面板 + 审查计划卡(证据驱动可信审查) ---- */
 .panel-review-summary { margin: var(--space-2) 0; padding: var(--space-2) var(--space-3); border: 1px solid var(--color-border); border-radius: var(--radius-md); background: var(--color-bg-subtle, rgba(0,0,0,0.02)); }
 .prs-counts { display: flex; flex-wrap: wrap; gap: var(--space-2); font-size: var(--fs-sm); }
-.prs-risk { color: var(--color-danger); }
-.prs-cleared { color: var(--color-success, #16a34a); }
-.prs-gap { color: var(--color-warning, #d97706); }
+.prs-established { color: var(--color-danger); }
+.prs-not-established { color: var(--color-success, #16a34a); }
+.prs-pending { color: var(--color-warning, #d97706); }
 .prs-total { color: var(--color-text-muted); margin-left: auto; }
 .prs-conf { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .conf-badge { font-size: var(--fs-xs); padding: 1px 6px; border-radius: var(--radius-sm); border: 1px solid var(--color-border); }
@@ -673,7 +719,9 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
 .prp-item { display: flex; align-items: center; gap: var(--space-2); padding: 2px 0; font-size: var(--fs-sm); }
 .prp-state { width: 16px; text-align: center; }
 .prp-state.is-done { color: var(--color-success,#16a34a); }
-.prp-state.is-gap { color: var(--color-warning,#d97706); }
+.prp-state.is-unverified { color: var(--color-warning,#d97706); }
+.prp-state.is-pending { color: var(--color-text-muted,#9ca3af); }
+.prp-state.is-unknown { color: var(--color-text-muted,#9ca3af); }
 .prp-target { flex: 1; }
 .prp-origin { font-size: var(--fs-xs); color: var(--color-text-muted); border: 1px dashed var(--color-border); padding: 0 6px; border-radius: var(--radius-sm); }
 </style>

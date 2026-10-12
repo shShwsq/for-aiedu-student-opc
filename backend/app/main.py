@@ -195,6 +195,16 @@ async def lifespan(app: FastAPI):
     # (后端重启后审查线程已死,启动时置 failed,避免前端永远"检查中")
     migrate_task_add_review_status_column()
     migrate_stale_review_status()
+    # 审查项字段语义收敛:review_items 列改名(description→conclusion 审查结论、
+    # suggestion→follow_up 可追问内容)+ 补 plan_item_id(规划对账 id 链路);幂等
+    from app.models.audit import (
+        migrate_review_item_columns,
+        purge_legacy_plan_backfill_items,
+    )
+
+    migrate_review_item_columns()
+    # 清掉旧版规划对账(target 子串匹配全失配)伪造的"[计划回填]"假缺口
+    purge_legacy_plan_backfill_items()
 
     # 领域事件:注册审计订阅者(所有事件 append-only 落库 domain_event_logs;
     # 建表已完成,后续扩展按同样方式 subscribe,见 app/domain_events.py)

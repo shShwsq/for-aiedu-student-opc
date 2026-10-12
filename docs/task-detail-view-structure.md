@@ -341,9 +341,15 @@ RoundGroup { roundIdx, segments, planSteps }
 #### 段 3:审查结果
 
 **审查项清单**(原与其他段合并在一个 tab 里,现为独立段):`ReviewItem` 按
-`utils/reviewBucket.bucketizeReviewItems` 三分(发现风险 / 已核查·剔除误报 /
-缺口·待改进),每档下紧凑卡片(标题 + 置信档位/分数 + 来源/严重度),点击开
+`utils/reviewBucket.bucketizeReviewItems` 三分(已核实成立 / 已核实不成立 /
+待核实 —— 分档主语是"检查助手对这条待核实对象的核实结果",不是"你的项目里有几类
+条目";旧口径 发现风险 / 已核查·剔除误报 / 缺口·待改进 让用户分不清在说谁),
+每档下紧凑卡片(标题 + 置信档位/分数 + 来源/严重度),点击开
 `DetailCardDrawer` 看正文与证据;置信度由后端核验证据引用后派生,模型不自报。
+**待核实档不显示置信档位**(它本就没证据):`utils/reviewBucket.pendingVerifyBadge`
+按成因给标签(未取证 / 部分核实 / 未核实 / 证据未核验),旧文案"未分级 · —"不再铺满。
+来源也不直铺英文枚举:`ORIGIN_LABELS` 把 `agent1_claim` 等显示成「AI助手 的结论」
+「你的要求」「领域经验」(后端报告导出共用同一份口径 `app/models/audit.ORIGIN_LABELS`)。
 **段内不再有「审查结果 (N)」同名 h2**(段名与计数已上移标题行,见 §5.2),
 只剩一条 `sidebar-section-status` 状态行,且仅在 running 时渲染(「检查助手核查中」,
 审查项边核边落);完成态卡片直接顶到标题行下。
@@ -419,7 +425,14 @@ RoundGroup { roundIdx, segments, planSteps }
 - **宿主约束**:组件必须写在 `.page-body` 内部(本视图 `<nav class="detail-rail">` 之后)。
   挪到 `.page` 末尾或改回 Teleport,定位基准就退回视口,抽屉重新盖住顶栏;
 - **窄屏**:≤640px 面板 `width: 100%`——不再写 `100vw`(基准已是容器,视口单位在有
-  纵向滚动条的桌面浏览器上会比容器宽几个像素,被 `overflow: hidden` 削掉)。
+  纵向滚动条的桌面浏览器上会比容器宽几个像素,被 `overflow: hidden` 削掉);
+- **审查项正文顺序(字段语义改造后)**:待核实对象(`review_target`)→ 审查结论
+  (`conclusion`,分析过程)→ **原始证据(`evidence.source`,保留文件:行 + quote)**→
+  分析依据 → 验证测试 → **可追问内容(`follow_up`)**。旧标签「被核实对象 / 发现问题 /
+  建议」已换名(旧 `description` 里装的是全文分析,标成"发现问题"与正文不符);
+  可追问内容带一个按钮,点击把这句作为用户消息发出走 resume(`emit('dig')` →
+  视图层 `handleSuggestionDig`),**共用侧栏建议卡的 `diggingSuggestion` 锁**——
+  否则抽屉里的追问与侧栏建议可以同时发两条,新一轮执行互相踩。
 
 ## 6. 全局弹窗
 

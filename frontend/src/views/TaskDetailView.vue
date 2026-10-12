@@ -75,6 +75,9 @@ import {
   confidenceClass,
   confidenceLabel,
   formatConfidenceScore,
+  originLabel,
+  pendingVerifyBadge,
+  REVIEW_BUCKET_ORDER,
 } from '@/utils/reviewBucket'
 import type {
   AttachmentInfo,
@@ -2359,7 +2362,7 @@ const resultGroups = computed<ResultGroup[]>(() => {
   return dyn
 })
 
-// ---- 审查结果(ReviewItem):证据驱动可信审查,按三态分桶展示 ----
+// ---- 审查结果(ReviewItem):证据驱动可信审查,按三分档展示 ----
 
 const reviewItems = computed<ReviewItem[]>(() => task.value?.review_items ?? [])
 const reviewBuckets = computed(() => bucketizeReviewItems(reviewItems.value))
@@ -2372,12 +2375,20 @@ const reviewSummary = computed<ReviewSummary | null>(() => {
 /** 实时审查计划(SSE review_plan_update;review_done 后以 _review.plan 为准) */
 const reviewPlanLive = ref<ReviewPlanUpdateEventData | null>(null)
 
-/** 三态分桶的展示顺序与标题(发现风险 → 已核查·剔除误报 → 缺口·待改进) */
-const REVIEW_BUCKET_ORDER = [
-  { key: 'risk', label: '发现风险' },
-  { key: 'cleared', label: '已核查·剔除误报' },
-  { key: 'gap', label: '缺口·待改进' },
-] as const
+/**
+ * 审查项卡片右上标签:待核实档说"为什么还没核实",其余说置信档位。
+ *
+ * 旧版无证据也铺一个"未分级 · —",满屏都是它,读不出是"未取证"还是"核验失败"。
+ * 分档标题与顺序集中在 utils/reviewBucket(与后端同一名单),不在视图里再拼一份。
+ */
+function reviewBadge(it: ReviewItem): { label: string; cls: string; title?: string } {
+  const pending = pendingVerifyBadge(it)
+  if (pending) return { label: pending.label, cls: 'conf-assertion', title: pending.title }
+  return {
+    label: `${confidenceLabel(it.confidence?.tier)} · ${formatConfidenceScore(it.confidence?.score)}`,
+    cls: `conf-${confidenceClass(it.confidence?.tier)}`,
+  }
+}
 
 /** 审查项证据里的源码/原文文件:复用工作区文件跳转 */
 async function openReviewFile(it: ReviewItem): Promise<void> {
@@ -3539,7 +3550,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
           <p v-else class="panel-empty-hint">等待检查助手核查…</p>
         </div>
       
-        <!-- 段: 审查结果(ReviewItem 三态分桶) -->
+        <!-- 段: 审查结果(ReviewItem 按核实结果三分档) -->
         <div v-show="activeSection === 'findings'" class="sidebar-panel">
           <!-- 审查结果(ReviewItem):紧凑卡片,点击开 drawer -->
           <section v-if="hasReviewResults" class="sidebar-review" data-onboarding="detail-review">
@@ -3575,13 +3586,13 @@ const showKnowledgeToolbar = computed<boolean>(() => {
                   <div class="review-header">
                     <span class="card-chevron">›</span>
                     <h4>{{ it.title }}</h4>
-                    <span :class="['conf-badge', `conf-${confidenceClass(it.confidence?.tier)}`]">
-                      {{ confidenceLabel(it.confidence?.tier) }} · {{ formatConfidenceScore(it.confidence?.score) }}
+                    <span :class="['conf-badge', reviewBadge(it).cls]" :title="reviewBadge(it).title">
+                      {{ reviewBadge(it).label }}
                     </span>
                     <span v-if="it.evidence_mismatch" class="conf-warn" title="有引用但后端核验未通过">⚠ 证据未核验</span>
                   </div>
                   <div v-if="it.severity || it.origin" class="review-meta">
-                    <span class="origin-tag" :title="it.origin">{{ it.origin }}</span>
+                    <span class="origin-tag">{{ originLabel(it.origin) }}</span>
                     <span v-if="it.severity" :class="['sev-tag', `sev-${it.severity}`]">{{ it.severity }}</span>
                   </div>
                 </article>
@@ -3789,8 +3800,10 @@ const showKnowledgeToolbar = computed<boolean>(() => {
       :open="drawerOpen"
       :item="drawerItem"
       :type="drawerType"
+      :digging="diggingSuggestion"
       @close="drawerOpen = false"
       @open-file="handleDrawerOpenFile"
+      @dig="handleSuggestionDig"
     />
     </div>
 
@@ -5483,16 +5496,16 @@ const showKnowledgeToolbar = computed<boolean>(() => {
 .diff-line-meta { color: var(--color-text-secondary); font-weight: var(--fw-medium); }
 .diff-line-ctx { color: var(--color-text); }
 
-/* ---- 审查结果(ReviewItem):三态分桶 + 证据链 + 置信徽标 ---- */
+/* ---- 审查结果(ReviewItem):三分档 + 证据链 + 置信/未核实原因标记 ---- */
 /* 原先与重点与知识点同在一个 tab 里,靠 margin-top 拉开两段;
    拆成独立段后段内间距由 .sidebar-panel 的 gap 统一给 */
 .sidebar-review { margin-top: 0; }
 .review-bucket { margin-top: var(--space-2); }
 .review-bucket-head { display: flex; align-items: center; gap: var(--space-2); margin: var(--space-2) 0; }
 .bucket-tag { font-size: var(--fs-sm); font-weight: var(--fw-semibold); padding: 1px 8px; border-radius: var(--radius-sm); }
-.bucket-risk { background: var(--color-danger-light); color: var(--color-danger); }
-.bucket-cleared { background: rgba(22, 163, 74, 0.12); color: var(--color-success, #16a34a); }
-.bucket-gap { background: rgba(217, 119, 6, 0.14); color: var(--color-warning, #d97706); }
+.bucket-established { background: var(--color-danger-light); color: var(--color-danger); }
+.bucket-not_established { background: rgba(22, 163, 74, 0.12); color: var(--color-success, #16a34a); }
+.bucket-pending_verify { background: rgba(217, 119, 6, 0.14); color: var(--color-warning, #d97706); }
 .review-card { border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-2) var(--space-3); margin-bottom: var(--space-2); cursor: pointer; }
 .review-card:hover { background: var(--color-bg-hover, rgba(0,0,0,0.03)); }
 .review-header { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }

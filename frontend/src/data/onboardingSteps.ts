@@ -204,7 +204,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     activateSection: 'findings',
     title: '审查结果',
     content:
-      '检查助手核查 agent1 的产出后逐条落地的审查项,按「发现风险 / 已核查·剔除误报 / 缺口·待改进」三档分组;每条带后端核验证据后派生的置信度,点开看证据。',
+      '检查助手逐条核实后的审查项,按「已核实成立 / 已核实不成立 / 待核实」三档分组(分档说的是核实结果,不是你项目里的条目类型);每条带后端核验证据后派生的置信度,点开看证据与可追问内容。',
   },
   {
     id: 'detail-results',

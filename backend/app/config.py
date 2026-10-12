@@ -153,6 +153,13 @@ class Settings(BaseSettings):
     # (相对路径按进程 CWD 解析,存储位置随 uvicorn 启动目录漂移),并挂载持久卷
     UPLOADS_DIR: str = "./data/uploads"
 
+    # ---- agent2 后台审查防跑飞(取证额度放开后的最后防线)----
+    # 单次后台审查的最长挂钟时间(秒):只读取证额度 100 次可以让审查跑特别久,
+    # 而它在 daemon 线程里无超时——真跑飞了只能用户手动「终止检查」。超时在工具循环
+    # 边界按"已发射条目收尾"(保留已落库审查项,标 review_status=stopped)。
+    # 设为 0 关闭硬时限(只靠用户终止与额度上限)
+    AGENT2_REVIEW_MAX_SECONDS: int = 3600
+
     # ---- 引用复核(check_reference,agent2 用)----
     # 场景命中且任务级 _agent_policy 未显式设置 allow_verify 时,自动开启
     # PoC 验证开关(实际跑 PoC 仍需任务配 test_env_url)。逗号分隔场景 id。

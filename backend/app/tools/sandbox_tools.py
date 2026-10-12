@@ -2250,6 +2250,32 @@ def search_code(
         )
 
 
+def _glob_matches(file_glob: str, fname: str, rel: str) -> bool:
+    """file_glob 同时按**文件名**与**相对路径**匹配(与 sandbox 模式的 rg --glob 同口径)
+
+    旧实现只 `fnmatch(fname, file_glob)`:模型写 `"backend/app/*.py"` 这种带路径前缀
+    的 glob 时永远不匹配(fname 只是 `config.py`),白烧一次取证额度还拿到 0 结果;
+    而 sandbox 模式下同样写法能命中——两种运行模式口径不一致更难排查。
+    """
+    import fnmatch
+
+    return fnmatch.fnmatch(fname, file_glob) or fnmatch.fnmatch(
+        rel.replace("\\", "/"), file_glob
+    )
+
+
+def _empty_glob_hint(file_glob: str | None, matched: int) -> str | None:
+    """0 匹配且 glob 含路径分隔符时给一句自检提示(避免费一次无声的失败取证)"""
+    if matched or not file_glob:
+        return None
+    if "/" in file_glob or "\\" in file_glob:
+        return (
+            "未命中任何匹配。file_glob 已同时按文件名与仓库相对路径匹配;"
+            "若仍为空,请去掉路径前缀(如只写 *.py)、放宽正则,或用 find_files 先定位文件。"
+        )
+    return None
+
+
 def _search_code_local(
     repo_path: str,
     pattern: str,
@@ -2260,9 +2286,7 @@ def _search_code_local(
     output_mode: str,
     offset: int,
 ) -> dict:
-    """local 模式:用 Python 实现搜索"""
-    import fnmatch
-
+    """local 模式:用 Python 实现搜索(glob 匹配口径见 _glob_matches)"""
     flags = 0 if case_sensitive else re.IGNORECASE
     regex = re.compile(pattern, flags)
 
@@ -2284,17 +2308,17 @@ def _search_code_local(
             ext = os.path.splitext(fname)[1].lower()
             if ext not in text_exts:
                 continue
-            if file_glob and not fnmatch.fnmatch(fname, file_glob):
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, repo_path)
+            if file_glob and not _glob_matches(file_glob, fname, rel):
                 continue
 
-            fpath = os.path.join(root, fname)
             try:
                 with open(fpath, encoding="utf-8", errors="ignore") as f:
                     lines = f.readlines()
             except (PermissionError, OSError):
                 continue
 
-            rel = os.path.relpath(fpath, repo_path)
             for i, line in enumerate(lines):
                 if regex.search(line):
                     m = {"file": rel, "line": i + 1, "content": line.rstrip()}
@@ -2309,18 +2333,26 @@ def _search_code_local(
         counts: dict[str, int] = {}
         for m in all_matches:
             counts[m["file"]] = counts.get(m["file"], 0) + 1
-        return {"counts": counts, "total_matches": len(all_matches)}
+        out: dict = {"counts": counts, "total_matches": len(all_matches)}
+        hint = _empty_glob_hint(file_glob, len(all_matches))
+        if hint:
+            out["hint"] = hint
+        return out
 
     if output_mode == "files_with_matches":
         files = sorted(set(m["file"] for m in all_matches))
         total = len(files)
         page = files[offset:offset + max_matches]
-        return {
+        out = {
             "files": page,
             "total_files": total,
             "truncated": offset + len(page) < total,
             "offset": offset,
         }
+        hint = _empty_glob_hint(file_glob, total)
+        if hint:
+            out["hint"] = hint
+        return out
 
     # output_mode == "content"
     total = len(all_matches)
@@ -2328,12 +2360,16 @@ def _search_code_local(
     for m in page:
         m.setdefault("context_before", [])
         m.setdefault("context_after", [])
-    return {
+    out = {
         "matches": page,
         "total_matches": total,
         "truncated": offset + len(page) < total,
         "offset": offset,
     }
+    hint = _empty_glob_hint(file_glob, total)
+    if hint:
+        out["hint"] = hint
+    return out
 
 
 def _search_code_sandbox(

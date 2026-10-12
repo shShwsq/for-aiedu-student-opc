@@ -13,7 +13,7 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 工具分**取证**与**发射**两族:
 
 - **取证工具(当前已实现)**:三类共 6 个可调用函数(其中 `verify` 内部再委派 2 个子工具),见 §1–§3;
-- **发射/输出工具(后端已落地,UI/出题接入中)**:`submit_review_plan`(审查规划,先行且可修订)/ `submit_review_item`(审查项,三态合一)/ `submit_knowledge_point`(知识点)/ `submit_suggestion`,是"证据驱动的可信审查"改造的**四个即时发射原语**,见 §4。
+- **发射/输出工具(后端已落地,UI/出题接入中)**:`submit_review_plan`(审查规划,先行且可修订)/ `submit_review_item`(审查项,按核实结果三分档)/ `submit_knowledge_point`(知识点)/ `submit_suggestion`,是"证据驱动的可信审查"改造的**四个即时发射原语**,见 §4。
 
 下表为**取证工具**(§1–§3):
 
@@ -148,19 +148,20 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 
 | 工具 | 落点实体 | 用途 | 参数(要点) | 次数 |
 |---|---|---|---|---|
-| `submit_review_plan` | **`task.params._review.plan`**(审查计划,不落表) | 规划先行:声明本轮拟核实的审查清单与取证调度;发现新疑点可**全量重发修订** | `items[]`(每条 `target` 拟核实对象 + `origin` 四类来源 + `priority` + `planned_evidence`:`source/verify/reference/none`)+ `note?`(规划理由) | 1 次起,可重发(覆盖式) |
-| `submit_review_item` | **`ReviewItem`(新表)——审查项(三态合一)** | 声明并落定一个审查项:发现风险 / 已核查·剔除误报 / 缺口·待改进 | `review_target`(被核实的 agent1 具体结论/动作)+ `origin`(agent1_claim/agent1_action/user_requirement/domain_baseline)+ `status`(covered/partial/missing)+ `verdict`(confirmed/suspected/false_positive/none/pending)+ `severity?` + `evidence{source,analysis_basis,verification}`(各带 `call_ref`,缺口可省)+ `suggestion?` + `agent1_ref?` + `dimension?`(分组标签);**不含 confidence**(后端派生) | 每项一次(约 3–8) |
+| `submit_review_plan` | **`task.params._review.plan`**(审查计划,不落表) | 规划先行:声明本轮拟核实的审查清单与取证调度;发现新疑点可**全量重发修订**;后端给每条补稳定 id(`P1`…)并在回执里回灌 | 3-5 条为宜:`items[]`(每条 `target` 拟核实对象 + `origin` 四类来源 + `priority` + `planned_evidence`:`source/verify/reference/none`)+ `note?`(规划理由) | 1 次起,可重发(覆盖式) |
+| `submit_review_item` | **`ReviewItem`——审查项(按核实结果三分档)** | 声明并落定一个审查项:已核实成立 / 已核实不成立 / 待核实 | `review_target`(待核实对象:项目里能被指认的具体位置/事项)+ `origin`(agent1_claim/agent1_action/user_requirement/domain_baseline)+ `plan_item_id?`(对上哪条计划项 P1/P2…,规划对账靠它)+ `status`(covered/partial/missing)+ `verdict`(confirmed/suspected/false_positive/none/pending)+ `severity?` + `conclusion`(审查结论,≤200 字;旧列 `description`)+ `follow_up?`(可追问内容,一句可直接发回 agent1 的问句;旧列 `suggestion`)+ `evidence{source,analysis_basis,verification}`(各带 `call_ref`,待核实类可省)+ `agent1_ref?` + `dimension?`(分组标签);**不含 confidence**(后端派生) | 每项一次(约 3–8,硬上限 20) |
 | `submit_knowledge_point` | **`Result`——知识点** | 发射一条学习提炼(重点/知识点) | `title`/`content` + `learning_note`/`practice_worthy` + `source_review_item_id?`(回指派生它的审查项)/`learning_topic`**必填**(取「学习主题词表」的 key,后端校验;非法/缺失回落默认主题) | 0..N |
 | `submit_suggestion` | 累积进 `task.params._review` | 发射一条"建议追问方向" | `text`(具体可执行,用户点击后作为指令交回 agent1) | 0..3 |
 
-> **审查项 ≠ 知识点**:`ReviewItem` 回答"代码有没有问题、多可信"(三态:风险/已核查/缺口,带证据者附证据链 + 置信度),`Result`(知识点)回答"该记住什么"(学习提炼,喂知识点看板/出题);二者用 `source_review_item_id` 显式连边,**分型但不割裂,保住"素材同源"**。三态由 `status`+`verdict`+是否带 `evidence` 组合判读(风险=verdict∈{confirmed,suspected};已核查/误报=verdict∈{none,false_positive}+covered;缺口=status∈{missing,partial})。
+> **审查项 ≠ 知识点**:`ReviewItem` 回答"这条待核实对象核实得怎么样、多可信"(三分档,带证据者附证据链 + 置信度),`Result`(知识点)回答"该记住什么"(学习提炼,喂知识点看板/出题);二者用 `source_review_item_id` 显式连边,**分型但不割裂,保住"素材同源"**。三分档由 `status`+`verdict` 组合判读(`app/models/audit.classify_status` 集中一处):**已核实成立**=verdict=confirmed(优先于覆盖态,取到过证就不被 partial/missing 降级);**已核实不成立**=verdict ∈ {none, false_positive};**待核实**=其余(suspected / pending / 无 verdict / missing / partial)。旧口径把 `suspected`(存疑未取证)归"发现风险",现纠正为待核实。
 
 **关键约定**:
-- **审查规划先行**:agent2 先调 `submit_review_plan` 结构化发出审查清单(据 **agent1 执行过程 + 结果 + 用户输入 + 领域基线**,`priority`/`planned_evidence` 显式调度取证预算——四个只读工具共享的 12 次额度不够"每项深查"时,按优先级取舍而非默默跳过),再**逐项核实并发射**;计划**不是围栏**,允许发射计划外审查项,过程中发现新疑点可全量重发修订计划。`origin` **必须含 `user_requirement`/`domain_baseline` 类条目**,否则会漏掉 agent1 没碰的领域;维度退化为分组标签,清单不再有"发现/覆盖"两套归属的分叉。
+- **审查规划先行**:agent2 先调 `submit_review_plan` 结构化发出审查清单(据 **agent1 执行过程 + 结果 + 用户输入 + 领域基线**,`priority`/`planned_evidence` 显式调度取证预算——四个只读工具共享 100 次额度,按"每条计划项能深查"给,不必再为省额度牺牲核实深度),再**逐项核实并发射**;计划**不是围栏**,允许发射计划外审查项,过程中发现新疑点可全量重发修订计划。`origin` **必须含 `user_requirement`/`domain_baseline` 类条目**,否则会漏掉 agent1 没碰的领域;维度退化为分组标签,清单不再有"发现/覆盖"两套归属的分叉。
 - `evidence.*.call_ref` **必须引用本轮取证工具结果里见过的 `_evidence_ref`**(核查到哪、发射到哪,引用就近);后端核验引用是否真取过证据,取不到自动降置信并标 `evidence_mismatch`。
-- 模型**不产出置信度数字**;`verdict` 才是它的定性判断,置信度由后端 `app/agents/evidence.py` 从"证据完整度 + 校验结果"派生(verified / source_confirmed / reference_corroborated / assertion_only);缺口项无证据则不写置信。
+- 模型**不产出置信度数字**;`verdict` 才是它的定性判断,置信度由后端 `app/agents/evidence.py` 从"证据完整度 + 校验结果"派生(verified / source_confirmed / reference_corroborated / assertion_only);待核实类无证据则不写置信(前端不再拿"未分级 · —"冒充档位,改显"未取证/部分核实/证据未核验")。
 - **即时落库 + 实时事件**:每次 `submit_review_plan` 覆盖计划并推 `review_plan_update`(侧栏计划卡逐条打勾);每条 `submit_review_item` 落 `ReviewItem` 并推 `review_item_add`;每条 `submit_knowledge_point` 落 `Result` 并推 `knowledge_point_add`(侧栏两区各自逐条增长,不再等 `review_done` 一次性出现);本轮首条各自按"同轮重跑幂等"清理本轮旧数据。
-- 循环退出时后端先做**规划对账**(计划内未匹配到发射审查项的条目,回填为 `status=missing` 的 ReviewItem——对"确认偏误"的机器级兜底),再聚合写 `task.params._review`(三态计数 + 置信分布 + `plan` 对账计数 planned/executed/backfilled_gap + 总体判定,清单本身即 `review_items` 行);`grouping` 由后端按 `ReviewItem.severity` 派生(无 severity → 平铺)。
+- 循环退出时后端先做**规划对账**:先按 `plan_item_id` 精确命中,无 id 时按 target 重合度(中文单字 + 英文/路径词 的 overlap coefficient ≥ 0.5)兜底。**未核实的计划项不再被伪造成 `status=missing` 审查项**(旧实现对两条各自成句的长中文做"互为子串"判定,实测 8/8 全失配 → 凭空多出一堆假缺口,并把聚合里的"核实"数字算成 0),只记进 `_review.plan.unverified`(带 reason:取证额度用尽 / 未排到取证),在计划卡显示「未核实」;对"确认偏误"的兜底依旧成立(漏掉的条目被如实报出,不藏起来)。随后聚合写 `task.params._review`(三分档计数 + 置信分布含"未取证" + `plan` 对账计数 planned/executed/unverified + 总体判定);`grouping` 由后端按 `ReviewItem.severity` 派生(无 severity → 平铺)。
+- **长审查的护栏**:取证额度 100 次后,单轮可能跑半小时以上——① 超出 `MAX_LIVE_TOOL_RESULTS=40` 窗口的工具回传正文压成一行摘要(台账不裁,`call_ref` 核验行为不变);② 挂钟硬时限 `settings.AGENT2_REVIEW_MAX_SECONDS`(默认 3600,0=关)在循环边界收掉,已发射条目照常聚合(标 `timed_out`,不被当成"检查终止");③ 用户侧「终止检查」仍是协作式取消,行为不变。
 - **兜底**:不支持结构化工具发射的模型,沿用 `extract_text_tool_calls` 文本兜底解析四个 `submit_*`;整轮一个都没解析出来时回退旧"末尾大 JSON"解析(仍分流落 `ReviewItem`/`Result` + 逐条派生置信;旧路径无结构化计划,前端不显示计划卡)。
 
 > 与 §1–§3 取证工具的配合关系:§1–§3 产生**证据**,§4 把证据**绑定到审查结论并即时输出**——这正是"证据驱动的可信审查"对"谁来审查审查者"的回答:每条审查结论挂可复核的证据指针,置信度由证据派生而非模型自评。

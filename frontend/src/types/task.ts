@@ -129,8 +129,13 @@ export interface TaskResult {
 // 证据驱动可信审查:审查项(ReviewItem)与审查结论聚合(_review)
 // ============================================================
 
-/** 审查项三态分桶(与后端 audit.classify_status 一致) */
-export type ReviewBucket = 'risk' | 'cleared' | 'gap'
+/** 审查项三分档(与后端 audit.classify_status 一致)
+ *
+ * 主语是"检查助手对这条待核实对象的核实结果":
+ * established 已核实成立 / not_established 已核实不成立 / pending_verify 待核实。
+ * (旧口径 risk/cleared/gap 把"agent1 说有漏洞且我未取证"也算发现风险,现纠正为待核实)
+ */
+export type ReviewBucket = 'established' | 'not_established' | 'pending_verify'
 export type ReviewOrigin = 'agent1_claim' | 'agent1_action' | 'user_requirement' | 'domain_baseline'
 export type ReviewStatusState = 'covered' | 'partial' | 'missing'
 export type ReviewVerdict = 'confirmed' | 'suspected' | 'false_positive' | 'none' | 'pending'
@@ -162,15 +167,22 @@ export interface ReviewEvidence {
   }
 }
 
-/** 审查项(后端 ReviewItemResponse,三态合一) */
+/** 置信分布计数:四个档位 + "未取证"(无 evidence 则 confidence 不写) */
+export type ConfidenceTally = Record<ConfidenceTier, number> & { no_evidence: number }
+
+/** 审查项(后端 ReviewItemResponse,三分档) */
 export interface ReviewItem {
   id: string
   round_idx: number
   title: string
-  description?: string | null
+  /** 审查结论(分析过程,可引用原始证据);旧列名 description */
+  conclusion?: string | null
+  /** 待核实对象;旧标签"被核实对象" */
   review_target: string
   origin: ReviewOrigin
   agent1_ref?: string | null
+  /** 关联的审查计划项 id(P1…,后端铸造;旧版靠 target 文本子串对账,几乎全失配) */
+  plan_item_id?: string | null
   dimension?: string | null
   status: ReviewStatusState
   verdict?: ReviewVerdict | null
@@ -179,34 +191,54 @@ export interface ReviewItem {
   confidence?: ReviewConfidence | null
   evidence_validated: boolean
   evidence_mismatch: boolean
-  suggestion?: string | null
-  /** 三态分桶(后端集中判读,前端直接复用) */
+  /** 可追问内容(一句可直接发回 AI助手 的问句);旧列名 suggestion */
+  follow_up?: string | null
+  /** 三分档(后端集中判读,前端直接复用) */
   bucket: ReviewBucket
   created_at: string
 }
 
 /** 审查计划条目(submit_review_plan.items) */
 export interface ReviewPlanItem {
+  /** 后端铸造的稳定 id(P1…),供 plan_item_id 回指 */
+  id?: string
   target: string
   origin: ReviewOrigin
   priority?: number
   planned_evidence?: 'source' | 'verify' | 'reference' | 'none'
 }
 
+/** 未核实到的计划项(旧版会被伪造成 missing 审查项落库,现只在计划卡展示) */
+export interface ReviewPlanUnverified {
+  id?: string
+  target: string
+  origin?: ReviewOrigin
+  priority?: number
+  /** budget_exhausted 取证额度用尽 / not_reached 未排到取证 */
+  reason?: 'budget_exhausted' | 'not_reached'
+}
+
 /** task.params._review 聚合审查结论(结构化落库) */
 export interface ReviewSummary {
-  counts: { total: number; risk: number; cleared: number; gap: number }
+  counts: {
+    total: number
+    established: number
+    not_established: number
+    pending_verify: number
+  }
   status: { covered: number; partial: number; missing: number }
-  confidence_tally: Record<ConfidenceTier, number>
+  confidence_tally: ConfidenceTally
   knowledge_point_count: number
   verdict_summary: string
   suggestions: string[]
+  /** 本轮因达硬时限提前收尾(仍保留已发射条目) */
+  timed_out?: boolean
   plan?: {
     items: ReviewPlanItem[]
     note?: string | null
     planned: number
     executed: number
-    backfilled_gap: number
+    unverified?: ReviewPlanUnverified[]
   } | null
 }
 

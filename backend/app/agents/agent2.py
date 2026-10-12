@@ -39,6 +39,8 @@
 """
 import json
 import logging
+import re
+import time
 from datetime import datetime
 from typing import Any, Callable
 from uuid import UUID, uuid4
@@ -64,16 +66,17 @@ from app.models.task import Conversation, Result, Task
 # 证据台账 + 置信度派生(纯函数,见 app/agents/evidence.py)
 from app.agents.evidence import EvidenceRecorder, derive_confidence_column, score_review_item
 
-# 审查项模型(三态判读口径 + 枚举白名单集中管理)
+# 审查项模型(三分档判读口径 + 枚举白名单集中管理)
 from app.models.audit import (
     ReviewItem,
     VALID_ORIGINS,
     VALID_SEVERITIES,
     VALID_STATUSES,
     VALID_VERDICTS,
-    BUCKET_CLEARED,
-    BUCKET_GAP,
-    BUCKET_RISK,
+    BUCKET_ESTABLISHED,
+    BUCKET_LABELS,
+    BUCKET_NOT_ESTABLISHED,
+    BUCKET_PENDING_VERIFY,
     classify_status,
 )
 
@@ -111,7 +114,11 @@ MAX_RAW_OUTPUT_CHARS = 3000
 UA_EVAL_MAX_TOKENS = 16384
 
 # 单次评估中最多调用只读工具的次数(防止读文件循环失控)
-MAX_READ_TOOL_CALLS = 12
+# 12 → 100:实测一次审查里 8 条计划项共享 12 次额度(人均 1.5 次),导致
+# 3 条结论退化成"受只读工具调用上限限制,未能独立二次读取"的 suspected。
+# 用户接受检查助手长时间后台跑,额度按"每条计划项能深查"给;配套的上下文
+# 护栏(_trim_agent2_tool_history)与硬时限(AGENT2_REVIEW_MAX_SECONDS)防跑飞。
+MAX_READ_TOOL_CALLS = 100
 
 # 单次评估中最多调用 verifier_agent 的次数(防止无限验证)
 MAX_VERIFY_CALLS = 3
@@ -129,9 +136,15 @@ _SUBMIT_TOOLS: list[dict[str, Any]] = [
 ]
 # 发射类硬上限(prompt 约定之外的最后防线):主循环靠"不再发工具"退出,
 # 取证额度有代码强制而发射原本没有,须防循环跑飞失控
-MAX_REVIEW_ITEMS = 15
+# 15 → 20:取证额度开到 100 后发射更多真实发现,15 条会拒收真结论
+MAX_REVIEW_ITEMS = 20
 MAX_KNOWLEDGE_POINTS = 12
 MAX_SUGGESTIONS = 5
+
+# 保留在 LLM 上下文里的最近工具回传条数:100 次取证 × 单条 3000 字会打爆 prompt,
+# 更早的回传只留一行摘要(引用号 + 参数索引),证据台账本体不裁——
+# 后端核验 call_ref/quote 的行为与不裁剪时一致(见 _trim_agent2_tool_history)
+MAX_LIVE_TOOL_RESULTS = 40
 
 
 def _agent2_learning_topics(db, user_id):
@@ -491,11 +504,12 @@ def run_agent2(
         "items": 0, "kp": 0, "sug": 0,
         "round_cleared_items": False, "round_cleared_kp": False,
         "emitted": False,
-        "targets": [],          # 已发射审查项的 review_target(规划对账用)
-        "item_payloads": [],    # 已发射审查项 payload(含 bucket/confidence/severity)
+        "item_payloads": [],    # 已发射审查项 payload(含 bucket/confidence/severity/plan_item_id)
         "kp_payloads": [],      # 已发射知识点 payload(供 orchestrator 计数/兼容)
         "suggestions": [],      # submit_suggestion 累积文本
-        "plan": None,           # 最近一次 submit_review_plan(覆盖式修订)
+        "plan": None,           # 最近一次 submit_review_plan(覆盖式修订,items 已补 id)
+        # 取证额度用量(规划对账靠它区分未核实项是"额度用尽"还是"没排到")
+        "tool_counts": {"read": 0, "verify": 0, "reference": 0},
     }
     # 被审 agent1 对话 id 集(校验 submit_review_item.agent1_ref 归属;空集=不校验)
     agent1_conv_ids: set[UUID] = set()
@@ -521,10 +535,27 @@ def run_agent2(
             task_id=task_id, round_idx=round_idx, tools=tools, **extra,
         )
 
-    stopped = False  # 用户终止检查:置位后在循环边界退出
-    while True:
-        # 终止检查点(循环顶):上一次工具回灌后用户按了终止,不再多付一次 LLM 往返
+    stopped = False  # 退出原因:user(用户终止)/ timeout(硬时限)/ None
+    stop_reason: str | None = None
+    # 取证额度开到 100 后,单轮审查可能跑到半小时以上;daemon 线程本身无超时,
+    # 用挂钟时限在循环边界收掉(见 settings.AGENT2_REVIEW_MAX_SECONDS)
+    from app.config import settings as _settings
+
+    review_max_seconds = int(getattr(_settings, "AGENT2_REVIEW_MAX_SECONDS", 0) or 0)
+    loop_started = time.monotonic()
+
+    def _stop_reason_now() -> str | None:
+        """循环边界的是否退出判定:用户终止优先于超时(措辞不同)"""
         if stop_check is not None and stop_check():
+            return "user"
+        if review_max_seconds > 0 and (time.monotonic() - loop_started) >= review_max_seconds:
+            return "timeout"
+        return None
+
+    while True:
+        # 终止/超时检查点(循环顶):上一次工具回灌后用户按了终止,不再多付一次 LLM 往返
+        stop_reason = _stop_reason_now()
+        if stop_reason:
             stopped = True
             break
         try:
@@ -546,9 +577,10 @@ def run_agent2(
             # 且降级/解析失败提前 return 时已写下的部分不丢)
             _record_agent2_thinking(db, task, task_id, round_idx, reasoning_chunk)
 
-        # 终止检查点(流式之后):stop_check 在 chunk 边界已把流收掉,
+        # 终止/超时检查点(流式之后):stop_check 在 chunk 边界已把流收掉,
         # 已收到的思考链上面照常落库,这里立即退出而不走工具/解析
-        if stop_check is not None and stop_check():
+        stop_reason = _stop_reason_now()
+        if stop_reason:
             stopped = True
             break
 
@@ -586,9 +618,10 @@ def run_agent2(
         messages.append(assistant_msg)
 
         for tc in tool_calls:
-            # 终止检查点(工具之间):单个工具(verify / check_reference)
+            # 终止/超时检查点(工具之间):单个工具(verify / check_reference)
             # 可阻塞数十秒,不在此拦截会白等一整个工具批次
-            if stop_check is not None and stop_check():
+            stop_reason = _stop_reason_now()
+            if stop_reason:
                 stopped = True
                 break
             fn_name = tc["name"]
@@ -599,13 +632,24 @@ def run_agent2(
 
             # ---- 发射工具(控制类,始终可用,不进 sandbox;不计取证额度) ----
             if fn_name == "submit_review_plan":
-                items = args.get("items") if isinstance(args.get("items"), list) else []
-                emit_state["plan"] = {"items": items, "note": args.get("note")}
+                raw_items = args.get("items") if isinstance(args.get("items"), list) else []
+                plan_items = _stamp_plan_items(raw_items)
+                emit_state["plan"] = {"items": plan_items, "note": args.get("note")}
                 emit_state["emitted"] = True
                 publish(task_id, "review_plan_update", {
-                    "items": items, "note": args.get("note"), "planned": len(items),
+                    "items": plan_items, "note": args.get("note"), "planned": len(plan_items),
                 })
-                _append_tool_receipt(messages, tc, {"ok": True, "planned": len(items)})
+                # 把 id 表回灌给模型:它得知道 P1/P2 才能用 plan_item_id 对上账
+                _append_tool_receipt(messages, tc, {
+                    "ok": True, "planned": len(plan_items),
+                    "plan_items": [
+                        {"id": p["id"], "target": p["target"]} for p in plan_items
+                    ],
+                    "hint": (
+                        "发射审查项时用 plan_item_id 指明它核实的是哪条计划项(P1/P2…),"
+                        "结束时系统按 id 对账"
+                    ),
+                })
                 continue
 
             if fn_name == "submit_review_item":
@@ -634,11 +678,10 @@ def run_agent2(
                 emit_state["items"] += 1
                 emit_state["emitted"] = True
                 emit_state["item_payloads"].append(payload)
-                if payload["review_target"]:
-                    emit_state["targets"].append(payload["review_target"])
                 _append_tool_receipt(messages, tc, {
                     "ok": True, "review_item_id": payload["id"],
                     "confidence": payload["confidence"],
+                    "plan_item_id": payload.get("plan_item_id"),
                 })
                 continue
 
@@ -847,24 +890,56 @@ def run_agent2(
         if stopped:
             break
 
+        # 上下文护栏:100 次取证不可能把回传正文全留在上下文里(见函数 docstring)
+        _trim_agent2_tool_history(messages, evidence.ledger)
+
         # 循环回去:LLM 看到工具结果后,要么再调工具,要么输出 JSON 评估
 
-    # 用户终止检查:优先于降级/解析分支返回(部分输出不作审查结论),
-    # orchestrator 据此标 review_status=stopped,保留 agent1 临时结果
-    if stopped:
+    # 终止/超时退出:优先于降级/解析分支返回。
+    # - 用户终止:部分输出不作审查结论,返回 stopped=True
+    #   (orchestrator 据此标 review_status=stopped,保留 agent1 临时结果)
+    # - 硬时限且已发射条目:不丢弃已完成部分,照常走结构化收尾(已落库的审查项/知识点
+    #   与 _review 聚合全保留),仅记 timed_out 标记与时限说明——审查确实产出了结论,
+    #   不该被当成"检查终止"
+    if stopped and stop_reason == "timeout" and emit_state["emitted"]:
         logger.info(
-            f"[task={task_id}] agent2 审查已被用户终止(round_idx={round_idx},"
+            f"[task={task_id}] agent2 审查达硬时限({review_max_seconds}s),"
+            f"按已发射 {emit_state['items']} 条审查项提前收尾"
+        )
+        emit_state["tool_counts"] = {
+            "read": read_tool_count,
+            "verify": verify_count,
+            "reference": reference_count,
+        }
+        out = _finalize_emitted(
+            db, task, task_id, round_idx, emit_state, evidence.ledger,
+            has_repo=bool(repo_path), verify_available=verify_enabled,
+            agent1_conv_ids=agent1_conv_ids,
+            timed_out=True, review_max_seconds=review_max_seconds,
+        )
+        return out
+
+    if stopped:
+        is_timeout = stop_reason == "timeout"
+        logger.info(
+            f"[task={task_id}] agent2 审查已"
+            f"{'达硬时限提前收尾' if is_timeout else '被用户终止'}"
+            f"(round_idx={round_idx},"
             f"已进工具调用: read={read_tool_count} verify={verify_count} "
             f"reference={reference_count})"
         )
         return {
             "covered": [],
             "missing": [],
-            "reasoning": "检查已由用户终止,未得出审查结论。",
+            "reasoning": (
+                f"检查达时限({review_max_seconds}s)提前收尾,未得出审查结论。"
+                if is_timeout else "检查已由用户终止,未得出审查结论。"
+            ),
             "suggestions": [],
             "results": [],
             "grouping": None,
             "stopped": True,
+            "timed_out": is_timeout,
         }
 
     # 流式调用降级:重试仍失败时返回降级结果(不抛异常杀死任务)。
@@ -893,6 +968,12 @@ def run_agent2(
     # 结构化发射路径(四 submit_* 已即时落库):规划对账 + 聚合 _review + 派生 grouping,
     # 不再解析末尾大 JSON(此路径无末次汇总调用)。
     if emit_state["emitted"]:
+        # 同步取证额度用量:规划对账靠它判未核实项是"额度用尽"还是"没排到"
+        emit_state["tool_counts"] = {
+            "read": read_tool_count,
+            "verify": verify_count,
+            "reference": reference_count,
+        }
         return _finalize_emitted(
             db, task, task_id, round_idx, emit_state, evidence.ledger,
             has_repo=bool(repo_path), verify_available=verify_enabled,
@@ -1272,6 +1353,42 @@ def _clamp_str(val: Any, allowed: frozenset[str]) -> str | None:
     return val if isinstance(val, str) and val in allowed else None
 
 
+# 从回灌正文里抓引用号(JSON 结果的 _evidence_ref 或 verify 末尾的 [evidence_ref=E#])
+_EVIDENCE_REF_RE = re.compile(r'"_evidence_ref"\s*:\s*"(E\d+)"|\[evidence_ref=(E\d+)\]')
+_TRIM_STUB_PREFIX = "[取证记录"
+
+
+def _trim_agent2_tool_history(
+    messages: list[dict[str, Any]], ledger: dict[str, Any],
+) -> None:
+    """把超出窗口的早期工具回传正文压成一行摘要(原地改 messages)。
+
+    为何必需:取证额度 100 次 × 单条硬截 3000 字最多能堆近 30 万字,直接把 prompt
+    打爆(模型报上下文超限 → 整轮审查降级)。只压最近 MAX_LIVE_TOOL_RESULTS 条之外的正文:
+    - 不动 assistant/tool 的配对结构(兼容接口要求 tool 消息成对存在),只换 content;
+    - **不动证据台账本体**(ledger 是 call_ref 核验的数据源),已压过的条目靠前缀识别不重压;
+    - 保留引用号与参数摘要,模型仍知道"当时取过哪条证、取的是什么",不会重复取证。
+    """
+    if MAX_LIVE_TOOL_RESULTS <= 0:
+        return
+    idxs = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    for i in idxs[:-MAX_LIVE_TOOL_RESULTS]:
+        content = str(messages[i].get("content") or "")
+        if content.startswith(_TRIM_STUB_PREFIX):
+            continue  # 已压过,别反复包裹
+        refs = sorted({a or b for a, b in _EVIDENCE_REF_RE.findall(content)})
+        briefs = " / ".join(
+            str((ledger.get(r) or {}).get("args_brief") or "")[:80]
+            for r in refs if (ledger.get(r) or {}).get("args_brief")
+        )
+        head = f"{' '.join(refs) or '无引用号'}"
+        if briefs:
+            head += f" · {briefs}"
+        messages[i]["content"] = (
+            f"{_TRIM_STUB_PREFIX} {head}｜正文已省略,call_ref 引用仍有效]"
+        )
+
+
 def _sanitize_evidence(evidence: Any) -> dict[str, Any] | None:
     """只保留三段合法 dict;evidence.source.line 归一为字符串(缺段=不适用)"""
     if not isinstance(evidence, dict):
@@ -1303,6 +1420,12 @@ def _persist_review_item(
     verdict = _clamp_str(args.get("verdict"), VALID_VERDICTS)
     severity = _clamp_str(args.get("severity"), VALID_SEVERITIES)
     evidence = _sanitize_evidence(args.get("evidence"))
+    # 审查结论 / 可追问内容(旧键名 description / suggestion 仍兼容接收)
+    conclusion = args.get("conclusion") or args.get("description")
+    follow_up = args.get("follow_up") or args.get("suggestion")
+    # 关联的计划项 id:归一化后存下(不校验命中——对不上就当未命中走相似兜底,
+    # 不能因模型编了一个 P99 就丢整条已落库的审查项)
+    plan_item_id = str(args.get("plan_item_id") or "").strip()[:16] or None
 
     # agent1_ref:校验确属本任务 agent1 对话,无效置空(不拒收)
     agent1_ref: UUID | None = None
@@ -1327,24 +1450,26 @@ def _persist_review_item(
 
     payload: dict[str, Any] = {
         "id": str(item_id), "round_idx": round_idx, "title": title[:512],
-        "description": args.get("description"), "review_target": review_target,
+        "conclusion": conclusion, "review_target": review_target,
         "origin": origin, "agent1_ref": str(agent1_ref) if agent1_ref else None,
+        "plan_item_id": plan_item_id,
         "dimension": args.get("dimension"), "status": status, "verdict": verdict,
         "severity": severity, "evidence": evidence, "confidence": confidence,
         "evidence_validated": validated, "evidence_mismatch": mismatch,
-        "suggestion": args.get("suggestion"), "bucket": bucket,
+        "follow_up": follow_up, "bucket": bucket,
     }
 
     if db is not None and task is not None:
         try:
             db.add(ReviewItem(
                 id=item_id, task_id=task.id, round_idx=round_idx,
-                title=title[:512], description=args.get("description"),
+                title=title[:512], conclusion=conclusion,
                 review_target=review_target, origin=origin, agent1_ref=agent1_ref,
+                plan_item_id=plan_item_id,
                 dimension=args.get("dimension"), status=status, verdict=verdict,
                 severity=severity, evidence=evidence, confidence=confidence,
                 evidence_validated=validated, evidence_mismatch=mismatch,
-                suggestion=args.get("suggestion"),
+                follow_up=follow_up,
             ))
             db.commit()
         except Exception as e:
@@ -1424,16 +1549,95 @@ def _derive_grouping_from_items(item_payloads: list[dict[str, Any]]) -> dict[str
     }
 
 
-def _targets_match(plan_target: str, emitted_targets: list[str]) -> bool:
-    """规划对账的宽松语义匹配:归一化后互为子串即算命中(不做 embedding)。"""
-    pt = (plan_target or "").strip().casefold()
-    if not pt:
-        return False
-    for t in emitted_targets:
-        et = (t or "").strip().casefold()
-        if et and (pt in et or et in pt):
-            return True
-    return False
+def _stamp_plan_items(items: list[Any]) -> list[dict[str, Any]]:
+    """给审查计划项补稳定 id(P1、P2…),并丢弃非 dict / 无 target 的条目。
+
+    id 按**最新快照序号**铸造:重发全量修订会重新编号,而对账只读最新快照
+    (emit_state["plan"] 覆盖式),所以 id 与快照恒自洽,不会出现旧 id 悬空。
+    """
+    stamped: list[dict[str, Any]] = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        target = str(it.get("target") or "").strip()
+        if not target:
+            continue
+        entry = dict(it)
+        entry["target"] = target
+        entry["id"] = f"P{len(stamped) + 1}"
+        stamped.append(entry)
+    return stamped
+
+
+# target 相似兜底用的分词:英文词/数字(含文件名、行号、路径片段)+ 中文单字
+_TOKEN_RE = re.compile(r"[a-z0-9_./:\\-]+|[\u4e00-\u9fff]")
+
+
+def _target_tokens(text: str) -> set[str]:
+    """把待核实对象切成可比对的 token 集(小写;中文按单字,英文/路径按词)"""
+    return set(_TOKEN_RE.findall((text or "").strip().casefold()))
+
+
+def _targets_overlap(a: str, b: str) -> float:
+    """两段 target 的重合度(overlap coefficient = |A∩B| / min(|A|,|B|))。
+
+    旧口径是"归一化后互为子串":计划 target 与发射 review_target 是模型各自
+    写的两句长中文,几乎不可能互为子串(实测 8/8 全部失配 → 被整批伪造成缺口)。
+    中文按单字切分后,同一回事的两句话重合度明显高于不同回事的两句话。
+    不做 embedding(可预测、可单测、无额外延迟)。
+    """
+    ta, tb = _target_tokens(a), _target_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / min(len(ta), len(tb))
+
+
+# 兜底相似阈值:0.5 = 较短一句的半数字符在另一句里出现。同一对象的不同写法
+# (如"JWT 默认密钥 fail-closed 缺失" vs "JWT 默认密钥无 fail-closed、主流程不校验")
+# 能跨过;不同对象(如"SSRF 面" vs "匿名任务权限边界")跨不过。
+_OVERLAP_THRESHOLD = 0.5
+
+
+def _reconcile_plan(
+    plan_items: list[dict[str, Any]], emitted_items: list[dict[str, Any]],
+) -> tuple[set[str], list[dict[str, Any]]]:
+    """规划对账:返回(已核实的计划项 id 集, 未核实的计划项列表)。
+
+    命中顺序:
+    ① `plan_item_id` 精确命中(主链路,模型按回执里的 P1/P2 指名);
+    ② 无 id 时按 target 重合度兜底(兼容存量模型不发 id)。
+    未命中项**不再被伪造成 ReviewItem 落库**(旧行为会凭空多出一堆 missing 缺口,
+    并把聚合里的"核实"数字算成 0),只返回给调用方写进 `_review.plan.unverified`。
+    """
+    emitted_ids = {
+        str(p.get("plan_item_id")) for p in emitted_items if p.get("plan_item_id")
+    }
+    emitted_targets = [
+        str(p.get("review_target") or "") for p in emitted_items if p.get("review_target")
+    ]
+    matched: set[str] = set()
+    unverified: list[dict[str, Any]] = []
+    for pitem in plan_items:
+        pid = str(pitem.get("id") or "")
+        target = str(pitem.get("target") or "")
+        if pid and pid in emitted_ids:
+            matched.add(pid)
+            continue
+        if any(_targets_overlap(target, et) >= _OVERLAP_THRESHOLD for et in emitted_targets):
+            matched.add(pid)
+            continue
+        unverified.append(pitem)
+    return matched, unverified
+
+
+def _budget_exhausted(state: dict[str, Any]) -> bool:
+    """本轮是否有取证额度触顶(未核实项的 reason 靠它区分"额度用尽/没排到")"""
+    counts = state.get("tool_counts") or {}
+    return bool(
+        counts.get("read", 0) >= MAX_READ_TOOL_CALLS
+        or counts.get("verify", 0) >= MAX_VERIFY_CALLS
+        or counts.get("reference", 0) >= MAX_REFERENCE_CALLS
+    )
 
 
 def _finalize_emitted(
@@ -1441,43 +1645,41 @@ def _finalize_emitted(
     state: dict[str, Any], evidence_ledger: dict,
     *, has_repo: bool, verify_available: bool,
     agent1_conv_ids: set[UUID] | None,
+    timed_out: bool = False, review_max_seconds: int = 0,
 ) -> dict[str, Any]:
-    """循环退出(已用发射工具)后收尾:规划对账回填 → 聚合 _review → 派生 grouping →
+    """循环退出(已用发射工具)后收尾:规划对账 → 聚合 _review → 派生 grouping →
     写 task.params → 返回覆盖旧契约的紧凑汇总(covered/missing/reasoning 供 review 卡与记忆)。
+
+    db/task/evidence_ledger/has_repo/verify_available/agent1_conv_ids 保留在签名里
+    (旧版对账要落库伪造条目,现在只读聚合态;保留形状以免调用方与存量测试改接口)。
     """
-    # 1) 规划对账:计划内未发射的条目回填为 missing ReviewItem
+    # 1) 规划对账:按 plan_item_id 精确命中,无 id 时按 target 重合度兜底;
+    #    未核实的计划项只记进 `_review.plan.unverified`(不落库,不冒充审查项)
     plan = state.get("plan") or {}
-    backfilled = 0
-    planned = len(plan.get("items") or [])
-    for pitem in (plan.get("items") or []):
-        target = pitem.get("target") if isinstance(pitem, dict) else None
-        if not target or _targets_match(target, state["targets"]):
-            continue
-        args = {
-            "title": f"[计划回填] {target}",
-            "description": "计划内未执行,由规划对账回填",
-            "review_target": target,
-            "origin": pitem.get("origin") if isinstance(pitem, dict) else None,
-            "status": "missing", "verdict": "pending",
-        }
-        payload = _persist_review_item(
-            db, task, round_idx, args,
-            evidence_ledger=evidence_ledger, has_repo=has_repo,
-            verify_available=verify_available, agent1_conv_ids=agent1_conv_ids,
-        )
-        publish(task_id, "review_item_add", payload)
-        state["item_payloads"].append(payload)
-        backfilled += 1
-
-    executed = planned - backfilled
-
-    # 2) 聚合标量(三态计数 + status + confidence_tally)
+    plan_items = plan.get("items") or []
+    planned = len(plan_items)
     items = state["item_payloads"]
-    counts = {"total": len(items), "risk": 0, "cleared": 0, "gap": 0}
+    matched_ids, unverified_items = _reconcile_plan(plan_items, items)
+    executed = len(matched_ids)
+    budget_hit = _budget_exhausted(state)
+    unverified = [
+        {
+            "id": p.get("id"), "target": p.get("target"), "origin": p.get("origin"),
+            "priority": p.get("priority"),
+            "reason": "budget_exhausted" if budget_hit else "not_reached",
+        }
+        for p in unverified_items
+    ]
+
+    # 2) 聚合标量(三分档计数 + status + confidence_tally + 未取证计数)
+    counts = {
+        "total": len(items),
+        BUCKET_ESTABLISHED: 0, BUCKET_NOT_ESTABLISHED: 0, BUCKET_PENDING_VERIFY: 0,
+    }
     status_tally = {"covered": 0, "partial": 0, "missing": 0}
     conf_tally = {
         "verified": 0, "source_confirmed": 0,
-        "reference_corroborated": 0, "assertion_only": 0,
+        "reference_corroborated": 0, "assertion_only": 0, "no_evidence": 0,
     }
     covered_ids: list[str] = []
     missing_ids: list[str] = []
@@ -1493,16 +1695,24 @@ def _finalize_emitted(
         elif st in ("partial", "missing"):
             missing_ids.append(str(it.get("dimension") or it.get("id")))
         tier = (it.get("confidence") or {}).get("tier")
-        if tier in conf_tally:
-            conf_tally[tier] += 1
+        conf_tally[tier if tier in conf_tally else "no_evidence"] += 1
 
+    # 一句人话的总结(主语是"核实结果",不堆内部术语;也是记忆/兼容 reasoning 的正文)
+    unverified_clause = ""
+    if unverified:
+        why = "取证额度用尽" if budget_hit else (
+            f"审查达时限 {review_max_seconds}s" if timed_out else "未排到取证"
+        )
+        unverified_clause = f",{len(unverified)} 项因{why}未核实"
     verdict_summary = (
-        f"{counts['total']} 项:发现风险 {counts['risk']}、"
-        f"已核查·剔除误报 {counts['cleared']}、缺口 {counts['gap']}"
-        f"(源码取证 {conf_tally['source_confirmed']}、已验证 {conf_tally['verified']}、"
+        f"核实 {counts['total']} 项:"
+        f"{BUCKET_LABELS[BUCKET_ESTABLISHED]} {counts[BUCKET_ESTABLISHED]}、"
+        f"{BUCKET_LABELS[BUCKET_NOT_ESTABLISHED]} {counts[BUCKET_NOT_ESTABLISHED]}、"
+        f"{BUCKET_LABELS[BUCKET_PENDING_VERIFY]} {counts[BUCKET_PENDING_VERIFY]}"
+        f"(源码取证 {conf_tally['source_confirmed']}、动态验证 {conf_tally['verified']}、"
         f"外部佐证 {conf_tally['reference_corroborated']}、"
-        f"仅断言 {conf_tally['assertion_only']});"
-        f"规划 {planned} / 核实 {max(executed, 0)} / 回填缺口 {backfilled}"
+        f"仅断言 {conf_tally['assertion_only']}、未取证 {conf_tally['no_evidence']});"
+        f"计划 {planned} 项已核实 {executed}{unverified_clause}"
     )
 
     review = {
@@ -1512,12 +1722,13 @@ def _finalize_emitted(
         "knowledge_point_count": state["kp"],
         "verdict_summary": verdict_summary,
         "suggestions": list(state["suggestions"]),
+        "timed_out": bool(timed_out),
         "plan": {
-            "items": plan.get("items") or [],
+            "items": plan_items,
             "note": plan.get("note"),
             "planned": planned,
-            "executed": max(executed, 0),
-            "backfilled_gap": backfilled,
+            "executed": executed,
+            "unverified": unverified,
         } if plan else None,
     }
 
@@ -1547,6 +1758,7 @@ def _finalize_emitted(
         "_emitted": True,
         "item_count": counts["total"],
         "kp_count": state["kp"],
+        "timed_out": bool(timed_out),
         "_review": review,
         "_evidence_ledger": evidence_ledger,
     }

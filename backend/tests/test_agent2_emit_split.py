@@ -2,12 +2,13 @@
 
 覆盖:
 - submit_review_item → 落 ReviewItem + 推 review_item_add + 回执含 review_item_id/confidence;
-  三态分桶计数正确
+  三分档计数正确
 - submit_knowledge_point → 落 Result(知识点)+ knowledge_point_add + 回执含 result_id
-- 发射硬上限(第 16 条 submit_review_item 拒收)
+- 发射硬上限(第 21 条 submit_review_item 拒收)
 - 本轮首条幂等清本轮
 - 循环退出写 task.params._review + 派生 grouping + 返回紧凑汇总(_emitted)
-- submit_review_plan 覆盖式 + 规划对账回填(计划 3 发射匹配 2 → 回填 1)
+- submit_review_plan 覆盖式 + 规划对账按 plan_item_id(计划 3 命中 2 → 未核实 1,
+  **不再伪造审查项落库**)
 - agent1_ref 校验(伪造非本任务 UUID 置空,不拒收)
 用 MagicMock 承接 db/task(落库断言看 db.add 调用;publish 用替身收集)。
 """
@@ -76,37 +77,44 @@ def _driver(monkeypatch, turns):
 
 
 # ============================================================
-# 三态发射 + 落库 + 事件 + 回执
+# 三分档发射 + 落库 + 事件 + 回执
 # ============================================================
 
 def test_three_states_emit_and_counts(monkeypatch):
-    risk = _tc("submit_review_item", {
+    established = _tc("submit_review_item", {
         "title": "SQL 注入", "review_target": "users.py 注入", "origin": "agent1_claim",
         "status": "covered", "verdict": "confirmed", "severity": "high",
+        "conclusion": "读了 users.py:42,拼接未经参数化,成立。",
+        "follow_up": "如何改成参数化查询?",
     })
-    cleared = _tc("submit_review_item", {
-        "title": "已核查无问题", "review_target": "auth 逻辑", "origin": "agent1_claim",
+    not_established = _tc("submit_review_item", {
+        "title": "已核实不成立", "review_target": "auth 逻辑", "origin": "agent1_claim",
         "status": "covered", "verdict": "none",
     })
-    gap = _tc("submit_review_item", {
-        "title": "缺并发审查", "review_target": "并发安全", "origin": "domain_baseline",
-        "status": "missing", "verdict": "pending",
+    pending = _tc("submit_review_item", {
+        "title": "并发存疑", "review_target": "并发安全", "origin": "domain_baseline",
+        "status": "partial", "verdict": "suspected",
     })
-    result, events, db, _task = _driver(monkeypatch, [[risk, cleared, gap]])
+    result, events, db, _task = _driver(
+        monkeypatch, [[established, not_established, pending]]
+    )
 
     assert result["_emitted"] is True
     assert result["item_count"] == 3
     review = result["_review"]
-    assert review["counts"] == {"total": 3, "risk": 1, "cleared": 1, "gap": 1}
-
-    # 落库:3 次 db.add(ReviewItem)
+    assert review["counts"] == {
+        "total": 3, "established": 1, "not_established": 1, "pending_verify": 1,
+    }
+    # 字段改名后的 payload 键(旧 description/suggestion 不再下发)
     added_items = [
         c.args[0] for c in db.add.call_args_list
         if isinstance(c.args[0], ReviewItem)
     ]
     assert len(added_items) == 3
+    assert added_items[0].conclusion.startswith("读了 users.py:42")
+    assert added_items[0].follow_up == "如何改成参数化查询?"
 
-    # 事件:3 条 review_item_add,首条幂等清本轮(只清一次)
+    # 事件:3 条 review_item_add
     assert [t for t, _ in events].count("review_item_add") == 3
 
     # 无 evidence → 后端不派生 confidence(仅带证据者有)
@@ -143,53 +151,67 @@ def test_knowledge_point_emit_and_link(monkeypatch):
 
 
 # ============================================================
-# 发射硬上限:第 16 条 submit_review_item 拒收
+# 发射硬上限:第 21 条 submit_review_item 拒收
 # ============================================================
 
 def test_review_item_cap_rejects(monkeypatch):
-    # 16 条审查项分 16 轮发射(每轮 1 条),第 16 条应被拒(上限 15)
+    # 21 条审查项分 21 轮发射(每轮 1 条),第 21 条应被拒(上限 20)
     turns = []
-    for i in range(16):
+    for i in range(21):
         turns.append([_tc("submit_review_item", {
             "title": f"item{i}", "review_target": f"t{i}", "origin": "agent1_claim",
             "status": "covered", "verdict": "confirmed",
         }, call_id=f"c{i}")])
     result, events, db, _task = _driver(monkeypatch, turns)
 
-    assert result["item_count"] == 15
+    assert result["item_count"] == 20
     added_items = [c.args[0] for c in db.add.call_args_list if isinstance(c.args[0], ReviewItem)]
-    assert len(added_items) == 15
+    assert len(added_items) == 20
+    assert [t for t, _ in events].count("review_item_add") == 20
 
 
 # ============================================================
-# 规划对账:计划 3,发射匹配 2 → 回填 1 条 missing;review_plan_update 覆盖式
+# 规划对账:计划 3,plan_item_id 命中 2 → 未核实 1(不落库,不占结果位)
 # ============================================================
 
-def test_plan_reconciliation_backfill(monkeypatch):
+def test_plan_reconciliation_by_plan_item_id(monkeypatch):
     plan = _tc("submit_review_plan", {"items": [
         {"target": "users.py SQL 注入", "origin": "agent1_claim", "priority": 1},
         {"target": "auth 越权", "origin": "agent1_claim", "priority": 2},
         {"target": "并发安全(未碰)", "origin": "domain_baseline", "priority": 3},
     ]})
+    # 两条发射都靠 id 对上账(review_target 写法与计划 target 完全不同句)
     a = _tc("submit_review_item", {
-        "title": "注入确认", "review_target": "users.py SQL 注入风险", "origin": "agent1_claim",
-        "status": "covered", "verdict": "confirmed",
+        "title": "注入确认", "review_target": "src/users.py:42 拼 SQL", "origin": "agent1_claim",
+        "plan_item_id": "P1", "status": "covered", "verdict": "confirmed",
     }, idx=1, call_id="c_a")
     b = _tc("submit_review_item", {
-        "title": "越权已核查", "review_target": "auth 越权", "origin": "agent1_claim",
-        "status": "covered", "verdict": "none",
+        "title": "越权已核查", "review_target": "routers/auth.py 未校归属", "origin": "agent1_claim",
+        "plan_item_id": "P2", "status": "covered", "verdict": "none",
     }, idx=2, call_id="c_b")
-    result, events, _db, _task = _driver(monkeypatch, [[plan], [a], [b]])
+    result, events, db, _task = _driver(monkeypatch, [[plan], [a], [b]])
 
     review = result["_review"]
     assert review["plan"]["planned"] == 3
     assert review["plan"]["executed"] == 2
-    assert review["plan"]["backfilled_gap"] == 1
-    # 回填项计入 total(2 发射 + 1 回填 = 3),且回填为 gap
-    assert review["counts"]["total"] == 3
-    assert review["counts"]["gap"] == 1
-    # 计划覆盖式:只 1 条 review_plan_update 事件
-    assert [t for t, _ in events].count("review_plan_update") == 1
+    assert [u["target"] for u in review["plan"]["unverified"]] == ["并发安全(未碰)"]
+    assert review["plan"]["unverified"][0]["id"] == "P3"
+    assert review["plan"]["unverified"][0]["reason"] == "not_reached"
+    # 计数只算真发射的 2 条——旧版会把未匹配的计划项伪造成 missing 审查项
+    assert review["counts"]["total"] == 2
+    assert review["counts"]["pending_verify"] == 0
+    # 落库也只有 2 条 ReviewItem(无 [计划回填] 行)
+    added_items = [c.args[0] for c in db.add.call_args_list if isinstance(c.args[0], ReviewItem)]
+    assert len(added_items) == 2
+    assert not any((it.title or "").startswith("[计划回填]") for it in added_items)
+    # 计划覆盖式:只 1 条 review_plan_update 事件,且 items 带后端铸造的 id
+    plan_events = [d for t, d in events if t == "review_plan_update"]
+    assert len(plan_events) == 1
+    assert [i["id"] for i in plan_events[0]["items"]] == ["P1", "P2", "P3"]
+    # 总结里"核实 N 项"与"计划已核实 M"各自自洽(旧版会出现"核实 0")
+    assert review["verdict_summary"].startswith("核实 2 项:")
+    assert "计划 3 项已核实 2" in review["verdict_summary"]
+    assert "回填缺口" not in review["verdict_summary"]
 
 
 # ============================================================

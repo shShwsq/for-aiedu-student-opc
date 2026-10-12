@@ -190,10 +190,12 @@ _SUBMIT_REVIEW_PLAN_TOOL: dict[str, Any] = {
     "function": {
         "name": "submit_review_plan",
         "description": (
-            "在开始逐项核实前,先结构化列出本任务的审查计划(3-8 条拟核实项),"
+            "在开始逐项核实前,先结构化列出本任务的审查计划(3-5 条拟核实项),"
             "让「要审什么」显式化、可实时展示与机器对账。发现新疑点可**重发全量修订**。"
-            "计划不是围栏:允许发射计划外审查项,但计划内未执行的条目会在审查结束时"
-            "回填为缺口(missing)审查项。必须含 user_requirement/domain_baseline 类条目,"
+            "系统会给每条补一个稳定 id(P1、P2…)并在回执里返回:发射审查项时用"
+            " `plan_item_id` 指明它核实的是哪一条,审查结束时按 id 对账;"
+            "未核实到的计划项**不会**被伪造成审查项,而是在审查计划里标为「未核实」。"
+            "计划不是围栏:允许发射计划外审查项。必须含 user_requirement/domain_baseline 类条目,"
             "否则会漏掉 agent1 根本没碰的领域。"
         ),
         "parameters": {
@@ -201,11 +203,17 @@ _SUBMIT_REVIEW_PLAN_TOOL: dict[str, Any] = {
             "properties": {
                 "items": {
                     "type": "array",
-                    "description": "3-8 条拟核实项,按优先级排序",
+                    "description": "3-5 条拟核实项,按优先级排序",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "target": {"type": "string", "description": "拟核实对象(自然语言)"},
+                            "target": {
+                                "type": "string",
+                                "description": (
+                                    "拟核实对象:写成项目里能被指认的具体东西"
+                                    "(文件:行/函数/配置项 + 要核的事),不要写成笼统维度名"
+                                ),
+                            },
                             "origin": {
                                 "type": "string",
                                 "enum": ["agent1_claim", "agent1_action", "user_requirement", "domain_baseline"],
@@ -231,20 +239,37 @@ _SUBMIT_REVIEW_ITEM_TOOL: dict[str, Any] = {
     "function": {
         "name": "submit_review_item",
         "description": (
-            "每核查完/判完一项即发射一条审查项(单一原语,三态合一):"
-            "① 发现风险(verdict=confirmed/suspected);② 已核查无问题/误报剔除"
-            "(verdict=none/false_positive);③ 缺口·待改进(status=missing/partial)。"
+            "每核查完/判完一项即发射一条审查项(单一原语,三分档合一):"
+            "① 已核实成立(verdict=confirmed);② 已核实不成立(verdict=none/false_positive);"
+            "③ 待核实(verdict=suspected/pending 或 status=missing/partial —— 存疑未取证不算成立)。"
             "证据段的 call_ref 引用就近取证的 _evidence_ref(如 E1),由后端核验并派生置信度;"
-            "**不要自报 confidence**(校准交给证据)。review_target 必填(被核实的具体对象)。"
+            "**不要自报 confidence**(校准交给证据)。review_target 必填(待核实对象)。"
+            "能对上计划就带 plan_item_id(取自 submit_review_plan 回执的 P1/P2…)。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "发现问题一句话"},
-                "description": {"type": "string", "description": "详细说明(大白话)"},
+                "title": {
+                    "type": "string",
+                    "description": "结论一句话(说清你的项目里这条到底是什么事,大白话)",
+                },
+                "conclusion": {
+                    "type": "string",
+                    "description": (
+                        "审查结论 ≤ 200 字,三段:核实到了什么 / 为什么成立或不成立 /"
+                        "对用户的影响。可引用原始证据的文件:行,但禁写内部标识(见可读性约束)"
+                    ),
+                },
                 "review_target": {
                     "type": "string",
-                    "description": "被核实的对象:agent1 的某条结论/动作,或用户的一条要求(必填)",
+                    "description": (
+                        "待核实对象:项目里能被指认的具体位置/事项"
+                        "(如 backend/app/config.py:34 JWT 默认密钥)"
+                    ),
+                },
+                "plan_item_id": {
+                    "type": "string",
+                    "description": "本条核实的是哪条审查计划项(P1/P2…,取自 submit_review_plan 回执;可省)",
                 },
                 "origin": {
                     "type": "string",
@@ -291,7 +316,15 @@ _SUBMIT_REVIEW_ITEM_TOOL: dict[str, Any] = {
                         },
                     },
                 },
-                "suggestion": {"type": "string", "description": "修复/行动建议(或缺口类'建议追问:…')"},
+                "suggestion": {"type": "string", "description": "(已改名 follow_up,保留旧键作兼容别名)"},
+                "follow_up": {
+                    "type": "string",
+                    "description": (
+                        "可追问内容:一句能直接点给 agent1 执行的问句"
+                        "(如发现 SSRF 后:「如何给 base_url/test_env_url 加协议白名单与内网 IP 拦截?」);"
+                        "已核实不成立/无后续可做的事则不填"
+                    ),
+                },
             },
             "required": ["title", "review_target", "origin", "status"],
         },
@@ -330,8 +363,8 @@ _SUBMIT_SUGGESTION_TOOL: dict[str, Any] = {
     "function": {
         "name": "submit_suggestion",
         "description": (
-            "逐条发射建议追问方向(最后手段:确属缺失且无法自查的方向;与缺口类审查项呼应)。"
-            "每条须具体可执行,点击后作为执行指令交给 agent1。"
+            "逐条发射建议追问方向(最后手段:确属缺失且无法自查的方向;与待核实类审查项呼应)。"
+            "每条须具体可执行,用户点击后作为执行指令交给 agent1。"
         ),
         "parameters": {
             "type": "object",
@@ -369,33 +402,54 @@ agent1(即"AI助手")是面向用户的台前回答者,用户看到的对话主�
 
 ## 审查基准维度
 本任务没有预定义的覆盖度清单。你需要根据用户意图自行确定本任务
-**应覆盖哪些审查维度**(3-8 个为宜,维度用英文下划线命名,如
+**应覆盖哪些审查维度**(3-5 条为宜,维度用英文下划线命名,如
 injection / readability / contract_terms),并把它们显式化为审查计划(见下)。
 
 ## 审查工作方式:规划先行 + 工具发射
 每条结论即时以工具结构化落库,**末尾不再输出大 JSON、也没有末次汇总调用**:
-1. **规划先行**:先调 `submit_review_plan` 列出审查计划(3-8 条拟核实项,每条带
+1. **规划先行**:先调 `submit_review_plan` 列出审查计划(3-5 条拟核实项,每条带
    `target`/`origin`/`priority`/`planned_evidence`;**必须含 `user_requirement`/
-   `domain_baseline` 类条目**,否则会漏掉 agent1 根本没碰的领域)。发现新疑点可
-   **重发 `submit_review_plan` 全量修订**。计划不是围栏:允许发射计划外审查项,
-   但计划内未执行的条目会在审查结束时被后端回填为缺口(missing)审查项。
+   `domain_baseline` 类条目**,否则会漏掉 agent1 根本没碰的领域)。取证额度已充足
+   (只读工具 100 次),不必为省额度牺牲核实深度:宁可每条都核到取到证,不要把清单拉长。
+   发现新疑点可**重发 `submit_review_plan` 全量修订**;系统会给每条补稳定 id
+   (P1、P2…)并在回执里返回。计划不是围栏:允许发射计划外审查项,未核实的计划项
+   **不会**被伪造成审查项,只在审查计划里标为「未核实」。
 2. **逐项核实并发射**:按计划核查,每核查完/判完一项即调 `submit_review_item`
-   发射一条审查项(单一原语,三态合一):
+   发射一条审查项(单一原语,三分档合一——**主语是"你对这条待核实对象的核实结果"**):
    - `origin`:来源(`agent1_claim`/`agent1_action`/`user_requirement`/`domain_baseline`);
-   - `review_target`:被核实的具体对象(必填,可追溯);`agent1_ref`:被审对话 ID(轮次总结里已标注,可选);
+   - `review_target`:待核实对象(必填,可追溯;写成项目里能被指认的具体位置/事项,
+     不要整句复述 agent1 的话);`plan_item_id`:对上计划时填 P1/P2…(规划对账靠它);
+     `agent1_ref`:被审对话 ID(轮次总结里已标注,可选);
    - `status`(covered/partial/missing)+ `verdict`(confirmed/suspected/false_positive/none/pending)
-     + `severity`(仅风险类)三态合一表达:发现风险 / 已核查无问题·误报剔除 / 缺口·待改进;
+     + `severity`(仅成立类)三字段合一表达三分档:
+     **已核实成立**(confirmed)/ **已核实不成立**(none/false_positive)/
+     **待核实**(suspected/pending 或 status=missing/partial —— 没取到证就不算成立);
+   - `conclusion`:审查结论 ≤ 200 字,三段:核实到了什么 / 为什么成立或不成立 / 对用户的影响;
+   - `follow_up`:可追问内容 —— 一句能直接点给 agent1 执行的问句(如"如何修复该 SSRF 安全问题?");
    - `evidence`:把结论挂在**非模型产物**上——`source`(源码/原文:file_path/line/quote)、
      `analysis_basis`(外部依据:ref_url/ref_status/ref_authority)、`verification`(验证:method/verified/poc_evidence)。
      每段的 `call_ref` **就近引用**取证工具回传里的 `_evidence_ref`(如 E1);**缺段=不适用**
-     (文书无 source 代码、纯静态无 poc、无引用则无 analysis_basis),缺不代表取证据失败。
-     缺口类(missing/partial)可不带 evidence,但 `origin` 须是 requirement/baseline 或给
-     `suggestion` 说明,否则视为凭空。
+     (文书无 source 代码、纯静态无 poc、无引用则无 analysis_basis),缺不代表取证据失败
+     —— 但缺证据的条目会被归入"待核实",这是预期行为。
+     待核实类(missing/partial/suspected)可不带 evidence,但 `origin` 须是 requirement/baseline
+     或在 `conclusion` 里说清为何未取证,否则视为凭空。
    - **不要自报 `confidence`**:置信度由后端核验你的 `call_ref`/`quote` 后派生(证据链的属性,不是口供)。
    - `evidence.source.line` 统一用字符串(如 "42")。
 3. **提炼知识点**:有学习价值的结论调 `submit_knowledge_point`(3-8 条精选,见"结果整理原则");
    用 `submit_review_item` 回执里的 `review_item_id` 作 `source_review_item_id` 回指派生它的审查项。
 4. **建议追问**:确属缺失且无法自查的方向,逐条 `submit_suggestion`(见"建议追问原则")。
+
+## 用户可读性硬约束(写 title / conclusion / follow_up 时逐条遵)
+这些字段直接给用户看,用户不懂我们的内部机制,也不知道"你在审 agent1":
+- **禁写内部标识**:`E1`/`E9` 等引用号、`call_ref`、`target 不存在`、`fail-closed`、
+  `领域基线`、`历史记忆`、`台账`、`verdict/status/covered/partial/missing` 等字段名与枚举值。
+  取证引用只写进 `evidence.*.call_ref`(系统消费),正文改成"我读了 config.py 里的默认值…"这种大白话。
+- **禁以「agent1 断言:…」开头**:待核实对象写代码位置/配置项/功能点;"这条源自 AI助手"
+  由 `origin` 字段表达(前端已把它显示成"AI助手 的结论")。
+- **英文术语要跟一句人话**:如"未做启动时密钥校验(生产环境不改环境变量就能被伪造任意用户登录态)",
+  不要只丢一个 `fail-closed`。
+- **结论与证据强度相称**:没取到证的写"待核实"语气("初步判断…但未独立读取源码确认"),
+  不要当成已坐实的漏洞陈述。
 
 **证据台账**:每当你调用取证工具(read_file/search_code/verify/check_reference),系统会在结果里
 附带一个 `_evidence_ref`(如 E1)或末尾 `[evidence_ref=E1]`;把它就近填进审查项 `evidence.*.call_ref`,
