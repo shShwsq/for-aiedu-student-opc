@@ -9,12 +9,17 @@
  * 「核查过程」只留过程输出,概览承担"现状 + 下一步"。
  * 文本解析见 utils/agent2Suggestions.ts,本组件只管展示与防重复点击的呈现。
  */
-defineProps<{
-  /** 建议文本清单(已由 extractSuggestions 过滤) */
-  suggestions: string[]
-  /** 已发起追问的那条文本;非空时全部按钮禁用,该条显示"已发起追问…" */
-  digging: string | null
-}>()
+withDefaults(
+  defineProps<{
+    /** 建议文本清单(已由 extractSuggestions / extractExploreSuggestions 过滤) */
+    suggestions: string[]
+    /** 已发起追问的那条文本;非空时全部按钮禁用,该条显示"已发起追问…" */
+    digging: string | null
+    /** 分组标题:区分"检查助手发现的缺口"与"你可能还想深入了解"两组 */
+    title?: string
+  }>(),
+  { title: '建议追问方向' },
+)
 
 defineEmits<{
   /** 点击"追问":把建议文本交给父组件发消息 */
@@ -25,7 +30,7 @@ defineEmits<{
 <template>
   <section v-if="suggestions.length > 0" class="suggestion-section">
     <h2 class="suggestion-title">
-      建议追问方向
+      {{ title }}
       <span class="suggestion-count">({{ suggestions.length }})</span>
     </h2>
     <div

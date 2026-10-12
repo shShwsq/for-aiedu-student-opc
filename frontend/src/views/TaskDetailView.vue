@@ -60,7 +60,7 @@ import { ensureFeaturesLoaded, practiceEnabled } from '@/composables/useFeatures
 import { buildStorageKey, useResizableSidebar } from '@/composables/useResizableSidebar'
 import { useAuthStore } from '@/stores/auth'
 import { listArtifacts } from '@/api/taskArtifacts'
-import { extractSuggestions } from '@/utils/agent2Suggestions'
+import { extractExploreSuggestions, extractSuggestions } from '@/utils/agent2Suggestions'
 import { clientLog } from '@/utils/clientLog'
 import { extractErrorMessage } from '@/utils/error'
 import { parseDiffFileSegments } from '@/utils/diffFiles'
@@ -273,6 +273,11 @@ onUnmounted(() =>
 
 /** 建议追问方向(检查助手审查完成时产出;展示在「概览」段) */
 const suggestions = computed<string[]>(() => extractSuggestions(task.value?.conversations))
+
+/** 探索性追问推荐(后台推荐器产出;与缺口分两组展示) */
+const exploreSuggestions = computed<string[]>(() =>
+  extractExploreSuggestions(task.value?.conversations),
+)
 
 /** 追问按钮防重复(点击后本组件发消息,新一轮审查开始才解锁) */
 const diggingSuggestion = ref<string | null>(null)
@@ -3482,10 +3487,18 @@ const showKnowledgeToolbar = computed<boolean>(() => {
             </div>
           </details>
 
-          <!-- 建议追问方向(原在核查段底部,现随分段重构上移到概览:
-               核查段只留过程,概览承担"现状 + 下一步") -->
+          <!-- 建议追问方向(概览段,原内联核查段底部):分两组——
+               检查助手发现的缺口(经核查、权威)与你可能还想深入了解
+               (后台推荐器、跨维度探索);核查段只留过程,概览承担"现状 + 下一步" -->
           <SuggestionCards
             :suggestions="suggestions"
+            title="检查助手发现的缺口"
+            :digging="diggingSuggestion"
+            @dig="handleSuggestionDig"
+          />
+          <SuggestionCards
+            :suggestions="exploreSuggestions"
+            title="你可能还想深入了解"
             :digging="diggingSuggestion"
             @dig="handleSuggestionDig"
           />

@@ -11,6 +11,7 @@
 模块导览:
 - executor:   执行链(内置 react_agent + CLI/acp_base 共享段落)
 - agent2:     质检审查智能体(后台审查者)
+- followup:   探索性追问推荐("你可能还想深入了解",后台轻调用)
 - verifier:   动态验证智能体
 - memory_curator: 记忆归纳/精简模板
 - practice:   练习出题

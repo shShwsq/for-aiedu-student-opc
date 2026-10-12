@@ -44,11 +44,13 @@ def test_prompts_package_has_no_app_imports():
 def test_prompts_modules_importable_and_nonempty():
     """各 prompt 模块可导入且非空(防搬家后出现空壳/拼写错误)。"""
     from app.prompts import (  # noqa: F401
-        agent2, executor, memory_curator, polish, practice, verifier,
+        agent2, executor, followup, memory_curator, polish, practice, verifier,
     )
 
     assert agent2.AGENT2_REVIEW_PROMPT.strip()
     assert executor.REACT_AGENT_SYSTEM_PROMPT.strip()
+    assert followup.FOLLOWUP_RECOMMEND_SYSTEM_PROMPT.strip()
+    assert followup.build_followup_messages("只看代码质量", "助手回答…")[0]["content"].strip()
     assert memory_curator._SUMMARIZE_PROMPT.strip()
     assert practice.build_system_prompt("security", False).strip()
     assert verifier.VERIFIER_SYSTEM_PROMPT.strip()

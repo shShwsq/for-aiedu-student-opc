@@ -426,6 +426,16 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             # scope,下方 end-scope 看到活跃流不推 done,SSE 不断线)
             _auto_resume_leftover_messages(task, db, task_id_str)
 
+            # 探索性追问推荐(单 agent 模式对齐双 agent:仅"你可能还想深入
+            # 了解"一组;无 agent2 缺口建议)。必须在推 done 前,才能经实时
+            # conversation 事件到达前端;仅最新流执行。失败静默。
+            if _is_latest_generation(task.id, flow_gen):
+                try:
+                    from app.services.followup_recommender import recommend_followups
+                    recommend_followups(task, db, len(react_summaries))
+                except Exception as fu_err:  # noqa: BLE001 - 兜底再包一层,绝不影响收尾
+                    logger.warning(f"[task={task.id}] 探索性追问推荐失败(忽略): {fu_err}")
+
             # 事件活跃期收尾:推 done + 关总线(仅当无并行流;
             # 判定与推送在 _end_event_scope 锁内原子完成,消除竞态)
             _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
@@ -1185,6 +1195,16 @@ def _run_background_review(
 
             # 通知前端审查结束(侧栏 badge 更新 + 拉取最终结果)。
             publish(task.id, "review_done", {"review_status": task.review_status})
+
+            # 探索性追问推荐("你可能还想深入了解"):必须在推 done 关闭事件总线
+            # 之前调用,产出的 conversation 事件才能经实时 SSE 到达前端(落库同时
+            # 保证刷新/快照可见)。失败静默;用户终止检查时整体跳过(与下游链一致)。
+            if not review_stopped:
+                try:
+                    from app.services.followup_recommender import recommend_followups
+                    recommend_followups(task, db, round_idx)
+                except Exception as fu_err:  # noqa: BLE001 - 兜底再包一层,绝不影响收尾
+                    logger.warning(f"[task={task.id}] 探索性追问推荐失败(忽略): {fu_err}")
         # done/finish 由 _end_event_scope 统一判定:并行流(用户追问已启动
         # 新一轮 agent1/resume)仍在跑时保持总线打开,由最后活跃流收尾
         # (被取代也必须调:注销自身 scope,否则总线永久悬挂)

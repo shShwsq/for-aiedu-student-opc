@@ -179,6 +179,7 @@ class Conversation(Base):
     #   question(用户提问) / message(用户追加消息)
     #   review(agent2 后台审查结论,详情存 reasoning)
     #   suggestions(agent2 建议追问方向,content 为 JSON)
+    #   followup_suggestions(后台推荐"你可能还想深入了解",content 为 JSON)
     #   summary(agent2 最终总结)
     #   thinking(agent1 / agent2 思考)
     #   tool_call / tool_result

@@ -97,10 +97,10 @@ def test_review_prompt_ship_conclusion_is_conditional():
 
 
 def test_review_prompt_has_suggestions_contract():
-    """建议追问契约:具体可执行、最后手段(能自查的不列建议)。"""
+    """建议追问契约:只报经核查的真实缺口(能自查的不列建议)、最多 3 条。"""
     assert "submit_suggestion" in AGENT2_REVIEW_PROMPT
     assert "最多 3 条" in AGENT2_REVIEW_PROMPT
-    assert "最后手段" in AGENT2_REVIEW_PROMPT
+    assert "经核查确认的真实缺口" in AGENT2_REVIEW_PROMPT
     assert "你能自己核查确认的,一律不列建议" in AGENT2_REVIEW_PROMPT
 
 
@@ -135,11 +135,12 @@ def test_review_prompt_material_wording_generalized():
     assert "真实源码依据" not in AGENT2_REVIEW_PROMPT
 
 
-def test_review_prompt_has_architecture_and_scope_broadening():
-    """代码审查维度含「架构设计」,并要求主动拓宽过窄的用户范围。
+def test_review_prompt_has_architecture_but_delegates_scope_broadening():
+    """代码审查维度仍含「架构设计」,但不再要求 agent2 主动拓宽过窄的用户范围。
 
-    老师反馈:常用维度应补上架构设计(OPC 缺架构师);用户只问部分维度时,
-    agent2 应在审查计划里补上未提及的标准维度(以 domain_baseline 体现)。
+    跨维度探索性追问已从 agent2 移出(改为后台推荐器单独产出 followup_suggestions),
+    agent2 的 suggestions 只报经核查确认的真实缺口。
     """
     assert "架构设计" in AGENT2_REVIEW_PROMPT
-    assert "主动拓宽过窄的用户范围" in AGENT2_REVIEW_PROMPT
+    assert "主动拓宽过窄的用户范围" not in AGENT2_REVIEW_PROMPT
+    assert "由后台推荐器" in AGENT2_REVIEW_PROMPT

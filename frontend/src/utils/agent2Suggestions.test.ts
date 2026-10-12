@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { extractSuggestions } from './agent2Suggestions'
+import { extractExploreSuggestions, extractSuggestions } from './agent2Suggestions'
 import type { Conversation } from '@/types/task'
 
 /** 只填必要字段的 agent2 suggestions 记录 */
@@ -73,5 +73,42 @@ describe('extractSuggestions', () => {
       suggestionConv({ suggestions: ['  带空白  ', '', '   ', 42, null, { x: 1 }, '真建议'] }),
     ]
     expect(extractSuggestions(convs)).toEqual(['  带空白  ', '真建议'])
+  })
+})
+
+describe('extractExploreSuggestions', () => {
+  /** type=followup_suggestions 的 agent2 记录 */
+  const explore = (content: unknown): Conversation =>
+    suggestionConv(content, { type: 'followup_suggestions' })
+
+  it('解析探索建议数组', () => {
+    expect(extractExploreSuggestions([explore({ suggestions: ['看架构', '看安全'] })])).toEqual([
+      '看架构',
+      '看安全',
+    ])
+  })
+
+  it('多条时取最后一条(整块覆盖语义)', () => {
+    const convs = [explore({ suggestions: ['旧一轮'] }), explore({ suggestions: ['最新一轮'] })]
+    expect(extractExploreSuggestions(convs)).toEqual(['最新一轮'])
+  })
+
+  it('忽略 type=suggestions 的缺口记录(两组互不串)', () => {
+    const convs = [suggestionConv({ suggestions: ['缺口建议'] })]
+    expect(extractExploreSuggestions(convs)).toEqual([])
+  })
+
+  it('容错口径同 extractSuggestions:非法 JSON / 非数组 / 无记录均空', () => {
+    expect(extractExploreSuggestions([explore('不是 JSON')])).toEqual([])
+    expect(extractExploreSuggestions([explore({ suggestions: '非数组' })])).toEqual([])
+    expect(extractExploreSuggestions([])).toEqual([])
+    expect(extractExploreSuggestions(null)).toEqual([])
+  })
+})
+
+describe('两组互不串', () => {
+  it('extractSuggestions 不误取 followup_suggestions 记录', () => {
+    const convs = [suggestionConv({ suggestions: ['探索建议'] }, { type: 'followup_suggestions' })]
+    expect(extractSuggestions(convs)).toEqual([])
   })
 })
