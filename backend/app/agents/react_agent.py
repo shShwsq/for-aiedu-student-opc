@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from app.event_bus import publish
 from app.llm.client import LLMClient
 from app.models.task import Conversation, Task
+from app.models.task_artifact import TaskArtifact
 from app.pause_controller import wait_if_paused
 from app.perf import perf_log
 from app.tools.schema import execute_tool, get_all_tools, set_current_task
@@ -855,6 +856,9 @@ def _merge_plan(current: list[dict], llm_update: list[dict]) -> list[dict]:
 
 # 工具调用摘要单轮最大字符数(避免单轮工具调用过多撑爆 history)
 MAX_TOOL_HISTORY_CHARS = 2000
+# 后台子任务落盘报告单份进回放的字符上限(采集侧已按 MAX_CHARS 截断,这里再收一次
+# 防单轮多份报告叠加把跨轮预算吃光)
+MAX_AGENT_REPORT_HISTORY_CHARS = 6000
 # Level 2 时保留最近几轮的完整 Level 1(不压缩)
 HISTORY_KEEP_RECENT = 1
 
@@ -1029,15 +1033,59 @@ def _load_rounds_data(
             by_round.setdefault(c.round_idx, []).append(c)
 
     rounds_data: list[dict[str, Any]] = []
+    reports_per_round = _load_agent_reports_by_round(db, task_id)
     for ridx in sorted(by_round.keys()):
-        rd = _extract_round_data(by_round[ridx], ridx)
+        rd = _extract_round_data(
+            by_round[ridx], ridx, reports=reports_per_round.get(ridx, ""),
+        )
         if rd is not None:
             rounds_data.append(rd)
     return rounds_data
 
 
+def _load_agent_reports_by_round(db: Session, task_id) -> dict[int, str]:
+    """读回本任务已回捞的后台子任务落盘报告,按轮次拼成文本(kind=agent_report)
+
+    为何需要:部分 CLI 的 Agent 工具是后台派生,子任务结论常常没能回流到本轮总结,
+    而沙箱回收/会话重建后那些结果再也拿不到。acp_base 已把它们回捞成持久
+    artifact,跨轮回放直接读它,新轮就能合并旧结论而不必重跑子任务。
+
+    一次查全部(不按轮循环查 N 次);单份截断由采集侧已完成(MAX_CHARS 上限),
+    这里只拼接。任何异常降级为"无报告"(回放是增强项,不拖垮执行轮)。
+    """
+    try:
+        rows = (
+            db.query(TaskArtifact)
+            .filter(
+                TaskArtifact.task_id == task_id,
+                TaskArtifact.kind == "agent_report",
+            )
+            .order_by(TaskArtifact.created_at)
+            .all()
+        )
+    except Exception as e:
+        logger.warning(f"[task={task_id}] 读取后台子任务落盘报告失败(忽略,不注入): {e}")
+        return {}
+
+    by_round: dict[int, list[str]] = {}
+    for art in rows:
+        meta = art.metadata_ or {}
+        try:
+            ridx = int(meta.get("round_idx") or 0)
+        except (TypeError, ValueError):
+            ridx = 0
+        if ridx < 1 or not (art.content or "").strip():
+            continue
+        name = str(meta.get("filename") or meta.get("path") or "")
+        body = art.content if len(art.content) <= MAX_AGENT_REPORT_HISTORY_CHARS else (
+            art.content[:MAX_AGENT_REPORT_HISTORY_CHARS] + "\n…(已截断)"
+        )
+        by_round.setdefault(ridx, []).append(f"### {name}\n{body}" if name else body)
+    return {ridx: "\n\n".join(parts) for ridx, parts in by_round.items()}
+
+
 def _extract_round_data(
-    round_convs: list[Conversation], ridx: int,
+    round_convs: list[Conversation], ridx: int, reports: str = "",
 ) -> dict[str, Any] | None:
     """从单轮对话记录提取结构化数据,无有效内容时返回 None
 
@@ -1047,6 +1095,8 @@ def _extract_round_data(
     - assistant_summary:react_agent 当轮最后一条 thinking(即最终总结)
     - review:agent2 当轮评估/审查(优先 reasoning;type 兼容
       evaluation=旧版协作评估 / review=后台审查 两代)
+    - reports:当轮回捞到的后台子任务落盘报告(由 _load_agent_reports_by_round
+      供给,写该轮总结时未回报的结果靠它补齐;空串=无)
     - priority:压缩降级优先级(2=missing 非空,1=未宣布完成,0=其他)
     """
     questions = [
@@ -1093,7 +1143,7 @@ def _extract_round_data(
     if ua_eval:
         review = ua_eval.reasoning or ua_eval.content or ""
 
-    if not question and not assistant_summary and not review and not tool_summary:
+    if not question and not assistant_summary and not review and not tool_summary and not reports:
         return None
 
     # 单条截断
@@ -1119,13 +1169,18 @@ def _extract_round_data(
         "tool_summary": tool_summary,
         "assistant_summary": assistant_summary,
         "review": review,
+        "reports": reports or "",
         "priority": priority,
     }
 
 
 def _round_token_cost(rd: dict[str, Any], include_tools: bool) -> int:
-    """单轮历史 token 成本(CJK 感知粗估)"""
-    parts = [rd["question"], rd["assistant_summary"], rd["review"]]
+    """单轮历史 token 成本(CJK 感知粗估)
+
+    reports 总是计入:后台子任务落盘报告与工具摘要不同桶,降级到 Level 1 也不会
+    把它丢掉,不计入会让预算估偏小、实际超 budget。
+    """
+    parts = [rd["question"], rd["assistant_summary"], rd["review"], rd.get("reports") or ""]
     if include_tools:
         parts.append(rd["tool_summary"])
     return _estimate_tokens("".join(parts))
@@ -1164,6 +1219,18 @@ def _rounds_to_messages(
             messages.append({
                 "role": "assistant",
                 "content": rd["assistant_summary"],
+            })
+        # 后台子任务落盘报告:单独一条 system 注入(不与本轮总结合并),因为它
+        # 是"本轮总结当时没拿到"的补位证据,合并会让模型分不清哪些已交付
+        reports = rd.get("reports") or ""
+        if reports:
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"{SYSTEM_INJECT_MARKER}后台子任务落盘报告|第 {rd['ridx']} 轮]\n"
+                    "以下是该轮派生的后台子任务写进工作区的完整结论(本轮总结当时未能拿到它们),"
+                    f"请作为已完成的证据直接沿用,不要重跑这些子任务:\n{reports}"
+                ),
             })
         if rd["review"]:
             messages.append({

@@ -577,13 +577,21 @@ ExecutorAgent (ABC)
         transcript 覆盖到该轮为止)
 17. _build_base_prompt(纯指令) → 按 (task_id, round_idx, role=user, type=question) 幂等查重,
     无记录才 _add_conversation 落库(首轮提问已在 create_task 时落库,此处跳过避免重复)
-18. _resolve_injection_plan(injection_state, 仓库上下文段, 记忆段, round_idx)
+18. _resolve_injection_plan(injection_state, 仓库上下文段, 记忆段, round_idx, 落盘要求段)
     → injection_state:复用命中→缓存条目;恢复成功→用记录指纹拼出的同构 dict;
       新建 session→None。返回 (注入段, 注入段, 回放下界, 指纹),下界 None=不回放 /
       0=全量回放 / k=增量回放(k < 轮次 < round_idx)
+    → 指纹分**三桶** {repo, memory, subagent}:合并指纹会让一段变化连带把另一段重发
     → 复用"已送达过"的 session 且某段逐字未变 → 该段置空(上一轮已发过,重发只是重复占 token)
+    → 跨轮回放的新数据源:上轮回捞到的 `agent_report` artifact 按 metadata.round_idx
+      归回对应轮,作为独立一条 `[系统注入|后台子任务落盘报告|第 N 轮]` 参与回放
+      (`_load_agent_reports_by_round`,一次查全任务;查失败/无记录则不注入,单份超长
+      再截一次)——否则旧轮未回报的子任务结论在新会话里永远缺席、只能重跑
+    → 后台子任务落盘要求段单独走 `_resolve_subagent_injection`:与 repo/memory 两桶的
+      默认方向**相反** —— 旧记录缺 subagent key 时按"未送达"处理(沿用"缺 key=已送达"
+      会让改造前上线的 session 永远收不到落盘要求),命中新指纹才跳过
     → 走全新链路 **或复用一个 prompt 从未成功送达的空 session**(缓存条目
-      prompt_accepted 为假,见 _session_has_context)→ 两段全量注入 + 全量回放
+      prompt_accepted 为假,见 _session_has_context)→ 各段全量注入 + 全量回放
     → 复用/恢复的 session 有上下文,但 last_accepted_round 落后于 round_idx-1
       (恢复 transcript 只覆盖到记录轮次,其后失败轮的提问进了 DB 却没进 transcript;
       重试消息 build_retry_message 不复述原提问)→ **增量回放**补发缺失轮次,
@@ -593,7 +601,8 @@ ExecutorAgent (ABC)
        CLI 执行链不依赖后端 LLM,超预算由兜底截断保留最近轮次)
     → 返回按"原内容"计算的注入段指纹(裁剪后的空内容不参与,下一轮仍可命中去重)
     → user_msg = _compose_send_text(base_msg, repo_ctx_section, memory_section, history_replay)
-      装配顺序:历史回放 + 仓库/上传上下文 + 记忆段 + 本轮指令(稳定段在前,易变指令置后)
+      装配顺序:历史回放 + 仓库/上传上下文 + 记忆段(含 skill 清单) + 后台子任务
+      落盘要求 + 本轮指令(稳定段在前,易变指令置后;各段去重见 §4.4)
 19. collector = _ACPCollector(task, db, round_idx, agent_type=agent_type)
 20. with session.auto_renew():  # prompt 期间 CLI 用自带 bash 不访问后端,单轮长执行可能拖过沙箱 TTL,
                                 # 后台线程周期性 renew 沙箱
@@ -616,15 +625,21 @@ ExecutorAgent (ABC)
     → 挂死兜底:按活动工具状态分级 idle 超时 → session/cancel + 置 last_prompt_truncated → 返回空结果
     → 流异常兜底:CLI 崩溃/连接中断(ACPStreamAborted)走同款善后,不把崩溃当正常完成、不 fail 任务
     → **异步子 Agent 续轮回收**(Qoder 的 Agent 工具 fire-and-forget,结果只能从下一轮回流):
-      本轮派生过后台子 Agent(工具名宽松匹配 Agent/Task/subagent + 回执含 "Async agent
-      launched…background")且**最后一次派生回执之后**的收尾文本还没交付实质结果(呈"在等
-      结果"口吻,或短于 ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS;派生之前写的正文与是否提前
-      end_turn 无关,故完全不参与判定)→ 在同一活跃 session 上带退避补发续轮 prompt
-      (_async_agent_collect_results),让 CLI 把已完成的子 Agent 结果注入下一轮产出报告。
+      判据只看结构化事实——collector 的**派生台账** `async_agent_launches` 非空即补发
+      (每项记 `tool_call_id` / 回执里的 `agentId` / `ts`;工具名宽松匹配 Agent/Task/subagent
+      **且**回执含 "Async agent launched…background" 才计入,同步完成的子任务不算)。
+      **不再拿收尾文本的口吻/篇幅做否决**:实测(任务 f4ff8649)模型把"后台代理仍在运行"
+      写在报告首句、末尾却是干净结论、篇幅远超实质阈值,旧文本判据把半份报告判成
+      "已交付"而永不补发,三个后台子任务结果全部丢失。硬前提仍两条:executor 在白名单、
+      首轮未被兜底截断;判定为不回收时**必须留一条日志写明原因**(此分支曾全程静默,
+      导致"没检测到"与"没启动回收"无法从日志区分)。
+      在同一活跃 session 上带退避补发续轮 prompt(_async_agent_collect_results),让 CLI 把
+      已完成的子 Agent 结果注入下一轮产出报告(续轮 prompt 同时要求读落盘文件)。
       停止补发的判据不止文本口吻 —— 续轮被兜底截断(prompt() 把 idle/流中断吞成"置
       last_prompt_truncated + 返回 {}")、stopReason 非 end_turn、已产出实质内容、连续两次
-      输出指纹相同(再问只会把同一份报告堆进 summary)、连接层异常;除"确认拿到完整报告"
-      外一律保持 still_pending=True,不谎报回收成功。
+      输出指纹相同(再问只会把同一份报告堆进 summary)、超 `ACP_ASYNC_AGENT_CONTINUE_DEADLINE_SECONDS`
+      自设预算(第 1 次必发,第 2 次起先查已耗时)、连接层异常;除"确认拿到完整报告"
+      外一律保持 still_pending=True,不谎报回收成功。`attempts` 记实际补发次数供收尾标注。
       会话记录(build_session_record 的 truncated 口径)排在回收之后写:续轮被截断时该轮
       同样不推进记录,否则下一轮恢复就不回放这段缺失尾巴
 21. finally: recorder.close() + collector.close() → client.close()
@@ -637,9 +652,29 @@ ExecutorAgent (ABC)
 23. summary = collector.content_full or "执行完成({agent_type},{n} 次工具调用)"
     若 client.last_prompt_truncated:推 phase=error 事件「[本轮提前终止: ...]」
     并在 summary 追加截断标注(让 agent2 审查时知道输出不完整)
-    若进入过续轮回收(collector.publish_note,terminal=True):仍不完整 → phase=error +
-    summary 追加「后台子任务…可能不完整,可稍后追问」;确认回收完成 → phase=notice
-    (成功提示借 error 相位会被前端渲染成「[错误] ...」,故新增不标错的收尾相位)
+    若本轮有后台子任务(collector.publish_note,terminal=True):
+    - 回收成功 → phase=notice(成功提示借 error 相位会被前端渲染成「[错误] ...」,
+      故新增不标错的收尾相位)
+    - 仍不完整(补发后未拿全 / 压根没启动补发)→ phase=error + summary 追加「后台子
+      任务…可能不完整,可稍后追问」,并另落一条 `role=system, type=warning` 对话:
+      publish_note 只追到瞬时流式卡片(总线不缓存增量),刷新/中途离开页面回来只能靠
+      落库记录看到"本轮不完整"
+    → **后台子任务落盘报告回捞**(_collect_async_agent_reports,只要台账非空就做,
+      不论回收成败):`ls -1` + `cat` 读仓库外的 `<reports_dir>/<task8>/r<round>/*.md`
+      (sandbox=/home/user/.agent_reports,local=<local_dir>/.agent_reports;路径由
+      `memory_injection.resolve_agent_reports_dir` 按模式算,local 无 local_dir 则不注入不回捞),
+      每份写 `TaskArtifact(kind="agent_report", metadata_={round_idx, path, filename,
+      char_count, truncated})`,先按 (task, round) 删旧再写(与 git_diff 的"最新态唯一"同范式);
+      全程 best-effort + 单命令 8s 超时,异常只记日志。意义:沙箱 TTL 回收会让 CLI 会话磁盘
+      一起消失(实测 `session/resume` 报 `INVALID_SESSION_IDENTIFIER`),落盘件活在 DB 里既
+      是长期交付物,又能被下一轮跨轮回放直接读取(见下)
+    → **本轮结论指针**：把最后一条"有可见正文"的 `agent1/thinking` 记录 id 写入
+      `task.params["_round_conclusion"][str(round_idx)] = {conv_id, chars, complete,
+      async_pending, updated_at}`(与 `_plan`/`_grouping`/`_acp_session` 同一 params 约定,
+      TaskResponse.params 整体回传前端,无需新接口/新会话类型)。CLI 收尾正文只落在 thinking
+      的 content 里,前端旧规则要求"最后一个迭代是纯思考"才把结论提到折叠组外 —— 收尾前
+      只要还有一次工具调用,整段结论就被默认折叠的「执行过程」组藏住(实测 5409 字符报告
+      即如此);按指针定位不再依赖该位置启发式,无该记录的存量任务自动回退旧规则
 24. current_plan = _extract_plan(collector.content_full) or previous_plan
 25. return [], summary, current_plan
 ```
@@ -756,7 +791,7 @@ CLI 侧每轮构造单条 user 文本，由 `_compose_send_text` 按**稳定注�
 >   2. **记录持久化**：`prompt` 成功后才写 `task.params["_acp_session"]`(sessionId / cwd / `injected_context_hash` / round_idx),失败轮不留指针;任务中途换执行器时按 `agent_type` 隔离,不拿别家的 sessionId 去恢复
 >   3. **回放通知排空**：`acp_bridge.py` 对 `session/load` / `session/resume` 在流结束后(正常收尾或后端超时先断均可)继续按"静默窗口"取空残留行并丢弃(仍持 `_rpc_lock`),并在 `/health` 上报 `bridge_protocol=2`;后端只对 `bridge_protocol >= 2` 的 bridge 启用恢复 —— 沙箱内存活的旧 bridge(无该字段,视为 1)不会触发恢复,避免往轮历史串进下一个请求的流里重复入库/推前端
 >   4. **恢复失败的兜底**：业务错误清过期记录(不每轮撞同一死会话)+ `session/new` + 文本回放;传输层瞬时失败保留记录下轮再试(磁盘会话多半仍完好)
->   5. **恢复的 session 当作"已有上下文"**：注入段指纹随记录一并恢复,`_resolve_injection_plan` 不重发已给过的仓库/记忆段;记录的 `round_idx` 兼作 `last_accepted_round`,落后于当前轮次时对缺失轮次做**增量回放**(见步骤 18)——恢复 transcript 只覆盖到记录轮次,其后失败轮的提问不补发就会随重试静默丢失
+>   5. **恢复的 session 当作"已有上下文"**：注入段指纹随记录一并恢复,`_resolve_injection_plan` 不重发已给过的仓库/记忆段(注入指纹分 repo/memory/subagent 三桶,其中 subagent 桶为后加:旧记录缺该 key 时按"未送达"处理,保证已上线的 session 也能收到一次落盘要求,与另两桶的默认方向相反);记录的 `round_idx` 兼作 `last_accepted_round`,落后于当前轮次时对缺失轮次做**增量回放**(见步骤 18)——恢复 transcript 只覆盖到记录轮次,其后失败轮的提问不补发就会随重试静默丢失
 >   6. **截断兜底轮不推进持久化记录**：idle 挂死/流中断被 prompt() 内部降级收尾时,该轮内容可能没被 CLI 写进磁盘 transcript,`build_session_record(truncated=True)` 返回 None,记录的 round_idx 留在上一次干净轮——之后恢复 + 增量回放才能把它补上(缓存侧照常记"已送达":进程内 session 确实收到过该 prompt)
 > - 尚未接入：Codex(`thread_id` 仍困在 codex_bridge 进程内存,需先透出并持久化 sessionId→thread_id 映射才能跳进程恢复)
 > - 已修复的缺口（2026-10 代码审查发现，同日修复）：全新链路首次 prompt 以业务性异常失败时（仅连接类异常清缓存），缓存条目保留，下一轮复用该从未收到过消息的空 session 时 `need_replay=False` 不回放——历史回放机制在此窗口失效。现由条目的 `prompt_accepted` 标记兜住：只在 `client.prompt()` 成功返回后置真（与注入段指纹同批回写），`_resolve_injection_plan` 对缺该标记为假的复用条目走全量注入 + 回放（旧格式条目缺 key 视为已送达，保持兼容）；回归测试见 `tests/test_acp_history_replay.py`。本节的 sessionId 持久化 + resume 接入已同步完成(见上方"接入实现"),同一场景现在拿到的是 CLI 自己的完整 transcript;**恢复/复用路径的同类缺口**(transcript 覆盖不到其后的失败轮,而重试消息不复述原提问)由 `last_accepted_round` 增量回放兜住(同轮审查发现的 major 问题,同批修复)
@@ -1067,7 +1102,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | [event_bus.py](../backend/app/event_bus.py) | 事件总线(publish / SSE 订阅) |
 | [agent_policy.py](../backend/app/agent_policy.py) | 智能体策略(默认值定义 + 用户级/任务级合并解析) |
 | [services/workspace_diff.py](../backend/app/services/workspace_diff.py) | 任务完成时工作区 diff/patch 捕获 + 仓库树快照(存 task_artifacts) |
-| [models/task_artifact.py](../backend/app/models/task_artifact.py) | 任务工作区产物模型(kind=git_diff / repo_tree) |
+| [models/task_artifact.py](../backend/app/models/task_artifact.py) | 任务工作区产物模型(kind=git_diff / repo_tree / agent_report) |
 | [tools/quality_tools.py](../backend/app/tools/quality_tools.py) | 代码质量工具(run_lint / run_coverage,local/sandbox 双模式) |
 | [tools/dependency_tools.py](../backend/app/tools/dependency_tools.py) | 依赖清单解析工具(list_dependencies,串联 query_cve) |
 | [models/agent_policy.py](../backend/app/models/agent_policy.py) | 用户级智能体策略表(agent2 启停 / 验证权限 / 引用复核) |

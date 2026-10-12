@@ -3,15 +3,19 @@
 覆盖:
 - _looks_like_pending_async_report:命中"在等后台结果"口吻(中英),完整报告不误判
 - _is_async_agent_launch:派生检测(工具名宽松 + 回执必须含异步标记)
+- _extract_async_agent_id:回执里的 agentId 抽取(仅标注用)
 - _needs_async_agent_recovery:末尾窗口口吻 / 文本没实质内容 → 需要回收;
   长完整报告(或正文中段带技术用词但末尾干净)→ 不回收
-- _should_recover_async_agent:主判据是"本轮派生过后台子 Agent",且文本判据只看
-  **最后一次派生回执之后**的收尾(派生之前写的正文不参与);首轮被兜底截断 /
-  开关关闭 / executor 不在白名单都不触发
+  (它现在只是循环内停止条件与日志线索,不再是启动否决门)
+- _should_recover_async_agent:返回 (是否回收, 原因)。主判据只看结构化事实——
+  本轮派生过后台子任务就补发;长且末尾干净的半份报告也必须补发(回归
+  任务 f4ff8649);首轮被兜底截断 / 开关关闭 / executor 不在白名单不触发且原因可读
 - _async_agent_autoccontinue_enabled:全局开关 + agent 类型白名单
 - _async_agent_collect_results:交付 / 续等后交付 / 耗尽 / 连接异常,以及
   **被兜底截断**(prompt() 吞异常返回 {})与 stopReason 非 end_turn 都必须判
   "仍不完整"(回归:过去只看文本口吻,把半份报告标成"已回收完整报告")
+- 预算与计数:attempts 如实记录;超 ACP_ASYNC_AGENT_CONTINUE_DEADLINE_SECONDS
+  后不再第 2 次补发(第 1 次必发);预算设 0 = 关闭该门
 - 报告堆叠防护:实质内容 + 仍带等待口吻 / 连续两次输出重复 → 停止补发
 - _ACPCollector.publish_note:进度与结论提示的相位(别把成功提示渲染成错误)
 
@@ -76,6 +80,18 @@ def test_is_async_agent_launch_loose_tool_name_but_strict_ack():
     assert not A._is_async_agent_launch("", _ASYNC_ACK)
 
 
+def test_extract_async_agent_id_from_qoder_ack():
+    """agentId 抽取(只用于日志与"未回报个数"标注,取不到不应报错)"""
+    ack = (
+        "Async agent launched successfully.\n"
+        "agentId: ageneral-purpose-5f77f8122aee3358 (internal ID - do not mention to user.)\n"
+        "The agent is working in the background."
+    )
+    assert A._extract_async_agent_id(ack) == "ageneral-purpose-5f77f8122aee3358"
+    assert A._extract_async_agent_id("no id here") == ""
+    assert A._extract_async_agent_id("") == ""
+
+
 # ============================================================
 # 是否需要续轮回收
 # ============================================================
@@ -123,8 +139,16 @@ def test_min_chars_zero_disables_substance_gate(monkeypatch):
 class _GateCollector:
     def __init__(self, content_full="", launch_count=1, tail_start=0):
         self.content_full = content_full
-        self.async_agent_launch_count = launch_count
         self.async_agent_launch_tail_start = tail_start
+        # 真实 collector 用台账计数;这里用同构台账保持与线上一致的读面
+        self.async_agent_launches = [
+            {"tool_call_id": f"c{i}", "agent_id": "", "ts": ""}
+            for i in range(launch_count)
+        ]
+
+    @property
+    def async_agent_launch_count(self):
+        return len(self.async_agent_launches)
 
 
 class _GateClient:
@@ -141,37 +165,57 @@ def _gate_on(monkeypatch):
 
 def test_should_recover_requires_launch(_gate_on):
     col = _GateCollector("结果稍后给你", launch_count=0)
-    assert A._should_recover_async_agent(col, _GateClient(), "qoder_cli") is False
+    need, reason = A._should_recover_async_agent(col, _GateClient(), "qoder_cli")
+    assert need is False
+    # 没派生过后台子任务 → 无需回收(reason 留空,与"有派生但不回收"区分)
+    assert reason == ""
 
 
 def test_should_recover_skips_truncated_first_round(_gate_on):
-    # 首轮已被兜底截断:残留文本不可信,不再补发(由收尾统一标注不完整)
+    # 首轮已被兜底提前截断:残留文本不可信,不再补发(由收尾统一标注不完整)
     col = _GateCollector("结果稍后给你")
-    assert A._should_recover_async_agent(
+    need, reason = A._should_recover_async_agent(
         col, _GateClient(truncated="idle timeout"), "qoder_cli"
-    ) is False
+    )
+    assert need is False
+    assert "idle timeout" in reason
 
 
 def test_should_recover_honors_executor_allowlist(_gate_on):
     col = _GateCollector("结果稍后给你")
-    assert A._should_recover_async_agent(col, _GateClient(), "deepseek_cli") is False
+    need, reason = A._should_recover_async_agent(col, _GateClient(), "deepseek_cli")
+    assert need is False
+    assert "ACP_ASYNC_AGENT_TYPES" in reason
 
 
 def test_should_recover_for_early_end_turn(_gate_on):
     assert A._should_recover_async_agent(
         _GateCollector("已启动子任务,等待返回"), _GateClient(), "qoder_cli"
-    ) is True
+    ) == (True, "")
 
 
-def test_should_recover_judges_only_text_after_launch_ack(_gate_on):
-    # 派生回执之前写的正文不参与判定(哪怕里面有"等待"):派生后没再写字 → 需回收
-    before = "先说明这里存在等待锁未释放的风险。" * 10
-    col = _GateCollector(before, launch_count=1, tail_start=len(before))
-    assert A._should_recover_async_agent(col, _GateClient(), "qoder_cli") is True
-    # 派生后写出了实质结论且末尾无等待口吻 → 视为已交付,不补发(避免报告堆叠)
-    after = "# 阶段性完整结论\n" + "- 已定位 3 处高危并给出修复方案;" * 20
-    col2 = _GateCollector(before + after, launch_count=1, tail_start=len(before))
-    assert A._should_recover_async_agent(col2, _GateClient(), "qoder_cli") is False
+def test_should_recover_ignores_delivered_looking_long_report(_gate_on):
+    """回归(任务 f4ff8649):派生后写出了 5000+ 字符、末尾干净无等待字样的半份
+    报告 —— 旧的文本判据会把它当"已交付"而永不补发,三个后台子任务结果全丢。
+    现在判据只看结构化事实:有派生就补发(堆叠防护仍在循环内部靠实质阈值处理)。
+    """
+    tail = "三个后台代理仍在运行。先给出已亲自复核确认的部分:\n" + "- 已验证问题;" * 600
+    assert len(tail) > A._async_delivered_min_chars()
+    # 文本判据确实会误判为"已交付"(证明两层判据不同源)
+    assert not A._needs_async_agent_recovery(tail)
+    col = _GateCollector("开场" + tail, launch_count=3, tail_start=len("开场"))
+    assert A._should_recover_async_agent(col, _GateClient(), "qoder_cli") == (True, "")
+
+
+def test_should_recover_treats_launch_count_stub_collector(_gate_on):
+    """鸭子类型兼容:只有 async_agent_launch_count 的桩也能走同一判据。"""
+
+    class _CountOnly:
+        content_full = "一份很长的报告" * 200
+        async_agent_launch_count = 2
+        async_agent_launch_tail_start = 0
+
+    assert A._should_recover_async_agent(_CountOnly(), _GateClient(), "qoder_cli")[0] is True
 
 
 # ============================================================
@@ -350,6 +394,72 @@ def test_max_continue_zero_makes_no_prompt(_fast_settings, monkeypatch):
     client = _StubClient(col, [_Resp("# 报告")])
     ctx = _collect(col, client)
     assert client.calls == 0
+    assert ctx["still_pending"] is True
+
+
+def test_records_attempts_for_final_annotation(_fast_settings):
+    """attempts 必须如实记录补发次数(收尾的 system/warning 告警直接用它写文本)"""
+    col = _StubCollector("waiting for the background agents")
+    client = _StubClient(col, [
+        _Resp("仍在等待甲的结果"),
+        _Resp("# Final full report delivered now."),
+    ])
+    ctx = _collect(col, client)
+    assert ctx["attempts"] == 2
+    assert ctx["still_pending"] is False
+
+
+class _FakeTime:
+    """只定住 _async_agent_collect_results 用到的 monotonic/sleep(预算测试要确定)"""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def test_continue_deadline_stops_further_attempts(monkeypatch):
+    """自设预算:第 2 次补发前发现已超预算就收手,并保持"仍不完整"标注。
+
+    第 1 次必发:否则一次都没试就放弃,回收机会归零。
+    """
+    monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_MAX_CONTINUE", 3)
+    monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS", 100)
+    monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_CONTINUE_BACKOFF_FACTOR", 1.0)
+    monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS", 100)
+    monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_CONTINUE_DEADLINE_SECONDS", 50)
+    monkeypatch.setattr(A, "time", _FakeTime())
+
+    col = _StubCollector("will report after they finish")
+    client = _StubClient(col, [
+        _Resp("仍在等待子任务甲的结果"),
+        _Resp("仍在等待子任务乙的结果"),
+    ])
+    ctx = _collect(col, client)
+    assert client.calls == 1
+    assert ctx["still_pending"] is True
+    assert ctx["attempts"] == 1
+    assert ctx["skip_reason"] == "deadline"
+
+
+def test_continue_deadline_zero_keeps_polling(_fast_settings, monkeypatch):
+    """预算 0 = 关闭该门,行为回到"按 MAX_CONTINUE 补发"。
+
+    每份输出用不同文本:否则会被"连续两次输出重复"的堆叠防护先停下,测不到预算门。
+    """
+    monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_CONTINUE_DEADLINE_SECONDS", 0)
+    col = _StubCollector("will report after they finish")
+    client = _StubClient(col, [
+        _Resp("仍在等待子任务甲的结果"),
+        _Resp("仍在等待子任务乙的结果"),
+        _Resp("仍在等待子任务丙的结果"),
+    ])
+    ctx = _collect(col, client)
+    assert client.calls == settings.ACP_ASYNC_AGENT_MAX_CONTINUE
     assert ctx["still_pending"] is True
 
 

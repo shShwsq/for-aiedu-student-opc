@@ -252,3 +252,32 @@ def resolve_agent_skills_dir_path(mode: str, local_dir) -> str:
     if str(mode) == "local" and local_dir:
         return os.path.join(str(local_dir), ".agent_skills")
     return sandbox_tools._SKILLS_DIR_SANDBOX
+
+
+def resolve_agent_reports_dir(mode: str, local_dir, subdir: str = "") -> str:
+    """计算后台子任务结论落盘目录的绝对路径(按运行模式;仅外部 CLI 需要)
+
+    与 resolve_agent_memory_file_path / resolve_agent_skills_dir_path 同口径:
+    - sandbox 模式:/home/user/.agent_reports[/<subdir>] —— 容器内真实路径
+    - local 模式:<local_dir>/.agent_reports[/<subdir>] —— local_dir 本就是任务级
+      临时目录(与 .agent_memory/.agent_skills 同级),不碰宿主机真实 ~
+
+    与记忆/skill 两处不同:local 模式拿不到 local_dir 时返回**空串**而不是退化到
+    /home/user 路径——那个路径在宿主机上不存在,写不进去也回捞不到,不如不注入
+    (宁可不落盘也不能往宿主机根目录外的随意路径写)。
+
+    全程用正斜杠:local_dir 在 Windows 宿主机上是反斜杠路径,直接拿它再拼
+    "/<subdir>" 会得到混分隔符的路径(既难比对,也不适合交给 shell/CLI)。
+    """
+    from pathlib import Path
+
+    from app.tools import sandbox_tools
+
+    if str(mode) == "local":
+        if not local_dir:
+            return ""
+        # as_posix():Windows 宿主机 local_dir 是反斜杠路径,统一成正斜杠再拼轮次子目录
+        base = (Path(str(local_dir)) / ".agent_reports").as_posix()
+    else:
+        base = sandbox_tools._AGENT_REPORTS_DIR_SANDBOX
+    return f"{base}/{subdir}" if subdir else base

@@ -86,6 +86,7 @@ from app.agents.runtime.acp_session import (
 from app.config import settings
 from app.event_bus import publish
 from app.models.task import Conversation, Task
+from app.models.task_artifact import TaskArtifact
 from app.models.user_agent_config import UserAgentConfig
 from app.perf import perf_log
 # CLI prompt 文案资产与上传检测(纯函数),集中管理于 app/prompts/
@@ -96,6 +97,7 @@ from app.prompts.executor import (
     build_cli_memory_section,
     build_cli_repo_context_section,
     build_cli_skills_section,
+    build_cli_subagent_reports_section,
     build_first_round_question,
     format_plan_reminder,
 )
@@ -161,6 +163,10 @@ _ASYNC_AGENT_LAUNCH_RE = re.compile(
     r"Async agent launched|working in the background", re.IGNORECASE
 )
 
+# 派生回执里的子 Agent id(Qoder 形如 "agentId: ageneral-purpose-5f77f8122aee3358")。
+# 只用于日志与"未回报数量"标注,不参与回收判定(判据看派生次数本身)。
+_ASYNC_AGENT_ID_RE = re.compile(r"agentId:\s*([A-Za-z0-9_.-]+)", re.IGNORECASE)
+
 # 派生子 Agent 的工具名(小写宽松匹配:各 CLI 把子智能体工具叫 Agent / Task /
 # subagent 不一)。工具名放宽,但回执文本必须同时命中异步标记,免得把同步
 # 子任务的回执算成异步派生。
@@ -190,7 +196,9 @@ _PENDING_ASYNC_REPORT_RE = re.compile(
 _ASYNC_AGENT_CONTINUE_PROMPT = (
     "The background sub-agents you launched earlier should have finished by now. "
     "Output their COMBINED full findings now as your final answer. "
-    "Do not launch new sub-agents. If a sub-agent is genuinely still running, "
+    "Do not launch new sub-agents. If a sub-agent wrote its findings to the "
+    "reports directory required above, read those files and consolidate them "
+    "into your answer. If a sub-agent is genuinely still running, "
     "report only what is ready and state which parts are still pending."
 )
 
@@ -231,6 +239,65 @@ def _is_agent_tool(tool_name: str) -> bool:
     return (tool_name or "").strip().lower() in _ASYNC_AGENT_TOOL_NAMES
 
 
+def _extract_async_agent_id(raw_output: str) -> str:
+    """从派生回执里取子 Agent id(仅供日志/标注;取不到返回空串)"""
+    m = _ASYNC_AGENT_ID_RE.search(raw_output or "")
+    return m.group(1) if m else ""
+
+
+def _collector_async_launches(collector: Any) -> list[dict]:
+    """本轮记录的"只拿到派生回执"后台子任务列表
+
+    真实 _ACPCollector 用 async_agent_launches 记账;单测里的桩对象可能只带
+    async_agent_launch_count,故回退按计数构造,保证判据对两者一致可用。
+    """
+    launches = getattr(collector, "async_agent_launches", None)
+    if isinstance(launches, list):
+        return launches
+    try:
+        count = int(getattr(collector, "async_agent_launch_count", 0) or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return [{"tool_call_id": "", "agent_id": ""}] * max(0, count)
+
+
+def _async_agent_skip_reason(client: Any, agent_type: str) -> str:
+    """"本轮有未回报的后台子任务,但不应当启动续轮回收"的原因文本(空串=应当回收)
+
+    只对台账非空的轮调用(由 _should_recover_async_agent 守住这一前置):它不判台账,
+    否则"无需回收"与"应回收"在返回值上分不开。
+    """
+    if not _async_agent_autoccontinue_enabled(agent_type):
+        return "已关闭(ACP_ASYNC_AGENT_AUTOCONTINUE=false 或 executor 不在 ACP_ASYNC_AGENT_TYPES 白名单)"
+    trunc = getattr(client, "last_prompt_truncated", None)
+    if trunc:
+        return f"首轮已被兜底提前终止({trunc}),残留文本不可信"
+    return ""
+
+
+def _should_recover_async_agent(
+    collector: "_ACPCollector", client: "ACPClient", agent_type: str
+) -> tuple[bool, str]:
+    """收尾判定:是否需要在同一活跃 session 上补发续轮回收后台子 Agent 结果。
+
+    返回 (是否回收, 不回收的原因文本)。
+
+    判据只看结构化事实:本轮存在"只拿到派生回执、没有后续回报"的 Agent 工具。
+    同一轮内这些子任务的结果物理上不可能回流(实测其 toolCallId 只有回执一条
+    completed 事件),因此不再拿收尾文本的口吻/篇幅做否决。实测教训(任务
+    f4ff8649):模型把"后台代理仍在运行"写在报告首句、末尾却是干净结论,篇幅又
+    远超实质阈值,旧的文本判据就把半份报告判成"已交付"而漏回收。
+    派生之后新写的文本长度只进日志(见调用处 _async_tail_text),不用于决策。
+    """
+    if not _collector_async_launches(collector):
+        # 没派生过后台子任务:正常收尾,不属于"未回收"的任何异常情形
+        return False, ""
+    reason = _async_agent_skip_reason(client, agent_type)
+    if reason:
+        return False, reason
+    return True, ""
+
+
 def _async_delivered_min_chars() -> int:
     """判定"已产出实质报告"的字符阈值(配置非法时返回 0=该判据不启用)。"""
     try:
@@ -240,14 +307,14 @@ def _async_delivered_min_chars() -> int:
 
 
 def _needs_async_agent_recovery(text: str) -> bool:
-    """收尾文本是否"还没交付子 Agent 的结果"(续轮回收的次要判据)。
+    """收尾文本是否"还没交付子 Agent 的结果"
 
-    主判据是本轮派生过后台子 Agent(子 Agent 结果只能从下一轮回流),这里只
-    负责排除"结果其实已经给全"的情形:
-    - 末尾呈"在等结果"口吻 → 需要回收(主要信号)
-    - 收尾文本没实质内容(为空或短于阈值)→ 需要回收(防漏报:模型提前
-      end_turn 时常常只留一句"子任务已启动",不含任何等待字样)
-    长完整报告且末尾无等待口吻 → 不回收,避免重复补发把同一份报告堆两遍。
+    现在只作为**日志线索与循环内停止条件**使用(见 _async_agent_collect_results
+    对新输出的判定),不再是"要不要启动续轮"的否决门:启动与否由结构化事实
+    (本轮派生过后台子任务)决定,详见 _should_recover_async_agent 的实测说明。
+    - 末尾呈"在等结果"口吻 → 还没交付
+    - 文本没实质内容(为空或短于阈值)→ 还没交付
+    长完整报告且末尾无等待口吻 → 文本上看已交付(但仍不能据此否决回收)。
     """
     stripped = (text or "").strip()
     if not stripped:
@@ -258,22 +325,15 @@ def _needs_async_agent_recovery(text: str) -> bool:
     return min_chars > 0 and len(stripped) < min_chars
 
 
-def _should_recover_async_agent(
-    collector: "_ACPCollector", client: "ACPClient", agent_type: str
-) -> bool:
-    """收尾判定:是否需要在同一活跃 session 上补发续轮回收后台子 Agent 结果。
+def _async_tail_text(collector: Any) -> str:
+    """最后一次派生回执之后新写的正文(仅供日志/标注)
 
-    文本判据只看"最后一次派生回执之后"的那段收尾文本(结果只能从下一轮回流,
-    派生之前写的正文与"是否提前收尾"无关,把它们混进来正是误判/漏判的来源)。
+    派生之前写的正文与"是否提前收尾"无关;旧版本拿它做否决门,现在只拿它写
+    日志(回收与否由结构化事实定),保留它方便事后定位"模型派生后到底写了多少"。
     """
-    content_full = collector.content_full or ""
+    content_full = getattr(collector, "content_full", "") or ""
     tail_start = getattr(collector, "async_agent_launch_tail_start", 0) or 0
-    return (
-        collector.async_agent_launch_count > 0
-        and _async_agent_autoccontinue_enabled(agent_type)
-        and not getattr(client, "last_prompt_truncated", None)
-        and _needs_async_agent_recovery(content_full[tail_start:])
-    )
+    return content_full[tail_start:]
 
 
 def _text_fingerprint(text: str) -> str:
@@ -300,27 +360,45 @@ def _async_agent_collect_results(
     - 复用同一 client + session_id + collector:续轮内容继续累积进 content_full
       并流式推前端,收尾时并入本轮 summary(不另起 conv/round)。
     - 停止条件(任一命中即停):拿到不再呈"在等结果"口吻的新输出(回收完成)/
-      被兜底截断或 stopReason 非 end_turn(结果不可信)/ 已产出实质内容却仍带
+      被兜底提前截断或 stopReason 非 end_turn(结果不可信)/ 已产出实质内容却仍带
       等待口吻或连续两次输出重复(再补发只会把同一份报告堆进 summary)/
-      连接层异常 / 达最大次数。
+      连接层异常 / 达最大次数 / 超出自设预算(ACP_ASYNC_AGENT_CONTINUE_DEADLINE)。
     - ctx["still_pending"]:是否仍可能没拿全结果。调用方一进续轮就该置 True,
       本函数只在确认拿到完整报告时置 False —— 其余所有退出路径都保持 True,
       免得把失败情形标成"已回收完整报告"。
+    - ctx["attempts"]:实际补发了几次(供收尾告警与 params 记录直接用,不再反推)。
+    - ctx["skip_reason"]:未回收/提前收手的短因由文本(只进日志,不影响主流程)。
 
     注:idle 挂死(PromptIdleTimeout)与流中断(ACPStreamAborted)都在
     `ACPClient.prompt()` 内部兜底(置 last_prompt_truncated 后返回 {}),
     不会抛到这儿,因此 except 只列会真正抛出的连接层异常。
     """
-    max_continue = int(getattr(settings, "ACP_ASYNC_AGENT_MAX_CONTINUE", 3) or 0)
-    cur_wait = float(getattr(settings, "ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS", 20) or 0)
+    max_continue = int(getattr(settings, "ACP_ASYNC_AGENT_MAX_CONTINUE", 2) or 0)
+    cur_wait = float(getattr(settings, "ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS", 30) or 0)
     factor = float(getattr(settings, "ACP_ASYNC_AGENT_CONTINUE_BACKOFF_FACTOR", 1.5) or 1.5)
     min_delivered = _async_delivered_min_chars()
+    # 自设预算:第 2 次及以后的补发前检查已耗时(第 1 次必发,否则一次都没试就放弃)。
+    # 0 = 关闭该预算
+    deadline = float(getattr(settings, "ACP_ASYNC_AGENT_CONTINUE_DEADLINE_SECONDS", 300) or 0)
+    started = time.monotonic()
 
+    ctx.setdefault("attempts", 0)
     last_fp = ""
     for attempt in range(1, max_continue + 1):
+        elapsed = time.monotonic() - started
+        if deadline > 0 and attempt > 1 and elapsed >= deadline:
+            ctx["still_pending"] = True
+            ctx["skip_reason"] = "deadline"
+            logger.warning(
+                f"[task={task.id}] {agent_type} 续轮回收已占用 {elapsed:.0f}s"
+                f">= 预算 {deadline:.0f}s,停止后续补发(已尝试 {attempt - 1} 次),"
+                f"结果按可能不完整标注"
+            )
+            return
         # 给后台子 Agent 完成时间(auto_renew 后台线程期间持续续期沙箱 TTL)
         if cur_wait > 0:
             time.sleep(cur_wait)
+        ctx["attempts"] = attempt
         prev_len = len(collector.content_full)
         try:
             result = client.prompt(
@@ -398,6 +476,136 @@ def _async_agent_collect_results(
         f"[task={task.id}] {agent_type} 续轮回收已达上限 {max_continue} 次,结果仍可能不完整"
     )
 
+
+def _async_agent_reports_dir(task_id, round_idx: int, mode: str, local_dir) -> str:
+    """后台子任务结论落盘目录(CLI 可直达的绝对路径,按运行模式)
+
+    - sandbox:/home/user/.agent_reports/<task8>/r<round>
+    - local:<local_dir>/.agent_reports/<task8>/r<round>(local 模式的 local_dir 本就是
+      任务级临时目录,与 .agent_memory/.agent_skills 同性质,不碰宿主机真实 ~)
+
+    落在仓库目录之外:仓库内新增文件会污染工作区 diff 与 git_diff artifact。
+    local 模式拿不到 local_dir 时返回空串(不注入不猜路径)。
+    """
+    from app.services.memory_injection import resolve_agent_reports_dir
+
+    return resolve_agent_reports_dir(
+        mode, local_dir, f"{str(task_id)[:8]}/r{int(round_idx)}"
+    )
+
+
+def _collect_async_agent_reports(
+    task: Task, db: Session, session: Any, reports_dir: str, round_idx: int,
+) -> int:
+    """把后台子任务落盘的结论回捞成 kind="agent_report" 的 artifact(尽力而为)
+
+    为何需要:沙箱 TTL 回收会连 CLI 自己的会话磁盘一起带走,下一轮 session/resume
+    报 INVALID_SESSION_IDENTIFIER 时那些未回报的后台结果物理不可恢复(实测任务
+    f4ff8649 的三个后台代理就这么丢了)。回捞进 DB 后:① 作为交付物长期存活,
+    ② 下一轮跨轮回放可直接读它合并(见 react_agent._load_rounds_data 的 reports
+    字段),不必重跑子任务。
+
+    先按 (task, round) 删旧再写(与 workspace_diff 的"最新态唯一"同范式:同一轮
+    重试/resume 不应堆叠重复报告)。全程 best-effort:目录不存在/命令异常/无内容
+    都只记日志,绝不拖垮收尾。返回写入份数。
+    """
+    if not getattr(settings, "ACP_ASYNC_AGENT_REPORTS_COLLECT", False) or not reports_dir:
+        return 0
+    try:
+        max_chars = max(0, int(getattr(settings, "ACP_ASYNC_AGENT_REPORTS_MAX_CHARS", 20000) or 0))
+        max_files = max(1, int(getattr(settings, "ACP_ASYNC_AGENT_REPORTS_MAX_FILES", 8) or 1))
+    except (TypeError, ValueError):
+        max_chars, max_files = 20000, 8
+
+    try:
+        listing = session.run_command(
+            f"ls -1 {shlex.quote(reports_dir)} 2>/dev/null", timeout=8, check=False
+        ) or ""
+    except Exception as e:
+        logger.info(f"[task={task.id}] 后台子任务落盘目录不可读(忽略): {e}")
+        return 0
+    # 只收目录下的 .md 文件:拒绝路径成分(防穿越/意外拼成子目录路径)
+    names = sorted(
+        n.strip() for n in listing.splitlines()
+        if n.strip().endswith(".md")
+        and "/" not in n.strip()
+        and "\\" not in n.strip()
+        and ".." not in n.strip()
+    )[:max_files]
+    if not names:
+        logger.info(
+            f"[task={task.id}] 第 {round_idx} 轮无后台子任务落盘报告可读"
+            f"({reports_dir}),不回捞"
+        )
+        return 0
+
+    # 先删同一轮的旧记录(resume/重试幂等:不删会堆叠)
+    try:
+        for old in db.query(TaskArtifact).filter(
+            TaskArtifact.task_id == task.id,
+            TaskArtifact.kind == "agent_report",
+        ).all():
+            try:
+                old_round = int(((old.metadata_ or {}).get("round_idx")) or 0)
+            except (TypeError, ValueError):
+                old_round = 0
+            if old_round == int(round_idx):
+                db.delete(old)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 清理旧落盘报告失败(忽略,继续写新的): {e}")
+        _safe_rollback(db)
+
+    saved = 0
+    for name in names:
+        path = f"{reports_dir}/{name}"
+        try:
+            content = session.run_command(
+                f"cat {shlex.quote(path)}", timeout=8, check=False
+            ) or ""
+        except Exception as e:
+            logger.warning(f"[task={task.id}] 回捞落盘报告 {name} 失败(跳过): {e}")
+            continue
+        if not content.strip():
+            continue
+        truncated = max_chars > 0 and len(content) > max_chars
+        if truncated:
+            content = content[:max_chars]
+        db.add(TaskArtifact(
+            task_id=task.id,
+            kind="agent_report",
+            content=content,
+            metadata_={
+                "round_idx": int(round_idx),
+                "path": path,
+                "filename": name,
+                "char_count": len(content),
+                "truncated": truncated,
+            },
+        ))
+        saved += 1
+
+    if not saved:
+        return 0
+    try:
+        db.commit()
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 保存后台子任务落盘报告失败(忽略): {e}")
+        _safe_rollback(db)
+        return 0
+    logger.info(
+        f"[task={task.id}] 已回捞第 {round_idx} 轮的后台子任务落盘报告 {saved} 份"
+        f"({reports_dir})"
+    )
+    return saved
+
+
+def _safe_rollback(db: Session) -> None:
+    """回滚失败不再扰异常(失败兜底路径专用)"""
+    try:
+        db.rollback()
+    except Exception:
+        pass
 
 
 def _alloc_local_bridge_port() -> int:
@@ -1905,12 +2113,17 @@ class _ACPCollector:
         self.reasoning_full = ""
         self.content_full = ""
         self.tool_call_count = 0
-        # 本轮检测到的"异步后台子 Agent 派生"次数(Qoder Agent 工具回
-        # "Async agent launched…background" 回执时 +1),供收尾判定是否续轮回收
-        self.async_agent_launch_count = 0
-        # 最后一次派生回执时刻 content_full 的长度:收尾只看这之后的文本,
-        # 派生之前写的正文与"是否提前 end_turn"无关
+        # 本轮记录的"异步后台子 Agent 派生"(Qoder Agent 工具回
+        # "Async agent launched…background" 回执时 append),供收尾判定是否续轮回收
+        # 与统计"未回报个数"。每项 {"tool_call_id","agent_id","ts"}
+        self.async_agent_launches: list[dict] = []
+        # 最后一次派生回执时刻 content_full 的长度:派生之前写的正文与"是否提前
+        # end_turn"无关(现在只用于日志与标注,不再是回收否决门)
         self.async_agent_launch_tail_start = 0
+        # 本轮最后一条落库思考的 conv_id 与其正文长度(>0 才是可当"本轮最终回答"
+        # 的候选),供收尾写 task.params["_round_conclusion"](前端结论外移依据)
+        self.last_thinking_conv_id: str | None = None
+        self.last_thinking_content_len = 0
         # 当前迭代状态
         self.iteration = 0
         self.current_conv_id = str(uuid.uuid4())
@@ -1937,6 +2150,11 @@ class _ACPCollector:
         # [perf] 首个 ACP 事件到达时间(collector 创建 ≈ prompt 发送前一刻)
         self._perf_t0 = time.perf_counter()
         self._perf_first_logged = False
+
+    @property
+    def async_agent_launch_count(self) -> int:
+        """本轮派生的后台子任务数(由 async_agent_launches 派生,保持旧字段读面)"""
+        return len(self.async_agent_launches)
 
     def _ensure_iter_started(self) -> None:
         """懒启动:首个 delta 到达时推送 phase=start"""
@@ -1971,7 +2189,7 @@ class _ACPCollector:
             "iteration": self.iteration,
         })
         if self.content_buf or self.reasoning_buf:
-            _add_conversation(
+            conv = _add_conversation(
                 self.db, self.task,
                 round_idx=self.round_idx,
                 role="agent1", type="thinking",
@@ -1979,6 +2197,12 @@ class _ACPCollector:
                 reasoning=self.reasoning_buf,
                 stream_conv_id=stream_conv_id,
             )
+            # 结论指针:CLI 本轮的最终回答就落在这条 thinking 的 content 里(可见
+            # 正文;只有思考无正文的迭代不算"回答")。记下 id 供收尾结构化标注到
+            # params,前端据此把结论外移到折叠组外的结论消息位
+            if self.content_buf:
+                self.last_thinking_conv_id = str(conv.id)
+                self.last_thinking_content_len = len(self.content_buf)
         self._iter_started = False
 
     def _start_new_iteration(self) -> None:
@@ -2350,8 +2574,12 @@ class _ACPCollector:
         # "Async agent launched successfully…working in the background" 回执
         # (子 Agent 真正结果要到下一轮才回流),据此在收尾判定是否续轮回收。
         if _is_async_agent_launch(tool_name, raw_output or ""):
-            self.async_agent_launch_count += 1
-            # 记住派生点:收尾判定只比对这之后新写出的文本
+            self.async_agent_launches.append({
+                "tool_call_id": tool_call_id,
+                "agent_id": _extract_async_agent_id(raw_output or ""),
+                "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+            })
+            # 记住派生点:派生之后新写的正文才与"是否提前收尾"相关(日志/标注用)
             self.async_agent_launch_tail_start = len(self.content_full)
 
         # Agent 工具完成:关闭对应子智能体扇出窗口(报告已在上面作为 tool_result 落库)
@@ -2699,6 +2927,7 @@ def _build_prompt_message(
     global_memory: str = "",
     history_replay: str = "",
     skills_section: str = "",
+    subagent_section: str = "",
 ) -> str:
     """构造发给 CLI 的完整 prompt 消息(历史回放 + 预 clone 上下文 + 记忆注入段 + 纯指令)
 
@@ -2707,6 +2936,9 @@ def _build_prompt_message(
 
     skills_section:CLI 可用技能注入段,与 run 链路一致并入记忆桶末尾(默认空,
     保持既有调用/单测行为不变)。
+
+    subagent_section:"后台子任务结论落盘要求"段(默认空=不注入);它与记忆段
+    同层但独立去重,由 run 链路算好后传入。
 
     run_acp_agent 不直接调本函数(它需要在同一 session 内跳过未变化的注入段),
     但两者均走 _compose_send_text,段落顺序因此一致。
@@ -2722,6 +2954,7 @@ def _build_prompt_message(
         ),
         _build_memory_section(memory_summary, global_memory) + skills_section,
         history_replay,
+        subagent_section,
     )
 
 
@@ -2852,14 +3085,16 @@ def _compose_send_text(
     repo_ctx_section: str = "",
     memory_section: str = "",
     history_replay: str = "",
+    subagent_section: str = "",
 ) -> str:
     """装配实际发给 CLI 的文本:稳定的系统注入段在前,本轮指令在后
 
     段落顺序(与此前"指令在最前 + 上下文在尾"相反):
     1. 跨轮历史回放(属"过去"的内容,也最稳定)
     2. 预 clone / 上传上下文
-    3. 项目记忆 + 全局记忆
-    4. 本轮指令(用户原话 / 追问原文 / plan 状态提醒)
+    3. 项目记忆 + 全局记忆(+ skill 清单)
+    4. 后台子任务结论落盘要求(任务内恒定,归为独立去重桶)
+    5. 本轮指令(用户原话 / 追问原文 / plan 状态提醒)
 
     理由:本轮要求落在末尾(模型对末尾指令最敏感),而前几段在同一 session
     内保持逐字不变,便于 CLI 侧与模型服务端的提示词前缀缓存命中。
@@ -2867,7 +3102,9 @@ def _compose_send_text(
     纯指令不带前导空行,靠这里补上分隔)。
     """
     parts = [
-        part for part in (history_replay, repo_ctx_section, memory_section, base_msg)
+        part for part in (
+            history_replay, repo_ctx_section, memory_section, subagent_section, base_msg,
+        )
         if part
     ]
     if not parts:
@@ -2884,16 +3121,21 @@ def _sha1_text(text: str) -> str:
 
 
 def _context_sections_hash(
-    repo_ctx_section: str, memory_section: str,
+    repo_ctx_section: str,
+    memory_section: str,
+    subagent_section: str = "",
 ) -> dict[str, str]:
-    """两类注入段各自的指纹(内容逐字一致 → 指纹一致)
+    """各类注入段各自的指纹(内容逐字一致 → 指纹一致)
 
-    分桶而非合并哈希:两类内容各自变化(首轮后预 clone 段就不再拼,而记忆段
+    分桶而非合并哈希:各类内容各自变化(首轮后预 clone 段就不再拼,而记忆段
     可能一直未变),合并指纹会让一段变化连带把另一段重发一遍。
+    subagent_section 默认空串:只算指纹不参与去重决策(决策见
+    _resolve_subagent_injection),旧调用方传两个位置参数仍可用。
     """
     return {
         "repo": _sha1_text(repo_ctx_section),
         "memory": _sha1_text(memory_section),
+        "subagent": _sha1_text(subagent_section),
     }
 
 
@@ -2933,10 +3175,13 @@ def _resolve_injection_plan(
     repo_ctx_section: str,
     memory_section: str,
     round_idx: int = 0,
+    subagent_section: str = "",
 ) -> tuple[str, str, int | None, dict[str, str]]:
     """决定本轮的系统注入与历史回放内容(注入策略集中在此,便于单测)
 
     返回 (实际注入的仓库上下文段, 实际注入的记忆段, 回放下界, 注入段指纹)。
+    subagent_section 只参与指纹输出(落库供下一轮去重比),它的去重决策另由
+    _resolve_subagent_injection 完成(两者分开是为了不动这个四元组的旧契约/单测)。
     回放下界 replay_from:None=不回放;0=全量回放(轮次 < round_idx);
     k>0=增量回放(k < 轮次 < round_idx,session 已覆盖 ≤k 的轮次)。
 
@@ -2956,7 +3201,7 @@ def _resolve_injection_plan(
     - 旧格式条目缺 last_accepted_round 时视为"不缺轮次"(热更新遗留条目,
       与接入前行为一致,不凭空多回放)
     """
-    ctx_hash = _context_sections_hash(repo_ctx_section, memory_section)
+    ctx_hash = _context_sections_hash(repo_ctx_section, memory_section, subagent_section)
     if reused is None or not _session_has_context(reused):
         # 新 session / 复用一个实际空白的 session:全量注入 + 全量回放
         return repo_ctx_section, memory_section, 0, ctx_hash
@@ -2970,6 +3215,29 @@ def _resolve_injection_plan(
         # session 有上下文但缺 (last_round, round_idx) 的轮次:增量补发
         return repo_out, mem_out, last_round, ctx_hash
     return repo_out, mem_out, None, ctx_hash
+
+
+def _resolve_subagent_injection(
+    reused: dict[str, Any] | None, subagent_section: str,
+) -> str:
+    """"后台子任务结论落盘要求"段的注入去重(同一 session 内逐字未变 → 不重发)
+
+    与 repo/memory 两桶的唯一区别在"旧记录缺 key"的解释:那两桶是接入去重前就存
+    在的内容,缺 key 按"已送达"处理(与接入前行为一致);本桶是新加的,改造前上线
+    的 session 记录里必然没有它,若沿用"缺 key=已送达"会让这些 session 永远收不到
+    落盘要求。因此缺失显式当"未送达"→ 本轮补发一次,之后靠新指纹去重。
+    全量注入路径(reused 为空 / session 实际空白)与两桶一致直接给全文。
+    """
+    if not subagent_section:
+        return ""
+    if reused is None or not _session_has_context(reused):
+        return subagent_section
+    previous = reused.get("injected_context_hash") or {}
+    prev_hash = previous.get("subagent") if isinstance(previous, dict) else None
+    if prev_hash is None:
+        # 旧记录没这一桶:按"未送达"处理(与 repo/memory 的默认方向相反,理由见 docstring)
+        return subagent_section
+    return "" if prev_hash == _sha1_text(subagent_section) else subagent_section
 
 
 def _restore_or_new_session(
@@ -3479,6 +3747,14 @@ def run_acp_agent(
             raw_skills = _build_cli_skills_section(task, _mem_mode, _mem_local_dir)
             if raw_skills:
                 raw_memory = raw_memory + raw_skills
+            # 后台子任务结论落盘要求段:只对"会派生后台子任务"的 executor 注入(与续轮
+            # 回收同一白名单),sandbox/local 路径按模式算(local 拿不到 local_dir 则空串
+            # =不注入);它与 skill/记忆不同桶,单独参与去重(见 _resolve_subagent_injection)
+            raw_subagent = ""
+            if _async_agent_autoccontinue_enabled(agent_type):
+                raw_subagent = build_cli_subagent_reports_section(
+                    _async_agent_reports_dir(task.id, round_idx, _mem_mode, _mem_local_dir)
+                )
             # 判定用的 session 状态:
             # - 复用进程内 session → 直接用缓存条目
             # - 恢复成功的 session → CLI 已从磁盘复原上下文(含既往注入段),
@@ -3496,7 +3772,10 @@ def run_acp_agent(
             )
             repo_ctx_section, memory_section, replay_from, ctx_hash = _resolve_injection_plan(
                 injection_state, raw_repo_ctx, raw_memory, round_idx=round_idx,
+                subagent_section=raw_subagent,
             )
+            # 落盘要求段单独去重(新桶:旧记录缺 key 按"未送达"处理,确保补一次)
+            subagent_section = _resolve_subagent_injection(injection_state, raw_subagent)
             if (raw_repo_ctx and not repo_ctx_section) or (
                 raw_memory and not memory_section
             ):
@@ -3524,6 +3803,7 @@ def run_acp_agent(
 
             user_msg = _compose_send_text(
                 base_msg, repo_ctx_section, memory_section, history_replay,
+                subagent_section,
             )
 
             # ---- 流式发送 prompt ----
@@ -3553,20 +3833,25 @@ def run_acp_agent(
                     _record_prompt_accepted(task_id_str, ctx_hash, round_idx)
 
                     # ---- 异步子 Agent 提前收尾:同一活跃 session 续轮回收 ----
-                    # 主判据:本轮派生过后台子 Agent(其结果只能从下一轮回流)+ 首轮
-                    # 未被兜底截断 + 收尾文本还没交付实质结果(末尾呈"在等结果"口吻,
-                    # 或短到不像一份报告 —— 提前 end_turn 常只留一句"子任务已启动",
-                    # 不含任何等待字样,只靠口吻正则会漏)。
+                    # 主判据是结构化事实:本轮派生过后台子 Agent(其结果只能从下一轮回流,
+                    # 同一轮内物理上拿不到)。旧版还额外要求收尾文本"没交付实质结果"
+                    # (末尾呈等待口吻或短到不像报告),实测会把半份报告误判成已交付而漏回收
+                    # (任务 f4ff8649:未完成声明写在报告首句,末尾干净且 5627 字符)。
+                    # 报告堆叠防护仍由 _async_agent_collect_results 内部的实质阈值/指纹完成。
                     # 实测(qwen3.8-flash):同 session 补发一条 session/prompt,
                     # CLI 会把已完成的后台子 Agent 结果注入下一轮并产出完整报告。
-                    if _should_recover_async_agent(collector, client, agent_type):
+                    need_recover, skip_reason = _should_recover_async_agent(
+                        collector, client, agent_type
+                    )
+                    _launches = _collector_async_launches(collector)
+                    if need_recover:
                         # 进了续轮就先按"尚未回收成功"标注:截断 / stopReason 非正常 /
                         # 异常 / 耗尽都保持 True,只有确认拿到完整报告才由回收函数置 False
                         _async_ctx["continued"] = True
                         _async_ctx["still_pending"] = True
                         logger.warning(
                             f"[task={task.id}] {agent_type} 第 {round_idx} 轮检测到异步子 Agent "
-                            f"提前 end_turn(派生 {collector.async_agent_launch_count} 个),"
+                            f"提前 end_turn(派生 {len(_launches)} 个,未回报),"
                             f"启动同 session 续轮回收"
                         )
                         # 进度提示续写进当前思考卡(不标错误):此刻卡片仍在流式中
@@ -3580,6 +3865,15 @@ def run_acp_agent(
                             logger.warning(
                                 f"[task={task.id}] {agent_type} 异步子 Agent 续轮回收异常(忽略,用已累积输出收尾): {e}"
                             )
+                    elif _launches:
+                        # 有未回报的后台子任务却没回收:必须留得下痕迹(以前这一分支全程
+                        # 静默,导致"到底没检测到还是没启动"无法从日志区分)。
+                        logger.warning(
+                            f"[task={task.id}] {agent_type} 第 {round_idx} 轮有 {len(_launches)} 个"
+                            f"后台子任务未回报,但未启动续轮回收(原因:{skip_reason});"
+                            f"派生后已写正文 {len(_async_tail_text(collector))} 字符"
+                        )
+                        _async_ctx["skip_reason"] = skip_reason
 
                     # 会话记录持久化:后端重启 / bridge 重建后仍可凭 sessionId 让
                     # CLI 恢复上下文(指纹一并存,恢复后才知道哪些注入段已给过)。
@@ -3669,25 +3963,95 @@ def run_acp_agent(
         )
 
     # 异步子 Agent 续轮回收后的状态标注(C:状态诚实,避免裸显"已完成")
-    if _async_ctx["continued"]:
-        if _async_ctx["still_pending"]:
-            logger.warning(
-                f"[task={task.id}] {agent_type} 第 {round_idx} 轮后台子任务续轮后仍未全部回报"
-            )
-            collector.publish_note(
-                "[后台子任务未全部回报,已尝试续轮回收但结果可能仍不完整]",
-                terminal=True, level="error",
-            )
-            summary += (
-                "\n\n[系统注记:本轮派生的后台子任务在续轮回收后仍未全部回报,"
-                "以上结果可能不完整,可稍后追问以获取完整报告]"
-            )
-        else:
+    _launches = _collector_async_launches(collector)
+    # 未确认回报的后台子任务数:回收成功→0;未启动回收或回收后仍不完整→全部派生数
+    # (拿不到"哪几个已回报"的细粒度信号:ACP 无子任务身份,只能按整体口径标注)
+    _unrecovered = 0
+    if _launches and not (_async_ctx["continued"] and not _async_ctx["still_pending"]):
+        _unrecovered = len(_launches)
+
+    if _launches:
+        if _unrecovered == 0:
             # 回收成功是正常结局,走 notice 相位:此刻迭代已 flush,卡片须自带
             # 结束态,但绝不能借 error 相位渲染成"[错误] …"
             collector.publish_note(
                 "[已回收后台子任务结果并合并为完整报告]", terminal=True, level="info",
             )
+        else:
+            _attempts = int(_async_ctx.get("attempts") or 0)
+            if _async_ctx["continued"]:
+                logger.warning(
+                    f"[task={task.id}] {agent_type} 第 {round_idx} 轮后台子任务续轮后仍未全部回报"
+                )
+                note = "[后台子任务未全部回报,已尝试续轮回收但结果可能仍不完整]"
+                summary_note = (
+                    "\n\n[系统注记:本轮派生的后台子任务在续轮回收后仍未全部回报,"
+                    "以上结果可能不完整,可稍后追问以获取完整报告]"
+                )
+            else:
+                # 本轮有未回报的后台子任务却没补发(开关关/白名单不含本 executor/首轮被截断):
+                # 同样必须诚实标注,否则前端只看到"已完成"的半份报告
+                logger.warning(
+                    f"[task={task.id}] {agent_type} 第 {round_idx} 轮后台子任务未回报"
+                    f"且未启动续轮回收(原因:{_async_ctx.get('skip_reason') or 'unknown'})"
+                )
+                note = "[后台子任务尚未回报,本轮未启动续轮回收,结果可能不完整]"
+                summary_note = (
+                    "\n\n[系统注记:本轮派生的后台子任务尚未回报(未启动续轮回收:"
+                    f"{_async_ctx.get('skip_reason') or 'unknown'}),以上结果可能不完整,"
+                    "可稍后追问以获取完整报告]"
+                )
+            collector.publish_note(note, terminal=True, level="error")
+            summary += summary_note
+            # 落库告警(role=system/type=warning 是已有类型,前端各面已接):
+            # publish_note 只追到瞬时流式卡片,总线不缓存 → 刷新后只剩告警在这一层,
+            # 没它就做不到"离开页面回来仍能看到本轮不完整"
+            try:
+                _add_conversation(
+                    db, task, round_idx=round_idx,
+                    role="system", type="warning",
+                    content=(
+                        f"本轮派生 {len(_launches)} 个后台子任务,{_unrecovered} 个未确认回报"
+                        f"(已尝试续轮回收 {_attempts} 次),结论可能不完整;"
+                        "可稍后追问“把后台子任务结果补全”以获取完整报告"
+                    ),
+                )
+            except Exception as e:
+                logger.warning(f"[task={task.id}] 后台子任务未回报告警落库失败(忽略): {e}")
+
+        # 落盘报告回捞(不论回收成不成都做:子任务写过的结论是最便宜的证据,
+        # 而沙箱随时可能被 TTL 回收)。自身 try/except,绝不拖垮收尾
+        try:
+            _reports_dir = _async_agent_reports_dir(
+                task.id, round_idx,
+                getattr(session, "mode", "") or ctx.get("mode", ""),
+                ctx.get("local_dir"),
+            )
+            _collect_async_agent_reports(task, db, session, _reports_dir, round_idx)
+        except Exception as e:
+            logger.warning(f"[task={task.id}] 回捞后台子任务落盘报告失败(忽略): {e}")
+
+    # 本轮"最终回答"的结构化标注(D:结论指针)
+    # CLI 收尾正文只落在最后一条 agent1/thinking 的 content 里,前端靠"最后一个
+    # 纯思考迭代"的位置启发式把它外移;这里记下 conv_id 使结论不再依赖该启发式
+    # (本轮只要还有尾部工具调用,结论就会被折叠过程组藏住)。无该记录的存量任务,
+    # 前端自动回退旧启发式,行为向后兼容
+    _concl_conv_id = getattr(collector, "last_thinking_conv_id", None)
+    if _concl_conv_id and getattr(collector, "last_thinking_content_len", 0) > 0:
+        try:
+            concl_map = dict((task.params or {}).get("_round_conclusion") or {})
+            concl_map[str(round_idx)] = {
+                "conv_id": _concl_conv_id,
+                "chars": int(collector.last_thinking_content_len),
+                "complete": _unrecovered == 0 and not client.last_prompt_truncated,
+                "async_pending": _unrecovered,
+                "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+            task.params = {**(task.params or {}), "_round_conclusion": concl_map}
+            db.commit()
+        except Exception as e:
+            logger.warning(f"[task={task.id}] 写入本轮结论标记失败(忽略): {e}")
+            _safe_rollback(db)
 
     current_plan: list[dict] = [dict(s) for s in (previous_plan or [])]
     extracted = _extract_plan(collector.content_full)

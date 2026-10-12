@@ -5,7 +5,7 @@
  * 1. 配对:compact/agent/toolpair 三类工具段与紧邻 result 配对,落单项进 plain 兜底
  * 2. 摘要:各工具的计数/路径提取、执行中、执行失败兜底
  * 3. Bash/run_command 命令解析:只读命令白名单摘要、危险命令拒绝
- * 4. 子智能体轨迹解析:A 族元信息头/think 块/B 族无头格式
+ * 4. 子智能体轨迹解析:A 族元信息头/think 块/B 族无头格式/C 族异步派生回执
  */
 import { describe, expect, it } from 'vitest'
 
@@ -13,6 +13,7 @@ import {
   buildToolSegments,
   buildToolSummary,
   commandOf,
+  AGENT_ASYNC_PENDING_BODY,
   parseAgentTrace,
   shortenPath,
   summarizeCliToolCall,
@@ -282,7 +283,46 @@ describe('parseAgentTrace(子智能体轨迹)', () => {
 
   it('空输入:全部字段为空/空串', () => {
     const trace = parseAgentTrace('')
-    expect(trace).toEqual({ subType: null, status: null, think: '', body: '' })
+    expect(trace).toEqual({
+      subType: null, status: null, think: '', body: '', asyncPending: false, agentId: null,
+    })
+  })
+
+  // C 族:Qoder 异步派生回执。回归背景(任务 f4ff8649):回执里没有 status 行,
+  // 旧版把它当普通报告正文渲染,卡片同时显示"已完成"—— 用户以为子任务已交结果。
+  it('C 族异步回执:asyncPending=true 且 body 不是回执原文', () => {
+    const ack = [
+      'Async agent launched successfully.',
+      'agentId: ageneral-purpose-5f77f8122aee3358 (internal ID - do not mention to user.)',
+      'The agent is working in the background. You will be notified automatically when it completes.',
+    ].join('\n')
+    const trace = parseAgentTrace(ack)
+    expect(trace.asyncPending).toBe(true)
+    expect(trace.agentId).toBe('ageneral-purpose-5f77f8122aee3358')
+    // 不把"已在后台启动"当结论渲染
+    expect(trace.body).toBe(AGENT_ASYNC_PENDING_BODY)
+    expect(trace.body).not.toContain('Async agent launched')
+    // 无 status 行也不能被当成 completed(status 仍为 null,由调用侧走 asyncPending 分支)
+    expect(trace.status).toBeNull()
+  })
+
+  it('C 族回执只靠英文标记判定,正文里出现"background"的报告不误判', () => {
+    const trace = parseAgentTrace('## Audit\n\n- the worker runs in a threadpool in the background.')
+    expect(trace.asyncPending).toBe(false)
+    expect(trace.body).toContain('threadpool')
+  })
+
+  it('异步回执无 agentId 时仍判 asyncPending(agentId 仅标注用)', () => {
+    const trace = parseAgentTrace('Async agent launched successfully. It is working in the background.')
+    expect(trace.asyncPending).toBe(true)
+    expect(trace.agentId).toBeNull()
+  })
+
+  it('A 族头里带 agent_id 时抽取到 agentId(不干扰原有字段)', () => {
+    const trace = parseAgentTrace('agent_id: agent-0\nactual_subagent_type: explore\n\n[summary]\n报告正文')
+    expect(trace.agentId).toBe('agent-0')
+    expect(trace.subType).toBe('explore')
+    expect(trace.asyncPending).toBe(false)
   })
 })
 

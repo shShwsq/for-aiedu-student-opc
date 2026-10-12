@@ -158,14 +158,33 @@ step-block
 工具行默认折叠,展开状态按 tool_call id 记录(`expandedToolRows`,
 子智能体内部思考用 `${callId}-think` 复合键)。
 
+**子智能体卡片的三种状态(`parseAgentTrace` + `utils/agentBlock`)**:
+
+| 状态 | 识别 | 后缀标签 | 默认展开 |
+|---|---|---|---|
+| 运行中 | 无配对 tool_result | 执行中… | 是 |
+| 已完成 | 报告正文(A/B 族形状) | 已完成 | 否(完成即自动折叠,可手动展开) |
+| 后台未回报 | 回执形状(`Async agent launched` / `working in the background`) | 后台未回报 `<agentId>` | **是**(永不自动折叠) |
+
+异步派生回执不是结论:正文固定为「后台子任务已派生,结果尚未回报」(原始回执留在
+子任务参数块可展开),**不得渲染成"已完成"** —— 旧版因回执不含 `status:` 元信息行
+而落到"已完成"分支,卡片谎报完成、结果从没回来过(任务 f4ff8649 实测 3 张)。这类
+卡片按 `hasResult && !agentAsync` 判定"未完成",折叠等于把唯一的诚实信号藏起来。
+
 ### 3.4 conclusion segment(结论段)
 
 该轮 agent1 的最终回答,**从最后一个 step 组中提出、组外平铺直接可见**,是主对话流里
 用户回看时的视觉焦点:
 
-- **来源**:agent1 每轮总结 = 该轮最后一条 thinking 的 content(ReAct 循环在无工具
-  调用时结束,见后端 `react_agent`);即最后一个"纯思考"迭代(有 thinking、无
-  toolItems/otherItems、content 非空);
+- **来源(优先路径)**:后端 `task.params._round_conclusion[round].conv_id` 指针
+  (`conclusionConvIdOf` → `liftConclusionByConvId`)。CLI 执行器收尾前只要还有一次
+  工具调用(如亲自复核),本轮末迭代就不是"纯思考",旧启发式会把整段结论留在默认
+  折叠的「执行过程」组里 —— 按指针定位不再依赖该位置条件;
+- **来源(兜底启发式,存量任务无指针 / 指针未命中)**:该轮最后一条 thinking 的
+  content(ReAct 循环在无工具调用时结束,见后端 `react_agent`),即最后一个"纯思考"
+  迭代(有 thinking、无 toolItems/otherItems、content 非空);
+- **id 匹配形状**:type=thinking 的历史行会被还原成只读流式卡片,id 带
+  `stream:history:` 前缀(`itemMatchesConvId` 两种形式都认);
 - **提取时机(轮闭合判定)**:该轮已有 agent2 活动(思考/评估在 agent1 该轮结束后
   才开始记录)、或任务不在运行中、或不是最后一轮。运行中的末轮不提取——新迭代开头
   也是纯思考,提前提取会造成结论闪现再跳回过程组;
@@ -196,7 +215,9 @@ roundGroups(computed)
       │  轮闭合判定:该轮有 agent2 活动 / 任务不在运行中 / 非末轮
       │  每轮:segmentRoundItems()
       │    一阶段:按 thinking 切迭代,非 agent1 消息记为 plain 段
-      │    一阶段半:轮闭合时,最后一个纯思考迭代提为 conclusion 段
+      │    一阶段半:轮闭合时提取 conclusion 段——优先按 params._round_conclusion 的
+      │           conv_id 定位(liftConclusionByConvId),存量任务回退"最后一个
+      │           纯思考迭代"启发式;两条路径共用思考留组内/正文外移形态
       │    二阶段:迭代按 plan step 关键词推断归组(TOOL_STEP_KEYWORDS),
       │           无 plan / 无法归属 → "执行过程"折叠组;
       │           plain 段按轮内原始位置穿插到组间/组内迭代边界

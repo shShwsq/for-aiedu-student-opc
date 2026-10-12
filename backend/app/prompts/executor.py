@@ -497,6 +497,40 @@ def build_cli_skills_section(skills: list[dict[str, Any]]) -> str:
 
 
 # ============================================================
+# CLI 侧后台子任务结论落盘段(acp_base 消费;目录由调用侧按运行模式算好)
+# ============================================================
+
+
+def build_cli_subagent_reports_section(reports_dir: str) -> str:
+    """构造"后台子任务结论必须落盘"段(拼在发送给 CLI 的 prompt 中,不落库不展示)。
+
+    背景:部分 CLI(Qoder 的 Agent 工具)以 fire-and-forget 方式派生后台子任务,
+    主智能体常在子任务回报前就结束本轮;而沙箱 TTL 回收会把 CLI 自己的会话磁盘
+    一起带走,下一轮 session/resume 失败时那些结果物理不可恢复。故这里要求把结论
+    落到工作区之外的独立目录:主智能体据此汇总,后端在回合结束前回捞成持久 artifact。
+
+    reports_dir:CLI 可直达的绝对路径(仅 sandbox 模式由调用侧给出;空串=不注入)。
+    本函数零 app.* 依赖,不做任何路径/DB 计算(见 tests/test_prompts_purity.py);
+    措辞工具中立(不写 read_file),并明确写在被审查仓库之外以免污染工作区 diff。
+    """
+    d = (reports_dir or "").strip()
+    if not d:
+        return ""
+    d = d.rstrip("/")
+    return (
+        "\n\n[后台子任务结论落盘要求]\n"
+        "如果你派生后台子任务(工具立刻返回\"已在后台运行\"之类的回执,结果稍后才回报),"
+        "请在每个子任务的指令中明确要求它:\n"
+        f"1. 把**完整结论**写入文件 {d}/<英文短名>.md(Markdown,含定位到的文件:行号、"
+        "证据与修复建议),文件写完再结束子任务;\n"
+        f"2. 只写进 {d}/ 这个目录,**不要**写进被审查的仓库目录"
+        "(仓库内的新增文件会污染工作区变更);\n"
+        f"3. 本轮收尾前若已能读到落盘结论,请**逐条汇总这些文件**并给出完整报告;"
+        "读不到时如实说明哪些子任务仍未回报,不要把\"已派子任务\"当成结论。"
+    )
+
+
+# ============================================================
 # CLI 侧跨轮历史回放段(acp_base 消费;结构化历史的加载与压缩在执行器侧)
 # ============================================================
 
@@ -607,12 +641,18 @@ def round_compact_text(rd: dict[str, Any]) -> str:
 
     包含用户要求:用户原话是压缩摘要必须保留的信息(任务的原始指令
     与历次追问方向),丢失会导致早期轮次"为什么这么做"的语义断链。
+
+    包含后台子任务落盘报告(rd["reports"],用 .get 兼容旧调用方构造的缺 key):
+    那是"本轮总结当时没拿到"的结论,压缩后若不保留就彻底丢失。
     """
     segs = [f"=== 第 {rd['ridx']} 轮 ==="]
     if rd["question"]:
         segs.append(f"[用户要求]\n{rd['question']}")
     if rd["assistant_summary"]:
         segs.append(f"[执行总结]\n{rd['assistant_summary']}")
+    reports = rd.get("reports") or ""
+    if reports:
+        segs.append(f"[后台子任务结论]\n{reports}")
     if rd["review"]:
         segs.append(f"[评审反馈]\n{rd['review']}")
     return "\n".join(segs)

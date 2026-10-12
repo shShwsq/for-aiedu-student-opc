@@ -337,23 +337,41 @@ class Settings(BaseSettings):
     # 尚未回报时就结束本轮(end_turn),平台据此显示"已完成"但业务其实未完成。
     # 检测到该签名后,在同一活跃 ACP session 上带退避地补发续轮 prompt,让 CLI 把已
     # 完成的后台子 Agent 结果注入下一轮并产出完整报告(实测 qwen3.8-flash 可回收)。
-    # 触发以"本轮派生过后台子 Agent"为主判据(其结果只能从下一轮回流),收尾文本的
-    # 口吻/篇幅只用于排除"结果其实已给全"的情形,避免重复补发把同一份报告堆两遍。
+    # 触发只看结构化事实:本轮存在"只拿到派生回执、没有后续回报"的 Agent 工具就补发。
+    # 曾用收尾文本的口吻/篇幅做否决,实测会漏判:模型把"后台代理仍在运行"写在报告
+    # 首句、末尾却是干净的结论,篇幅又远超实质阈值,半份报告因此被当"已交付"。
+    # 文本判据只保留为循环内的停止条件与日志线索(见 ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS)。
     ACP_ASYNC_AGENT_AUTOCONTINUE: bool = True
     # 生效的 agent 类型(逗号分隔);仅这些 executor 走异步 Agent 续轮回收
+    # 同时决定"后台子任务结论落盘"注入段是否拼进 prompt(仅 sandbox 模式)
     ACP_ASYNC_AGENT_TYPES: str = "qoder_cli"
-    # 单轮最多补发几次续轮 prompt(防子 Agent 迟迟不回报时无限循环)
-    ACP_ASYNC_AGENT_MAX_CONTINUE: int = 3
-    # 每次补发前等待秒数(给后台子 Agent 完成时间),按 factor 递增
-    ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS: int = 20
+    # 单轮最多补发几次续轮 prompt(防子 Agent 迟迟不回报时无限循环)。
+    # 3 → 2:补发一次的回报增量最有用,再补只会让模型把同一份报告重复堆进 summary
+    ACP_ASYNC_AGENT_MAX_CONTINUE: int = 2
+    # 每次补发前等待秒数(给后台子 Agent 完成时间),按 factor 递增。
+    # 20 → 30:实测子 Agent 完成多在 1~5 分钟窗口,20s 首探大概率空手而归白耗一次
+    ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS: int = 30
     ACP_ASYNC_AGENT_CONTINUE_BACKOFF_FACTOR: float = 1.5
+    # 续轮回收的自设预算(秒):第 2 次及以后补发前检查已耗时,超了就收手并标注
+    # "结果可能不完整"。注意它不是硬上界:已进入的 prompt 只能等它自己结束,真正的
+    # 最坏耗时由上面的 idle 兜底决定(无活动工具 300s / 有工具在跑 1800s),因此
+    # MAX_CONTINUE=2 时单轮回收最坏仍可能占用数十分钟。子 Agent 长期不回报请调小
+    # MAX_CONTINUE 或关掉 AUTOCONTINUE。设为 0 = 该预算关闭
+    ACP_ASYNC_AGENT_CONTINUE_DEADLINE_SECONDS: int = 300
     # 判定"续轮已产出实质报告"的字符阈值:补发拿到不少于该长度的文本就收手
     # (即便末尾还带"等待"字样)。再补发只会让模型把同一份报告重复输出堆进
     # summary,因此停止补发并保留"结果可能不完整"的标注。设为 0 = 该判据关闭
     ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS: int = 1500
-    # 耗时上界提醒:每次补发除 sleep 外还受上面的 idle 兜底约束(无活动工具 300s,
-    # 有工具在跑 1800s),MAX_CONTINUE=3 时单轮回收最坏可占用数十分钟 —— 远大于
-    # 三档退避的 20+30+45=95s。子 Agent 长期不回报请调小 MAX_CONTINUE 或关掉开关。
+    # 后台子任务结论落盘:派生后台子 Agent 时要求每个子任务把完整结论写进
+    # 工作区外的独立目录(见 acp_base._async_agent_reports_dir),回合结束前由后端
+    # 回捞成 kind="agent_report" 的 artifact。价值有两层:① 沙箱 TTL 回收会让 CLI
+    # 的会话磁盘一起消失,跨轮 session/resume 失败后未回报的结果物理不可恢复,
+    # 落盘件活在 DB 里;② 下一轮回放可直接读它合并,不必重跑子任务
+    ACP_ASYNC_AGENT_REPORTS_COLLECT: bool = True
+    # 单份落盘报告回捞的字符上限(超出截断并在 metadata 标 truncated)
+    ACP_ASYNC_AGENT_REPORTS_MAX_CHARS: int = 20000
+    # 单轮最多回捞的报告文件数(按文件名序,超出只取前 N 并标注)
+    ACP_ASYNC_AGENT_REPORTS_MAX_FILES: int = 8
 
     # Qoder CLI 配置(qoder_cli executor 用,国际版)
     # qodercli 可执行文件名/路径(沙箱内 PATH 查找或绝对路径)

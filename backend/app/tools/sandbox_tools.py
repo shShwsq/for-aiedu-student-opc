@@ -114,6 +114,12 @@ _GLOBAL_MEMORY_FILE = "global_memory.md"
 # 其用自身 Read 工具查阅。内置 react_agent 走 skill 工具(读进程内 REGISTRY),不用此目录。
 _SKILLS_DIR_SANDBOX = "/home/user/.agent_skills"
 
+# 后台子任务结论落盘目录(沙箱内绝对路径)。部分 CLI 的 Agent 工具是 fire-and-forget,
+# 子任务结论只存在会话内存/磁盘里,沙箱回收或跨会话就丢;故要求子任务把结论落盘到
+# 仓库外的独立目录,后端在本轮结束前回捞成 artifact(见 acp_base._collect_async_agent_reports)。
+# 分任务/分轮子目录由调用侧拼(<task8>/r<round>),本常量只到根。
+_AGENT_REPORTS_DIR_SANDBOX = "/home/user/.agent_reports"
+
 # local 会话元信息文件名(临时目录根,进程重启后孤儿恢复按它定位 task)
 _LOCAL_SESSION_META_FILE = ".secondlook_meta.json"
 

@@ -124,10 +124,13 @@ def test_extract_round_data_takes_last_question_and_thinking():
 
 
 def test_extract_round_data_no_content_returns_none():
-    """全空轮(无 question/summary/review/tool)→ None"""
+    """全空轮(无 question/summary/review/tool)→ None;但有落盘报告时不算空轮"""
     assert _extract_round_data([], 3) is None
     convs = [_Conv(3, "agent1", "tool_result", content="x")]
     assert _extract_round_data(convs, 3) is None
+    # 本轮总结什么也没写,但子任务结论已落盘回捞→ 仍要带进历史(否则证据丢失)
+    rd = _extract_round_data(convs, 3, reports="子任务完整结论")
+    assert rd is not None and rd["reports"] == "子任务完整结论"
 
 
 def test_extract_round_data_priority_logic():
@@ -153,10 +156,11 @@ def test_extract_round_data_priority_logic():
 # _rounds_to_messages:角色边界 + 注入标记
 # ============================================================
 
-def _rd(ridx=1, question="q", tool_summary="", assistant_summary="a", review=""):
+def _rd(ridx=1, question="q", tool_summary="", assistant_summary="a", review="", reports=""):
     return {
         "ridx": ridx, "question": question, "tool_summary": tool_summary,
-        "assistant_summary": assistant_summary, "review": review, "priority": 0,
+        "assistant_summary": assistant_summary, "review": review,
+        "reports": reports, "priority": 0,
     }
 
 
@@ -203,6 +207,37 @@ def test_rounds_to_messages_user_content_never_marked():
     for m in msgs:
         if m["role"] == "user":
             assert not m["content"].startswith(SYSTEM_INJECT_MARKER)
+
+
+def test_rounds_to_messages_reports_is_own_system_message():
+    """后台子任务落盘报告 = 独立一条 system 注入,排在轮总结之后、评审之前。
+
+    不与 assistant_summary 合并:合并后模型分不清"本轮自己写的"与"补位证据"。
+    """
+    msgs = _rounds_to_messages(
+        [_rd(1, question="q", assistant_summary="本轮只写了第一批", reports="子任务 A 的完整结论")],
+        [False],
+    )
+    roles = [m["role"] for m in msgs]
+    assert roles == ["user", "assistant", "system"]
+    injected = msgs[-1]["content"]
+    assert injected.startswith(f"{SYSTEM_INJECT_MARKER}后台子任务落盘报告|第 1 轮]")
+    assert "子任务 A 的完整结论" in injected
+    assert "不要重跑" in injected
+
+
+def test_rounds_to_messages_without_reports_key_still_works():
+    """存量调用方构造的 rd 没有 reports 键(旧形状)→ 不报错、不产出多余消息。
+
+    回归防护:reports 一律 .get 读取,不让历史回放因缺键直接 KeyError 拖垮执行轮。
+    """
+    legacy = {
+        "ridx": 1, "question": "q", "tool_summary": "", "assistant_summary": "a",
+        "review": "", "priority": 0,
+    }
+    msgs = _rounds_to_messages([legacy], [True])
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert react_agent._round_token_cost(legacy, include_tools=True) > 0
 
 
 # ============================================================

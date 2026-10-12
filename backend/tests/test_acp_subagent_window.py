@@ -183,3 +183,41 @@ def test_async_background_agent_still_detected_after_window_close(captured):
     # 关窗 + 记录一次异步派生(供收尾续轮回收)
     assert not c.in_subagent_window
     assert c.async_agent_launch_count == 1
+
+
+def test_async_launch_ledger_records_tool_call_id_and_agent_id(captured):
+    """派生台账记下 toolCallId + 回执里的 agentId(收尾告警标"未回报个数"的依据)。
+
+    回归(任务 f4ff8649):回收判据一度只看收尾文本,长半份报告被误判"已交付";
+    现在判据看这份台账,所以台账必须准确(工具名为 Agent 且回执命中异步标记才算)。
+    """
+    c, _events, _saved = captured
+    ack = (
+        "Async agent launched successfully.\n"
+        "agentId: ageneral-purpose-5f77f8122aee3358 (internal ID - do not mention to user.)\n"
+        "The agent is working in the background."
+    )
+    c(agent_call("call_a1", "Audit errors"))
+    c(completed("call_a1", ack))
+    c(agent_call("call_a2", "Audit tests"))
+    c(completed("call_a2", ack))
+
+    assert c.async_agent_launch_count == 2
+    assert [x["tool_call_id"] for x in c.async_agent_launches] == ["call_a1", "call_a2"]
+    assert all(x["agent_id"] == "ageneral-purpose-5f77f8122aee3358"
+               for x in c.async_agent_launches)
+    assert all(x["ts"] for x in c.async_agent_launches)
+
+    # 同步完成的子智能体(completed 里是报告本身,不含异步标记)不计入台账
+    c(agent_call("call_sync", "Audit ssrf"))
+    c(completed("call_sync", "# SSRF Audit Report\n- F1 confirmed"))
+    assert c.async_agent_launch_count == 2
+
+
+def test_async_launch_without_agent_id_header_is_still_recorded(captured):
+    """回执里没有 agentId 行也不能漏记(agentId 只是标注信息,不是判定必要条件)。"""
+    c, _events, _saved = captured
+    c(agent_call("call_noid", "bg job"))
+    c(completed("call_noid", "Async agent launched successfully. It is working in the background."))
+    assert c.async_agent_launch_count == 1
+    assert c.async_agent_launches[0]["agent_id"] == ""

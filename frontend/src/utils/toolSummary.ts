@@ -513,30 +513,54 @@ export interface AgentTrace {
   think: string
   /** 报告正文(已剥元信息头/[summary]/think 标记),Markdown */
   body: string
+  /** 是否只拿到"后台已启动"回执(异步派生,结果尚未回报) */
+  asyncPending: boolean
+  /** 回执里的子任务 id(Qoder 形如 ageneral-purpose-…;无则 null) */
+  agentId: string | null
 }
+
+/** 异步派生回执标记(Qoder 的 Agent 工具 fire-and-forget) */
+const ASYNC_LAUNCH_RE = /Async agent launched|working in the background/i
+
+/** 回执形状下的固定正文:不把"已启动"回执当报告渲染 */
+export const AGENT_ASYNC_PENDING_BODY = '后台子任务已派生,结果尚未回报'
 
 /**
  * 解析子智能体输出轨迹。
  *
- * 两种格式族(logs/acp 实测):
+ * 三种形状(logs/acp 实测):
  * - A 族(Kimi):开头若干 `key: value` 元信息行(agent_id/actual_subagent_type/status),
  *   其后 [summary] 标记、可选 <think> 块,再后是 Markdown 报告正文
  * - B 族(Qoder/qwen):无元信息头,直接是 Markdown 报告正文
+ * - C 族(Qoder 异步派生回执):"Async agent launched successfully…agentId: xxx…
+ *   working in the background" —— 它不是结论,必须标成"未回报"而不是"已完成"
+ *   (回归:旧版只认 A 族的 status 头,回执里没有 status 行就落到"已完成"分支,
+ *   卡片谎报完成而正文只是启动回执)
  */
 export function parseAgentTrace(content: string): AgentTrace {
   let subType: string | null = null
+  let agentId: string | null = null
   let status: string | null = null
 
-  // A 族元信息头:仅开头连续的 key: value 行(遇到首个不匹配行即止)
+  const asyncPending = ASYNC_LAUNCH_RE.test(content)
+
+  // A 族元信息头 / C 族回执里的 agentId:仅开头连续的 key: value 行(遇到首个不匹配行即止)
   const lines = content.split('\n')
   let idx = 0
   while (idx < lines.length) {
     const line = lines[idx]
-    const m = line.match(/^(agent_id|actual_subagent_type|status):\s*(\S.*)$/)
+    const m = line.match(/^(agent_id|agentId|actual_subagent_type|status):\s*(\S.*)$/)
     if (!m) break
     if (m[1] === 'actual_subagent_type') subType = m[2].trim()
     else if (m[1] === 'status') status = m[2].trim()
+    else agentId = m[2].trim().split(/\s+/)[0] // agent_id / agentId(剥尾随括号说明)
     idx++
+  }
+  // C 族回执的 agentId 不在开头(首行是 "Async agent launched successfully.",会提前
+  //  break 掉上面的连续头解析),因此单独全文提一次
+  if (!agentId) {
+    const idMatch = content.match(/\bagentId:\s*([A-Za-z0-9_.-]+)/)
+    if (idMatch) agentId = idMatch[1]
   }
   let rest = lines.slice(idx).join('\n')
 
@@ -551,5 +575,13 @@ export function parseAgentTrace(content: string): AgentTrace {
     rest = rest.replace(thinkMatch[0], '')
   }
 
-  return { subType, status, think, body: rest.trim() }
+  return {
+    subType,
+    status,
+    think,
+    // 回执形状:正文固定为诚实说明(原始回执留在调用参数/详情块可展开查看)
+    body: asyncPending ? AGENT_ASYNC_PENDING_BODY : rest.trim(),
+    asyncPending,
+    agentId,
+  }
 }

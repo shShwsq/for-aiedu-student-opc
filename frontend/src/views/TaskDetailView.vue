@@ -1556,12 +1556,59 @@ const expandedToolRows = reactive<Set<string>>(new Set())
 /** 用户手动折叠过的工具行(仅子智能体卡片用):覆盖“运行中默认展开” */
 const collapsedToolRows = reactive<Set<string>>(new Set())
 
+/** 该轮的"结论指针" conv_id(后端 task.params._round_conclusion[round].conv_id)。
+ *  无记录(改造前的存量任务 / 本轮没写出可见正文)返回空串 → 回退位置启发式 */
+function conclusionConvIdOf(roundIdx: number): string {
+  const raw = (task.value?.params as Record<string, unknown> | undefined)
+    ?._round_conclusion as Record<string, unknown> | undefined
+  const entry = raw?.[String(roundIdx)] as { conv_id?: string } | undefined
+  return typeof entry?.conv_id === 'string' ? entry.conv_id : ''
+}
+
 /** 判断 DisplayItem 是否为 agent1 的 thinking(迭代起点) */
 function isReactThinkingItem(item: DisplayItem): boolean {
   if (item.is_streaming) {
     return item.streaming?.role === 'agent1'
   }
   return item.role === 'agent1' && item.type === 'thinking'
+}
+
+/** DisplayItem 是否对应给定的会话记录 id。
+ *  type=thinking 的历史行会被还原成只读流式卡片,id 加了
+ *  `stream:history:` 前缀(见 roundGroups),因此两种形式都要能对上 */
+function itemMatchesConvId(item: DisplayItem, convId: string): boolean {
+  if (!convId) return false
+  return item.id === convId || item.id === `stream:history:${convId}`
+}
+
+/** 按后端结论指针把该轮最终回答从过程组里提出(就地修改 iterations)。
+ *  命中返回结论卡(正文卡),未命中/无可见正文返回 null 交回启发式。
+ *  与启发式保持同一形态:思考留组内(只清正文),无思考可留则整迭代提出。 */
+function liftConclusionByConvId(
+  iterations: IterationSegment[], convId: string,
+): DisplayItem | null {
+  for (let i = iterations.length - 1; i >= 0; i--) {
+    const iter = iterations[i]
+    const idx = iter.thinkingItems.findIndex((it) => itemMatchesConvId(it, convId))
+    if (idx < 0) continue
+    const target = iter.thinkingItems[idx]
+    if (!itemFieldText(target, 'content').trim()) return null
+    if (itemFieldText(target, 'reasoning').trim()) {
+      iter.thinkingItems[idx] = stripItemContent(target)
+      return stripItemReasoning(target)
+    }
+    iter.thinkingItems.splice(idx, 1)
+    if (
+      iter.thinkingItems.length === 0 &&
+      iter.toolItems.length === 0 &&
+      iter.otherItems.length === 0
+    ) {
+      // 空壳迭代不留:整块提出(调用方据此补 plain 的虚位)
+      iterations.splice(i, 1)
+    }
+    return target
+  }
+  return null
 }
 
 /** 判断 DisplayItem 是否属于 agent1(用于归入当前迭代) */
@@ -1656,12 +1703,16 @@ function stripItemReasoning(item: DisplayItem): DisplayItem {
 
 /** 把单个 round 内的 DisplayItem 列表先按迭代分段,再按 plan step 分组。
  *  roundClosed:该轮是否已结束(由 roundGroups 按 agent2 活动/运行态/非末轮判定);
- *  闭合时把最后一个"纯思考"迭代提为结论段平铺,避免总结被折叠的过程组藏住 */
+ *  闭合时把本轮最终回答提为结论段平铺,避免总结被折叠的过程组藏住。
+ *  conclusionConvId:后端记录的"本轮最终回答"所在会话记录 id(优先按它定位);
+ *  空串或未命中时回退旧启发式(存量任务没有该记录,行为与改造前一致)。
+ */
 function segmentRoundItems(
   roundIdx: number,
   items: DisplayItem[],
   planSteps: PlanStep[],
   roundClosed: boolean,
+  conclusionConvId = '',
 ): RoundSegment[] {
   // 第一阶段:按 thinking 起点切迭代(原逻辑)
   const iterations: IterationSegment[] = []
@@ -1723,33 +1774,46 @@ function segmentRoundItems(
   closeCurrent()
 
   // 一阶段半:轮闭合时提取该轮最终结论
-  // agent1 的每轮总结 = 该轮最后一条 thinking 的 content(无工具调用即结束 ReAct 循环,
-  // 见后端 react_agent)。未闭合的轮不提取——运行中新迭代开头也是"纯思考",
-  // 后续还会跟工具调用,提前提出会造成结论闪现再跳回过程组。
+  // 两条路径(优先前者):
+  // 1) 后端结论指针:按 conv_id 定位本轮最终回答所在的思考项。不再要求
+  //    "最后一个迭代是纯思考" —— 本轮只要尾部还有工具调用(如 CLI 收尾前又跑了
+  //    一次验证命令),旧启发式会把整段结论留在默认折叠的过程组里藏住。
+  // 2) 位置启发式(存量任务/指针未命中):该轮最后一条 thinking 的 content,
+  //    且该迭代无工具/其他项(无工具调用即结束 ReAct 循环)。未闭合的轮不提取——
+  //    运行中新迭代开头也是"纯思考",后续还会跟工具调用,提前提出会造成
+  //    结论闪现再跳回过程组。
   // 思考(reasoning)不随结论外移:有思考时组内该项只保留思考卡、结论只保留正文卡,
   // 保持"过程(含最终思考)全在组内、组外只有纯正文消息"的干净结构。
   let conclusion: DisplayItem | null = null
   // 结论迭代是否整块提出(无思考可留时):true 时 plain 定位需补一个虚拟槽位
   let conclusionPopped = false
   if (roundClosed && iterations.length > 0) {
-    const last = iterations[iterations.length - 1]
-    const lastThinking = last.thinkingItems[last.thinkingItems.length - 1]
-    const conclusionText = itemFieldText(lastThinking, 'content')
-    const reasoningText = itemFieldText(lastThinking, 'reasoning')
-    if (
-      last.toolItems.length === 0 &&
-      last.otherItems.length === 0 &&
-      conclusionText.trim()
-    ) {
-      if (reasoningText.trim() && lastThinking) {
-        // 思考留组内:组内只显示思考卡,结论只显示正文卡(克隆时改 id 保证 key 唯一)
-        last.thinkingItems[last.thinkingItems.length - 1] = stripItemContent(lastThinking)
-        conclusion = stripItemReasoning(lastThinking)
-      } else {
-        // 无思考可留:整迭代提出,组内不留空壳
-        conclusion = lastThinking!
-        iterations.pop()
-        conclusionPopped = true
+    if (conclusionConvId) {
+      const iterCountBefore = iterations.length
+      conclusion = liftConclusionByConvId(iterations, conclusionConvId)
+      // 迭代数减少 = 结论连带整块提出了一个迭代,plain 定位需补回那一个槽位
+      conclusionPopped = conclusion !== null && iterations.length < iterCountBefore
+    }
+    if (!conclusion) {
+      const last = iterations[iterations.length - 1]
+      const lastThinking = last.thinkingItems[last.thinkingItems.length - 1]
+      const conclusionText = itemFieldText(lastThinking, 'content')
+      const reasoningText = itemFieldText(lastThinking, 'reasoning')
+      if (
+        last.toolItems.length === 0 &&
+        last.otherItems.length === 0 &&
+        conclusionText.trim()
+      ) {
+        if (reasoningText.trim() && lastThinking) {
+          // 思考留组内:组内只显示思考卡,结论只显示正文卡(克隆时改 id 保证 key 唯一)
+          last.thinkingItems[last.thinkingItems.length - 1] = stripItemContent(lastThinking)
+          conclusion = stripItemReasoning(lastThinking)
+        } else {
+          // 无思考可留:整迭代提出,组内不留空壳
+          conclusion = lastThinking!
+          iterations.pop()
+          conclusionPopped = true
+        }
       }
     }
   }
@@ -2024,7 +2088,9 @@ const roundGroups = computed<RoundGroup[]>(() => {
         agent2Rounds.has(roundIdx) || !isRunning.value || roundIdx !== lastRoundIdx
       return {
         roundIdx,
-        segments: segmentRoundItems(roundIdx, sorted, steps, roundClosed),
+        segments: segmentRoundItems(
+          roundIdx, sorted, steps, roundClosed, conclusionConvIdOf(roundIdx),
+        ),
         planSteps: steps,
       }
     })
@@ -2113,9 +2179,11 @@ function toggleRow(key: string): void {
 }
 
 /** 子智能体折叠块是否展开:运行中默认展开、完成默认折叠,手动展开/折叠优先
- *  (状态机在 utils/agentBlock,与主展开集 expandedToolRows 共用“手动展开”语义) */
+ *  (状态机在 utils/agentBlock,与主展开集 expandedToolRows 共用“手动展开”语义)。
+ *  只拿到后台派生回执的卡片算"未完成":结果从没回来过,折叠等于把唯一可见的
+ *  诚实信号藏起来 */
 function agentBlockOpen(row: ToolRenderRow): boolean {
-  return isAgentBlockOpen(row.callId, row.hasResult, {
+  return isAgentBlockOpen(row.callId, row.hasResult && !row.agentAsync, {
     expanded: expandedToolRows,
     collapsed: collapsedToolRows,
   })
@@ -2123,7 +2191,7 @@ function agentBlockOpen(row: ToolRenderRow): boolean {
 
 /** 点击子智能体标题:翻转并记入手动集(展开进 expanded,折叠进 collapsed) */
 function toggleAgentBlockRow(row: ToolRenderRow): void {
-  toggleAgentBlock(row.callId, row.hasResult, {
+  toggleAgentBlock(row.callId, row.hasResult && !row.agentAsync, {
     expanded: expandedToolRows,
     collapsed: collapsedToolRows,
   })
@@ -2147,6 +2215,9 @@ interface ToolRenderRow {
   summarySuffix: string
   /** 是否已有结果(执行中为 false) */
   hasResult: boolean
+  /** agent 卡片专用:只拿到"后台已启动"回执(结果尚未回报)。
+   *  它不该按"已完成"折叠,也不能被当成报告正文渲染 */
+  agentAsync: boolean
   /** 结果文本(compact 轻量展开 / toolpair 结果块) */
   resultContent: string
   /** agent/toolpair:调用参数 detail(展开后等宽块) */
@@ -2181,6 +2252,7 @@ function toolRowsOf(iter: IterationSegment): ToolRenderRow[] {
     callDetail: '',
     agentThink: '',
     agentBodyHtml: '',
+    agentAsync: false,
     filePath: '',
     fileDisplay: '',
     summaryPrefix: '',
@@ -2220,10 +2292,14 @@ function toolRowsOf(iter: IterationSegment): ToolRenderRow[] {
     }
     if (seg.kind === 'agent') {
       const trace = seg.result ? parseAgentTrace(seg.result.content || '') : null
+      // 异步派生回执:不是结论,必须标"后台未回报"(回归:旧版因 trace.status 为
+      // null 而落到 else,给一张正文只是启动回执的卡片打上"已完成")
+      const asyncPending = !!trace?.asyncPending
       // 标题:子任务意图 + 子智能体类型/状态后缀
       const tags: string[] = []
       if (trace?.subType) tags.push(trace.subType)
       if (!seg.result) tags.push('执行中…')
+      else if (asyncPending) tags.push(trace?.agentId ? `后台未回报 ${trace.agentId}` : '后台未回报')
       else if (trace?.status && trace.status !== 'completed') tags.push(trace.status)
       else tags.push('已完成')
       return {
@@ -2233,6 +2309,7 @@ function toolRowsOf(iter: IterationSegment): ToolRenderRow[] {
         summary: `🤖 ${parts.intent}${tags.length ? ' · ' + tags.join(' · ') : ''}`,
         hasResult: !!seg.result,
         ...empty,
+        agentAsync: asyncPending,
         callDetail: parts.detail,
         agentThink: trace?.think || '',
         agentBodyHtml: trace ? renderMarkdown(trace.body) : '',
