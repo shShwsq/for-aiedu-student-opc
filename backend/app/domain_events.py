@@ -1,7 +1,7 @@
 """领域事件总线(进程内 hook 层)
 
 借鉴 deepseek-harness(Cordis)的"事件即扩展点"思想:
-- 领域事件 = agent 协作流程在阶段边界产生的客观事实
+# 领域事件 = 执行 + 后台质检流程在阶段边界产生的客观事实
   (任务启动/完成/失败、轮完成、验证完成等)
 - 扩展代码(审计日志、统计、未来 webhook/通知)通过 subscribe() 挂载,
   不需要修改 orchestrator / agent2 主流程
@@ -36,10 +36,10 @@ logger = logging.getLogger(__name__)
 
 # 任务生命周期
 TASK_STARTED = "task.started"            # 任务进入 RUNNING(orchestrator 启动)
-TASK_COMPLETED = "task.completed"        # agent1 执行完成即任务完成(单/双 agent、resume 路径)
+TASK_COMPLETED = "task.completed"        # agent1 执行完成即任务完成(payload.mode 区分执行路径;"dual_agent" 为历史字段值,新值域会割裂存量统计)
 TASK_FAILED = "task.failed"              # 任务失败(主流程与 resume 的 except 路径)
 
-# 协作流程边界
+# 执行/审查流程边界
 AGENT1_ROUND_COMPLETED = "agent1.round_completed"  # agent1(执行器)完成一轮执行
 VERIFIER_COMPLETED = "verifier.completed"        # verifier_agent 完成一次动态验证(含失败)
 REVIEW_COMPLETED = "review.completed"            # agent2 后台审查完成(含失败;payload.review_status)

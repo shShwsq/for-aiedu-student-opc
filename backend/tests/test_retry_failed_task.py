@@ -1,7 +1,7 @@
 """orchestrator.retry_failed_task 单测(纯函数级,mock DB/沙箱/执行链路)。
 
 核心约束:
-- 无 agent2/react_agent 对话(早期失败)→ 从头重跑 run_dual_agent_audit
+- 无 agent2/react_agent 对话(早期失败)→ 从头重跑 run_pipeline_audit
 - 有进度(执行中途失败)→ 断点续跑 resume_audit_with_message(retry=True)
 - 续跑前沙箱会话已被回收且任务配了 repo_url → 重新 _prepare_repo_context
 """
@@ -41,7 +41,7 @@ def _patch_env(monkeypatch, session_alive=True):
         orchestrator, "_prepare_repo_context", MagicMock(return_value=(None, "")),
     )
     monkeypatch.setattr(
-        orchestrator, "run_dual_agent_audit", MagicMock(),
+        orchestrator, "run_pipeline_audit", MagicMock(),
     )
     monkeypatch.setattr(
         orchestrator, "resume_audit_with_message", MagicMock(),
@@ -60,7 +60,7 @@ def test_no_progress_reruns_from_scratch(monkeypatch):
 
     retry_failed_task(task, db)
 
-    orchestrator.run_dual_agent_audit.assert_called_once_with(task, db)
+    orchestrator.run_pipeline_audit.assert_called_once_with(task, db)
     orchestrator.resume_audit_with_message.assert_not_called()
     assert task.error_message is None
 
@@ -73,7 +73,7 @@ def test_with_progress_resumes_with_retry_flag(monkeypatch):
 
     retry_failed_task(task, db)
 
-    orchestrator.run_dual_agent_audit.assert_not_called()
+    orchestrator.run_pipeline_audit.assert_not_called()
     orchestrator.resume_audit_with_message.assert_called_once()
     args, kwargs = orchestrator.resume_audit_with_message.call_args
     # (task, db, retry_message, retry=True);续跑消息须带上次失败原因

@@ -2,7 +2,7 @@
 
 > 适合 vibe coding 的迭代路线:每个阶段都是一个**能独立跑通、能立即看到效果**的闭环。做完一个阶段先玩一下,有手感了再进下一个。
 
-> 术语勘误(2026-10):下文各阶段保留当时原貌。其中「双智能体协作」已不符合现行实现——agent2 审查后台化后,流程为 **agent1 单轮执行 + agent2 单次后台审查(不向 agent1 发问,多轮由用户 resume 驱动)** 的串行流水线,协作循环/检查点打断/max_rounds 均已移除,关闭检查助手即单 agent 模式。现行口径见 `docs/spec.md` §1.1 与 `docs/agent-architecture.md` §1;`run_dual_agent_audit` / `mode="dual_agent"` 仅作历史标识符保留。
+> 术语勘误(2026-10):下文各阶段保留当时原貌。其中「双智能体协作」已不符合现行实现——agent2 审查后台化后,流程为 **agent1 单轮执行 + agent2 单次后台审查(不向 agent1 发问,多轮由用户 resume 驱动)** 的串行流水线,协作循环/检查点打断/max_rounds 均已移除,关闭检查助手即单 agent 模式。现行口径见 `docs/spec.md` §1.1 与 `docs/agent-architecture.md` §1;`mode="dual_agent"` 为审计日志(domain_event_logs)存量 payload 的历史字段值,保留不改值域;原 `run_dual_agent_audit` 函数已更名为 `run_pipeline_audit`(旧名暂留兼容别名)。
 
 ---
 

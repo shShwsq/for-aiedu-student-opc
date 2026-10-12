@@ -138,7 +138,7 @@ def test_agent1_done_before_done_and_bus_stays_open(monkeypatch):
     _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
     rec = _EventRecorder(monkeypatch)
 
-    orchestrator.run_dual_agent_audit(task, MagicMock())
+    orchestrator.run_pipeline_audit(task, MagicMock())
 
     # agent1_done 早于 review_done,review_done 早于 done
     assert rec.index("agent1_done") != -1
@@ -166,7 +166,7 @@ def test_review_status_transitions_running_to_done(monkeypatch):
     _patch_env(monkeypatch, executor, _ua)
     _EventRecorder(monkeypatch)
 
-    orchestrator.run_dual_agent_audit(task, MagicMock())
+    orchestrator.run_pipeline_audit(task, MagicMock())
 
     assert observed["review_status_at_review"] == "running"
     assert task.review_status == "done"
@@ -189,7 +189,7 @@ def test_review_replaces_interim_results_with_knowledge(monkeypatch):
     _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
     _EventRecorder(monkeypatch)
 
-    orchestrator.run_dual_agent_audit(task, db)
+    orchestrator.run_pipeline_audit(task, db)
 
     results_added = [
         c.args[0] for c in db.add.call_args_list
@@ -221,7 +221,7 @@ def test_review_failure_keeps_interim_results(monkeypatch):
     _patch_env(monkeypatch, executor, lambda *a, **k: degraded)
     rec = _EventRecorder(monkeypatch)
 
-    orchestrator.run_dual_agent_audit(task, db)
+    orchestrator.run_pipeline_audit(task, db)
 
     assert task.status == TaskStatus.COMPLETED  # 任务不因审查失败而失败
     assert task.review_status == "failed"
@@ -480,7 +480,7 @@ def test_followup_during_review_runs_parallel(monkeypatch):
     rec = _EventRecorder(monkeypatch)
 
     try:
-        orchestrator.run_dual_agent_audit(task, MagicMock())
+        orchestrator.run_pipeline_audit(task, MagicMock())
 
         # 老审查照常落库知识点,但被新流取代(世代门控)→ 不写 badge、
         # 不推 review_done(任务级字段归新流所有,防 badge 抖动)
@@ -513,7 +513,7 @@ def test_no_parallel_flow_publishes_done(monkeypatch):
     monkeypatch.setattr(orchestrator, "launch_resume_thread", _fake_launch)
 
     try:
-        orchestrator.run_dual_agent_audit(task, MagicMock())
+        orchestrator.run_pipeline_audit(task, MagicMock())
     finally:
         clear_user_messages(str(task.id))
 
@@ -576,7 +576,7 @@ def test_leftover_messages_auto_resume_new_round(monkeypatch):
             str(task.id), "第二条遗留",
             message_id=m2, created_at="t2", upload_ids=["u2", "u3"],
         )
-        orchestrator.run_dual_agent_audit(task, db)
+        orchestrator.run_pipeline_audit(task, db)
 
         # 自动续轮:合并文本(\n\n)+ 附件去重保序
         assert launched == [
@@ -630,7 +630,7 @@ def test_superseded_review_skips_badge_updates(monkeypatch):
     db = MagicMock()
 
     try:
-        orchestrator.run_dual_agent_audit(task, db)
+        orchestrator.run_pipeline_audit(task, db)
 
         # 降级探针被传入且取代后返回 True
         assert probe_results and probe_results[-1] is True
@@ -660,7 +660,7 @@ def test_dual_audit_failure_error_before_finish(monkeypatch):
     _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
     rec = _EventRecorder(monkeypatch)
 
-    orchestrator.run_dual_agent_audit(task, MagicMock())
+    orchestrator.run_pipeline_audit(task, MagicMock())
 
     assert task.status == TaskStatus.FAILED
     assert rec.events("error")
@@ -689,7 +689,7 @@ def test_single_agent_mode_no_review_events(monkeypatch):
     )
     rec = _EventRecorder(monkeypatch)
 
-    orchestrator.run_dual_agent_audit(task, MagicMock())
+    orchestrator.run_pipeline_audit(task, MagicMock())
 
     assert task.status == TaskStatus.COMPLETED
     assert task.review_status is None          # 不进入审查状态机
@@ -732,7 +732,7 @@ def test_review_stopped_keeps_interim_and_skips_downstream(monkeypatch):
         lambda *a, **k: downstream.append("practice"),
     )
 
-    orchestrator.run_dual_agent_audit(task, db)
+    orchestrator.run_pipeline_audit(task, db)
 
     assert task.status == TaskStatus.COMPLETED   # 终止不是任务失败
     assert task.review_status == "stopped"
@@ -794,7 +794,7 @@ def test_extract_kp_off_finalizes_interim_title(monkeypatch):
     )
     rec = _EventRecorder(monkeypatch)
 
-    orchestrator.run_dual_agent_audit(task, db)
+    orchestrator.run_pipeline_audit(task, db)
 
     # 关闭提炼后“本轮无知识点”属预期,不能因此判审查失败
     assert task.review_status == "done"
@@ -829,7 +829,7 @@ def test_extract_kp_off_finalizes_interim_title_on_emit_path(monkeypatch):
     )
     _EventRecorder(monkeypatch)
 
-    orchestrator.run_dual_agent_audit(task, db)
+    orchestrator.run_pipeline_audit(task, db)
 
     assert task.review_status == "done"
     _assert_interim_title_finalized(db, "执行结果(未提炼知识点)")
@@ -849,7 +849,7 @@ def test_extract_kp_on_still_replaces_interim_results(monkeypatch):
     _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
     rec = _EventRecorder(monkeypatch)
 
-    orchestrator.run_dual_agent_audit(task, db)
+    orchestrator.run_pipeline_audit(task, db)
 
     assert task.review_status == "done"
     assert rec.events("review_done")[0][2] == {"review_status": "done"}
@@ -887,7 +887,7 @@ def test_background_review_registers_round_and_stop_check(monkeypatch):
     _EventRecorder(monkeypatch)
 
     try:
-        orchestrator.run_dual_agent_audit(task, MagicMock())
+        orchestrator.run_pipeline_audit(task, MagicMock())
 
         assert probe["registered"] is True
         assert probe["callable"] is True
@@ -929,7 +929,7 @@ def test_review_round_registered_before_review_thread_starts(monkeypatch):
     _EventRecorder(monkeypatch)
 
     try:
-        orchestrator.run_dual_agent_audit(task, MagicMock())
+        orchestrator.run_pipeline_audit(task, MagicMock())
 
         assert probe["registered"] is True
         assert probe["round"] == 1            # 终止落在本轮审查上

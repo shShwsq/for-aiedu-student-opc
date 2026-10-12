@@ -303,7 +303,7 @@ def test_resume_except_typed_error_message(monkeypatch):
 
 
 # ============================================================
-# run_dual_agent_audit:直接执行 + 降级分流
+# run_pipeline_audit:直接执行 + 降级分流
 # ============================================================
 
 
@@ -383,7 +383,7 @@ def test_dual_starts_with_react_agent_no_initial_eval(monkeypatch):
 
     _patch_dual_env(monkeypatch, executor, _ua)
 
-    orchestrator.run_dual_agent_audit(task, MagicMock())
+    orchestrator.run_pipeline_audit(task, MagicMock())
 
     # agent1 先执行:第 1 轮、followup_query=None(直接用用户意图),只此一轮
     executor.run.assert_called_once()
@@ -414,7 +414,7 @@ def test_dual_collab_degraded_ends_round(monkeypatch):
 
     _patch_dual_env(monkeypatch, executor, _ua)
 
-    orchestrator.run_dual_agent_audit(task, MagicMock())
+    orchestrator.run_pipeline_audit(task, MagicMock())
 
     # 初始运行只有 1 轮 agent1(协作循环已移除)
     assert executor.run.call_count == 1
@@ -448,7 +448,7 @@ def test_dual_conversation_round_skips_review(monkeypatch):
 
     _patch_dual_env(monkeypatch, executor, lambda *a, **k: ua_calls.append(1))
 
-    orchestrator.run_dual_agent_audit(task, _mk_no_tool_db())
+    orchestrator.run_pipeline_audit(task, _mk_no_tool_db())
 
     executor.run.assert_called_once()
     assert not ua_calls  # 纯对话轮不触发 agent2 审查

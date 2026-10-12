@@ -265,11 +265,12 @@ def _run_resume_in_background(
         db.close()
 
 
-def run_dual_agent_audit(task: Task, db: Session) -> None:
-    """执行「AI助手 执行 + 检查助手 后台质检」流水线
+def run_pipeline_audit(task: Task, db: Session) -> None:
+    """执行「AI助手 执行 + 检查助手 后台质检」流水线(单轮执行 → 完成 → 后台审查)
 
-    函数名中的 dual_agent 为历史标识(协作循环已移除,现为串行流水线),
-    调用方与测试面广,保留不改名。
+    历史名 run_dual_agent_audit:协作循环已移除,函数名已于 2026-10 改为
+    run_pipeline_audit;事件 payload 字段值 mode="dual_agent" 仍保留
+    (domain_event_logs 存量行按旧值记录,改值域会割裂历史统计)。
     """
     task_id_str = str(task.id)
 
@@ -540,7 +541,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         db.commit()
         _publish_status(task)
 
-        # 领域事件:任务完成(双 agent 路径,时刻=agent1 结束,不含审查时长)
+        # 领域事件:任务完成(agent1 结束路径,时刻=agent1 结束,不含审查时长)
         emit(
             TASK_COMPLETED, task.id,
             mode="dual_agent", rounds=len(react_summaries),
@@ -672,6 +673,12 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
 # ============================================================
 # 辅助:plan 状态持久化 / 轮次类型判定 / 记录 agent2 的对话 / 临时结果 / 后台审查
 # ============================================================
+
+
+# 历史名兼容别名(旧名 run_dual_agent_audit):仅作迁移期兼容面,
+# 存量 monkeypatch/外部脚本可能按旧名取用;新代码一律使用 run_pipeline_audit,
+# 兼容期结束后可整体删除本行
+run_dual_agent_audit = run_pipeline_audit
 
 
 def _save_plan_to_task(task: Task, db: Session, plan: list[dict]) -> None:
@@ -2054,7 +2061,7 @@ def resume_audit_with_message(
     db.commit()
     _publish_status(task)
 
-    # 加载上下文(与 run_dual_agent_audit 一致)
+    # 加载上下文(与 run_pipeline_audit 一致)
     # llm_client:agent2 评估;react_client:内置 react_agent(空时回退到 llm_config_id)
     llm_client = _build_llm_client(db, task.user_id, task.llm_config_id)
     react_client, _ = _build_react_llm_client(db, task)
@@ -2141,7 +2148,7 @@ def resume_audit_with_message(
     msg_label = RETRY_MSG_LABEL if retry else USER_FOLLOWUP_MSG_LABEL
     effective_intent = task.user_input + f"\n\n{msg_label}\n{followup_text}"
 
-    # 本轮是否正常完成(内存标志):与 run_dual_agent_audit 同理,
+    # 本轮是否正常完成(内存标志):与 run_pipeline_audit 同理,
     # finally 兑底 error 推送必须用它判定,不能用 task.status ——
     # 本轮完成后用户可能又发新追问(状态被改回 RUNNING),旧线程 finally
     # 按状态判定会误推 error 并重新标记总线结束,导致新 resume 线程事件全丢。
@@ -2341,7 +2348,7 @@ def retry_failed_task(task: Task, db: Session) -> None:
 
     判定依据:是否已有 agent2 / react_agent 的对话落库
     - 无(预克隆/沙箱/LLM 配置等早期失败,执行未真正开始):
-      没有可续内容,直接重跑 run_dual_agent_audit
+      没有可续内容,直接重跑 run_pipeline_audit
     - 有(执行中途失败):复用 resume_audit_with_message 断点续跑,
       以重试续跑消息直接驱动 agent1 基于已有进度接续未完成工作
       (round_idx 由 _get_next_round_idx 自动续接,不产生重复轮次)
@@ -2375,7 +2382,7 @@ def retry_failed_task(task: Task, db: Session) -> None:
         logger.info(f"[task={task.id}] 重试:无可续进度,从头重跑")
         task.error_message = None
         db.commit()
-        run_dual_agent_audit(task, db)
+        run_pipeline_audit(task, db)
         return
 
     # 执行中途失败:沙箱会话已被回收时,重新 clone 恢复工作区

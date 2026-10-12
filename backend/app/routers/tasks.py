@@ -33,7 +33,7 @@ from app.agents.orchestrator import (
     launch_resume_thread,
     resume_audit_with_message,
     retry_failed_task,
-    run_dual_agent_audit,
+    run_pipeline_audit,
 )
 from app.database import SessionLocal, get_db
 from app.deps import get_optional_user, get_optional_user_sse
@@ -875,7 +875,7 @@ def retry_failed_task_endpoint(
 
     仅 failed 状态接受(其他状态返回 accepted=false,天然防重复点击)。
     后台线程调 retry_failed_task 按进度分流:
-    - 无可续进度(早期失败):从头重跑 run_dual_agent_audit
+    - 无可续进度(早期失败):从头重跑 run_pipeline_audit
     - 有进度(执行中途失败):复用 resume 链路断点续跑
 
     与 send_message 的 completed 分支同理,需先 reset_task_bus:
@@ -2135,7 +2135,7 @@ def _run_task_in_background(task_id: str) -> None:
         if not task:
             logger.error(f"后台任务:task {task_id} 不存在")
             return
-        run_dual_agent_audit(task, db)
+        run_pipeline_audit(task, db)
     except Exception as e:
         logger.exception(f"[task={task_id}] 后台执行失败")
         # 兜底:确保 task 状态被标记为失败

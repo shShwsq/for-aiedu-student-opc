@@ -10,7 +10,7 @@
 
 ## 1. 架构总览
 
-系统采用 **agent1(执行)+ agent2(后台质检)串行流水线** 模型，由 `orchestrator.run_dual_agent_audit` 编排（函数名为历史标识：原「双智能体协作循环」已移除，agent2 单次后台审查不向 agent1 发问，多轮由用户 resume 驱动；关闭 agent2 即单 agent 模式）：
+系统采用 **agent1(执行)+ agent2(后台质检)串行流水线** 模型，由 `orchestrator.run_pipeline_audit` 编排（历史名 `run_dual_agent_audit`，已更名、暂留兼容别名；原「双智能体协作循环」已移除，agent2 单次后台审查不向 agent1 发问，多轮由用户 resume 驱动；关闭 agent2 即单 agent 模式）：
 
 ```
 用户意图
@@ -1006,7 +1006,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 
 ### 8.5 资源清理（finally 块）
 
-`run_dual_agent_audit` 和 `resume_audit_with_message` 的 finally 块清理：
+`run_pipeline_audit` 和 `resume_audit_with_message` 的 finally 块清理：
 - `clear_pause_state` / `clear_user_messages` / `clear_pending_verify_authorization` / `clear_pending_command_confirm`
 - `sandbox_tools.mark_task_completed`（延迟关闭沙箱，TTL 1 小时惰性清理）
 - 推送 `done` / `error` 终止事件
