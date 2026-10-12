@@ -1520,25 +1520,6 @@ onUnmounted(() => {
             <!-- 分隔线 -->
             <div class="chat-divider" />
   
-            <!-- 维度模板(场景内可选,点一下预填输入框) -->
-            <div
-              v-if="scenarioPromptTemplates.length"
-              class="template-chips"
-              role="group"
-              aria-label="维度提示词模板"
-            >
-              <button
-                v-for="t in scenarioPromptTemplates"
-                :key="t.id"
-                type="button"
-                class="template-chip"
-                :class="{ active: userInput === t.prompt }"
-                @click="applyTemplate(t)"
-              >
-                {{ t.label }}
-              </button>
-            </div>
-  
             <!-- 主体:大 textarea -->
             <textarea
               ref="textareaRef"
@@ -1550,17 +1531,45 @@ onUnmounted(() => {
               @keydown="onTextareaKeydown"
             />
   
-            <!-- 输入工具栏:AI 润色 -->
+            <!-- 输入工具栏:维度模板 chips(左) + AI 润色(右,同一行省空间) -->
             <div class="input-toolbar">
+              <div
+                v-if="scenarioPromptTemplates.length"
+                class="template-chips"
+                role="group"
+                aria-label="维度提示词模板"
+              >
+                <button
+                  v-for="t in scenarioPromptTemplates"
+                  :key="t.id"
+                  type="button"
+                  class="template-chip"
+                  :class="{ active: userInput === t.prompt }"
+                  @click="applyTemplate(t)"
+                >
+                  {{ t.label }}
+                </button>
+              </div>
               <button
                 type="button"
                 class="polish-btn"
                 :disabled="polishing || !userInput.trim()"
-                :title="polishing ? '润色中…' : '用 AI 把描述改得更清晰(保持原意与范围)'"
+                :title="polishing ? '润色中…' : 'AI 润色:用 AI 把描述改得更清晰(保持原意与范围)'"
+                aria-label="AI 润色"
                 @click="handlePolishPrompt"
               >
                 <span v-if="polishing" class="polish-spinner" aria-hidden="true" />
-                {{ polishing ? '润色中…' : 'AI 润色' }}
+                <svg
+                  v-else
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                  aria-hidden="true"
+                >
+                  <path d="M10 6q0 7 7 7-7 0-7 7 0-7-7-7 7 0 7-7Z" />
+                  <path d="M18 2q0 4 4 4-4 0-4 4 0-4-4-4 4 0 4-4Z" />
+                </svg>
               </button>
             </div>
   
@@ -2089,20 +2098,29 @@ onUnmounted(() => {
   border-color: var(--color-primary);
 }
 
-/* ---- 输入工具栏:AI 润色 ---- */
+/* ---- 输入工具栏:维度模板 chips(左) + AI 润色(右) ---- */
 .input-toolbar {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin-top: 6px;
+}
+
+/* chips 组与润色按钮同一行:去掉原有下方间距,并保证无 chips 时按钮靠右 */
+.input-toolbar .template-chips {
+  margin-bottom: 0;
 }
 
 .polish-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 4px 12px;
-  font-size: var(--fs-sm);
-  font-family: var(--font-sans);
+  justify-content: center;
+  width: 30px;
+  height: 28px;
+  padding: 0;
+  flex-shrink: 0;
+  margin-left: auto;
   color: var(--color-text-muted);
   background: transparent;
   border: 1px solid var(--color-border);
