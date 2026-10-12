@@ -4,8 +4,9 @@
  * 锁死「对话使用的模型」这一栏的口径:
  * 1. 解析链与后端一致(任务配置 → 同评估模型 → 任务默认审查模型槽位 → 环境默认)
  * 2. 配置被删除时如实回退并标 stale(不能把已不存在的配置报成在用)
- * 3. CLI 执行器不编模型名(react 角色由 CLI 自管)
- * 4. 文案不出现复读(名称缺失时只报来源)
+ * 3. 清单没拉到之前不下「已删除」的结论(未知不等于已删)
+ * 4. CLI 执行器不编模型名(react 角色由 CLI 自管)
+ * 5. 文案不出现复读(名称缺失时只报来源)
  */
 import { describe, expect, it } from 'vitest'
 
@@ -25,6 +26,7 @@ function cfg(id: string, name = id, hasKey = true): LLMConfigItemOut {
 
 const sources = (over: Partial<TaskModelSources> = {}): TaskModelSources => ({
   configs: [cfg('a'), cfg('b')],
+  configsLoaded: true,
   slotLabel: '',
   envModel: '',
   ...over,
@@ -106,6 +108,20 @@ describe('resolveAgentModel', () => {
 
   it('executor 缺失按内置处理(老任务没有该字段)', () => {
     expect(resolveAgentModel({ reactId: 'a' }, sources()).source).toBe('task')
+  })
+})
+
+describe('清单未就位时不下结论', () => {
+  it('configsLoaded=false 时「找不到」只算未知,不报「原选配置已删除」', () => {
+    const pending = sources({ configs: [], configsLoaded: false })
+    expect(resolveReviewModel({ reviewId: 'a' }, pending).stale).toBe(false)
+    expect(taskModelDisplayText(resolveReviewModel({ reviewId: 'a' }, pending))).toBe('环境默认')
+    expect(resolveAgentModel({ reactId: 'b' }, pending).stale).toBe(false)
+  })
+
+  it('清单拉到之后才把找不到的 id 判成已删(请求失败保持 false → 永不误报)', () => {
+    expect(resolveReviewModel({ reviewId: 'gone' }, sources()).stale).toBe(true)
+    expect(resolveReviewModel({ reviewId: 'gone' }, sources({ configsLoaded: false })).stale).toBe(false)
   })
 })
 

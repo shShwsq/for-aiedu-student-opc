@@ -15,6 +15,7 @@ import { computed, ref } from 'vue'
 import * as authApi from '@/api/auth'
 import { clearTokens, getAccessToken, setTokens } from '@/api/client'
 import { invalidateLlmConfigs } from '@/composables/useLlmConfigOptions'
+import { invalidateTaskModelSources } from '@/composables/useTaskRuntimeModels'
 import type { GitProvider } from '@/types/git_provider'
 import type { User } from '@/types/auth'
 
@@ -66,7 +67,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  /** 登出:清空 token + user + 模型配置缓存 */
+  /** 登出:清空 token + user + 模型相关模块级缓存 */
   function logout(): void {
     clearTokens()
     user.value = null
@@ -74,6 +75,10 @@ export const useAuthStore = defineStore('auth', () => {
     // 模型列表是模块级缓存(按用户私有):不清会让下一个登录者在同一标签页里
     // 看到上一个账号的模型名(归属校验会拒掉选择,但展示本身就是泄露面)
     invalidateLlmConfigs()
+    // 「任务默认审查模型」槽位名与环境默认模型名也是同一类展示信息(存在
+    // useTaskRuntimeModels 的模块级 ref 里),不跟着清的话详情页「对话模型」会先报
+    // 上一个账号的默认模型,直到自己的请求落地
+    invalidateTaskModelSources()
   }
 
   return {

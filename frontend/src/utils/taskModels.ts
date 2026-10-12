@@ -11,6 +11,9 @@
  * 「配置 id 存着但清单里找不到」= 那条 LLM 配置已被删除,后端此时回退默认模型。
  * 这种情况标 stale(先例:types/model_slots 的 stale 字段),文案要说清已回退,
  * 否则用户会对着一个已经不存在的配置排障。
+ *
+ * 但**只有在清单确实拉到手上时**「找不到」才等于「被删除」:请求在途或失败时
+ * 找不到只是未知(见 `TaskModelSources.configsLoaded`),此时不能断言已删。
  */
 import type { LLMConfigItemOut } from '@/types/model_configs'
 
@@ -29,6 +32,13 @@ export interface ResolvedTaskModel {
 export interface TaskModelSources {
   /** 当前用户已保存的 LLM 配置清单 */
   configs: LLMConfigItemOut[]
+  /**
+   * 清单是否已经**成功**拉到过一次(false 时的「找不到」是未知,不是已删)
+   *
+   * 就是 useLlmConfigOptions 的 `llmConfigsLoaded`:失败时它保持 false,
+   * 因此调用方不能拿「loading 结束」当它成功。
+   */
+  configsLoaded: boolean
   /** 用户级「任务默认审查模型」槽位命中的配置展示名;空串=槽位未指向已存配置 */
   slotLabel: string
   /** 环境变量默认模型名;空串=未知 */
@@ -77,12 +87,22 @@ function findConfig(id: string | null | undefined, sources: TaskModelSources): L
   return id ? sources.configs.find((c) => c.id === id) : undefined
 }
 
+/**
+ * 「存着 id 但清单里没有」是否算配置已被删除
+ *
+ * 清单没到手时不算:那时「找不到」只是未知,报「原选配置已删除,已回退」
+ * 会让用户对着一条好端端的配置排障(侧栏在加载完成前就闪过这句错文案)。
+ */
+function isDeletedConfigId(id: string | null | undefined, sources: TaskModelSources): boolean {
+  return sources.configsLoaded && !!id
+}
+
 /** 检查助手实际使用的模型 */
 export function resolveReviewModel(input: TaskModelIds, sources: TaskModelSources): ResolvedTaskModel {
   const cfg = findConfig(input.reviewId, sources)
   if (cfg) return { label: runtimeModelLabel(cfg), source: 'task', stale: false }
   const fallback = resolveDefaultModel(sources)
-  return { ...fallback, stale: !!input.reviewId }
+  return { ...fallback, stale: isDeletedConfigId(input.reviewId, sources) }
 }
 
 /** AI助手实际使用的模型(CLI 执行器下由 CLI 自管,不看任务字段) */
@@ -94,11 +114,12 @@ export function resolveAgentModel(input: TaskModelIds, sources: TaskModelSources
   if (cfg) return { label: runtimeModelLabel(cfg), source: 'task', stale: false }
   // react 未单独指定(或指定的已被删)→ 回退评估模型那条链
   const review = resolveReviewModel(input, sources)
+  const reactDeleted = isDeletedConfigId(input.reactId, sources)
   if (review.source === 'task') {
     // 与评估模型同源:选择框里 react 传的是空串,reactId 有值却落这里 = 原选已删
-    return { label: review.label, source: 'same-as-review', stale: !!input.reactId }
+    return { label: review.label, source: 'same-as-review', stale: reactDeleted }
   }
-  return { ...review, stale: review.stale || !!input.reactId }
+  return { ...review, stale: review.stale || reactDeleted }
 }
 
 /**

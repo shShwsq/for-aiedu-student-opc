@@ -54,8 +54,14 @@ const saving = ref(false)
 const isEmbedded = computed(() => props.variant === 'panel')
 
 /** 模型来源(配置清单 + 任务默认审查模型槽位),两个入口并发去重共用一次拉取 */
-const { loading: loadingModels, sources, reviewOptions, reactOptions, ensureLoaded } =
-  useTaskRuntimeModels()
+const {
+  loading: loadingModels,
+  ready: modelsReady,
+  sources,
+  reviewOptions,
+  reactOptions,
+  ensureLoaded,
+} = useTaskRuntimeModels()
 
 /** 任务是否使用内置执行器(CLI 执行器 react 模型自管,选择器禁用) */
 const isBuiltin = computed(() => (props.task.executor ?? 'builtin') === 'builtin')
@@ -74,11 +80,31 @@ const agentModelText = computed(() => taskModelDisplayText(agentModel.value))
 const reviewModelText = computed(() => taskModelDisplayText(reviewModel.value))
 
 /**
- * 「实际使用」行只在任务没直接指定模型时出现:指定过时选择框已经写着名字,
- * 再复述一遍是噪音;留空 / 原选被删 / 需说明 CLI 自管这几种才需要解释落点
+ * 「实际使用」行只在数据到位、且任务没直接指定模型时出现:
+ * - 未 ready(清单/槽位还在拉,或拉挂了)时什么都不说:那时只会把「原选配置已删除」
+ *   报给一条还没拉到的配置,跨账号时甚至会先报上一个登录者的默认模型名
+ * - 任务直接指定过模型时选择框已经写着名字,再复述一遍是噪音
  */
-const showAgentEffective = computed(() => isBuiltin.value && agentModel.value.source !== 'task')
-const showReviewEffective = computed(() => reviewModel.value.source !== 'task')
+const showAgentEffective = computed(
+  () => modelsReady.value && isBuiltin.value && agentModel.value.source !== 'task',
+)
+const showReviewEffective = computed(
+  () => modelsReady.value && reviewModel.value.source !== 'task',
+)
+
+/**
+ * 选择框占位文案:把「还没拉到」与「拉到了但那条已被删」分开说
+ *
+ * BaseSelect 的 model-value 不在 options 里时回落到 placeholder,所以不能一律拿
+ * 「请选择」去占:加载期那是“还没知道”,加载完后的空缺才是“原选被删”——
+ * 后者用「请选择」说会让用户以为选错了,而不是配置不在了。
+ * (不把已删 id 注进 options 当一项展示:选中它就会 PATCH 一个不存在的 id,后端拒 400)
+ */
+function selectPlaceholder(id?: string | null): string {
+  if (!modelsReady.value) return '模型信息加载中…'
+  if (id && !sources.value.configs.some((c) => c.id === id)) return '原选配置已删除'
+  return '请选择'
+}
 
 onMounted(() => {
   void ensureLoaded()
@@ -143,6 +169,15 @@ function onReactModelChange(value: string | number): void {
           <span v-if="saving" class="rs-saving">保存中…</span>
         </h2>
 
+        <!-- 未就绪时只说状态,不给结论(选择框此时同时禁用,避免拿着不完整的清单就保存) -->
+        <p v-if="!modelsReady" class="rs-effective">
+          {{
+            loadingModels
+              ? '模型信息加载中…'
+              : '模型清单未加载成功,刷新页面重试'
+          }}
+        </p>
+
         <!-- agent1 模型 -->
         <div class="rs-field">
           <span class="rs-label">AI助手模型</span>
@@ -150,7 +185,8 @@ function onReactModelChange(value: string | number): void {
             v-if="isBuiltin"
             :model-value="task.react_llm_config_id ?? ''"
             :options="reactOptions"
-            :disabled="loadingModels"
+            :placeholder="selectPlaceholder(task.react_llm_config_id)"
+            :disabled="!modelsReady"
             size="sm"
             aria-label="AI助手模型"
             @change="onReactModelChange"
@@ -167,7 +203,8 @@ function onReactModelChange(value: string | number): void {
           <BaseSelect
             :model-value="task.llm_config_id ?? ''"
             :options="reviewOptions"
-            :disabled="loadingModels"
+            :placeholder="selectPlaceholder(task.llm_config_id)"
+            :disabled="!modelsReady"
             size="sm"
             aria-label="检查助手模型"
             @change="onUserModelChange"
@@ -175,7 +212,7 @@ function onReactModelChange(value: string | number): void {
           <p v-if="showReviewEffective" class="rs-effective" :title="reviewModelText">
             实际使用：{{ reviewModelText }}
           </p>
-          <p v-if="!loadingModels && sources.configs.length === 0" class="rs-hint">
+          <p v-if="modelsReady && sources.configs.length === 0" class="rs-hint">
             暂无可选模型,请到「模型设置」配置 LLM 凭据
           </p>
         </div>
