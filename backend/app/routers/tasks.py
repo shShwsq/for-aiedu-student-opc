@@ -1003,7 +1003,7 @@ def retry_failed_task_endpoint(
         round_idx=latest_conv.round_idx if latest_conv else 0,
         role="system",
         type="info",
-        content="发起失败任务重试(优先断点续跑)...",
+        content="正在继续...",
     )
     db.add(conv)
     db.commit()
