@@ -309,7 +309,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', handleKeydown))
                     v-model="explainDraft"
                     class="kp-explain-editor"
                     rows="8"
-                    placeholder="用 Markdown 写:是什么 / 为什么会踩 / 怎么判断与修复 / 易错点"
+                    placeholder="用 Markdown 写:### 是什么 / ### 实战要点 / ### 怎么判断与修复(可选) / ### 一句话记忆(可选)"
                   />
                   <div class="kp-explain-actions">
                     <button class="btn-secondary" :disabled="explainSaving" @click="saveExplanation">

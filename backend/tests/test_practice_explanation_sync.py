@@ -196,7 +196,7 @@ def test_sync_single_task_adopts_content_without_llm():
     t1 = uuid4()
     kp_id = uuid4()
     kp = _kp(kp_id)
-    r = _result(t1, "### 是什么\n### 为什么会踩\n### 怎么判断与修复\n### 易错点", kp_id=kp_id)
+    r = _result(t1, "### 是什么\n### 实战要点", kp_id=kp_id)
     db, state = _fake_db([kp], [r], [], [_task(t1)])
     stats = sync_knowledge_explanations(db, "u1", [kp_id], client=_ExplodingClient())
     assert stats["adopted"] == 1

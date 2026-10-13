@@ -534,7 +534,7 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
 3. **提炼知识点**:有学习价值的结论调 `submit_knowledge_point`(3-8 条精选,见"结果整理原则");
    用 `submit_review_item` 回执里的 `review_item_id` 作 `source_review_item_id` 回指派生它的审查项。
    `content` 是知识点讲解正文(不是审查结论复述):它会被直接采用为练习看板的讲解,
-   按四段式输出(### 是什么 / ### 为什么会踩 / ### 怎么判断与修复 / ### 易错点,200~400 字);
+   按 `submit_knowledge_point` 工具 `content` 参数里内嵌的格式契约输出(两必选段 + 两可选段,结构只定义一处);
 4. **建议追问**:agent1 未覆盖、需补查才能闭环的方向,逐条 `submit_suggestion`(见"建议追问原则")。
 
 ## 用户可读性硬约束(写 title / conclusion / follow_up / suggestion 时逐条遵)

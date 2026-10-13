@@ -210,7 +210,7 @@ class KnowledgePoint(Base):
         default=DEFAULT_LEARNING_TOPIC, server_default=DEFAULT_LEARNING_TOPIC,
     )
 
-    # ---- 知识点讲解(Markdown 正文,200~400 字)----
+    # ---- 知识点讲解(Markdown 正文,结构为两必选 + 两可选,软目标 200~600 字)----
     # 讲解正文(None/空串 = 尚未生成)
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     # 讲解来源:auto=模型生成 / manual=用户编辑 / ""=尚未生成

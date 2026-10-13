@@ -58,7 +58,7 @@ _FINDING_CONTENT_CHARS = 1200
 _MATERIAL_CHARS = 900
 _QUESTION_EXPLANATION_CHARS = 300
 
-# 讲解输出上限:4 段小标题 + 正文,按 MAX_KP_PER_BATCH=6 个知识点、每个 200~400 字
+# 讲解输出上限:段数可变(两必选 + 两可选→最多 4 段),按 MAX_KP_PER_BATCH=6 个知识点、每个软目标 200~600 字
 # 估算,主流中文 tokenizer(0.6-1.0 token/字)约 1500-3000 token,4096 留一倍余量
 _MAX_OUTPUT_TOKENS = 4096
 
