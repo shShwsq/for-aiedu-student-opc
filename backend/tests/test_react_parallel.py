@@ -332,6 +332,55 @@ def test_facet_pass_assistant_carries_tool_calls(monkeypatch):
     _assert_tool_msgs_preceded_by_tool_calls(client.snapshots)
 
 
+def test_facet_pass_repairs_dangling_base_at_send_point(monkeypatch):
+    """L2 单独也能救场:即便交接处漏了清洗(L1),分面第一次调用发给 provider 的
+    序列也要被 runtime 发送口归一化补成合法序列(线上 400 的直接死因)。
+
+    这里绕过 _dispatch_facets 直接把含悬空 assistant 的基座交给 _run_facet_pass,
+    捕获真实进 chat_stream 的 messages —— 断的是"兜底真的在发送口上"。
+    """
+    monkeypatch.setattr(R, "set_current_task", lambda *a, **k: None)
+    monkeypatch.setattr(R, "execute_tool", lambda fn, args: {"ok": 1})
+
+    turns = [
+        [_chunk(content="本面结论", finish="stop")],
+        [_chunk(content="第二迭代", finish="stop")],
+    ]
+
+    class CapturingClient(FakeClient):
+        def __init__(self, turns):
+            super().__init__(turns)
+            self.snapshots = []
+
+        def chat_stream(self, **kwargs):
+            self.snapshots.append([dict(m) for m in kwargs.get("messages", [])])
+            return super().chat_stream(**kwargs)
+
+    client = CapturingClient(turns)
+    facet_tools = R._facet_readonly_tools(R.get_all_tools())
+    allowed = R._facet_allowed_tool_names(facet_tools)
+    dangling_base = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        _assistant_with_calls("tc-dispatch", content="派发分面"),  # 未收口
+    ]
+
+    fr = R._run_facet_pass(
+        _facet(), dangling_base, facet_tools, allowed, client, _Task(),
+        round_idx=1, max_iter=2, executor_command_confirm="always_approve",
+        deadline=time.monotonic() + 60,
+    )
+
+    assert fr.error == "", "悬空基座不该让分面报错"
+    assert client.snapshots, "分面从未发起 LLM 调用,断言形同虚设"
+    first = client.snapshots[0]
+    _assert_tool_calls_fully_answered([first])
+    _assert_tool_msgs_preceded_by_tool_calls([first])
+    # 补的是合成响应(不是把整条 call 丢掉):派发动作仍在序列里留痕
+    assert any(tc["id"] == "tc-dispatch" for m in first
+               for tc in (m.get("tool_calls") or []))
+
+
 def test_dispatch_facets_base_is_closed_sequence(monkeypatch):
     """回归 P0(线上任务 2b38f1ef):派发此刻本轮 assistant(tool_calls)尚未收口,
     原样当基座交给分面子循环 → 子循环第一次 LLM 调用即被 provider 拒 400。
