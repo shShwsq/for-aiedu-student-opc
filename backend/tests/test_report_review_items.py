@@ -17,7 +17,7 @@ def _item(**over):
         review_target="users.py 存在注入", origin="agent1_claim",
         status="covered", verdict="confirmed", severity="high",
         conclusion="读了 src/users.py:42,拼接 SQL 未经参数化,成立。",
-        confidence={"tier": "source_confirmed", "label": "源码取证", "score": 0.78},
+        confidence={"tier": "source_confirmed", "label": "源码取证"},
         evidence={"source": {"file_path": "src/users.py", "line": "42", "quote": "cur.execute(sql)"}},
         evidence_mismatch=False, follow_up="如何把这条查询改成参数化查询?",
     )
@@ -42,6 +42,7 @@ def test_markdown_sections_and_buckets():
     assert "### 待核实 (1)" in text
     # 置信(带证据) + 无证据(未取证,旧文案"未分级"读不出原因)
     assert "源码取证" in text
+    assert "78%" not in text  # 百分比已去掉,只留档位标签
     assert "无证据(未取证)" in text
     assert "原始证据(src/users.py:42)" in text
     # 字段新语义与中文标签

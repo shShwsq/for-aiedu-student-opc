@@ -20,7 +20,7 @@ from typing import Any
 from app.agents.verification_outcome import DEFINITIVE_OUTCOMES, OUTCOME_UNKNOWN
 
 # ============================================================
-# 置信档位(取最高一档成立;score 为该档基线)
+# 置信档位(取最高一档成立)
 # ============================================================
 
 TIER_VERIFIED = "verified"                    # 已动态验证(verify 跑成 PoC)
@@ -34,17 +34,6 @@ TIER_LABELS: dict[str, str] = {
     TIER_REFERENCE: "外部佐证",
     TIER_ASSERTION: "仅断言·待核实",
 }
-
-_TIER_SCORE: dict[str, float] = {
-    TIER_VERIFIED: 0.92,
-    TIER_SOURCE: 0.78,
-    TIER_REFERENCE: 0.68,
-    TIER_ASSERTION: 0.35,
-}
-
-# 多一类佐证加分,封顶(严格 <1.0)
-_CORROBORATION_BONUS = 0.03
-_SCORE_CAP = 0.99
 
 # cat -n 行号前缀(行首可选空白 + 数字 + 分隔),quote 剥离用
 _LINE_NO_PREFIX = re.compile(r"^\s*\d+[\t \u00a0\u2007\u202f]*")
@@ -200,7 +189,7 @@ def score_review_item(
     缺口/无证据者返回 None(confidence 不写)。
 
     返回:
-        {tier, label, score, evidence_validated, evidence_mismatch,
+        {tier, label, evidence_validated, evidence_mismatch,
          verification_outcome, note}
     校验规则:
       ① 非空 call_ref 必须命中台账,否则 evidence_mismatch;
@@ -209,7 +198,7 @@ def score_review_item(
         verify 台账;跑成了但未定论(不可达/未授权/未申报)不抬档也不判 mismatch,
         指向跑失败的台账才判 mismatch(无 verify 环境时不采信也不判 mismatch);
       ④ ref_ok = ref_status=ok 且 authority∈{authoritative,credible} 且 call_ref 指向 reference 台账。
-    取最高一档成立;多一类佐证 +0.03(封顶 <1.0);mismatch 压到 assertion_only,
+    取最高一档成立;mismatch 压到 assertion_only,
     但"false_positive 且 source_ok"例外保底 source_confirmed(误报剔除也要证据)。
     """
     if not isinstance(evidence, dict) or not evidence:
@@ -292,12 +281,6 @@ def score_review_item(
     else:
         tier = TIER_ASSERTION
 
-    # 加分:多一类佐证 +0.03(封顶);mismatch 时不加分
-    corroborations = sum([verified_ok, source_ok, ref_ok])
-    score = _TIER_SCORE[tier]
-    if not mismatch and corroborations > 1:
-        score = min(_SCORE_CAP, score + _CORROBORATION_BONUS * (corroborations - 1))
-
     validated = (not mismatch) and (source_ok or ref_ok or verified_ok)
     if mismatch:
         note = "引用未核验通过,置信下调为仅断言"
@@ -308,7 +291,6 @@ def score_review_item(
     return {
         "tier": tier,
         "label": TIER_LABELS[tier],
-        "score": round(score, 3),
         "evidence_validated": bool(validated),
         "evidence_mismatch": bool(mismatch),
         "verification_outcome": verification_outcome,
@@ -317,7 +299,7 @@ def score_review_item(
 
 
 def derive_confidence_column(score: dict | None) -> dict | None:
-    """从 score_review_item 返回体抽出写入 ReviewItem.confidence 的 {tier,label,score}"""
+    """从 score_review_item 返回体抽出写入 ReviewItem.confidence 的 {tier,label}"""
     if not score:
         return None
-    return {"tier": score["tier"], "label": score["label"], "score": score["score"]}
+    return {"tier": score["tier"], "label": score["label"]}

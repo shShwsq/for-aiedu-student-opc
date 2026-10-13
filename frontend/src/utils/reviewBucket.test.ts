@@ -221,7 +221,7 @@ describe('旧快照兼容(假缺口已被启动迁移删掉)', () => {
   }
 
   const survivors = [
-    item({ bucket: 'established', confidence: { tier: 'source_confirmed', label: '源码取证', score: 0.8 } }),
+    item({ bucket: 'established', confidence: { tier: 'source_confirmed', label: '源码取证' } }),
     item({ bucket: 'not_established' }),
     item({ bucket: 'pending_verify' }),
   ]

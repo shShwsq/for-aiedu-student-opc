@@ -112,4 +112,28 @@ describe('findRetiredCardConvId', () => {
     const record = mkRecord({ reasoning: null, content: '' })
     expect(findRetiredCardConvId(cards, record)).toBeNull()
   })
+
+  it('分面并行:同轮多张 facet 卡片按 stream_conv_id 各自退役不串扰', () => {
+    // 两个分面各一张实时卡(conv_id 唯一),落库记录带自己的 stream_conv_id,
+    // 精确匹配只退役对应那张,另一张继续留在流式区
+    const cards = [
+      mkCard({ conv_id: 'facet-a', reasoning: '注入面思考文本,足够长可参与对账阈值以上。' }),
+      mkCard({ conv_id: 'facet-b', reasoning: '并发面思考文本,足够长可参与对账阈值以上。' }),
+    ]
+    const record = mkRecord({
+      stream_conv_id: 'facet-a',
+      reasoning: '注入面思考文本,足够长可参与对账阈值以上。',
+    })
+    expect(findRetiredCardConvId(cards, record)).toBe('facet-a')
+  })
+
+  it('分面并行:facet 落库记录缺 stream_conv_id 时按文本对账仍可定位对应卡片', () => {
+    const shared = '两个分面共有的一段较长思考文本内容用于文本对账兜底。'
+    const cards = [
+      mkCard({ conv_id: 'facet-a', reasoning: shared }),
+      mkCard({ conv_id: 'facet-b', reasoning: '并发面独有且完全不同的另一段较长思考文本。' }),
+    ]
+    const record = mkRecord({ stream_conv_id: null, reasoning: shared })
+    expect(findRetiredCardConvId(cards, record)).toBe('facet-a')
+  })
 })

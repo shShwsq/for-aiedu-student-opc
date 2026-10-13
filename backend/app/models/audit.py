@@ -165,7 +165,7 @@ class ReviewItem(Base):
     #  analysis_basis{ref_url,ref_status,ref_authority,call_ref},
     #  verification{method,verified,poc_evidence,call_ref}};缺失段=不适用
     evidence: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    # {tier,label,score}(后端派生,非模型自报;仅带证据者有)
+    # {tier,label}(后端派生,非模型自报;仅带证据者有)
     confidence: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     # call_ref 是否全部核验通过
     evidence_validated: Mapped[bool] = mapped_column(

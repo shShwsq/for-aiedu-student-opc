@@ -87,8 +87,9 @@ class Settings(BaseSettings):
     # 已验证的 provider 闸门 + ThreadPoolExecutor 形状,但 worker 不碰共享
     # session/publish(只跑 LLM + 只读工具 + 内存缓冲),fan-in 在主线程逐条做。
     # 真优势:子智能体带原生身份(ACP 侧不带身份导致并行 chunk 交织乱码)。
-    # 默认关,灰度启用(需先确认模型槽位/配额,否则并行只会更快撞 403)。
-    REACT_PARALLEL_ENABLED: bool = False
+    # 默认开;仍受分面阈值(MIN_FACETS)/并发闸门(PROVIDER_MAX_CONCURRENCY)/
+    # 追问轮守卫约束。配额吃紧时运维可在 .env 显式置 False 回退串行。
+    REACT_PARALLEL_ENABLED: bool = True
     # 分面扇出线程数上限(实际取 min(本项, 可见分面数))
     REACT_PARALLEL_MAX_CONCURRENCY: int = 4
     # 可见分面数低于此阈值走原串行路径(小仓库并行反而亏:每子循环 bootstrap
@@ -96,6 +97,9 @@ class Settings(BaseSettings):
     REACT_PARALLEL_MIN_FACETS: int = 3
     # 单个分面子循环的最大迭代次数(有界,防止某一分面跑飞拖垮整轮)
     REACT_FACET_MAX_ITERATIONS: int = 12
+    # 单个分面子循环的墙钟预算(秒):循环每次迭代边界与收 chunk 时协作式检查,
+    # 超时则转入本分面总结收尾(部分结论)并隔离,不拖垮 fan-in 整轮
+    REACT_FACET_TIMEOUT_SECONDS: int = 240
     # 审查链路同厂商(provider+model 归组)全局并发天花板,跨任务共享:
     # 置于分面子循环的 LLM 调用外层,防并行放大并发把配额打爆(本次真凶是 403)
     REACT_PROVIDER_MAX_CONCURRENCY: int = 4

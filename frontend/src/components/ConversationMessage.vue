@@ -26,6 +26,8 @@ interface StreamingItem {
   reasoning_grace?: boolean
   reasoning_pin?: boolean | null
   role?: 'agent1' | 'agent2'
+  /** 仅内置 react 分面并行有:分面名(思考卡据此标注) */
+  facet?: string
 }
 
 interface DisplayItem {
@@ -252,6 +254,10 @@ function formatSize(bytes: number): string {
   <div v-if="showCard" class="msg-group">
     <!-- 流式思考项:reasoning 卡片 + content 卡片,两者独立 -->
     <template v-if="item.is_streaming && item.streaming">
+      <!-- 分面并行身份标(多路思考卡据此区分;无 facet 时不渲染) -->
+      <div v-if="item.streaming.facet" class="msg-facet-badge">
+        分面 · {{ item.streaming.facet }}
+      </div>
       <!-- reasoning 独立卡片(流式中自动展开,结束后折叠) -->
       <div
         v-if="streamingReasoning"
@@ -423,6 +429,18 @@ function formatSize(bytes: number): string {
   color: var(--color-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.05em;
+}
+
+.msg-facet-badge {
+  display: inline-block;
+  margin-bottom: var(--space-1);
+  padding: 1px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text-muted);
+  background: var(--color-msg-header-hover, rgba(120, 120, 120, 0.12));
+  border-radius: var(--radius-sm);
+  letter-spacing: 0.02em;
 }
 
 .msg-reasoning-meta {

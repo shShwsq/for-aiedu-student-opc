@@ -44,7 +44,6 @@ def test_source_confirmed_when_quote_matches():
     assert out["tier"] == TIER_SOURCE
     assert out["evidence_validated"] is True
     assert out["evidence_mismatch"] is False
-    assert out["score"] > 0.5
 
 
 def test_mismatch_when_call_ref_not_in_ledger():
@@ -78,8 +77,6 @@ def test_verified_tier_needs_success_verify_ledger():
     }
     out = score_review_item(ev, "confirmed", ledger, has_repo=True, verify_available=True)
     assert out["tier"] == TIER_VERIFIED
-    # verified + source 两类佐证 → 基线 + 0.03
-    assert out["score"] == round(0.92 + 0.03, 3)
 
 
 def test_not_confirmed_is_definitive_too():
@@ -190,9 +187,9 @@ def test_quote_matches_strips_line_numbers_and_whitespace():
 
 def test_derive_confidence_column():
     assert derive_confidence_column(None) is None
-    sc = {"tier": TIER_SOURCE, "label": "源码取证", "score": 0.78,
+    sc = {"tier": TIER_SOURCE, "label": "源码取证",
           "evidence_validated": True, "evidence_mismatch": False, "note": None}
-    assert derive_confidence_column(sc) == {"tier": TIER_SOURCE, "label": "源码取证", "score": 0.78}
+    assert derive_confidence_column(sc) == {"tier": TIER_SOURCE, "label": "源码取证"}
 
 
 # ============================================================

@@ -56,3 +56,18 @@ def test_prompts_modules_importable_and_nonempty():
     assert verifier.VERIFIER_SYSTEM_PROMPT.strip()
     assert polish.POLISH_SYSTEM_PROMPT.strip()
     assert polish.build_polish_messages("你好")[0]["content"].strip()
+
+
+def test_build_facet_instruction_is_pure_and_tool_neutral():
+    """分面指令层纯函数:零 app.* 依赖(由上方 AST 扫描守门),措辞工具中立。"""
+    from app.prompts import executor
+
+    text = executor.build_facet_instruction("check_sql_injection", "find sqli")
+    assert "check_sql_injection" in text
+    assert "find sqli" in text
+    # 只读约束明示,且不出现改动工具
+    assert "只读工具" in text
+    for mutating in ("write_file", "run_command", "clone_repo"):
+        assert mutating not in text
+    # 空入参不抛(健壮性)
+    assert executor.build_facet_instruction("", "").strip()

@@ -644,6 +644,24 @@ MAX_ITERATION_PROMPT = (
 )
 
 
+def build_facet_instruction(facet_name: str, facet_body: str) -> str:
+    """构造单个分面的只读核查指令(作为分面子循环的独立 system 指令层,不落库不展示)。
+
+    背景:内置 react_agent 分面并行时,每个分面跑一条有界只读 ReAct 子循环。
+    借鉴 codex 的 subagent_developer_instructions 将子 agent 的角色/约束作为独立
+    指令层而非塞进 user 消息 —— 不污染真实用户问题,且便于集中管理/去重。
+    本函数零 app.* 依赖(见 tests/test_prompts_purity.py),措辞工具中立。
+    """
+    return (
+        f"[审查分面:{(facet_name or '').strip()}]\n"
+        "本轮只针对该分面深入核查,不要覆盖其他维度:\n"
+        f"{(facet_body or '').strip()}\n"
+        "只使用只读工具(list_files/read_file/search_code/find_files/"
+        "run_semgrep/run_lint/git_*/query_cve/list_dependencies 等),"
+        "定位到具体文件:行号后给出该分面的完整结论(证据+修复建议)。"
+    )
+
+
 # ============================================================
 # 跨轮历史记忆:Level 2 LLM 压缩
 # ============================================================

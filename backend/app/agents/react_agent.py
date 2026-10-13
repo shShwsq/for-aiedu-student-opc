@@ -46,7 +46,6 @@ from app.user_messages import drain_user_messages, has_pending_messages
 from app.agents.runtime.conversation import record_conversation as _add_conversation
 from app.agents.runtime.constants import MAX_HISTORY_MSG_CHARS
 from app.agents.runtime.llm_stream import (
-    ToolCallAccumulator,
     extract_text_tool_calls as _extract_text_tool_calls,
     strip_tool_call_blocks as _strip_tool_call_blocks,
     stream_llm,
@@ -65,6 +64,7 @@ from app.prompts.executor import (
     REACT_AGENT_SYSTEM_PROMPT,
     SYSTEM_INJECT_MARKER,
     _has_creation_upload,
+    build_facet_instruction,
     build_first_round_question,
     build_history_compress_segments,
     build_repo_context_section,
@@ -322,8 +322,8 @@ def run_react_agent(
                 "steps": current_plan,
             })
 
-    # ---- 分面并行分支(默认关;门控不满足时 _maybe_run_parallel 返回 None,
-    #      下方串行循环完全不变) ----
+    # ---- 分面并行分支(默认开;门控不满足(含追问轮)/显式关闭时
+    #      _maybe_run_parallel 返回 None,下方串行循环完全不变) ----
     parallel_outcome = _maybe_run_parallel(
         task, db, round_idx, client, tools, messages, current_plan,
         executor_command_confirm,
@@ -714,7 +714,8 @@ def run_react_agent(
 # 但把并行边界收得更紧:worker 只跑 LLM + 只读工具 + 内存缓冲,绝不碰共享
 # db session / publish / current_plan(全在 fan-in 主线程逐条做)。子智能体
 # 带原生身份(facet 标签),规避 ACP 侧不带身份导致的并行 chunk 交织乱码。
-# 默认由 REACT_PARALLEL_ENABLED 关闭,门控不满足时原串行循环完全不变。
+# 默认由 REACT_PARALLEL_ENABLED 开启,门控不满足(开关关/追问轮/分面数不足)时
+# 原串行循环完全不变。
 # ============================================================
 
 # 会改动工作区/沙箱物理状态的工具:并行分面一律禁用(共享工作区不可并发写)。
@@ -722,6 +723,10 @@ def run_react_agent(
 _FACET_MUTATING_TOOLS: frozenset[str] = frozenset({
     "clone_repo", "write_file", "run_python_code", "run_command", "str_replace_editor",
 })
+
+# 收尾轮(loop-break / max-iter / timeout)的墙钟宽限(秒):对已到期的
+# deadline 再叠一段宽限,保证收尾这一发 LLM 能真正吏出总结而非被 stop_check 秒停。
+_FACET_FINALIZE_GRACE_SECONDS = 90
 
 # 审查链路厂商级并发闸门(按 provider+model 归组,跨任务共享)
 _review_provider_gates: dict[str, tuple[int, threading.BoundedSemaphore]] = {}
@@ -767,36 +772,36 @@ def _facet_allowed_tool_names(tools: list[dict[str, Any]]) -> set[str]:
     return {(t.get("function") or {}).get("name") for t in tools} - {None}
 
 
-def _silent_stream_turn(
+def _facet_stream_turn(
     client: LLMClient,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
-) -> tuple[str, str, list[dict[str, Any]], str | None]:
-    """无副作用的流式 LLM 调用:收 chunk 但不 publish、不落库。
+    *,
+    task: Task,
+    round_idx: int,
+    facet: str,
+    iteration: int,
+    deadline: float,
+) -> tuple[str, str, list[dict[str, Any]], str | None, str]:
+    """分面实时流式调用:边收 chunk 边 publish 带 facet 身份的 thinking_delta,
+    累积 reasoning/content/tool_calls,不落库、不碰 current_plan。
 
-    并行分面用它替代 stream_llm —— 后者每 token 都 publish 到同一条 SSE,
-    多路并发会交织。这里只在内存累积 reasoning/content/tool_calls,fan-in
-    时再作为带 facet 标签的完整 conversation 一次性落库+推送。LLM 调用置于
-    厂商闸门内,防并行放大并发把配额打爆。
+    与主循环共用 stream_llm(同一条 thinking_delta 通道),但:
+    ① extra 带 facet/parallel 身份,前端按每次调用唯一的 conv_id 天然分桶,
+       规避多路并行交织(ACP 侧正因不带身份才乱码);工具类行不实时、仍走 fan-in。
+    ② 外包厂商闸门限并发,防并行放大把配额打爆;
+    ③ deadline 逐 chunk 协作式收流(stop_check),超时返回部分输出。
+    返回 (reasoning, content, tool_calls, finish_reason, conv_id)。
     """
-    reasoning = ""
-    content = ""
-    finish_reason: str | None = None
-    acc = ToolCallAccumulator()
     with _review_provider_gate(client):
-        for chunk in client.chat_stream(
-            messages=messages, tools=tools,
-            tool_choice="auto", max_tokens=4096,
-        ):
-            if chunk.reasoning_delta:
-                reasoning += chunk.reasoning_delta
-            if chunk.content_delta:
-                content += chunk.content_delta
-            if chunk.tool_call_deltas:
-                acc.add(chunk.tool_call_deltas)
-            if chunk.finish_reason:
-                finish_reason = chunk.finish_reason
-    return reasoning, content, acc.tool_calls, finish_reason
+        res = stream_llm(
+            client, messages,
+            task_id=task.id, round_idx=round_idx, role="agent1",
+            tools=tools, iteration=iteration,
+            extra={"facet": facet, "parallel": True},
+            stop_check=lambda: time.monotonic() > deadline,
+        )
+    return res.reasoning, res.content, res.tool_calls, res.finish_reason, res.conv_id
 
 
 @dataclass
@@ -804,12 +809,16 @@ class _FacetResult:
     """单个分面子循环的产物(纯内存,由 fan-in 主线程负责落库)。
 
     pending_rows: 顺序的待落库对话行 {role,type,content,reasoning?},
-        tool_call/tool_result 相邻成对(fan-in 按邻接补 tool_call_id)。
+        tool_call/tool_result 相邻成对(fan-in 按邻接补 tool_call_id);
+        thinking 行额外带 stream_conv_id(实时流式卡片的 conv_id,fan-in
+        据此把实时卡退役成历史卡)。
+    timed_out: 本分面是否因墙钟预算超时收尾(部分结论)。
     """
     facet: str
     summary: str = ""
     pending_rows: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
+    timed_out: bool = False
 
 
 def _run_facet_pass(
@@ -822,11 +831,15 @@ def _run_facet_pass(
     round_idx: int,
     max_iter: int,
     executor_command_confirm: str,
+    deadline: float,
 ) -> _FacetResult:
     """跑一个分面的有界只读 ReAct 子循环(在 worker 线程执行,全程无共享副作用)。
 
     与主循环同机制(LLM→只读工具→再思考直到 stop),但:独立 set_current_task
-    (ContextVar per-thread)、只读工具、无 publish/无 db、pending_rows 缓冲。
+    (ContextVar per-thread)、只读工具、无 db、pending_rows 缓冲;thinking 实时
+    流式(带 facet 身份),工具类行仅缓存待 fan-in 落库。
+    deadline:本分面的墙钟上界(time.monotonic() 基准),循环边界与收 chunk
+    都协作式检查,超时转入总结收尾(部分结论)并置 timed_out,不拖垮 fan-in 整轮。
     """
     facet_name = getattr(facet, "name", str(facet))
     facet_body = getattr(facet, "body", "") or ""
@@ -841,23 +854,58 @@ def _run_facet_pass(
             executor_command_confirm=executor_command_confirm,
         )
         messages: list[dict[str, Any]] = [dict(m) for m in base_messages]
+        # 分面角色/约束作为独立 system 指令层(不污染真实用户问题)
         messages.append({
-            "role": "user",
-            "content": (
-                f"[审查分面:{facet_name}]\n"
-                f"本轮只针对该分面深入核查,不要覆盖其他维度:\n"
-                f"{facet_body}\n"
-                "只使用只读工具(list_files/read_file/search_code/find_files/"
-                "run_semgrep/run_lint/git_*/query_cve/list_dependencies 等),"
-                "定位到具体文件:行号后给出该分面的完整结论(证据+修复建议)。"
-            ),
+            "role": "system",
+            "content": build_facet_instruction(facet_name, facet_body),
         })
 
         recent_calls: list[str] = []
         summary = ""
+
+        def _finalize_turn(prompt_text: str, notice: str | None, it: int) -> None:
+            """收尾轮(loop-break / max-iter / timeout 共用)。
+
+            可选先落一条 notice 思考行,注入收尾提示后再跑一次流式产出总结。
+            用独立宽限 deadline(time.monotonic()+_FACET_FINALIZE_GRACE_SECONDS)
+            保证即便主预算已到期这一发也能真正吏出总结而非被 stop_check 秒停。
+            """
+            nonlocal summary
+            if notice:
+                result.pending_rows.append({
+                    "role": "agent1", "type": "thinking",
+                    "content": notice, "reasoning": "",
+                })
+            messages.append({"role": "user", "content": prompt_text})
+            finalize_deadline = time.monotonic() + _FACET_FINALIZE_GRACE_SECONDS
+            try:
+                _r, c, _tc, _f, cid = _facet_stream_turn(
+                    client, messages, facet_tools,
+                    task=task, round_idx=round_idx, facet=facet_name,
+                    iteration=it, deadline=finalize_deadline,
+                )
+            except Exception:
+                return
+            if c:
+                summary = c
+                result.pending_rows.append({
+                    "role": "agent1", "type": "thinking",
+                    "content": c, "reasoning": _r, "stream_conv_id": cid,
+                })
+
         for _it in range(1, max_iter + 1):
-            reasoning, content, tool_calls, finish = _silent_stream_turn(
+            # 超时守卫:循环边界先查预算,命中即转总结收尾(不再开新回合)
+            if time.monotonic() > deadline:
+                result.timed_out = True
+                _finalize_turn(
+                    MAX_ITERATION_PROMPT,
+                    "检测到达到时间预算,强制转入本分面总结", _it,
+                )
+                break
+            reasoning, content, tool_calls, _finish, conv_id = _facet_stream_turn(
                 client, messages, facet_tools,
+                task=task, round_idx=round_idx, facet=facet_name,
+                iteration=_it, deadline=deadline,
             )
             # Hermes 风格文本 tool_call 兜底(部分模型把调用写进正文)
             if not tool_calls and content:
@@ -867,6 +915,7 @@ def _run_facet_pass(
             result.pending_rows.append({
                 "role": "agent1", "type": "thinking",
                 "content": content, "reasoning": reasoning,
+                "stream_conv_id": conv_id,
             })
             messages.append({"role": "assistant", "content": content})
 
@@ -905,35 +954,13 @@ def _run_facet_pass(
                 len(recent_calls) >= MAX_SAME_CALLS
                 and len(set(recent_calls[-MAX_SAME_CALLS:])) == 1
             ):
-                result.pending_rows.append({
-                    "role": "agent1", "type": "thinking",
-                    "content": "检测到调用循环,强制转入本分面总结", "reasoning": "",
-                })
-                messages.append({"role": "user", "content": LOOP_BREAK_PROMPT})
-                try:
-                    _r, c, _tc, _f = _silent_stream_turn(client, messages, facet_tools)
-                    if c:
-                        summary = c
-                        result.pending_rows.append({
-                            "role": "agent1", "type": "thinking",
-                            "content": c, "reasoning": _r,
-                        })
-                except Exception:
-                    pass
+                _finalize_turn(
+                    LOOP_BREAK_PROMPT, "检测到调用循环,强制转入本分面总结", _it,
+                )
                 break
         else:
             # 跑满迭代:请模型就本分面输出总结
-            messages.append({"role": "user", "content": MAX_ITERATION_PROMPT})
-            try:
-                _r, c, _tc, _f = _silent_stream_turn(client, messages, facet_tools)
-                if c:
-                    summary = c
-                    result.pending_rows.append({
-                        "role": "agent1", "type": "thinking",
-                        "content": c, "reasoning": _r,
-                    })
-            except Exception:
-                pass
+            _finalize_turn(MAX_ITERATION_PROMPT, None, max_iter)
         result.summary = summary
     except Exception as e:  # 单分面失败不拖垮整轮
         logger.exception(f"[task={task.id}] 分面 {facet_name} 子循环失败")
@@ -947,13 +974,16 @@ def _resolve_facets(task: Task) -> list[Any]:
     return list(skill_loader.resolve_visible_skills(task.user_id, task.allowed_skills))
 
 
-def _parallel_gate(task: Task) -> list[Any] | None:
+def _parallel_gate(task: Task, round_idx: int) -> list[Any] | None:
     """是否走分面并行;返回分面列表或 None(None=走原串行路径)。
 
-    门控:开关关 / 分面数 < MIN_FACETS → None。小仓库并行 bootstrap 与上下文
+    门控:开关关 / 追问轮(round_idx>1)/ 分面数 < MIN_FACETS → None。追问轮走
+    定向串行作答(不重新全量扇出);小仓库并行 bootstrap 与上下文
     复制成本高于串行收益,故按分面数阈值降级。
     """
     if not getattr(settings, "REACT_PARALLEL_ENABLED", False):
+        return None
+    if round_idx > 1:
         return None
     facets = _resolve_facets(task)
     if len(facets) < max(2, getattr(settings, "REACT_PARALLEL_MIN_FACETS", 3)):
@@ -981,12 +1011,17 @@ def _fan_in(
                 content=row.get("content") or "",
                 reasoning=row.get("reasoning"),
                 tool_call_id=tool_call_id,
+                stream_conv_id=row.get("stream_conv_id"),
                 extra_payload={"facet": fr.facet, "parallel": True},
             )
             if row["type"] == "tool_call":
                 last_call_id = str(conv.id)
         if fr.error:
             summaries.append(f"### {fr.facet}\n(该分面审查失败:{fr.error})")
+        elif fr.timed_out:
+            summaries.append(
+                f"### {fr.facet}\n{fr.summary or '(本分面无明确结论)'}\n(部分结论,已超时收尾)"
+            )
         else:
             summaries.append(f"### {fr.facet}\n{fr.summary or '(本分面无明确结论)'}")
     return "\n\n".join(summaries) if summaries else "执行完成"
@@ -1005,7 +1040,7 @@ def _maybe_run_parallel(
     """门控 + 扇出/扇入。命中并行返回 (results, summary, final_plan);
     否则返回 None(调用方继续走原串行循环)。final_plan 沿用入参 current_plan
     (Phase 1:分面专注只读分析,不驱动 plan 推进)。"""
-    facets = _parallel_gate(task)
+    facets = _parallel_gate(task, round_idx)
     if not facets:
         return None
 
@@ -1013,10 +1048,13 @@ def _maybe_run_parallel(
     allowed_names = _facet_allowed_tool_names(facet_tools)
     max_workers = min(len(facets), max(1, settings.REACT_PARALLEL_MAX_CONCURRENCY))
     max_iter = max(1, settings.REACT_FACET_MAX_ITERATIONS)
+    # 统一算一次扇出基准 deadline(墙钟预算),贯穿所有分面
+    deadline = time.monotonic() + max(1, settings.REACT_FACET_TIMEOUT_SECONDS)
 
     logger.info(
         f"[task={task.id}] react_agent 分面并行启动:{len(facets)} 分面,"
-        f"max_workers={max_workers},max_iter/面={max_iter}"
+        f"max_workers={max_workers},max_iter/面={max_iter},"
+        f"timeout/面={settings.REACT_FACET_TIMEOUT_SECONDS}s"
     )
     # 扇出前暂停检查点(长工具链中也能及时响应暂停)
     wait_if_paused(task.id)
@@ -1031,6 +1069,7 @@ def _maybe_run_parallel(
             pool.submit(
                 _run_facet_pass, f, messages, facet_tools, allowed_names,
                 client, task, round_idx, max_iter, executor_command_confirm,
+                deadline,
             )
             for f in facets
         ]

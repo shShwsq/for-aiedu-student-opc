@@ -4,9 +4,12 @@
 - _facet_readonly_tools / _facet_allowed_tool_names:只读子集剔除改动工具
 - _review_provider_gate:按 provider+model 归组的并发天花板
 - _run_facet_pass:有界只读子循环 —— 只读工具执行、改动工具被拒、pending_rows
-  形状、summary 捕获、单分面异常隔离(不抛)
-- _fan_in:主线程串行落库 —— 分面顺序、tool_result 邻接补 tool_call_id、facet 标签
-- _parallel_gate:开关关闭 / 分面数不足 → 回落串行(返回 None)
+  形状、summary 捕获、单分面异常隔离(不抛)、墙钟超时转总结收尾(timed_out)、
+  分面角色作为独立 system 指令层
+- _facet_stream_turn:发布 facet-tagged thinking_delta + conv_id 每次调用唯一
+- _fan_in:主线程串行落库 —— 分面顺序、tool_result 邻接补 tool_call_id、facet 标签、
+  stream_conv_id 透传(实时卡退役)、超时分面小标题
+- _parallel_gate:开关关闭 / 追问轮 / 分面数不足 → 回落串行(返回 None)
 """
 import threading
 import time
@@ -149,6 +152,7 @@ def test_facet_pass_executes_readonly_and_captures_summary(monkeypatch):
     fr = R._run_facet_pass(
         _facet(), base_messages, facet_tools, allowed, client, _Task(),
         round_idx=1, max_iter=5, executor_command_confirm="always_approve",
+        deadline=time.monotonic() + 60,
     )
 
     assert fr.error == ""
@@ -158,6 +162,8 @@ def test_facet_pass_executes_readonly_and_captures_summary(monkeypatch):
     # pending_rows 顺序:thinking → tool_call → tool_result → thinking
     types = [r["type"] for r in fr.pending_rows]
     assert types == ["thinking", "tool_call", "tool_result", "thinking"]
+    # 每条 thinking 行都带实时流式卡片的 stream_conv_id(fan-in 据此退役实时卡)
+    assert all(r.get("stream_conv_id") for r in fr.pending_rows if r["type"] == "thinking")
 
 
 def test_facet_pass_blocks_mutating_tool(monkeypatch):
@@ -182,6 +188,7 @@ def test_facet_pass_blocks_mutating_tool(monkeypatch):
         _facet("review_concurrency"), [{"role": "system", "content": "s"}],
         facet_tools, allowed, client, _Task(),
         round_idx=1, max_iter=5, executor_command_confirm="always_approve",
+        deadline=time.monotonic() + 60,
     )
 
     assert executed == []  # 改动工具从未执行
@@ -201,6 +208,7 @@ def test_facet_pass_isolates_llm_error(monkeypatch):
     fr = R._run_facet_pass(
         _facet(), [{"role": "system", "content": "s"}], facet_tools, allowed,
         BoomClient([]), _Task(), round_idx=1, max_iter=3, executor_command_confirm="always_approve",
+        deadline=time.monotonic() + 60,
     )
     # 异常被吞进 result.error,不抛出(单分面失败不拖垮整轮)
     assert "provider 500" in fr.error
@@ -222,11 +230,12 @@ def test_fan_in_order_adjacency_and_facet_tag(monkeypatch):
             self.id = f"conv-{_Conv._n}"
 
     def fake_add(db, task, *, round_idx, role, type, content, reasoning=None,
-                 tool_call_id=None, extra_payload=None):
+                 tool_call_id=None, extra_payload=None, stream_conv_id=None):
         c = _Conv()
         recorded.append({
             "type": type, "role": role, "tool_call_id": tool_call_id,
             "facet": (extra_payload or {}).get("facet"),
+            "stream_conv_id": stream_conv_id,
             "id": c.id,
         })
         return c
@@ -279,14 +288,22 @@ def test_fan_in_reports_facet_error(monkeypatch):
 def test_gate_disabled_returns_none(monkeypatch):
     monkeypatch.setattr(settings, "REACT_PARALLEL_ENABLED", False)
     monkeypatch.setattr(R, "_resolve_facets", lambda task: [_facet()] * 5)
-    assert R._parallel_gate(_Task()) is None
+    assert R._parallel_gate(_Task(), 1) is None
+
+
+def test_gate_followup_round_returns_none(monkeypatch):
+    # 追问轮(round_idx>1)回退串行:不重新全量扇出(默认开启前的遗留守卫)
+    monkeypatch.setattr(settings, "REACT_PARALLEL_ENABLED", True)
+    monkeypatch.setattr(settings, "REACT_PARALLEL_MIN_FACETS", 3)
+    monkeypatch.setattr(R, "_resolve_facets", lambda task: [_facet()] * 5)
+    assert R._parallel_gate(_Task(), 2) is None
 
 
 def test_gate_too_few_facets_returns_none(monkeypatch):
     monkeypatch.setattr(settings, "REACT_PARALLEL_ENABLED", True)
     monkeypatch.setattr(settings, "REACT_PARALLEL_MIN_FACETS", 3)
     monkeypatch.setattr(R, "_resolve_facets", lambda task: [_facet()] * 2)
-    assert R._parallel_gate(_Task()) is None
+    assert R._parallel_gate(_Task(), 1) is None
 
 
 def test_gate_enough_facets_returns_list(monkeypatch):
@@ -294,5 +311,154 @@ def test_gate_enough_facets_returns_list(monkeypatch):
     monkeypatch.setattr(settings, "REACT_PARALLEL_MIN_FACETS", 3)
     facets = [_facet(name=f"f{i}") for i in range(3)]
     monkeypatch.setattr(R, "_resolve_facets", lambda task: facets)
-    out = R._parallel_gate(_Task())
+    out = R._parallel_gate(_Task(), 1)
     assert out is not None and len(out) == 3
+
+
+# ============================================================
+# 分面超时:墙钟预算到期转总结收尾(部分结论)且不拖垮整轮
+# ============================================================
+
+
+def test_facet_pass_timeout_isolates_and_summarizes(monkeypatch):
+    monkeypatch.setattr(R, "set_current_task", lambda *a, **k: None)
+    monkeypatch.setattr(R, "execute_tool", lambda fn, args: {})
+    # 唯一一段脚本给超时后的收尾轮(_finalize_turn 用独立宽限 deadline)
+    turns = [[_chunk(content="超时前抓到的部分结论", finish="stop")]]
+    client = FakeClient(turns)
+    facet_tools = R._facet_readonly_tools(R.get_all_tools())
+    allowed = R._facet_allowed_tool_names(facet_tools)
+
+    fr = R._run_facet_pass(
+        _facet(), [{"role": "system", "content": "s"}], facet_tools, allowed,
+        client, _Task(), round_idx=1, max_iter=5,
+        executor_command_confirm="always_approve",
+        deadline=time.monotonic() - 1,  # 已过期:循环首边界即命中
+    )
+
+    assert fr.timed_out is True
+    assert fr.error == ""
+    assert fr.summary == "超时前抓到的部分结论"
+    # pending_rows 含超时提示行 + 总结行(总结行带 stream_conv_id)
+    assert any("时间预算" in (r.get("content") or "") for r in fr.pending_rows)
+    assert fr.pending_rows[-1].get("stream_conv_id")
+
+
+# ============================================================
+# 分面独立指令层:角色约束作为 system 指令而非 user 消息
+# ============================================================
+
+
+def test_facet_pass_injects_system_facet_instruction(monkeypatch):
+    monkeypatch.setattr(R, "set_current_task", lambda *a, **k: None)
+    captured: list[list[dict]] = []
+
+    def fake_turn(client, messages, tools, **kw):
+        captured.append(list(messages))
+        return ("", "本分面结论", [], "stop", "cid-1")
+
+    monkeypatch.setattr(R, "_facet_stream_turn", fake_turn)
+    facet_tools = R._facet_readonly_tools(R.get_all_tools())
+    allowed = R._facet_allowed_tool_names(facet_tools)
+
+    fr = R._run_facet_pass(
+        _facet(body="find sqli"),
+        [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}],
+        facet_tools, allowed, object(), _Task(), round_idx=1, max_iter=5,
+        executor_command_confirm="always_approve",
+        deadline=time.monotonic() + 60,
+    )
+
+    assert fr.summary == "本分面结论"
+    sys_msgs = [m for m in captured[0] if m["role"] == "system"]
+    # 分面指令作为独立 system 层下发,不污染真实 user 问题
+    assert any(
+        "审查分面" in m["content"] and "check_sql_injection" in m["content"]
+        for m in sys_msgs
+    )
+    assert not any(
+        "审查分面" in m["content"] for m in captured[0] if m["role"] == "user"
+    )
+
+
+# ============================================================
+# _facet_stream_turn:发布 facet-tagged thinking_delta + conv_id 唯一
+# ============================================================
+
+
+def test_facet_stream_turn_publishes_facet_tagged_delta(monkeypatch):
+    import app.agents.runtime.llm_stream as LS
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        LS, "publish",
+        lambda task_id, etype, data: events.append((etype, data)),
+    )
+    client = FakeClient([[_chunk(reasoning="想", content="答", finish="stop")]])
+
+    r, c, tool_calls, finish, cid = R._facet_stream_turn(
+        client, [{"role": "system", "content": "s"}], None,
+        task=_Task(), round_idx=1, facet="check_sql_injection",
+        iteration=2, deadline=time.monotonic() + 60,
+    )
+
+    assert r == "想" and c == "答" and finish == "stop" and cid
+    deltas = [d for e, d in events if e == "thinking_delta"]
+    assert deltas
+    assert all(d.get("facet") == "check_sql_injection" for d in deltas)
+    assert all(d.get("parallel") is True for d in deltas)
+    assert any(d.get("phase") == "start" for d in deltas)
+    assert any(d.get("phase") == "end" for d in deltas)
+
+
+def test_facet_stream_turn_conv_id_unique_per_call(monkeypatch):
+    monkeypatch.setattr("app.agents.runtime.llm_stream.publish", lambda *a, **k: None)
+    client = FakeClient([
+        [_chunk(content="a", finish="stop")],
+        [_chunk(content="b", finish="stop")],
+    ])
+    task = _Task()
+    _, _, _, _, cid1 = R._facet_stream_turn(
+        client, [{"role": "system", "content": "s"}], None,
+        task=task, round_idx=1, facet="f", iteration=1,
+        deadline=time.monotonic() + 60,
+    )
+    _, _, _, _, cid2 = R._facet_stream_turn(
+        client, [{"role": "system", "content": "s"}], None,
+        task=task, round_idx=1, facet="f", iteration=2,
+        deadline=time.monotonic() + 60,
+    )
+    # 每分面每次调用唯一 conv_id,前端据此天然分桶不串扰
+    assert cid1 != cid2
+
+
+# ============================================================
+# fan-in:stream_conv_id 透传 + 超时小标题
+# ============================================================
+
+
+def test_fan_in_forwards_stream_conv_id(monkeypatch):
+    recorded: list[dict] = []
+    monkeypatch.setattr(
+        R, "_add_conversation",
+        lambda db, task, **kw: recorded.append(kw) or SimpleNamespace(id="x"),
+    )
+    fr = R._FacetResult(
+        facet="A", summary="A结论",
+        pending_rows=[{
+            "role": "agent1", "type": "thinking",
+            "content": "想A", "reasoning": "r", "stream_conv_id": "sc-1",
+        }],
+    )
+    R._fan_in(_Task(), object(), 1, [fr])
+    assert recorded[0]["stream_conv_id"] == "sc-1"
+    assert recorded[0]["extra_payload"] == {"facet": "A", "parallel": True}
+
+
+def test_fan_in_labels_timed_out_facet(monkeypatch):
+    monkeypatch.setattr(
+        R, "_add_conversation", lambda *a, **k: SimpleNamespace(id="x"),
+    )
+    fr = R._FacetResult(facet="T", summary="部分结论", timed_out=True)
+    summary = R._fan_in(_Task(), object(), 1, [fr])
+    assert "部分结论,已超时收尾" in summary

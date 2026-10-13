@@ -149,7 +149,6 @@ export type ConfidenceTier =
 export interface ReviewConfidence {
   tier: ConfidenceTier
   label: string
-  score: number
 }
 
 /** 证据链三段(缺段=不适用),各段可带 call_ref 指向取证台账 */
@@ -294,6 +293,12 @@ export interface Conversation {
    * 其他消息/历史数据为 null
    */
   attachments?: AttachmentInfo[] | null
+  /**
+   * 仅内置 react 分面并行的 agent1 思考/工具有:分面名(skill 名)。
+   * 随 conversation 事件的 extra_payload 下发(会话内可见);
+   * 快照刷新(GET /tasks/{id})不含(后端未持久化),退化为无标签。
+   */
+  facet?: string | null
   created_at: string
 }
 
@@ -409,6 +414,10 @@ export interface ConversationEventData {
    * 老任务/老后端为 undefined,文本对账仍可用。
    */
   stream_conv_id?: string | null
+  /** 仅内置 react 分面并行有:分面名(随 extra_payload 下发) */
+  facet?: string | null
+  /** 仅分面并行落库的项有:标记来自并行扇出 */
+  parallel?: boolean
   created_at: string | null
 }
 
@@ -482,6 +491,11 @@ export interface ThinkingDeltaEventData {
    * true 时前端显示"正在验证"而非"正在评估"。
    */
   verify?: boolean
+  /**
+   * 仅内置 react 分面并行的思考流有:分面名(skill 名)。
+   * 前端据此在思考卡标题区标注“分面 · X”,多路并行时区分各路。
+   */
+  facet?: string
 }
 
 /** done/error 事件 data */

@@ -1523,9 +1523,7 @@ def _review_confidence_str(it) -> str:
     if not conf:
         # 无证据 = 未取到证(待核实档的常态),旧文案"未分级"读不出原因
         return "无证据(未取证)"
-    label = conf.get("label", "无证据")
-    score = conf.get("score")
-    return f"{label}({score:.0%})" if isinstance(score, (int, float)) else label
+    return conf.get("label") or "无证据"
 
 
 def _review_item_meta_str(it) -> str:
