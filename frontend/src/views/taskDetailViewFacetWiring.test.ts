@@ -11,7 +11,9 @@
  * 4. 思考卡在 facet 存在且块内未标身份时渲染"子任务 · X"标签,无 facet(串行/老任务)不渲染;
  * 5. 类型契约:ThinkingDeltaEventData / ConversationEventData 均带可选 facet;
  * 6. 每个子任务聚合成一个可折叠块:运行中默认展开(正文 max-height 内滚),
- *    fan-in 落库后整块自动折叠,手动点标题可覆盖自动规则。
+ *    fan-in 落库后整块自动折叠,手动点标题可覆盖自动规则;
+ * 7. 块嵌在所属执行过程组内部(不是组外的兄弟段),且子任务轨的新思考不得
+ *    覆盖上一段(归档缺失 = 块内只剩最后一段思考,历史行同样中招)。
  */
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -20,6 +22,8 @@ import { describe, expect, it } from 'vitest'
 const VIEW = readFileSync(resolve(process.cwd(), 'src/views/TaskDetailView.vue'), 'utf-8')
 const MSG = readFileSync(resolve(process.cwd(), 'src/components/ConversationMessage.vue'), 'utf-8')
 const TYPES = readFileSync(resolve(process.cwd(), 'src/types/task.ts'), 'utf-8')
+// 子任务块 markup 已抽成组件(供 step-body 多锚点复用),模板/样式锚点换到该文件
+const SUBTASK = readFileSync(resolve(process.cwd(), 'src/components/SubtaskBlock.vue'), 'utf-8')
 
 /** 取定位串之后的一段源码(找不到定位串就直接失败,免得断言空跑) */
 function sliceFrom(src: string, anchor: string, chars = 2000): string {
@@ -79,6 +83,15 @@ describe('子任务块:整块聚合 + 运行中展开 / 完成自动折叠', () 
       .toContain('afterMainIdx: iterCounter')
   })
 
+  it('子任务轨归档上一段(否则新思考覆盖旧思考,块内只剩最后一段)', () => {
+    expect(VIEW).toContain('const closeTrack = (t: FacetTrack)')
+    // closeTracks 复用单轨归档,不双份实现
+    expect(sliceFrom(VIEW, 'const closeTracks = (', 200)).toContain('closeTrack(t)')
+    // 关键:facet 思考开新迭代前先归档上一段(与主轨 closeCurrent 对称)
+    const branch = sliceFrom(VIEW, 'if (isReactThinkingItem(item)) {', 500)
+    expect(branch).toContain('closeTrack(t)')
+  })
+
   it('派发工具的 tool_result 按 tool_call_id 认领回主轨(否则漏进子任务块)', () => {
     const fn = sliceFrom(VIEW, 'function claimBackByToolCallId(')
     expect(fn).toContain('item.tool_call_id')
@@ -89,11 +102,42 @@ describe('子任务块:整块聚合 + 运行中展开 / 完成自动折叠', () 
     )
   })
 
-  it('模板新增 subtask 分支:标题「子任务 · X」+ max-height 内滚正文', () => {
-    const tpl = sliceFrom(VIEW, `v-else-if="seg.kind === 'subtask'"`, 1400)
+  it('子任务块 markup 在 SubtaskBlock 组件里:标题「子任务 · X」+ max-height 内滚正文', () => {
+    const tpl = sliceFrom(SUBTASK, 'class="subtask-header"', 1400)
     expect(tpl).toContain('子任务 · {{ seg.label }}')
     expect(tpl).toContain('class="subtask-body"')
-    expect(VIEW).toContain('max-height: min(60vh, 560px)')
+    expect(SUBTASK).toContain('max-height: min(60vh, 560px)')
+    // 块内思考卡不再重复身份标(身份由块标题承载)
+    expect(SUBTASK).toContain('hide-facet-badge')
+  })
+
+  it('子任务块嵌在执行过程组内部,不再作 round 级兄弟段', () => {
+    // 组体携带嵌套子块的两个字段
+    expect(sliceFrom(VIEW, 'interface StepGroup {', 1400)).toContain('subtasksByIter: Map<number, SubtaskSegment[]>')
+    expect(sliceFrom(VIEW, 'interface StepGroup {', 1400)).toContain('tailSubtasks: SubtaskSegment[]')
+    // 两个组构造点都必须初始化(漏一个 = 运行时 undefined)
+    expect(VIEW.match(/subtasksByIter: new Map\(\),/g)).toHaveLength(2)
+    expect(VIEW.match(/tailSubtasks: \[\],/g)).toHaveLength(2)
+    // 按锚点定位渲染(0 = 首个迭代之前),非简单 append
+    expect(VIEW).toContain('function subtasksAfter(group: StepGroup, iterIdx: number)')
+    // 组体内出现子块,且 round 级模板分枝已删
+    // 切片放到 4200:step-body 内要一直读到组尾的 tailSubtasks 兜底块
+    const body = sliceFrom(VIEW, 'class="step-body"', 4200)
+    expect(body).toContain('<SubtaskBlock')
+    expect(body).toContain('seg.tailSubtasks')
+    expect(VIEW).not.toContain(`v-else-if="seg.kind === 'subtask'"`)
+  })
+
+  it('含 live 子任务的组保持展开(嵌套后子块可见性受所属组约束)', () => {
+    expect(VIEW).toContain('function groupHasLiveSubtask(group: StepGroup): boolean')
+    const pass = sliceFrom(VIEW, 'const subLive = groupHasLiveSubtask(g)', 400)
+    expect(pass).toContain('g.hasStreaming = true')
+    expect(pass).toContain('leadingGroup || subLive')
+    // 子任务灌组必须在前沿组判定之前(live 要计入嵌套子块)
+    const attach = VIEW.indexOf('group.subtasksByIter.set(anchor, list)')
+    const live = VIEW.indexOf('const subLive = groupHasLiveSubtask(g)')
+    expect(attach).toBeGreaterThanOrEqual(0)
+    expect(live).toBeGreaterThan(attach)
   })
 
   it('v-for key 对 subtask 单独分支(否则 seg.item 为 undefined 会崩)', () => {

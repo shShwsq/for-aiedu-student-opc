@@ -31,6 +31,7 @@ import DetailCardDrawer from '@/components/DetailCardDrawer.vue'
 import SuggestionCards from '@/components/SuggestionCards.vue'
 import ConversationMessage from '@/components/ConversationMessage.vue'
 import IterationBody from '@/components/IterationBody.vue'
+import SubtaskBlock from '@/components/SubtaskBlock.vue'
 import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
 import UserMessageInput from '@/components/UserMessageInput.vue'
 import TaskRuntimeSettings from '@/components/TaskRuntimeSettings.vue'
@@ -1626,6 +1627,10 @@ interface StepGroup {
   live: boolean
   /** 该 step 内的平铺消息(如用户追问/回答,位于组内迭代边界;含此消息的组默认展开) */
   plains: PlainSegment[]
+  /** 组内嵌套的子任务块:key = 主轨迭代序号(渲染在该迭代之后),key = 0 表示首个迭代之前 */
+  subtasksByIter: Map<number, SubtaskSegment[]>
+  /** 锚点解析不到组时的兜底子任务块(渲染在组尾,理论不可达) */
+  tailSubtasks: SubtaskSegment[]
 }
 
 /** 结论段:该轮 agent1 的最终回答(最后一个纯思考迭代),轮闭合后提出组外,
@@ -1657,7 +1662,7 @@ interface SubtaskSegment {
   /** 是否已有落库产物(块内存在非流式行)→ 自动折叠的判据:
    *  子任务思考间隙(思考已结束、工具行未实时下发)只有流式卡,不会误判为完成而频闪 */
   hasResult: boolean
-  /** 归属锚点:该子任务首现时已完成的主轨迭代序号(放置到对应 step 组之后) */
+  /** 归属锚点:该子任务首现时已完成的主轨迭代序号(嵌在对应 step 组内、渲染在该迭代之后) */
   afterMainIdx: number
 }
 
@@ -1848,6 +1853,22 @@ function stripItemReasoning(item: DisplayItem): DisplayItem {
   return { ...item, id: `${item.id}-body`, reasoning: null }
 }
 
+/** 组内是否嵌了仍在运行的子任务块:决定所属执行过程组要不要保持展开。
+ *  子任务块只在组体(.step-body)内渲染,组收起就把运行中的子任务一起藏了,
+ *  所以 live 子任务必须参与组的 live / hasStreaming 判定 */
+function groupHasLiveSubtask(group: StepGroup): boolean {
+  for (const list of group.subtasksByIter.values()) {
+    if (list.some((s) => s.live)) return true
+  }
+  return group.tailSubtasks.some((s) => s.live)
+}
+
+/** 筛选 step 组内应显示在迭代 iterIdx 之后的子任务块(0 = 首个迭代之前)。
+ *  与 plainsAfter 同形:按锚点键定位,不是简单 append,否则后锚点子块会被挤到组首 */
+function subtasksAfter(group: StepGroup, iterIdx: number): SubtaskSegment[] {
+  return group.subtasksByIter.get(iterIdx) ?? []
+}
+
 /** 把单个 round 内的 DisplayItem 列表先按迭代分段,再按 plan step 分组。
  *  roundClosed:该轮是否已结束(由 roundGroups 按 agent2 活动/运行态/非末轮判定);
  *  闭合时把本轮最终回答提为结论段平铺,避免总结被折叠的过程组藏住。
@@ -1907,14 +1928,19 @@ function segmentRoundItems(
     return t
   }
 
-  /** 收尾所有子任务轨(与主轨 closeCurrent 同拍调用,避免漏收) */
-  const closeTracks = () => {
-    for (const t of facetTracks.values()) {
-      if (t.current) {
-        t.iters.push(t.current)
-        t.current = null
-      }
+  /** 归档单条子任务轨的在制迭代(与主轨 closeCurrent 对称)。
+   *  新思考开迭代前必须先归档上一段,否则上一段连同已归入的工具行被静默覆盖,
+   *  表现为块内只剩最后一段思考(历史行同样中招) */
+  const closeTrack = (t: FacetTrack) => {
+    if (t.current) {
+      t.iters.push(t.current)
+      t.current = null
     }
+  }
+
+  /** 收尾所有子任务轨(与主轨 closeCurrent 同拍调用,避免漏收最后一拍) */
+  const closeTracks = () => {
+    for (const t of facetTracks.values()) closeTrack(t)
   }
 
   const newIteration = (
@@ -1949,6 +1975,7 @@ function segmentRoundItems(
         // 子任务:开新迭代;主轨挂起(其后落库的派发 tool_result 由认领逻辑归位)
         closeCurrent()
         const t = ensureTrack(facet)
+        closeTrack(t)
         t.n++
         t.current = newIteration(t.n, `${roundIdx}-sub${t.tkey}-${t.n}`, item)
       } else {
@@ -2045,6 +2072,8 @@ function segmentRoundItems(
     hasStreaming: false,
     live: false,
     plains: [],
+    subtasksByIter: new Map(),
+    tailSubtasks: [],
   }
 
   /** 迭代序号 → 所属 step 组(用于把平铺消息穿插到对应组内边界) */
@@ -2068,6 +2097,8 @@ function segmentRoundItems(
           hasStreaming: false,
           live: false,
           plains: [],
+          subtasksByIter: new Map(),
+          tailSubtasks: [],
         }
         stepGroupsMap.set(stepId, group)
       }
@@ -2099,13 +2130,71 @@ function segmentRoundItems(
     orderedGroups.push(noStepGroup)
   }
 
+  // 子任务块:把子任务轨的迭代聚合成可折叠块,**嵌进所属执行过程组内部**
+  // (折叠层级 = 执行过程 ⌄ [ 迭代… → 子任务块… ]),而非作兄弟段排在其后。
+  // 放置锚点 = 该子任务首现时已完成的主轨迭代序号:
+  // - >=1 且能解析到组 → 灌进该组的 subtasksByIter(渲染在该迭代之后,即派发工具所在迭代下方)
+  // - 0(轮首)→ 第一个组的 subtasksByIter.get(0)(渲染在该组首个迭代之前)
+  // - 解析不到组(锚点迭代被结论整块提出等)→ 最后一个组的 tailSubtasks(渲染在组尾)
+  // 必须排在下面"前沿组"判定之前:组的 live/hasStreaming 现在要计入嵌套的 live 子任务。
+  for (const t of facetTracks.values()) {
+    if (!t.iters.length) continue
+    let toolCount = 0
+    let live = false
+    let hasResult = false
+    for (const it of t.iters) {
+      toolCount += it.toolItems.filter((x) => x.type === 'tool_call').length
+      for (const x of [...it.thinkingItems, ...it.toolItems, ...it.otherItems]) {
+        if (x.is_streaming) live = true
+        else hasResult = true
+      }
+    }
+    const seg: SubtaskSegment = {
+      kind: 'subtask',
+      id: `${roundIdx}-subtask-${t.tkey}`,
+      roundIdx,
+      label: t.label,
+      iterations: t.iters,
+      thinkingCount: t.iters.length,
+      toolCount,
+      live,
+      hasResult,
+      afterMainIdx: t.afterMainIdx,
+    }
+    const anchor = seg.afterMainIdx
+    const resolved = anchor >= 1 ? groupByIterIdx.get(anchor) : orderedGroups[0]
+    // 解析出的组必须已在输出序列里,否则子块会跟组一起被丢弃(模板只渲染 orderedGroups)
+    const group = resolved && orderedGroups.includes(resolved) ? resolved : null
+    if (group) {
+      let list = group.subtasksByIter.get(anchor)
+      if (!list) {
+        list = []
+        group.subtasksByIter.set(anchor, list)
+      }
+      list.push(seg)
+    } else if (orderedGroups.length > 0) {
+      orderedGroups[orderedGroups.length - 1].tailSubtasks.push(seg)
+    } else {
+      // 主轨一个迭代都没有(只剩子任务行)的兜底:现建"执行过程"组承接,
+      // 否则子任务内容没有宿主组可嵌 → 整块消失
+      noStepGroup.tailSubtasks.push(seg)
+      orderedGroups.push(noStepGroup)
+    }
+  }
+
   // 活跃轮的"前沿组"整段保持展开。此前只看 hasStreaming:thinking 一收完就转去
   // 跑工具(clone_repo / 子智能体可能几十秒),这段空档 hasStreaming 变 false,
   // 组正好在"工具正在跑"的时候收起,下一次 thinking 到达再展开 —— 直播在
   // 迭代边界上反复断流。前沿组之外的早期 step 组仍保持折叠,不形成刷屏长垄。
-  if (!roundClosed && leadingGroup) {
+  // 嵌套子任务后追加两条:含 live 子任务的组也算活跃、且不受 leadingGroup
+  // 是否存在约束(主轨已被平铺消息切完时前沿组为空,运行中的子任务仍需可见)。
+  if (!roundClosed) {
     for (const g of orderedGroups) {
-      g.live = g === leadingGroup || g.hasStreaming
+      const subLive = groupHasLiveSubtask(g)
+      if (subLive) g.hasStreaming = true
+      if (leadingGroup || subLive) {
+        g.live = g === leadingGroup || g.hasStreaming
+      }
     }
   }
 
@@ -2151,66 +2240,17 @@ function segmentRoundItems(
     }
   }
 
-  // 子任务块:把子任务轨的迭代聚合成可折叠块(运行中展开、fan-in 落库后折叠)。
-  // 放置锚点 = 该子任务首现时已完成的主轨迭代 → 排到它所属 step 组之后;
-  // 轮首(afterMainIdx=0)排到 headPlains 之后、step 组之前;找不到落末尾(理论不可达)。
-  const headSubtasks: SubtaskSegment[] = []
-  const tailSubtasks: SubtaskSegment[] = []
-  const afterGroupSubtasks = new Map<StepGroup, SubtaskSegment[]>()
-  for (const t of facetTracks.values()) {
-    if (!t.iters.length) continue
-    let toolCount = 0
-    let live = false
-    let hasResult = false
-    for (const it of t.iters) {
-      toolCount += it.toolItems.filter((x) => x.type === 'tool_call').length
-      for (const x of [...it.thinkingItems, ...it.toolItems, ...it.otherItems]) {
-        if (x.is_streaming) live = true
-        else hasResult = true
-      }
-    }
-    const seg: SubtaskSegment = {
-      kind: 'subtask',
-      id: `${roundIdx}-subtask-${t.tkey}`,
-      roundIdx,
-      label: t.label,
-      iterations: t.iters,
-      thinkingCount: t.iters.length,
-      toolCount,
-      live,
-      hasResult,
-      afterMainIdx: t.afterMainIdx,
-    }
-    if (seg.afterMainIdx <= 0) {
-      headSubtasks.push(seg)
-      continue
-    }
-    const group = groupByIterIdx.get(seg.afterMainIdx)
-    if (group) {
-      let list = afterGroupSubtasks.get(group)
-      if (!list) {
-        list = []
-        afterGroupSubtasks.set(group, list)
-      }
-      list.push(seg)
-    } else {
-      tailSubtasks.push(seg)
-    }
-  }
-
+  // 子任务块已在上面灌进各组(subtasksByIter / tailSubtasks),段级不再插入
+  // 兄弟段:层级 = headPlains → [执行过程组(内嵌子任务块)] → 结论 → tailPlains
   segments.push(...headPlains)
-  segments.push(...headSubtasks)
   for (const g of orderedGroups) {
     segments.push(g)
     const after = afterGroupPlains.get(g)
     if (after) segments.push(...after)
-    const afterSub = afterGroupSubtasks.get(g)
-    if (afterSub) segments.push(...afterSub)
   }
   // 结论段排在所有过程组之后、轮末平铺消息(如修正指令卡)之前:
-  // 时间顺序上 agent1 总结 → agent2 评估/追问,视觉上"过程(折叠) → 子任务 → 结论 → 修正指令"
+  // 时间顺序上 agent1 总结 → agent2 评估/追问,视觉上"过程[ 迭代 → 子任务块 ](折叠) → 结论 → 修正指令"
   if (conclusion) segments.push({ kind: 'conclusion', item: conclusion })
-  segments.push(...tailSubtasks)
   segments.push(...tailPlains)
 
   return segments
@@ -3325,6 +3365,20 @@ const showKnowledgeToolbar = computed<boolean>(() => {
                         />
                       </div>
                     </template>
+                    <!-- 轮首子任务块(afterMainIdx=0):嵌在组内,渲染在首个迭代之前 -->
+                    <SubtaskBlock
+                      v-for="s in subtasksAfter(seg, 0)"
+                      :key="s.id"
+                      :seg="s"
+                      :open="subtaskOpen(s)"
+                      :expanded-keys="expandedToolRows"
+                      :collapsed-keys="collapsedToolRows"
+                      @toggle-subtask="toggleSubtask(s)"
+                      @toggle-reasoning="toggleReasoning"
+                      @toggle-key="toggleRow"
+                      @toggle-agent="toggleAgentBlockRow"
+                      @open-file="onToolFileClick"
+                    />
                     <template v-for="iter in seg.iterations" :key="iter.id">
                     <!-- 迭代内容直接平铺:无摘要行、无边框包装(wrapper 仅作结构容器);
                          思考卡 + 工具渲染行 + 其他项交给 IterationBody 组件,与子任务块共用 -->
@@ -3348,44 +3402,39 @@ const showKnowledgeToolbar = computed<boolean>(() => {
                         />
                       </div>
                     </template>
+                    <!-- 子任务块:紧跟派发它的那个主轨迭代之后渲染(嵌在组内,非兄弟段) -->
+                    <SubtaskBlock
+                      v-for="s in subtasksAfter(seg, iter.iterationIdx)"
+                      :key="s.id"
+                      :seg="s"
+                      :open="subtaskOpen(s)"
+                      :expanded-keys="expandedToolRows"
+                      :collapsed-keys="collapsedToolRows"
+                      @toggle-subtask="toggleSubtask(s)"
+                      @toggle-reasoning="toggleReasoning"
+                      @toggle-key="toggleRow"
+                      @toggle-agent="toggleAgentBlockRow"
+                      @open-file="onToolFileClick"
+                    />
                     </template>
+                    <!-- 锚点解析不到组的兜底子任务块:渲染在组尾 -->
+                    <SubtaskBlock
+                      v-for="s in seg.tailSubtasks"
+                      :key="s.id"
+                      :seg="s"
+                      :open="subtaskOpen(s)"
+                      :expanded-keys="expandedToolRows"
+                      :collapsed-keys="collapsedToolRows"
+                      @toggle-subtask="toggleSubtask(s)"
+                      @toggle-reasoning="toggleReasoning"
+                      @toggle-key="toggleRow"
+                      @toggle-agent="toggleAgentBlockRow"
+                      @open-file="onToolFileClick"
+                    />
                   </div>
                 </div>
 
-                <!-- 子任务块:内置 react 并行派发的每个子任务 = 一个可折叠块;
-                     运行中默认展开(正文 max-height 内滚),fan-in 落库后整块自动折叠 -->
-                <div
-                  v-else-if="seg.kind === 'subtask'"
-                  class="subtask-block"
-                  :class="{ 'subtask-live': seg.live }"
-                >
-                  <div class="subtask-header" @click="toggleSubtask(seg)">
-                    <span class="subtask-toggle">{{ subtaskOpen(seg) ? '▼' : '▶' }}</span>
-                    <span
-                      :class="['step-status-icon', seg.live ? 'step-status-in_progress' : 'step-status-done']"
-                    >{{ seg.live ? '◌' : '✓' }}</span>
-                    <span class="subtask-title">子任务 · {{ seg.label }}</span>
-                    <span v-if="seg.live" class="step-streaming-tag">
-                      <span class="typing-dots"><span></span><span></span><span></span></span>
-                    </span>
-                    <span class="subtask-counts">{{ seg.thinkingCount }} 段思考 · {{ seg.toolCount }} 次工具调用</span>
-                  </div>
-                  <div v-if="subtaskOpen(seg)" class="subtask-body">
-                    <template v-for="iter in seg.iterations" :key="iter.id">
-                      <IterationBody
-                        :iter="iter"
-                        :expanded-keys="expandedToolRows"
-                        :collapsed-keys="collapsedToolRows"
-                        hide-facet-badge
-                        @toggle-reasoning="toggleReasoning"
-                        @toggle-key="toggleRow"
-                        @toggle-agent="toggleAgentBlockRow"
-                        @open-file="onToolFileClick"
-                      />
-                    </template>
-                  </div>
-                </div>
-
+                <!-- 子任务块已下沉到 step-body 内部(SubtaskBlock),不再作 round 级兄弟段 -->
                 <!-- 结论段:该轮 agent1 最终回答,纯正文消息直接可见
                      (无标签无思考卡;最终思考留在上方过程组内) -->
                 <ConversationMessage
@@ -5232,64 +5281,8 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   padding-bottom: var(--space-1);
 }
 
-/* ---- 子任务块(内置 react 并行派发:每个子任务一个可折叠块;
-   迭代体样式已随 IterationBody 组件自带 scoped CSS,父视图仅留块级容器样式) ---- */
-.subtask-block {
-  margin-bottom: var(--space-2);
-  border-left: 2px solid var(--color-primary, #6366f1);
-  border-radius: var(--radius-sm);
-  background: var(--color-surface);
-}
-
-.subtask-live {
-  border-left-color: var(--color-warning, #f59e0b);
-}
-
-.subtask-header {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  cursor: pointer;
-  user-select: none;
-  transition: background 0.15s ease;
-}
-
-.subtask-header:hover {
-  background: var(--color-surface-alt);
-}
-
-.subtask-toggle {
-  flex-shrink: 0;
-  width: 14px;
-  font-size: var(--fs-xs);
-  color: var(--color-text-secondary);
-  text-align: center;
-}
-
-.subtask-title {
-  flex: 1;
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-medium);
-  color: var(--color-text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.subtask-counts {
-  flex-shrink: 0;
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-}
-
-.subtask-body {
-  max-height: min(60vh, 560px);
-  overflow-y: auto;
-  padding-left: var(--space-3);
-  padding-bottom: var(--space-1);
-  border-top: 1px solid var(--color-border);
-}
+/* ---- 子任务块样式已随 SubtaskBlock 组件自带 scoped CSS 迁出
+   (父视图的 scoped 规则管不到子组件内部节点,状态图标/打字动画也在组件内复制了一份) ---- */
 
 /* ---- 工具卡片(agent 子智能体 / toolpair 普通工具:标题行 + 折叠内容) ---- */
 .tool-card {
