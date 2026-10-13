@@ -6,7 +6,10 @@
 CLI/ACP 执行器(agent1 走 Qoder/DeepSeek/Codex)不阻塞在 wait_if_paused:
 其流式循环把 `is_paused()` 作为 pause_probe 传入,命中即向 CLI 发 session/cancel
 真中断生成(见 acp_base.ACPPromptPaused),执行轮结束后由编排层在轮后
-wait_if_paused 门控冻结,等恢复再对半截结果收尾。
+wait_if_paused 门控冻结。恢复后的收尾语义由 settings.ACP_AUTO_CONTINUE_ON_RESUME
+决定:默认(开)在同一活跃 ACP session 自动补发一轮"继续"让 agent1 接着做,
+直到某轮正常跑完才收尾进审查;关闭(或达 ACP_AUTO_CONTINUE_MAX_ROUNDS 上限)
+时退回旧行为——对半截结果直接收尾。见 orchestrator._run_agent1_rounds_with_auto_continue。
 
 设计:
 - 每个 task 对应一个 _PauseState,内含一个 threading.Event

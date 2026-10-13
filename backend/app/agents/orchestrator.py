@@ -501,7 +501,8 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
         # ===== 轮次类型判定:纯对话轮(如问候/纯问答)跳过审查与重下游 =====
         # 本轮无任何工具调用 → agent1 未触碰工作区,无新证据可审;
         # 保留既有结果与审查状态(首轮即对话则任务无结果,回答在对话流)
-        if not _round_has_tool_calls(db, task.id, active_round):
+        # 自动续跑可能跨多轮,按 [1, active_round] 整个 run 判定(见 _run_had_tool_calls)
+        if not _run_had_tool_calls(db, task.id, 1, active_round):
             _finish_conversation_round(
                 task, db, rounds=len(react_summaries), mode="dual_agent",
                 flow_gen=flow_gen,
@@ -897,6 +898,19 @@ def _round_has_tool_calls(db: Session, task_id, round_idx: int) -> bool:
         )
         .first()
         is not None
+    )
+
+
+def _run_had_tool_calls(db: Session, task_id, start_round: int, end_round: int) -> bool:
+    """本次运行覆盖的轮区间 [start_round, end_round] 内是否任一轮有工具调用。
+
+    单轮(start==end)等价 _round_has_tool_calls。自动续跑可能跨多轮
+    (被中断轮有工具、终轮恰好纯文本):只看终轮会误判为纯对话轮而
+    跳过审查,故按整个 run 判定。审查本身仍针对终轮(调用方的 active_round)。
+    """
+    return any(
+        _round_has_tool_calls(db, task_id, r)
+        for r in range(start_round, end_round + 1)
     )
 
 
@@ -2326,7 +2340,9 @@ def resume_audit_with_message(
         # 本轮无任何工具调用 → agent1 回答完全来自历史上下文,无新证据可审;
         # 保留既有整理结果与审查状态,不触发练习题/记忆归纳。
         # 单 agent 模式本就无审查链,保持原行为(结果替换为 summary)
-        if ua_enabled and not _round_has_tool_calls(db, task.id, active_round):
+        if ua_enabled and not _run_had_tool_calls(
+            db, task.id, start_round_idx, active_round
+        ):
             _finish_conversation_round(
                 task, db, rounds=len(react_summaries), mode="resume",
                 flow_gen=flow_gen,

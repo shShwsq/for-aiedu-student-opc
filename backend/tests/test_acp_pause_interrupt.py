@@ -395,3 +395,20 @@ def test_resolve_continuation_message_uses_queued_user_text(monkeypatch):
     assert msg == "改成只审 src/"
     # 查库定位待入流消息(即便 .all() 为空也不报错)
     db.query.assert_called_once()
+
+
+def test_run_had_tool_calls_any_across_range(monkeypatch):
+    """整个 run 任一轮有工具调用就不当纯对话轮(防终轮纯文本误跳审查)。
+
+    场景:第1轮(被中断)有工具,第2轮(终轮)纯文本 → 只看终轮会误跳。
+    """
+    from app.agents.orchestrator import _run_had_tool_calls
+
+    def fake_round(_db, _tid, r):
+        return r == 1  # 只有第1轮有工具
+
+    monkeypatch.setattr(orchestrator, "_round_has_tool_calls", fake_round)
+    # 区间 [1,2]:第1轮命中 → True(不跳过审查)
+    assert _run_had_tool_calls(_FakeDb(), "t", 1, 2) is True
+    # 单轮 [2,2]:第2轮无工具 → False(等价旧逐轮判定)
+    assert _run_had_tool_calls(_FakeDb(), "t", 2, 2) is False
