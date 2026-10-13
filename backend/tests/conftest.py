@@ -20,6 +20,14 @@ import pytest
 
 from app.config import settings
 
+# 统一注册 ORM mapper,消除收集顺序引起的"配置半截"崩溃:某些模块只 import 了带
+# 双向关系的一侧(如 app.models.user_git_binding),没 import 另一侧(app.models.user),
+# 一旦有用例触发 configure_mappers,User.git_bindings / binding.user 解析不到对方 →
+# 全局 mapper 初始化失败,波及同轮其它用例(典型:plan_parallel + emit_split 并跑)。
+# conftest 早于所有测试模块导入,这里补齐那对反向引用,任何顺序下 registry 都完整。
+import app.models.user  # noqa: E402,F401
+import app.models.user_git_binding  # noqa: E402,F401
+
 
 def _db_reachable() -> bool:
     """一次性探测:能连上 DATABASE_URL 返回 True,连不上/超时返回 False。
