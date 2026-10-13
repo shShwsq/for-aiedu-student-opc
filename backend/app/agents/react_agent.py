@@ -947,7 +947,7 @@ def _resolve_facets(task: Task) -> list[Any]:
     return list(skill_loader.resolve_visible_skills(task.user_id, task.allowed_skills))
 
 
-def _parallel_gate(task: Task, followup_query: str | None) -> list[Any] | None:
+def _parallel_gate(task: Task) -> list[Any] | None:
     """是否走分面并行;返回分面列表或 None(None=走原串行路径)。
 
     门控:开关关 / 分面数 < MIN_FACETS → None。小仓库并行 bootstrap 与上下文
@@ -1005,7 +1005,7 @@ def _maybe_run_parallel(
     """门控 + 扇出/扇入。命中并行返回 (results, summary, final_plan);
     否则返回 None(调用方继续走原串行循环)。final_plan 沿用入参 current_plan
     (Phase 1:分面专注只读分析,不驱动 plan 推进)。"""
-    facets = _parallel_gate(task, None)
+    facets = _parallel_gate(task)
     if not facets:
         return None
 

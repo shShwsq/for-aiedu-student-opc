@@ -279,14 +279,14 @@ def test_fan_in_reports_facet_error(monkeypatch):
 def test_gate_disabled_returns_none(monkeypatch):
     monkeypatch.setattr(settings, "REACT_PARALLEL_ENABLED", False)
     monkeypatch.setattr(R, "_resolve_facets", lambda task: [_facet()] * 5)
-    assert R._parallel_gate(_Task(), None) is None
+    assert R._parallel_gate(_Task()) is None
 
 
 def test_gate_too_few_facets_returns_none(monkeypatch):
     monkeypatch.setattr(settings, "REACT_PARALLEL_ENABLED", True)
     monkeypatch.setattr(settings, "REACT_PARALLEL_MIN_FACETS", 3)
     monkeypatch.setattr(R, "_resolve_facets", lambda task: [_facet()] * 2)
-    assert R._parallel_gate(_Task(), None) is None
+    assert R._parallel_gate(_Task()) is None
 
 
 def test_gate_enough_facets_returns_list(monkeypatch):
@@ -294,5 +294,5 @@ def test_gate_enough_facets_returns_list(monkeypatch):
     monkeypatch.setattr(settings, "REACT_PARALLEL_MIN_FACETS", 3)
     facets = [_facet(name=f"f{i}") for i in range(3)]
     monkeypatch.setattr(R, "_resolve_facets", lambda task: facets)
-    out = R._parallel_gate(_Task(), None)
+    out = R._parallel_gate(_Task())
     assert out is not None and len(out) == 3
