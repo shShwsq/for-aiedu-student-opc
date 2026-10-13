@@ -199,6 +199,8 @@ _SUBMIT_REVIEW_PLAN_TOOL: dict[str, Any] = {
             "让「要审什么」显式化、可实时展示与机器对账。发现新疑点可**重发全量修订**。"
             "系统会给每条补一个稳定 id(P1、P2…)并在回执里返回:发射审查项时用"
             " `plan_item_id` 指明它核实的是哪一条,审查结束时按 id 对账;"
+            "计划登记后,**是否派发子智能体并行核查由你决定**"
+            "(`dispatch_review_subagents`),不派发则自己逐项用只读工具核查;"
             "未核实到的计划项**不会**被伪造成审查项,而是在审查计划里标为「未核实」。"
             "计划不是围栏:允许发射计划外审查项。每条都指向 agent1 的一处产出"
             "(`agent1_claim`=它的某个结论/发现,`agent1_action`=它修改或生成的代码/文件/产物)。"
@@ -397,6 +399,67 @@ _SUBMIT_SUGGESTION_TOOL: dict[str, Any] = {
 
 
 # ============================================================
+# 审查子智能体按需派发工具(工具驱动扇出;仅在开关开 + 有工作区时注册)
+# ============================================================
+
+# 派发纪律正文:既作为工具描述喂给模型,也在 AGENT2_REVIEW_PROMPT 里作为独立
+# 章节出现(单一来源,避免两处手工保持一致)。措辞对标 prompts/executor.py 的
+# 分面按需派发纪律。本模块零 app.* 依赖(见 tests/test_prompts_purity.py)。
+AGENT2_SUBAGENT_DISPATCH_GUIDANCE = (
+    "## 审查子智能体按需派发(仅当工具列表里有 dispatch_review_subagents 时适用)\n"
+    "审查子智能体 = 每个计划项一条独立的只读核查子循环,自带只读取证工具与独立证据"
+    "台账,由你按需派发。\n"
+    "**先规划后派发**:先 `submit_review_plan` 列出计划(带 P1/P2… id),再自行判断"
+    "哪些项值得并行核实、派哪几项(可全派、可定向派高风险那几条、也可一个都不派)。\n"
+    "**何时派**:计划里 ≥ 3 条互不依赖、且各需独立取证的核实项 → 一次派发那几项;"
+    "需要广度并行的审查只挑高风险项。\n"
+    "**何时不派**:计划项少于 3 条、一条线索就能查清、无工作区可用、或你已经查完的项"
+    "(不重复派发);`planned_evidence=verify` 的项一律自己走主循环动态验证,不能派发。\n"
+    "**派发后**:逐项发射审查项并引用回灌信封里的证据号(带 `plan_item_id` 对账),"
+    "不要重跑已完成的核查;被拒/未派发的项按原流程自己用只读工具取证。\n"
+    "派发调用会等待全部子智能体完成才返回,返回的就是各项结论(含失败/超时状态)。"
+)
+
+# 工具描述:复用纪律要点 + 硬约束(verify 不可派 / 一次审查通常只派 1 次)
+DISPATCH_SUBAGENTS_TOOL_DESCRIPTION = (
+    "派出审查子智能体,并行核实审查计划里的若干项(每个子智能体 = 一个计划项的"
+    "独立只读核查子循环,自带只读取证工具与独立证据台账)。\n"
+    "适合:计划里 ≥ 3 条相互独立的核实项,且每项都要独立取证(定向并行)。\n"
+    "不适合:计划项少于 3 条、只需一条线索就能查清、无工作区可用、或你已经查完的项。\n"
+    "先 `submit_review_plan` 登记计划再按需派发:`planned_evidence=verify` 的项不能派发"
+    "(须主循环自行验证),含这类项的请求会被逐项拒收;一次审查通常只派发 1 次。\n"
+    "调用会等待全部子智能体完成后返回各项结论(含证据引用号),拿到后请逐项发射"
+    "审查项并引用回灌信封里的证据号,不要重跑这些核查。"
+)
+
+_DISPATCH_SUBAGENTS_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "dispatch_review_subagents",
+        "description": DISPATCH_SUBAGENTS_TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "plan_item_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "要派发的计划项 id(P1/P2…,取自 submit_review_plan 回执;"
+                        "只列你判断值得并行核实的项)"
+                    ),
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "派发理由(可选,侧栏展示,≤ 200 字)",
+                },
+            },
+            "required": ["plan_item_ids"],
+        },
+    },
+}
+
+
+# ============================================================
 # 审查模式 system prompt(后台审查者人设)
 # ============================================================
 
@@ -440,10 +503,12 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
    发现新疑点可**重发 `submit_review_plan` 全量修订**;系统会给每条补稳定 id
    (P1、P2…)并在回执里返回。计划不是围栏:允许发射计划外审查项,未核实的计划项
    **不会**被伪造成审查项,只在审查计划里标为「未核实」。
-   计划发射后,系统会自动对 planned_evidence 非 verify 的计划项**并行只读核查**,
-   并把各项结论(含证据引用号,已登记进本轮证据台账)注入回上下文;届时不必重跑
-   这些核查:逐项审查项直接引用信封里的证据号(带 plan_item_id 对账),
-   声明 verify 或需补查的项再按原流程自行调用工具。
+   计划登记后,**是否派发子智能体并行核查由你决定**:调 `dispatch_review_subagents`
+   把值得并行的计划项(互不独立取证 ≥ 3 条时)扇出成只读子循环,不派发则自己逐项用
+   只读工具核查。派发会等待全部子智能体完成并把各项结论(含证据引用号,已登记进本轮
+   证据台账)注入回上下文;届时不必重跑这些核查:逐项审查项直接引用信封里的证据号
+   (带 plan_item_id 对账),声明 verify 或需补查的项再按原流程自行调用工具
+   (详见下方「审查子智能体按需派发」)。
 2. **逐项核实并发射**:按计划核查,每核查完/判完一项即调 `submit_review_item`
    发射一条审查项(单一原语,三分档合一——**主语是"你对这条待核实对象的核实结果"**):
    - `origin`:来源(`agent1_claim`=核实 agent1 的结论/发现 / `agent1_action`=核实 agent1
@@ -590,18 +655,25 @@ agent1 结论若引用了外部依据(URL / CVE 编号 / 安全公告 / 官方�
 """
 
 
+# 把按需派发纪律作为独立章节并入审查 system prompt(单一来源:同一文本也用于
+# 工具描述要点);带"仅当工具列表里有 dispatch_review_subagents 时适用"守卫,
+# 工具未注册(开关关/无工作区)时这段是无害说明,不影响纯串行自核。
+AGENT2_REVIEW_PROMPT = AGENT2_REVIEW_PROMPT + "\n\n" + AGENT2_SUBAGENT_DISPATCH_GUIDANCE + "\n"
+
+
 # 兼容别名:旧名 AGENT2_SYSTEM_PROMPT 指向审查模式 prompt
 # (测试/文档可能引用;新代码应显式使用 AGENT2_REVIEW_PROMPT)
 AGENT2_SYSTEM_PROMPT = AGENT2_REVIEW_PROMPT
 
 
 # ============================================================
-# 计划项并行核查的文本资产(子循环指令 + fan-in 回灌装配)
+# 审查子智能体(计划项)并行核查的文本资产(子循环指令 + fan-in 回灌装配)
 #
-# 背景:agent2 发射审查计划后,合格计划项(planned_evidence 非 verify)会被
-# 扇出成有界只读 ReAct 子循环并行核实(执行逻辑见 app/agents/agent2.py 的
-# _run_plan_item_pass / _fan_out_plan_items)。形状镜像 prompts/executor.py 的
-# 分面并行文本资产,但本模块仍守零 app.* 依赖硬约束(见 tests/test_prompts_purity.py)。
+# 背景:agent2 按需调 dispatch_review_subagents 派发后,选定的计划项
+# (planned_evidence 非 verify)会被扇出成有界只读 ReAct 子循环并行核实(执行逻辑见
+# app/agents/agent2.py 的 _run_plan_item_pass / _fan_out_plan_items)。形状镜像
+# prompts/executor.py 的分面并行文本资产,但本模块仍守零 app.* 依赖硬约束
+# (见 tests/test_prompts_purity.py)。
 # ============================================================
 
 # 与 prompts/executor.py 的 SYSTEM_INJECT_MARKER 同值:注入内容用固定前缀
@@ -655,12 +727,12 @@ AGENT2_PLAN_ITEM_FINALIZE_PROMPT = (
 # fan-in 回灌的行动指引(整批只附一份,不逐项重复):各分项结论已就位,
 # 主循环回合的职责是发射与集成而非重做。措辞集中在这一处,便于后续调参。
 AGENT2_PLAN_PARALLEL_GUIDANCE = (
-    "上一阶段系统已自动完成审查计划合格项的并行只读核查,"
+    "你派发的子智能体已完成所选取计划项的并行只读核查,"
     "以下是各计划项的结论(逐项独立注入,证据引用号已登记进本轮证据台账)。\n"
     "请在此基础上继续本轮审查:\n"
     "- 已有结论的项直接发射 submit_review_item(带 plan_item_id 对账,"
     "evidence.*.call_ref 填信封里的证据引用号),不要重跑已完成的核查\n"
-    "- planned_evidence=verify 或需补查的项,再按原流程自行调用工具\n"
+    "- planned_evidence=verify 或未派发/需补查的项,再按原流程自行调用工具\n"
     "- 知识点提炼(submit_knowledge_point)同样基于这些结论进行"
 )
 

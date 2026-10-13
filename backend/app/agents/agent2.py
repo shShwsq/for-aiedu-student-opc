@@ -60,6 +60,7 @@ from app.agents.runtime.llm_stream import (
     strip_tool_call_blocks,
 )
 from app.agents.runtime.tool_intent import build_tool_intent
+from app.config import settings
 from app.domain_events import VERIFIER_COMPLETED, emit
 from app.event_bus import publish
 from app.llm.client import LLMClient
@@ -103,6 +104,7 @@ from app.prompts.agent2 import (
     _SUBMIT_REVIEW_ITEM_TOOL,
     _SUBMIT_KNOWLEDGE_POINT_TOOL,
     _SUBMIT_SUGGESTION_TOOL,
+    _DISPATCH_SUBAGENTS_TOOL,
     build_agent2_plan_item_instruction,
     build_agent2_plan_result_messages,
 )
@@ -504,6 +506,11 @@ def run_agent2(
         tools.append(_VERIFY_TOOL_DEFINITION)
     if reference_check_enabled:
         tools.append(_REFERENCE_TOOL_DEFINITION)
+    # 审查子智能体按需派发:开关开 + 有工作区(worker 依赖只读工具)时注册派发工具。
+    # 注册条件只能静态化(计划项 id 运行时才产生),项数/合法性校验移到调用时
+    # (见主循环 dispatch_review_subagents 特判)。关闭 = 不注册 = 纯串行自核。
+    if repo_path and getattr(settings, "AGENT2_SUBAGENT_DISPATCH_ENABLED", True):
+        tools.append(_DISPATCH_SUBAGENTS_TOOL)
     tools = tools or None
 
     # LLM 调用循环:处理只读核查/verify/引用复核工具调用(结果回灌后再调 LLM 输出 JSON 评估)
@@ -531,9 +538,9 @@ def run_agent2(
         "tool_counts": {"read": 0, "verify": 0, "reference": 0},
         # 本轮验证额度(按计划项现算,供对账判"额度是否触顶"用同一个口径)
         "verify_budget": MIN_VERIFY_CALLS,
-        # 计划项并行只扇出一次(首次 submit_review_plan 命中门控时);
-        # 重发全量修订不再二次扇出
-        "parallel_done": False,
+        # 本轮已用的子智能体派发调用次数(取代旧 parallel_done 标志):
+        # 受 AGENT2_SUBAGENT_DISPATCH_MAX_CALLS 约束,防模型反复扇出烧配额
+        "dispatch_calls": 0,
     }
     # 被审 agent1 对话 id 集(校验 submit_review_item.agent1_ref 归属;空集=不校验)
     agent1_conv_ids: set[UUID] = set()
@@ -683,7 +690,7 @@ def run_agent2(
                         f"[task={task_id}][并行 fan-in] 落库 agent2 "
                         f"{row['type']} 行失败(忽略): {e}"
                     )
-        emit_state["parallel_done"] = True
+        # 派发调用计数由主循环特判分支负责(本函数只做扇出主体,不碰额度)
         logger.info(
             f"[task={task_id}] agent2 计划项并行核查 fan-in 完成:"
             f"{len(env_items)} 项结论已回灌,累计取证 "
@@ -691,6 +698,39 @@ def run_agent2(
             f"reference={sum(p.ref_calls for p in results)}"
         )
         return build_agent2_plan_result_messages(env_items)
+
+    def _record_dispatch_call(args: dict[str, Any]):
+        """派发是过程,应在时间线可见:落一条 tool_call 对话行(返回 conv 或 None)。
+
+        与发射类工具(submit_*)不同 —— 那些不落行,而派发扇出子智能体值得在时间线
+        显示"派发 N 个审查子智能体:P1/P2/P3"。worker 子循环自身的取证行由 fan-in 落。
+        """
+        if db is None or task is None:
+            return None
+        intent = build_tool_intent(
+            "dispatch_review_subagents", args, prefix="[agent2 质检]"
+        )
+        try:
+            return record_conversation(
+                db, task, round_idx=round_idx, role="agent2", type="tool_call",
+                content=f"{intent}\n{json.dumps(args, ensure_ascii=False, indent=2)}",
+            )
+        except Exception as e:
+            logger.warning(f"[task={task_id}] 落库 agent2 派发调用失败(忽略): {e}")
+            return None
+
+    def _record_dispatch_result(call_conv, receipt: dict[str, Any]) -> None:
+        """派发结果落一条 tool_result 对话行(邻接配对 tool_call_id)。"""
+        if db is None or task is None or call_conv is None:
+            return
+        try:
+            record_conversation(
+                db, task, round_idx=round_idx, role="agent2", type="tool_result",
+                content=json.dumps(receipt, ensure_ascii=False),
+                tool_call_id=str(call_conv.id),
+            )
+        except Exception as e:
+            logger.warning(f"[task={task_id}] 落库 agent2 派发结果失败(忽略): {e}")
 
     while True:
         # 终止/超时检查点(循环顶):上一次工具回灌后用户按了终止,不再多付一次 LLM 往返
@@ -770,6 +810,64 @@ def run_agent2(
             except json.JSONDecodeError:
                 args = {}
 
+            # ---- 审查子智能体按需派发(工具驱动扇出,主线程 fan-in) ----
+            if fn_name == "dispatch_review_subagents":
+                call_conv = _record_dispatch_call(args)
+                max_calls = max(
+                    0, int(getattr(settings, "AGENT2_SUBAGENT_DISPATCH_MAX_CALLS", 1) or 0)
+                )
+                if emit_state["dispatch_calls"] >= max_calls:
+                    receipt = {
+                        "ok": False,
+                        "reason": (
+                            f"本轮派发次数已达上限({max_calls}),请基于已有结论集成,"
+                            "不要重复派发"
+                        ),
+                    }
+                    _append_tool_receipt(messages, tc, receipt)
+                    _record_dispatch_result(call_conv, receipt)
+                    continue
+                # 把请求 id 翻译成合格项(未编号/未知 id/verify 项逐条拒收;去重保序)
+                latest_plan = (emit_state["plan"] or {}).get("items") or []
+                eligible, rejected = _dispatchable_plan_items(
+                    latest_plan, args.get("plan_item_ids") or [],
+                    repo_path, reference_check_enabled,
+                )
+                min_items = max(
+                    2, int(getattr(settings, "AGENT2_PARALLEL_MIN_ITEMS", 3) or 3)
+                )
+                if len(eligible) < min_items:
+                    # 整批拒绝:子循环 bootstrap + 上下文复制成本高于串行收益
+                    receipt = {
+                        "ok": False,
+                        "reason": (
+                            f"合格可派发项不足 {min_items} 条(派发子智能体的固定成本"
+                            "高于串行收益),请自行逐项用只读工具核查"
+                        ),
+                        "rejected": rejected,
+                    }
+                    _append_tool_receipt(messages, tc, receipt)
+                    _record_dispatch_result(call_conv, receipt)
+                    continue
+                emit_state["dispatch_calls"] += 1
+                # 扇出主体零改动(线程池/deadline/厂商闸门/只读白名单/落库/证据收养)
+                envelopes = _fan_out_plan_items(eligible)
+                receipt = {
+                    "ok": True,
+                    "dispatched": [p["id"] for p in eligible],
+                    "rejected": rejected,
+                    "hint": (
+                        "结论(含证据引用号)已按 system 信封回灌——直接逐项发射审查项"
+                        "并引用信封里的证据号,不要重跑这些核查;未派发/被拒的项按原"
+                        "流程自行调用工具"
+                    ),
+                }
+                # tool 结果必须与 assistant tool_calls 相邻:先回执,再信封
+                _append_tool_receipt(messages, tc, receipt)
+                messages.extend(envelopes)
+                _record_dispatch_result(call_conv, receipt)
+                continue
+
             # ---- 发射工具(控制类,始终可用,不进 sandbox;不计取证额度) ----
             if fn_name == "submit_review_plan":
                 raw_items = args.get("items") if isinstance(args.get("items"), list) else []
@@ -779,36 +877,21 @@ def run_agent2(
                 publish(task_id, "review_plan_update", {
                     "items": plan_items, "note": args.get("note"), "planned": len(plan_items),
                 })
-                # 计划项并行核查(门控不满足/已扇出过→空列表,串行行为不变)
-                envelopes: list[dict[str, Any]] = []
-                if not emit_state["parallel_done"]:
-                    eligible = _plan_item_gate(
-                        plan_items, repo_path, reference_check_enabled,
-                    )
-                    if eligible:
-                        envelopes = _fan_out_plan_items(eligible)
-                # 把 id 表回灌给模型:它得知道 P1/P2 才能用 plan_item_id 对上账
-                receipt: dict[str, Any] = {
+                # 把 id 表回灌给模型:它得知道 P1/P2 才能用 plan_item_id 对上账,
+                # 并据此决定是否派发子智能体(dispatch_review_subagents)。
+                # 不再在此自动扇出 —— 派发主体交给模型,不派就走原串行自核。
+                receipt = {
                     "ok": True, "planned": len(plan_items),
                     "plan_items": [
                         {"id": p["id"], "target": p["target"]} for p in plan_items
                     ],
                     "hint": (
                         "发射审查项时用 plan_item_id 指明它核实的是哪条计划项(P1/P2…),"
-                        "结束时系统按 id 对账"
+                        "结束时系统按 id 对账;登记计划后是否派发子智能体并行核查由你决定"
+                        "(dispatch_review_subagents),不派发则自己逐项用只读工具核查"
                     ),
                 }
-                if envelopes:
-                    receipt["parallel_verified"] = [p["id"] for p in eligible]
-                    receipt["hint"] += (
-                        ";系统已对合格计划项完成并行只读核查,结论(含证据引用号)"
-                        "已按 system 信封回灌——直接逐项发射审查项并引用信封里的"
-                        "证据号,不要重跑这些核查;planned_evidence=verify 或需补查的"
-                        "项再按原流程自行调用工具"
-                    )
                 _append_tool_receipt(messages, tc, receipt)
-                # 信封排在回执之后注入:assistant 工具调用与 tool 结果保持相邻
-                messages.extend(envelopes)
                 continue
 
             if fn_name == "submit_review_item":
@@ -1389,17 +1472,17 @@ def _execute_reference_tool(
 
 
 # ============================================================
-# 计划项并行核查(读阶段并发 / 写阶段主线程串行)
+# 审查子智能体按需派发(工具驱动扇出;读阶段并发 / 写阶段主线程串行)
 #
-# 审查计划发射后,合格项(planned_evidence 非 verify)扇出成 N 条有界只读
-# ReAct 子循环并行核实。形状复用 react_agent 分面并行:worker 只跑 LLM +
-# 只读工具 + 内存缓冲,绝不碰共享 db session / publish / 证据台账 / emit_state;
-# 收养证据、落库、发射全部在 fan-in 后由主线程逐条做。verify 项仍走主循环
-# 串行路径(PoC 会写沙箱状态、与新轮 agent1 争抢端口/进程,不可并发)。
-# 子循环带原生身份(thinking_delta extra 带 "计划项 Pn" + parallel),前端按
+# agent2 发射 submit_review_plan 后自行决定是否调 dispatch_review_subagents 把选定的
+# 计划项扇出成 N 条有界只读 ReAct 子循环并行核实。形状复用 react_agent 分面并行:
+# worker 只跑 LLM + 只读工具 + 内存缓冲,绝不碰共享 db session / publish / 证据台账 /
+# emit_state;收养证据、落库、发射全部在 fan-in 后由主线程逐条做。verify 项由模型请求
+# 时逐项拒收,仍走主循环串行路径(PoC 会写沙箱状态、与新轮 agent1 争抢端口/进程,不可
+# 并发)。子循环带原生身份(thinking_delta extra 带 "计划项 Pn" + parallel),前端按
 # conv_id 分桶,规避 ACP 侧不带身份导致的并行 chunk 交织乱码。
-# 门控(_plan_item_gate)不满足/显式关闭时,submit_review_plan 分支原样返回,
-# 串行循环逐字节不变。
+# 合法性翻译(_dispatchable_plan_items)是纯函数;项数下限(MIN_ITEMS)整批拒绝在
+# 主循环特判分支完成;开关关 = 不注册派发工具 = 纯串行自核(串行循环逐字节不变)。
 # ============================================================
 
 # 收尾轮(跑满迭代/超时)的墙钟宽限(秒):对已到期的 deadline 再叠一段,
@@ -1427,38 +1510,69 @@ class _PlanItemResult:
     ref_calls: int = 0
 
 
-def _plan_item_gate(
+def _dispatchable_plan_items(
     plan_items: list[dict[str, Any]],
+    requested_ids: list[str],
     repo_path: str | None,
     reference_check_enabled: bool,
-) -> list[dict[str, Any]]:
-    """是否走计划项并行;返回合格计划项列表(空列表 = 原串行路径)。
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """把派发请求里的计划项 id 翻译成(可派发项, 逐条拒收理由)。
 
-    门控:开关关 / 无工作区(只读工具不可用) / 合格项数 < MIN_ITEMS → 空列表。
-    合格 = planned_evidence 非 verify(reference 关闭时 reference 项降级为纯
-    只读——读档核查仍成立)。项少时并行反而亏(每子循环 bootstrap + 上下文
-    复制成本高于串行收益),同 REACT_FACET_DISPATCH_MIN_FACETS 的理由。
+    与旧 _plan_item_gate 的区别:不再"决定要不要自动并行",而是按模型请求
+    **定向挑选子集**。开关关 / 无工作区(worker 依赖只读工具)→ 全部拒收。
+    逐项:未知/未编号 id → 拒收;planned_evidence=verify → 拒收(verifier 与新轮
+    agent1 共享任务沙箱,并行会争抢端口/进程,且 superseded_check 只在主循环生效);
+    reference 且引用复核关闭 → 降级 source 后派发(读档核查仍成立,与旧门控同口径)。
+    请求 id 去重保序。**项数下限(MIN_ITEMS)由调用方整批判定**,本函数不裁。
+    纯函数:不碰 db / 不 publish(单测便宜)。
     """
     from app.config import settings as _s
 
-    if not getattr(_s, "AGENT2_PARALLEL_ENABLED", False):
-        return []
-    if not repo_path:
-        return []
+    by_id = {
+        str(it.get("id")): it for it in (plan_items or []) if isinstance(it, dict)
+    }
+    requested = [str(r or "").strip() for r in (requested_ids or [])]
+
+    enabled = bool(getattr(_s, "AGENT2_SUBAGENT_DISPATCH_ENABLED", True))
+    if not enabled or not repo_path:
+        reason = (
+            "子智能体派发未启用(AGENT2_SUBAGENT_DISPATCH_ENABLED=False)"
+            if not enabled
+            else "当前任务没有可访问的工作区,子智能体依赖只读工具"
+        )
+        seen_all: set[str] = set()
+        rejected_all: list[dict[str, str]] = []
+        for sid in requested:
+            if sid and sid not in seen_all:
+                seen_all.add(sid)
+                rejected_all.append({"id": sid, "reason": reason})
+        return [], rejected_all
+
+    seen: set[str] = set()
     eligible: list[dict[str, Any]] = []
-    for it in plan_items or []:
-        if not isinstance(it, dict):
+    rejected: list[dict[str, str]] = []
+    for sid in requested:
+        if not sid or sid in seen:
+            continue  # 空/重复:静默去重,不进拒收清单
+        seen.add(sid)
+        it = by_id.get(sid)
+        if it is None:
+            rejected.append({
+                "id": sid,
+                "reason": "未知或未编号的计划项 id(取自 submit_review_plan 回执)",
+            })
             continue
         planned = str(it.get("planned_evidence") or "source").strip()
         if planned == "verify":
+            rejected.append({
+                "id": sid,
+                "reason": "planned_evidence=verify,需主循环自行验证(沙箱共享不可并发)",
+            })
             continue
         if planned == "reference" and not reference_check_enabled:
             it = {**it, "planned_evidence": "source"}
         eligible.append(it)
-    min_items = max(2, int(getattr(_s, "AGENT2_PARALLEL_MIN_ITEMS", 3) or 3))
-    if len(eligible) < min_items:
-        return []
-    return eligible
+    return eligible, rejected
 
 
 def _run_plan_item_pass(

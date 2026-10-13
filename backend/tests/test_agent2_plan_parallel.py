@@ -1,19 +1,22 @@
-"""agent2 计划项并行核查(扇出只读子循环 + fan-in 收养/回灌)测试
+"""agent2 审查子智能体按需派发(工具驱动扇出 + fan-in 收养/回灌)测试
 
-覆盖计划(docs/agent-architecture.md 第 2 节"计划项并行核查")的关键契约:
-- 门控(_plan_item_gate):开关关 / 无 repo_path / 合格项不足 → 不扇出,
-  串行行为不变;planned_evidence=verify 项永不进子循环;
-- worker 只读白名单:请求 verify/发射类工具被拒并如实回告(不执行);
-- 证据收养:EvidenceRecorder.adopt_entries 重编号 + remap_refs_in_text 改写
-  结论引用号,收养后 score_review_item 按新 ref 正常派置信度;
-- fan-in:receipt.parallel_verified、system 信封注入顺序、pending_rows 落库
-  配对 tool_call_id、只扇出一次(计划重发修订不二次扇出);
-- 终止/超时传播:扇出期间命中 stop_check 整批丢弃;单项超时转收尾总结;
-- 单 worker 异常不拖垮整轮(信封标该项核查失败)。
+覆盖计划(.trae/documents/agent2审查子智能体按需派发改造计划.md)的关键契约:
+- 合法性翻译(_dispatchable_plan_items):开关关 / 无 repo_path → 全部拒收;
+  未编号/未知 id、planned_evidence=verify 项逐条拒收;reference 关闭时降级 source;
+  请求 id 去重保序;项数下限(MIN_ITEMS)整批拒绝由调用方完成(见集成用例)。
+- 工具注册(dispatch_review_subagents):开关开 + 有工作区才注册;关闭不注册 = 纯串行。
+- 不再自动扇出:只发 submit_review_plan(不发派发调用)→ 串行行为不变,
+  worker 零调用、无 system 信封、回执无 dispatched。
+- 显式派发主链路:先 submit_review_plan 再 dispatch_review_subagents(P1/P2/P3)
+  → worker 每项取证、fan-in 收养证据重编号、回执带 dispatched、信封排在回执之后注入。
+- 额度(AGENT2_SUBAGENT_DISPATCH_MAX_CALLS):同轮第二次派发 / 计划修订后二次派发
+  均被拒(ok=false)。
+- worker 只读白名单:请求 verify/发射类工具被拒并如实回告(不执行)。
+- 终止/超时传播:派发期间命中 stop_check 整批丢弃;单项超时转收尾总结;
+  单 worker 异常不拖垮整轮(信封标该项核查失败)。
 
-替身策略沿用 test_agent2_stream_degrade:主循环按模块属性替身
-_stream_agent2_llm(3 元组兼容面),worker 子循环直连 stream_llm(StreamResult),
-两者可独立屏蔽互不影响。
+替身策略沿用旧并行测试:主循环按模块属性替身 _stream_agent2_llm(3 元组兼容面),
+worker 子循环直连 stream_llm(StreamResult),两者可独立屏蔽互不影响。
 """
 import json
 import time
@@ -49,8 +52,15 @@ def _tc(name, args, cid="call_1"):
     }
 
 
-def _plan_tc(items):
-    return _tc("submit_review_plan", {"items": items, "note": "计划"})
+def _plan_tc(items, cid="call_plan"):
+    return _tc("submit_review_plan", {"items": items, "note": "计划"}, cid=cid)
+
+
+def _dispatch_tc(ids, cid="call_disp"):
+    return _tc(
+        "dispatch_review_subagents", {"plan_item_ids": list(ids), "reason": "并行核查"},
+        cid=cid,
+    )
 
 
 def _sr(content="", tool_calls=None, reasoning="", conv_id=None, stopped=False):
@@ -62,6 +72,7 @@ def _sr(content="", tool_calls=None, reasoning="", conv_id=None, stopped=False):
 
 
 def _plan_items(n=3, planned="source"):
+    """未补 id 的计划项(供 submit_review_plan 参数用;_stamp_plan_items 会补 P1/P2…)"""
     return [
         {
             "target": f"结论{i}", "origin": "agent1_claim",
@@ -71,10 +82,19 @@ def _plan_items(n=3, planned="source"):
     ]
 
 
-def _patch_common(monkeypatch, *, enabled=True, min_items=3, concurrency=4):
-    """并行链路公共屏蔽:闸门透传、publish 捕获、设置项钉住"""
+def _pi(pid, planned="source"):
+    """已带 id 的计划项(供纯函数 _dispatchable_plan_items 直接测试)"""
+    return {
+        "id": pid, "target": f"结论{pid}", "origin": "agent1_claim",
+        "planned_evidence": planned,
+    }
+
+
+def _patch_common(monkeypatch, *, enabled=True, min_items=3, max_calls=1, concurrency=4):
+    """派发链路公共屏蔽:闸门透传、publish 捕获、设置项钉住"""
     publishes = []
-    monkeypatch.setattr(settings, "AGENT2_PARALLEL_ENABLED", enabled)
+    monkeypatch.setattr(settings, "AGENT2_SUBAGENT_DISPATCH_ENABLED", enabled)
+    monkeypatch.setattr(settings, "AGENT2_SUBAGENT_DISPATCH_MAX_CALLS", max_calls)
     monkeypatch.setattr(settings, "AGENT2_PARALLEL_MIN_ITEMS", min_items)
     monkeypatch.setattr(settings, "AGENT2_PARALLEL_MAX_CONCURRENCY", concurrency)
     monkeypatch.setattr(react_agent, "_review_provider_gate", lambda client: nullcontext())
@@ -83,19 +103,27 @@ def _patch_common(monkeypatch, *, enabled=True, min_items=3, concurrency=4):
 
 
 def _mk_main_stream(script):
-    """主循环替身:按调用序弹 (content, tool_calls, reasoning),并记录 messages 快照"""
+    """主循环替身:按调用序弹 (content, tool_calls, reasoning),记录 messages 快照与 tools"""
     calls = []
     snapshots = []
+    tools_snapshots = []
 
     def _fake(client, messages, *, task_id, round_idx, tools=None, **extra):
         snapshots.append([dict(m) for m in messages])
+        tools_snapshots.append(tools)
         calls.append(1)
         if len(calls) <= len(script):
             return script[len(calls) - 1]
         return (_FINAL_JSON, [], "")
 
     _fake.snapshots = snapshots
+    _fake.tools_snapshots = tools_snapshots
     return _fake
+
+
+def _tool_names(tools_snapshots, idx=0):
+    tools = tools_snapshots[idx] or []
+    return {(t.get("function") or {}).get("name") for t in tools}
 
 
 def _mk_worker_stream(plans):
@@ -144,52 +172,97 @@ def _run(monkeypatch, main_script, worker, *, repo_path="C:/repo", **kw):
     monkeypatch.setattr(agent2, "_execute_read_tool", _fake_read_tool)
     monkeypatch.setattr(agent2, "stream_llm", worker)
     return agent2.run_agent2(
-        "审计这个仓库", [], task_id="task-par", round_idx=1,
+        "审计这个仓库", [], task_id="task-disp", round_idx=1,
         client=MagicMock(), repo_path=repo_path, **kw,
     )
 
 
 # ============================================================
-# 门控(_plan_item_gate)
+# 合法性翻译(_dispatchable_plan_items)
 # ============================================================
 
 
-def test_gate_disabled_returns_empty(monkeypatch):
+def test_dispatch_disabled_rejects_all(monkeypatch):
     _patch_common(monkeypatch, enabled=False)
-    assert agent2._plan_item_gate(_plan_items(4), "C:/repo", True) == []
+    items = [_pi("P1"), _pi("P2"), _pi("P3")]
+    eligible, rejected = agent2._dispatchable_plan_items(
+        items, ["P1", "P2", "P3"], "C:/repo", True,
+    )
+    assert eligible == []
+    assert {r["id"] for r in rejected} == {"P1", "P2", "P3"}
 
 
-def test_gate_requires_repo_path(monkeypatch):
+def test_dispatch_requires_repo_path(monkeypatch):
     _patch_common(monkeypatch)
-    assert agent2._plan_item_gate(_plan_items(4), None, True) == []
+    items = [_pi("P1"), _pi("P2"), _pi("P3")]
+    eligible, rejected = agent2._dispatchable_plan_items(
+        items, ["P1", "P2", "P3"], None, True,
+    )
+    assert eligible == []
+    assert len(rejected) == 3
 
 
-def test_gate_below_min_items_returns_empty(monkeypatch):
-    _patch_common(monkeypatch, min_items=3)
-    assert agent2._plan_item_gate(_plan_items(2), "C:/repo", True) == []
+def test_dispatch_rejects_verify_and_unknown(monkeypatch):
+    """verify 项逐条拒收(沙箱共享不可并发);未知/未编号 id 拒收;其余照派"""
+    _patch_common(monkeypatch)
+    items = [_pi("P1"), _pi("P2", planned="verify"), _pi("P3")]
+    eligible, rejected = agent2._dispatchable_plan_items(
+        items, ["P1", "P2", "P9"], "C:/repo", True,
+    )
+    assert [it["id"] for it in eligible] == ["P1"]
+    reasons = {r["id"]: r["reason"] for r in rejected}
+    assert "P2" in reasons and "verify" in reasons["P2"]
+    assert "P9" in reasons  # 未知 id
 
 
-def test_gate_excludes_verify_items(monkeypatch):
-    """verify 项不进子循环(沙箱共享不可并发);非 verify 项不足 MIN_ITEMS 不扇出"""
-    _patch_common(monkeypatch, min_items=3)
-    items = _plan_items(2) + [{"target": "PoC", "planned_evidence": "verify"}] + _plan_items(1)
-    eligible = agent2._plan_item_gate(items, "C:/repo", True)
-    assert len(eligible) == 3
-    assert all(str(it.get("planned_evidence")) != "verify" for it in eligible)
-
-    # 全 verify → 无合格项
-    assert agent2._plan_item_gate(
-        [{"target": f"t{i}", "planned_evidence": "verify"} for i in range(4)],
-        "C:/repo", True,
-    ) == []
+def test_dispatch_dedup_preserves_order(monkeypatch):
+    _patch_common(monkeypatch)
+    items = [_pi("P1"), _pi("P2"), _pi("P3")]
+    eligible, rejected = agent2._dispatchable_plan_items(
+        items, ["P3", "P1", "P3", "P2", ""], "C:/repo", True,
+    )
+    assert [it["id"] for it in eligible] == ["P3", "P1", "P2"]
+    assert rejected == []
 
 
-def test_gate_reference_downgrades_when_disabled(monkeypatch):
-    """引用复核关闭时 reference 项降级为纯只读,仍可并行(读档核查成立)"""
-    _patch_common(monkeypatch, min_items=3)
-    eligible = agent2._plan_item_gate(_plan_items(3, planned="reference"), "C:/repo", False)
-    assert len(eligible) == 3
+def test_dispatch_reference_downgrades_when_disabled(monkeypatch):
+    """引用复核关闭时 reference 项降级为纯只读,仍可派发;且不篡改原计划项"""
+    _patch_common(monkeypatch)
+    items = [_pi("P1", planned="reference"), _pi("P2", planned="reference")]
+    eligible, _ = agent2._dispatchable_plan_items(items, ["P1", "P2"], "C:/repo", False)
     assert all(it["planned_evidence"] == "source" for it in eligible)
+    assert all(it["planned_evidence"] == "reference" for it in items)  # 原件不动
+
+
+# ============================================================
+# 工具注册条件(dispatch_review_subagents)
+# ============================================================
+
+
+def test_dispatch_tool_registered_when_repo_and_enabled(monkeypatch):
+    _patch_common(monkeypatch, enabled=True)
+    worker = _mk_worker_stream({})
+    main = _mk_main_stream([(_FINAL_JSON, [], "")])
+    _run(monkeypatch, main, worker, repo_path="C:/repo")
+    assert "dispatch_review_subagents" in _tool_names(main.tools_snapshots)
+
+
+def test_dispatch_tool_not_registered_when_disabled(monkeypatch):
+    _patch_common(monkeypatch, enabled=False)
+    worker = _mk_worker_stream({})
+    main = _mk_main_stream([(_FINAL_JSON, [], "")])
+    result = _run(monkeypatch, main, worker, repo_path="C:/repo")
+    assert not result.get("degraded") and not result.get("stopped")
+    assert "dispatch_review_subagents" not in _tool_names(main.tools_snapshots)
+    assert worker.calls == []  # 未注册 → 无派发 → 纯串行
+
+
+def test_dispatch_tool_not_registered_without_repo_path(monkeypatch):
+    _patch_common(monkeypatch, enabled=True)
+    worker = _mk_worker_stream({})
+    main = _mk_main_stream([(_FINAL_JSON, [], "")])
+    _run(monkeypatch, main, worker, repo_path=None)
+    assert "dispatch_review_subagents" not in _tool_names(main.tools_snapshots)
 
 
 # ============================================================
@@ -247,26 +320,28 @@ def test_adopted_refs_score_source_confirmed():
 
 
 # ============================================================
-# run_agent2 全链路:扇出 + fan-in 回灌
+# run_agent2 全链路:计划 → 派发 → fan-in 回灌
 # ============================================================
 
 
-def test_fan_out_and_fan_in_parallel_verifies_plan_items(monkeypatch):
-    """3 项计划 → 各子循环(1 次只读取证 + 1 次总结);fan-in 收养证据、
-    回执带 parallel_verified、system 信封排在工具回执之后注入"""
+def test_dispatch_and_fan_in_verifies_plan_items(monkeypatch):
+    """主用例:先 submit_review_plan 再 dispatch_review_subagents(P1,P2,P3)。
+    → 各子循环(每项 1 次取证 + 1 次总结);fan-in 收养证据、回执带 dispatched、
+    system 信封排在工具回执之后注入。"""
     publishes = _patch_common(monkeypatch)
     worker = _mk_worker_stream({
         f"P{i}": [
             _sr(tool_calls=[_tc("read_file", {"file_path": f"a{i}.py"}, cid=f"c{i}")]),
-            _sr(content=f"结论成立,证据 E1"),
+            _sr(content="结论成立,证据 E1"),
         ]
         for i in (1, 2, 3)
     })
-    main = _mk_main_stream([("", [_plan_tc(_plan_items(3))], "先规划")])
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "先规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"])], "派发"),
+    ])
     result = _run(monkeypatch, main, worker)
 
-    # emit 路径走结构化收尾:reasoning 是聚合对账文案(非 LLM JSON),
-    # 只断"未降级未终止"的完成态
     assert not result.get("degraded") and not result.get("stopped")
     assert len(worker.calls) == 6  # 每项 2 发
     # worker 请求带身份与只读白名单(无 submit_*/verify 工具)
@@ -275,60 +350,149 @@ def test_fan_out_and_fan_in_parallel_verifies_plan_items(monkeypatch):
         assert kwargs["extra"]["facet"].startswith("计划项 ")
         names = {t["function"]["name"] for t in kwargs["tools"]}
         assert "read_file" in names and not any(n.startswith("submit_") for n in names)
-    # 信封排在 submit_review_plan 回执之后(assistant tool_calls 与 tool 结果相邻)
     fan_in_msgs = main.snapshots[-1]
     envelopes = [m for m in fan_in_msgs if m.get("role") == "system"
                  and "[系统注入|计划项结论|P" in str(m.get("content"))]
     assert [m["content"].split("|P")[1][0] for m in envelopes] == ["1", "2", "3"]
     # 每个 worker 的局部 E1 收养后按主台账重新编号并改写结论引用号
-    # (主台账此前无证据:P1→E1 恒等、P2→E2、P3→E3)
     assert "证据 E1" in envelopes[0]["content"]
     assert "证据 E2" in envelopes[1]["content"]
     assert "证据 E3" in envelopes[2]["content"]
-    # 信封排在 submit_review_plan 回执之后(assistant tool_calls 与 tool 结果相邻)
+    # 回执排在信封之前(assistant tool_calls 与 tool 结果相邻)
     idx_receipt = next(i for i, m in enumerate(fan_in_msgs)
-                       if m.get("role") == "tool" and "parallel_verified" in str(m.get("content")))
+                       if m.get("role") == "tool" and '"dispatched"' in str(m.get("content")))
     idx_env = next(i for i, m in enumerate(fan_in_msgs) if "[系统注入|并行核查]" in str(m.get("content")))
     assert idx_receipt < idx_env
-    # 回执列出并行完成项
     receipt = json.loads(fan_in_msgs[idx_receipt]["content"])
-    assert receipt["parallel_verified"] == ["P1", "P2", "P3"]
+    assert receipt["ok"] is True and receipt["dispatched"] == ["P1", "P2", "P3"]
     assert any(p == "review_plan_update" for p, _ in publishes)
+    # 派发回执以 tool 形式回灌:其前一条 assistant 必带匹配的 tool_calls(消息序列形状)
+    _assert_tool_msgs_preceded_by_tool_calls(main.snapshots)
 
 
-def test_gate_miss_keeps_serial_path(monkeypatch):
-    """无 repo_path → 不扇出:stream_llm 零调用、无信封、串行行为不变"""
+def test_plan_submit_without_dispatch_stays_serial(monkeypatch):
+    """反转旧"自动扇出":只发 submit_review_plan(不发派发调用)→ 不扇出、
+    无信封、回执无 dispatched。这是改造后的常态。"""
     _patch_common(monkeypatch)
     worker = _mk_worker_stream({})
-    main = _mk_main_stream([("", [_plan_tc(_plan_items(3))], "先规划")])
-    result = _run(monkeypatch, main, worker, repo_path=None)
-
-    assert not result.get("degraded") and not result.get("stopped")
-    assert worker.calls == []
-    fan_in_msgs = main.snapshots[-1]
-    assert not any("[系统注入|" in str(m.get("content")) for m in fan_in_msgs if m.get("role") == "system")
-    receipt = json.loads(next(m["content"] for m in fan_in_msgs if m.get("role") == "tool" and m["content"].startswith("{")))
-    assert "parallel_verified" not in receipt
-
-
-def test_fan_out_only_once_across_plan_resubmits(monkeypatch):
-    """计划重发全量修订不再二次扇出(parallel_done 标志)"""
-    _patch_common(monkeypatch)
-    worker = _mk_worker_stream({
-        f"P{i}": [
-            _sr(tool_calls=[_tc("read_file", {"file_path": "a.py"}, cid=f"c{i}")]),
-            _sr(content="ok"),
-        ]
-        for i in (1, 2, 3)
-    })
     main = _mk_main_stream([
-        ("", [_plan_tc(_plan_items(3))], "规划"),
-        ("", [_plan_tc(_plan_items(4))], "修订重发"),  # 4 项重发也命中门控,但不得二次扇出
+        ("", [_plan_tc(_plan_items(3))], "先规划"),
+        # 模型选择自己逐项核查:直接发审查项而非派发
+        ("", [_tc("submit_review_item", {
+            "title": "注入", "review_target": "users.py:42", "origin": "agent1_claim",
+            "plan_item_id": "P1", "status": "covered", "verdict": "confirmed",
+        }, cid="call_item")], "自核 P1"),
     ])
     result = _run(monkeypatch, main, worker)
 
     assert not result.get("degraded") and not result.get("stopped")
-    assert len(worker.calls) == 6  # 仍是首轮 3 项 × 2 发
+    assert worker.calls == []  # 未派发 → 子循环零调用
+    fan_in_msgs = main.snapshots[-1]
+    assert not any("[系统注入|" in str(m.get("content"))
+                   for m in fan_in_msgs if m.get("role") == "system")
+    plan_receipt = json.loads(next(
+        m["content"] for m in fan_in_msgs
+        if m.get("role") == "tool" and '"planned"' in str(m.get("content"))))
+    assert "dispatched" not in plan_receipt
+    assert "dispatch_review_subagents" in plan_receipt["hint"]
+
+
+def test_model_does_not_dispatch_for_small_plan(monkeypatch):
+    """决策行为(止血桩):2 条计划项的小审查,模型不派发 → 纯串行自核,零子循环。"""
+    _patch_common(monkeypatch, min_items=3)
+    worker = _mk_worker_stream({})
+    main = _mk_main_stream([("", [_plan_tc(_plan_items(2))], "规划 2 项")])
+    result = _run(monkeypatch, main, worker)
+
+    assert not result.get("degraded") and not result.get("stopped")
+    assert worker.calls == []
+
+
+def test_dispatch_below_min_items_rejects_batch(monkeypatch):
+    """请求只 1 条(< MIN_ITEMS)→ 整批拒绝、不扇出、回执提示自行逐项核查。"""
+    _patch_common(monkeypatch, min_items=3)
+    worker = _mk_worker_stream({})
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "规划"),
+        ("", [_dispatch_tc(["P1"])], "只派 1 项"),
+    ])
+    _run(monkeypatch, main, worker)
+
+    assert worker.calls == []  # 整批拒绝 → 不扇出
+    fan_in_msgs = main.snapshots[-1]
+    reject = json.loads(next(
+        m["content"] for m in fan_in_msgs
+        if m.get("role") == "tool" and '"ok": false' in str(m.get("content"))))
+    assert reject["ok"] is False and "不足" in reject["reason"]
+
+
+def test_dispatch_mixed_rejects_verify_keeps_others(monkeypatch):
+    """请求含 verify 项 + 未知 id:逐条拒收,其余合格项 ≥ MIN_ITEMS 时照派。"""
+    _patch_common(monkeypatch, min_items=3)
+    items = [
+        {"target": "c1", "origin": "agent1_claim", "planned_evidence": "source"},
+        {"target": "c2", "origin": "agent1_claim", "planned_evidence": "verify"},
+        {"target": "c3", "origin": "agent1_claim", "planned_evidence": "source"},
+        {"target": "c4", "origin": "agent1_claim", "planned_evidence": "source"},
+    ]
+    worker = _mk_worker_stream({
+        f"P{i}": [_sr(content=f"P{i} 结论")] for i in (1, 3, 4)
+    })
+    main = _mk_main_stream([
+        ("", [_plan_tc(items)], "规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3", "P4"])], "全派(含 1 条 verify)"),
+    ])
+    _run(monkeypatch, main, worker)
+
+    fan_in_msgs = main.snapshots[-1]
+    receipt = json.loads(next(
+        m["content"] for m in fan_in_msgs
+        if m.get("role") == "tool" and '"dispatched"' in str(m.get("content"))))
+    assert receipt["dispatched"] == ["P1", "P3", "P4"]  # verify P2 被逐项拒收
+    assert {r["id"] for r in receipt["rejected"]} == {"P2"}
+
+
+def test_second_dispatch_rejected_by_max_calls(monkeypatch):
+    """同轮第二次派发 → 额度用尽(ok=false),仅首轮扇出。"""
+    _patch_common(monkeypatch, max_calls=1)
+    worker = _mk_worker_stream({
+        f"P{i}": [_sr(content=f"P{i} 结论")] for i in (1, 2, 3)
+    })
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"])], "首次派发"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"], cid="call_disp2")], "重复派发"),
+    ])
+    _run(monkeypatch, main, worker)
+
+    assert len(worker.calls) == 3  # 仅首轮扇出(每项 1 发)
+    fan_in_msgs = main.snapshots[-1]
+    quota = next(
+        json.loads(m["content"]) for m in fan_in_msgs
+        if m.get("role") == "tool" and "派发次数已达上限" in str(m.get("content")))
+    assert quota["ok"] is False
+
+
+def test_resubmit_plan_still_bounded_by_max_calls(monkeypatch):
+    """计划重发全量修订(P4)后仍受 MAX_CALLS=1 约束:第二次派发被拒。"""
+    _patch_common(monkeypatch, max_calls=1)
+    worker = _mk_worker_stream({
+        f"P{i}": [_sr(content=f"P{i} 结论")] for i in (1, 2, 3)
+    })
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"])], "首次派发"),
+        ("", [_plan_tc(_plan_items(4))], "修订重发"),
+        ("", [_dispatch_tc(["P1", "P2", "P3", "P4"], cid="call_disp2")], "修订后再派"),
+    ])
+    _run(monkeypatch, main, worker)
+
+    assert len(worker.calls) == 3  # 仍是首轮 3 项各 1 发
+    fan_in_msgs = main.snapshots[-1]
+    assert any(
+        "派发次数已达上限" in str(m.get("content"))
+        for m in fan_in_msgs if m.get("role") == "tool"
+    )
 
 
 def test_worker_readonly_whitelist_blocks_verify(monkeypatch):
@@ -341,7 +505,10 @@ def test_worker_readonly_whitelist_blocks_verify(monkeypatch):
         ],
         **{f"P{i}": [_sr(content="ok")] for i in (2, 3)},
     })
-    main = _mk_main_stream([("", [_plan_tc(_plan_items(3))], "规划")])
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"])], "派发"),
+    ])
     _run(monkeypatch, main, worker)
 
     p1_calls = [m for pid, _kw, m in worker.calls if pid == "P1"]
@@ -352,7 +519,7 @@ def test_worker_readonly_whitelist_blocks_verify(monkeypatch):
 
 
 def test_user_stop_during_fan_out_discards_all(monkeypatch):
-    """扇出期间命中用户终止:部分结果整批丢弃(不落库、无信封),审查按 stopped 收尾"""
+    """派发期间命中用户终止:部分结果整批丢弃(不落库、无信封),审查按 stopped 收尾"""
     _patch_common(monkeypatch)
     flag = {"stop": False}
 
@@ -365,7 +532,10 @@ def test_user_stop_during_fan_out_discards_all(monkeypatch):
         agent2, "record_conversation",
         lambda db, task, **kw: rows.append(kw) or MagicMock(id="x"),
     )
-    main = _mk_main_stream([("", [_plan_tc(_plan_items(3))], "规划")])
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"])], "派发"),
+    ])
     result = _run(
         monkeypatch, main, _worker,
         db=MagicMock(), task=_mk_task(), stop_check=lambda: flag["stop"],
@@ -388,7 +558,10 @@ def test_single_worker_error_does_not_sink_round(monkeypatch):
             raise RuntimeError("provider 429")
         return _sr(content=f"{pid} 结论")
 
-    main = _mk_main_stream([("", [_plan_tc(_plan_items(3))], "规划")])
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"])], "派发"),
+    ])
     result = _run(monkeypatch, main, _worker)
 
     assert not result.get("degraded") and not result.get("stopped")
@@ -417,7 +590,10 @@ def test_fan_in_pending_rows_pair_tool_call_id(monkeypatch):
         ],
         **{f"P{i}": [_sr(content="ok", conv_id=f"s-{i}")] for i in (2, 3)},
     })
-    main = _mk_main_stream([("", [_plan_tc(_plan_items(3))], "规划")])
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"])], "派发"),
+    ])
     _run(monkeypatch, main, worker, db=MagicMock(), task=_mk_task())
 
     p1_rows = [r for r in rows if (r.get("extra_payload") or {}).get("facet") == "计划项 P1"]
@@ -429,6 +605,35 @@ def test_fan_in_pending_rows_pair_tool_call_id(monkeypatch):
     assert p1_rows[i_result]["tool_call_id"] == f"conv{tool_call_row_idx + 1}"
     assert p1_rows[0]["stream_conv_id"] == "s-thinking-1"
     assert all(r["role"] == "agent2" and r["extra_payload"]["parallel"] is True for r in p1_rows)
+
+
+def test_dispatch_records_tool_call_line_for_timeline(monkeypatch):
+    """派发是过程,应落一条 tool_call 对话行(intent 含"派发 N 个审查子智能体"),
+    与发射类工具(submit_*)不落行形成对照。"""
+    _patch_common(monkeypatch)
+    rows = []
+
+    def _capture(db, task, **kwargs):
+        rows.append(kwargs)
+        return MagicMock(id=f"conv{len(rows)}")
+
+    monkeypatch.setattr(agent2, "record_conversation", _capture)
+    worker = _mk_worker_stream({f"P{i}": [_sr(content="ok")] for i in (1, 2, 3)})
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"])], "派发"),
+    ])
+    _run(monkeypatch, main, worker, db=MagicMock(), task=_mk_task())
+
+    call_rows = [
+        r for r in rows
+        if r["type"] == "tool_call" and "派发 3 个审查子智能体" in str(r.get("content"))
+    ]
+    assert call_rows, "派发应落一条 tool_call 对话行"
+    assert "dispatch_review_subagents" in call_rows[0]["content"]
+    # 结果行邻接配对到调用行的 conv id
+    result_rows = [r for r in rows if r["type"] == "tool_result" and r.get("tool_call_id")]
+    assert result_rows
 
 
 # ============================================================

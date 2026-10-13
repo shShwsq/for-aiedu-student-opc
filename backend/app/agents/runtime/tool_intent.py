@@ -73,6 +73,13 @@ def _b_dispatch_review_facets(a: dict[str, Any]) -> str:
     return f"派发 {len(facets)} 个审查分面:{'/'.join(facets)}"
 
 
+def _b_dispatch_review_subagents(a: dict[str, Any]) -> str:
+    ids = [str(i).strip() for i in (a.get("plan_item_ids") or []) if str(i).strip()]
+    if not ids:
+        return "派发审查子智能体"
+    return f"派发 {len(ids)} 个审查子智能体:{'/'.join(ids)}"
+
+
 _TOOL_INTENT_BUILDERS: dict[str, IntentBuilder] = {
     "clone_repo": lambda a: f"克隆仓库 {a.get('repo_url', '?')}",
     "list_files": lambda a: f"查看目录结构: {a.get('subdir') or '根目录'}",
@@ -102,6 +109,8 @@ _TOOL_INTENT_BUILDERS: dict[str, IntentBuilder] = {
     "http_request": _b_http_request,
     # agent1 分面按需派发
     "dispatch_review_facets": _b_dispatch_review_facets,
+    # agent2 审查子智能体按需派发
+    "dispatch_review_subagents": _b_dispatch_review_subagents,
 }
 
 

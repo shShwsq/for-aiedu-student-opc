@@ -104,3 +104,21 @@ def test_dispatch_facets_tool_description_is_disciplined():
     filled = tmpl.format(facet_names="check_ssrf, review_concurrency")
     assert "{facet_names}" not in filled
     assert "check_ssrf" in filled
+
+
+def test_agent2_subagent_dispatch_guidance_present_and_drift_free():
+    """agent2 审查子智能体按需派发的文本资产:纪律存在、已并入 system prompt,
+    且不含已删除配置名与"系统会自动"旧措辞(防提示词与实现漂移)。"""
+    from app.prompts import agent2 as a2
+
+    # 纪律正文存在,并共享进 system prompt(单一来源)
+    assert a2.AGENT2_SUBAGENT_DISPATCH_GUIDANCE.strip()
+    assert "dispatch_review_subagents" in a2.AGENT2_SUBAGENT_DISPATCH_GUIDANCE
+    assert a2.AGENT2_SUBAGENT_DISPATCH_GUIDANCE in a2.AGENT2_REVIEW_PROMPT
+    # 工具描述与定义
+    assert a2.DISPATCH_SUBAGENTS_TOOL_DESCRIPTION.strip()
+    assert a2._DISPATCH_SUBAGENTS_TOOL["function"]["name"] == "dispatch_review_subagents"
+    # 漂移护栏:不含已删除的自动扇出配置名 / 旧"系统会自动"措辞
+    assert "AGENT2_PARALLEL_ENABLED" not in a2.AGENT2_REVIEW_PROMPT
+    assert "系统会自动" not in a2.AGENT2_REVIEW_PROMPT
+    assert "系统会自动" not in a2.AGENT2_PLAN_PARALLEL_GUIDANCE

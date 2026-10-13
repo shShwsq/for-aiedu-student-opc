@@ -204,19 +204,25 @@ class Settings(BaseSettings):
     # 设为 0 关闭硬时限(只靠用户终止与额度上限)
     AGENT2_REVIEW_MAX_SECONDS: int = 3600
 
-    # ---- agent2 计划项并行核查(读阶段并发 / 写阶段主线程串行) ----
-    # 后台审查发射 submit_review_plan 后,把合格计划项(planned_evidence 非
-    # verify)扇出成有界只读 ReAct 子循环并行核实 —— 形状复用 react_agent
-    # 分面并行(worker 只跑 LLM + 只读工具 + 内存缓冲,不碰共享 db
-    # session/publish/证据台账;发射、落库、verify 全部 fan-in 后留主线程)。
-    # 子智能体带原生身份(计划项 id),规避 ACP 侧不带身份导致的并行 chunk
-    # 交织乱码。默认开;仍受最小项数/厂商闸门(REACT_PROVIDER_MAX_CONCURRENCY
-    # 同闸)约束。配额吃紧时运维可在 .env 显式置 False 回退串行。
-    AGENT2_PARALLEL_ENABLED: bool = True
-    # 计划项扇出线程数上限(实际取 min(本项, 合格计划项数))
+    # ---- agent2 审查子智能体按需派发(工具驱动,主循环内扇出) ----
+    # agent2 发射 submit_review_plan 后,**自行判断**是否调用 dispatch_review_subagents
+    # 工具把选定的计划项扇出成 N 条有界只读 ReAct 子循环并行核实(每个子智能体 =
+    # 一个计划项),而非"计划一发射就无差别自动扇出" —— 与 agent1 分面按需派发同构。
+    # 派发决策由模型自己做(先规划再决定派哪些项/是否全派/一个都不派),不派则按原
+    # 串行流程自己逐项取证。形状复用 react_agent 分面并行(worker 只跑 LLM + 只读
+    # 工具 + 内存缓冲,不碰共享 db session/publish/证据台账;发射、落库、verify 全部
+    # fan-in 后留主线程)。子智能体带原生身份(计划项 id),规避 ACP 侧不带身份导致
+    # 的并行 chunk 交织乱码。默认开;仍受最低合格项数/厂商闸门(REACT_PROVIDER_MAX_
+    # CONCURRENCY 同闸)约束。关闭 = 不注册派发工具(纯串行自核,而非回退自动扇出)。
+    AGENT2_SUBAGENT_DISPATCH_ENABLED: bool = True
+    # 单轮(一次 run_agent2)内派发调用次数上限:对标 Codex"同一未决线程避免重复
+    # 派发",防反复扇出烧配额;超限直接回执 ok=false 让模型基于已有结论集成。
+    AGENT2_SUBAGENT_DISPATCH_MAX_CALLS: int = 1
+    # 计划项扇出线程数上限(实际取 min(本项, 本次派发合格项数))
     AGENT2_PARALLEL_MAX_CONCURRENCY: int = 4
-    # 合格计划项低于此阈值走原串行路径(项少时并行 bootstrap + 上下文
-    # 复制成本高于串行收益,同 REACT_FACET_DISPATCH_MIN_FACETS 的理由)
+    # **调用时**可派发的最低合格项数:请求过滤掉未知/verify 项后剩余 < 此数
+    # → 整批拒绝(项少时子循环 bootstrap + 上下文复制成本高于串行收益,是工程
+    # 事实,模型无法估算,故设硬下限;下界固定 2),回执提示"自行逐项核查"
     AGENT2_PARALLEL_MIN_ITEMS: int = 3
     # 单个计划项子循环的最大迭代次数(有界,防止某一项跑飞拖垮整轮 fan-in)
     AGENT2_PLAN_ITEM_MAX_ITERATIONS: int = 8

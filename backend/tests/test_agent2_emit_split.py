@@ -208,6 +208,10 @@ def test_plan_reconciliation_by_plan_item_id(monkeypatch):
     plan_events = [d for t, d in events if t == "review_plan_update"]
     assert len(plan_events) == 1
     assert [i["id"] for i in plan_events[0]["items"]] == ["P1", "P2", "P3"]
+    # 自动扇出移除后事件序仍是:计划先于审查项(submit_review_plan 不再触发并行核查事件)
+    first_plan = next(i for i, (t, _) in enumerate(events) if t == "review_plan_update")
+    first_item = next(i for i, (t, _) in enumerate(events) if t == "review_item_add")
+    assert first_plan < first_item
     # 总结里"核实 N 项"与"计划已核实 M"各自自洽(旧版会出现"核实 0")
     assert review["verdict_summary"].startswith("核实 2 项:")
     assert "计划 3 项已核实 2" in review["verdict_summary"]
