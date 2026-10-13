@@ -542,14 +542,19 @@ _TABLES = (
 @pytest.fixture(scope="module")
 def test_engine():
     try:
-        maint = create_engine(settings.DATABASE_URL, isolation_level="AUTOCOMMIT")
+        # connect_timeout:远端库不可达时快速失败(否则 TCP 连接无超时会长挂),
+        # 触发下方 pytest.skip 而非让整轮 pytest 卡死无输出。
+        maint = create_engine(
+            settings.DATABASE_URL, isolation_level="AUTOCOMMIT",
+            connect_args={"connect_timeout": 5},
+        )
         with maint.connect() as conn:
             conn.execute(text(f"DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE"))
             conn.execute(text(f"CREATE SCHEMA {TEST_SCHEMA}"))
         maint.dispose()
         engine = create_engine(
             settings.DATABASE_URL,
-            connect_args={"options": f"-c search_path={TEST_SCHEMA}"},
+            connect_args={"connect_timeout": 5, "options": f"-c search_path={TEST_SCHEMA}"},
         )
         Base.metadata.create_all(engine)
     except Exception as e:
@@ -557,7 +562,10 @@ def test_engine():
     yield engine
     engine.dispose()
     try:
-        cleanup = create_engine(settings.DATABASE_URL, isolation_level="AUTOCOMMIT")
+        cleanup = create_engine(
+            settings.DATABASE_URL, isolation_level="AUTOCOMMIT",
+            connect_args={"connect_timeout": 5},
+        )
         with cleanup.connect() as conn:
             conn.execute(text(f"DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE"))
         cleanup.dispose()
