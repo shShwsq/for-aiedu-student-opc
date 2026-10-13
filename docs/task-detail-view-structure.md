@@ -316,6 +316,18 @@ RoundGroup { roundIdx, segments, planSteps }
    「实际使用」行只在任务**没有**直接指定模型时出现(留空 / 原选配置已被删除 / 走默认档):
    选择框本身已写着配置名时再复述一遍是噪音;配置被删那种额外带「原选配置已删除,已回退」。
    生效时机同 bar 形态:running/paused 下的修改在下一轮执行才生效,组件内 toast 说明。
+   **执行器行**:面板顶部常驻一行「执行器」,显示当前 agent1 用哪个执行器(内置固定
+   「内置」,CLI 取后端注册表 `display_name`,经 `useAgentTypes` 的 `GET /agents/types`
+   模块级缓存解析,未加载完回退到原始 executor 字符串)。执行器在运行态**不可切换**
+   (改执行器等于换一套执行栈,仍走「新建任务」页选定),详情只做透明展示。
+   **CLI 模型参数**:当执行器是支持任务级模型参数的 CLI(qoder_cli / deepseek_cli,
+   判定与选项清单集中在 `data/cliModelOptions`)时,「AI助手模型」不再是「由 CLI 自管」
+   的一句提示,而是可编辑的下拉组(模型 / 思考强度,qoder 另加上下文窗口)——改动即保存,
+   写进 `task.params.model/reasoning_effort/context_window`(与「新建任务」页同一存储位置),
+   经同一 `PATCH /tasks/{id}/runtime_config` 端点落库。上下文窗口仅 qoder_cli 落库
+   (dsh 无该概念,后端忽略不报错)。codex_cli 模型经 `~/.codex/config.toml` 自管,
+   与内置执行器一样只报提示不给编辑;后端对这两类执行器传入 CLI 参数报 400
+   (单测 `test_runtime_config_cli_model.py`)。
 3. **任务清单**(有 plan 时):原主对话流"计划清单"卡迁入,展示最新一轮的
    计划步骤(✓ done / ◌ in_progress / ○ pending)与进度 x/y;数据来自
    SSE plan 事件与历史对话提取(`<plan>` 块 / TodoList tool_call),
