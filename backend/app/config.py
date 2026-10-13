@@ -202,6 +202,32 @@ class Settings(BaseSettings):
     # 设为 0 关闭硬时限(只靠用户终止与额度上限)
     AGENT2_REVIEW_MAX_SECONDS: int = 3600
 
+    # ---- agent2 计划项并行核查(读阶段并发 / 写阶段主线程串行) ----
+    # 后台审查发射 submit_review_plan 后,把合格计划项(planned_evidence 非
+    # verify)扇出成有界只读 ReAct 子循环并行核实 —— 形状复用 react_agent
+    # 分面并行(worker 只跑 LLM + 只读工具 + 内存缓冲,不碰共享 db
+    # session/publish/证据台账;发射、落库、verify 全部 fan-in 后留主线程)。
+    # 子智能体带原生身份(计划项 id),规避 ACP 侧不带身份导致的并行 chunk
+    # 交织乱码。默认开;仍受最小项数/厂商闸门(REACT_PROVIDER_MAX_CONCURRENCY
+    # 同闸)约束。配额吃紧时运维可在 .env 显式置 False 回退串行。
+    AGENT2_PARALLEL_ENABLED: bool = True
+    # 计划项扇出线程数上限(实际取 min(本项, 合格计划项数))
+    AGENT2_PARALLEL_MAX_CONCURRENCY: int = 4
+    # 合格计划项低于此阈值走原串行路径(项少时并行 bootstrap + 上下文
+    # 复制成本高于串行收益,同 REACT_PARALLEL_MIN_FACETS 的理由)
+    AGENT2_PARALLEL_MIN_ITEMS: int = 3
+    # 单个计划项子循环的最大迭代次数(有界,防止某一项跑飞拖垮整轮 fan-in)
+    AGENT2_PLAN_ITEM_MAX_ITERATIONS: int = 8
+    # 单个计划项子循环的墙钟预算(秒):循环边界与收 chunk 时协作式检查,
+    # 超时则转入本项总结收尾(部分结论)并隔离,不拖垮 fan-in 整轮
+    AGENT2_PLAN_ITEM_TIMEOUT_SECONDS: int = 240
+    # 单个计划项子循环的取证额度(读类与引用类各自计数):fan-in 后累计
+    # 计入主循环总池(MAX_READ_TOOL_CALLS=100 / MAX_REFERENCE_CALLS=3)
+    AGENT2_PLAN_ITEM_MAX_READ_CALLS: int = 25
+    # 单项结论注入信封前的 token 上限(CJK 感知粗估,镜像
+    # REACT_FACET_SUMMARY_MAX_TOKENS:并行放大的是"份数",每份必须有界)
+    AGENT2_PLAN_ITEM_SUMMARY_MAX_TOKENS: int = 3000
+
     # ---- 动态验证(PoC verifier)额度与授权 ----
     # 单轮审查里调用动态验证的次数上限(下限固定 3,实际额度按审查计划里
     # 声明 planned_evidence=verify 的条目数联动)。每次验证内部最多 10 轮工具

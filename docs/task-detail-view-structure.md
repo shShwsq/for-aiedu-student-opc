@@ -356,7 +356,8 @@ RoundGroup { roundIdx, segments, planSteps }
    按轮折叠组(进行中轮自动展开),轮组标题为核查摘要文案(如"3 次核查 · 1 条
    修正指令",不显示轮次数字),**轮内是一条时序穿插的条目流**(思考 → 它触发的
    工具 → 下一段思考 …),由 `utils/agent2Timeline.buildAgent2Rounds` 算定:
-   含流式思考(SSE thinking_delta,verify 标记显示"动态验证";展开规则与主对话流
+   含流式思考(SSE thinking_delta,verify 标记显示"动态验证";计划项并行核查时
+   多路思考卡按 facet 显示"核查 · 计划项 Pn"身份标签,见 §17;展开规则与主对话流
    思考卡同一套生命周期,见 §3.2 ——审查动辄数分钟且正文全在 reasoning,折叠着就
    等于只看得到字数跑)、历史思考链、工具核查(读码/PoC/引用复核,tool_call 与
    tool_result 配对为单行摘要+展开)、评估结论、最终总结卡。
@@ -731,3 +732,25 @@ agent2 提示词里的指称不变),左侧历史任务栏在 `AppHeader` 里的 
    推进世代 + 释掉在途句柄 + 置 loading),否则同标签页换账号时,详情页会先报上一个
    账号的默认模型名——不止「实际使用」行,选择框的默认选项名(印在触发按钮上)会一直
    带着别人的配置名,直到自己的请求落地。
+
+## 17. 计划项并行核查:侧栏多路思考卡的身份标签(本次改动)
+
+agent2 发射审查计划后,合格计划项会扇出为多个只读子循环并行核查(后端机制见
+`agent-architecture.md` §2.9)。前端只做了最小接线——实时流按 conv_id 分桶已天然
+隔离多路并行(Agent2Panel 与主对话流共用同一个 `streamingItems` Map,
+`handleThinkingDelta` 早已解构 facet 写入实时卡),缺的只是"哪张卡是哪路"的身份显示:
+
+| 旧结构 | 新结构 |
+|---|---|
+| 多路并行思考卡与主循环思考卡长得一样,只能靠滚内容猜是哪条计划项 | `Agent2Panel` 流式卡 summary 在 `e.stream.facet` 存在时渲染"核查 · 计划项 Pn"小标签(`.panel-facet-tag`),串行/老任务无 facet 不渲染 |
+| 组件本地 `StreamingLike` 未声明 facet | 补可选 `facet?: string`(与 TaskDetailView 的 `StreamingItem` 同一张卡片实体,字段对齐) |
+
+类型零新增:`types/task.ts` 的 `ThinkingDeltaEventData`/`ConversationEventData`/`Conversation`
+已有可选 facet 字段(内置 react 分面并行先落的接线),agent2 侧直接复用。
+静态守卫:`components/agent2PanelFacetWiring.test.ts`(镜像
+`views/taskDetailViewFacetWiring.test.ts` 的扫描风格),钉住 StreamingLike 声明、
+条件渲染与上游 conv_id 分桶三处形状。
+
+保留不变:思考卡展开生命周期、tool_call/tool_result 配对、按轮折叠组时序穿插;
+主对话流的"分面 · X"标签(内置 react 分面并行)与样式不动,agent2 侧用
+"核查 · X"是因为受众在审查侧栏语境。

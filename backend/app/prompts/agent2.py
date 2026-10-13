@@ -435,6 +435,10 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
    发现新疑点可**重发 `submit_review_plan` 全量修订**;系统会给每条补稳定 id
    (P1、P2…)并在回执里返回。计划不是围栏:允许发射计划外审查项,未核实的计划项
    **不会**被伪造成审查项,只在审查计划里标为「未核实」。
+   计划发射后,系统会自动对 planned_evidence 非 verify 的计划项**并行只读核查**,
+   并把各项结论(含证据引用号,已登记进本轮证据台账)注入回上下文;届时不必重跑
+   这些核查:逐项审查项直接引用信封里的证据号(带 plan_item_id 对账),
+   声明 verify 或需补查的项再按原流程自行调用工具。
 2. **逐项核实并发射**:按计划核查,每核查完/判完一项即调 `submit_review_item`
    发射一条审查项(单一原语,三分档合一——**主语是"你对这条待核实对象的核实结果"**):
    - `origin`:来源(`agent1_claim`=核实 agent1 的结论/发现 / `agent1_action`=核实 agent1
@@ -582,3 +586,115 @@ agent1 结论若引用了外部依据(URL / CVE 编号 / 安全公告 / 官方�
 # 兼容别名:旧名 AGENT2_SYSTEM_PROMPT 指向审查模式 prompt
 # (测试/文档可能引用;新代码应显式使用 AGENT2_REVIEW_PROMPT)
 AGENT2_SYSTEM_PROMPT = AGENT2_REVIEW_PROMPT
+
+
+# ============================================================
+# 计划项并行核查的文本资产(子循环指令 + fan-in 回灌装配)
+#
+# 背景:agent2 发射审查计划后,合格计划项(planned_evidence 非 verify)会被
+# 扇出成有界只读 ReAct 子循环并行核实(执行逻辑见 app/agents/agent2.py 的
+# _run_plan_item_pass / _fan_out_plan_items)。形状镜像 prompts/executor.py 的
+# 分面并行文本资产,但本模块仍守零 app.* 依赖硬约束(见 tests/test_prompts_purity.py)。
+# ============================================================
+
+# 与 prompts/executor.py 的 SYSTEM_INJECT_MARKER 同值:注入内容用固定前缀
+# 开头,让模型能区分"用户原话"与"系统注入"(防间接注入面)。prompts 包内
+# 模块互不 import(纯度约束),两处字面量必须人工保持同步。
+_SYSTEM_INJECT_MARKER = "[系统注入|"
+
+
+def build_agent2_plan_item_instruction(plan_item: dict) -> str:
+    """构造单个计划项的只读核查指令(子循环的独立 system 指令层,不落库不展示)。
+
+    镜像 executor.build_facet_instruction:子 agent 的角色/约束作独立指令层,
+    不污染真实上下文。参数为 _stamp_plan_items 补过 id 的计划项 dict
+    (id/target/origin/priority/planned_evidence)。本函数零 app.* 依赖,纯文本拼装。
+    """
+    pid = str((plan_item or {}).get("id") or "(未编号)").strip()
+    target = str((plan_item or {}).get("target") or "").strip()
+    origin = str((plan_item or {}).get("origin") or "agent1_claim").strip()
+    planned = str((plan_item or {}).get("planned_evidence") or "source").strip()
+    ref_note = (
+        "本项拟采引用复核取证,可用 check_reference 核对引用链接。\n"
+        if planned == "reference" else ""
+    )
+    return (
+        f"[审查计划项:{pid}]\n"
+        "本轮只针对该计划项深入核查,不要覆盖其他计划项:\n"
+        f"待核实对象:{target}\n"
+        f"来源:{origin}(核实 AI助手 的结论或它修改/生成的产物)\n"
+        + ref_note +
+        "只使用只读取证工具(read_file / list_files / find_files / search_code"
+        + (" / check_reference" if planned == "reference" else "") + "),"
+        "不调用动态验证,也不发射任何审查结论(不会给你 submit_* 类工具)。\n"
+        "定位到具体文件:行号或原文引用后,输出该计划项的完整结论(自然语言,不要 JSON):\n"
+        "① 成立/不成立/待核实(没取到证就不算成立);\n"
+        "② 证据:引用你实际读到的原文 + 文件:行号,并附上工具回传里的证据引用号"
+        "(如 E1/E2…);\n"
+        "③ 对用户的影响与修复建议(各一句)。"
+    )
+
+
+# 子循环预算耗尽(超时/跑满迭代)时的收尾提示:镜像 executor.MAX_ITERATION_PROMPT,
+# 但产出口径对齐计划项结论(而非 react_agent 的本轮总结)
+AGENT2_PLAN_ITEM_FINALIZE_PROMPT = (
+    "系统提示:本计划项的核查预算已耗尽(时间或迭代上限)。"
+    "请停止调用工具,用自然语言总结本计划项当前的结论:"
+    "核实到了什么 / 取到了哪些证据(附证据引用号)/ 哪些尚未核实;"
+    "没取到证的写待核实语气,不要臆造结论。"
+)
+
+
+# fan-in 回灌的行动指引(整批只附一份,不逐项重复):各分项结论已就位,
+# 主循环回合的职责是发射与集成而非重做。措辞集中在这一处,便于后续调参。
+AGENT2_PLAN_PARALLEL_GUIDANCE = (
+    "上一阶段系统已自动完成审查计划合格项的并行只读核查,"
+    "以下是各计划项的结论(逐项独立注入,证据引用号已登记进本轮证据台账)。\n"
+    "请在此基础上继续本轮审查:\n"
+    "- 已有结论的项直接发射 submit_review_item(带 plan_item_id 对账,"
+    "evidence.*.call_ref 填信封里的证据引用号),不要重跑已完成的核查\n"
+    "- planned_evidence=verify 或需补查的项,再按原流程自行调用工具\n"
+    "- 知识点提炼(submit_knowledge_point)同样基于这些结论进行"
+)
+
+
+def build_agent2_plan_result_messages(
+    items: list[tuple[str, str, str]],
+) -> list[dict[str, str]]:
+    """把各计划项结论装配成回灌主循环上下文的 system 消息序列。
+
+    镜像 executor.build_facet_result_messages:首条行动指引,随后每项一条
+    独立信封(刻意用 system 角色:注入内容不能被当成用户原话)。
+
+    参数:
+        items: 按计划项顺序的 (pid, status, summary) 列表;
+            status 取 "ok" / "error" / "timed_out";
+            summary 为已截断且证据引用号已改写为主台账 ref 的结论文本,
+            status="error" 时传该项的错误信息。
+
+    返回: [{"role": "system", "content": ...}];空入参返回空列表。
+    本函数零 app.* 依赖(见 tests/test_prompts_purity.py),只做文本拼装。
+    """
+    if not items:
+        return []
+
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": f"{_SYSTEM_INJECT_MARKER}并行核查]\n{AGENT2_PLAN_PARALLEL_GUIDANCE}",
+        }
+    ]
+    for pid, status, summary in items:
+        name = (pid or "").strip() or "(未编号)"
+        body = (summary or "").strip()
+        if status == "error":
+            text = f"(该计划项核查失败:{body or '未知错误'})"
+        elif status == "timed_out":
+            text = f"{body or '(本计划项无明确结论)'}\n(部分结论,已超时收尾)"
+        else:
+            text = body or "(本计划项无明确结论)"
+        messages.append({
+            "role": "system",
+            "content": f"{_SYSTEM_INJECT_MARKER}计划项结论|{name}]\n{text}",
+        })
+    return messages

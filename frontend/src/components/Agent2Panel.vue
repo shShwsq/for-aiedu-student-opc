@@ -64,6 +64,8 @@ interface StreamingLike {
   content: string
   status: 'streaming' | 'done' | 'error'
   verify?: boolean
+  /** 仅计划项并行核查有:身份标签(如"计划项 P1"),多路子循环思考卡据此区分 */
+  facet?: string
   /** 思考展开状态三要素(见 utils/thinkingExpand),与主对话流同一张卡片实体 */
   reasoning_auto?: boolean
   reasoning_grace?: boolean
@@ -396,6 +398,8 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
               <span :class="['panel-stream-label', { 'is-verify': e.stream.verify }]">
                 {{ e.stream.verify ? '动态验证' : '思考中' }}{{ e.stream.status === 'streaming' ? '…' : '' }}
               </span>
+              <!-- 并行核查身份标(多路子循环卡片据此区分;串行/老任务无 facet 不渲染) -->
+              <span v-if="e.stream.facet" class="panel-facet-tag">核查 · {{ e.stream.facet }}</span>
               <span class="panel-row-count">· {{ charCount(e.stream.reasoning || e.stream.content) }} 字</span>
             </summary>
             <div
@@ -589,6 +593,15 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
 }
 
 .panel-stream-label.is-verify {
+  color: var(--color-info);
+}
+
+.panel-facet-tag {
+  margin-left: var(--space-1);
+  padding: 1px var(--space-2);
+  font-size: var(--fs-xs);
+  border-radius: var(--radius-sm);
+  background: var(--color-info-soft, rgba(59, 130, 246, 0.12));
   color: var(--color-info);
 }
 

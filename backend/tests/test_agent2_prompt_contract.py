@@ -13,12 +13,16 @@ AGENT2_SYSTEM_PROMPT 为审查模式的兼容别名。
 import pytest
 
 from app.prompts.agent2 import (
+    AGENT2_PLAN_ITEM_FINALIZE_PROMPT,
+    AGENT2_PLAN_PARALLEL_GUIDANCE,
     AGENT2_REVIEW_PROMPT,
     AGENT2_SYSTEM_PROMPT,
     _SUBMIT_REVIEW_PLAN_TOOL,
     _SUBMIT_REVIEW_ITEM_TOOL,
     _SUBMIT_KNOWLEDGE_POINT_TOOL,
     _SUBMIT_SUGGESTION_TOOL,
+    build_agent2_plan_item_instruction,
+    build_agent2_plan_result_messages,
 )
 
 
@@ -218,3 +222,58 @@ def test_review_prompt_has_architecture_but_delegates_scope_broadening():
     assert "架构设计" in AGENT2_REVIEW_PROMPT
     assert "主动拓宽过窄的用户范围" not in AGENT2_REVIEW_PROMPT
     assert "由后台推荐器" in AGENT2_REVIEW_PROMPT
+
+
+# ============================================================
+# 计划项并行核查文本资产(子循环指令 + fan-in 信封)
+# ============================================================
+
+
+def test_review_prompt_announces_parallel_plan_verification():
+    """主 prompt 补段:告知模型计划后系统会自动并行核查,不要重跑。"""
+    assert "并行只读核查" in AGENT2_REVIEW_PROMPT
+    assert "不必重跑" in AGENT2_REVIEW_PROMPT
+
+
+def test_plan_item_instruction_shape():
+    """单项指令层:身份头 + target + 只读白名单措辞;reference 项附 check_reference。"""
+    txt = build_agent2_plan_item_instruction({
+        "id": "P2", "target": "登录接口未鉴权", "origin": "agent1_claim",
+        "planned_evidence": "source",
+    })
+    assert "[审查计划项:P2]" in txt
+    assert "登录接口未鉴权" in txt
+    assert "只使用只读取证工具" in txt
+    assert "不发射任何审查结论" in txt
+    assert "证据引用号" in txt
+    assert "check_reference" not in txt  # source 项不提引用复核
+    ref_txt = build_agent2_plan_item_instruction({
+        "id": "P3", "target": "t", "planned_evidence": "reference",
+    })
+    assert "check_reference" in ref_txt
+
+
+def test_plan_result_messages_envelope_shape():
+    """fan-in 信封:首条行动指引(整批一份)+ 每项一条 system 信封;
+    三种状态措辞镜射分面版;空入参空列表。"""
+    msgs = build_agent2_plan_result_messages([
+        ("P1", "ok", "成立,见 E1"),
+        ("P2", "error", "provider 500"),
+        ("P3", "timed_out", "部分结论 E4"),
+    ])
+    assert len(msgs) == 4
+    assert all(m["role"] == "system" for m in msgs)
+    assert "[系统注入|并行核查]" in msgs[0]["content"]
+    assert AGENT2_PLAN_PARALLEL_GUIDANCE in msgs[0]["content"]
+    assert "不要重跑已完成的核查" in msgs[0]["content"]
+    assert "[系统注入|计划项结论|P1]" in msgs[1]["content"] and "成立,见 E1" in msgs[1]["content"]
+    assert "核查失败" in msgs[2]["content"] and "provider 500" in msgs[2]["content"]
+    assert "部分结论,已超时收尾" in msgs[3]["content"]
+    assert build_agent2_plan_result_messages([]) == []
+
+
+def test_plan_item_finalize_prompt_bounds_scope():
+    """收尾提示:停工具、输出部分结论、没取证不臆造。"""
+    assert "停止调用工具" in AGENT2_PLAN_ITEM_FINALIZE_PROMPT
+    assert "证据引用号" in AGENT2_PLAN_ITEM_FINALIZE_PROMPT
+    assert "不要臆造结论" in AGENT2_PLAN_ITEM_FINALIZE_PROMPT

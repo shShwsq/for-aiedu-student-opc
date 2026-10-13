@@ -164,6 +164,50 @@ class EvidenceRecorder:
         }
         return f"{text}\n[evidence_ref={eref}]"
 
+    def adopt_entries(self, entries: dict[str, dict]) -> dict[str, str]:
+        """把并行子台账按计划插入顺序整批搬进主台账,重新编号为新的 E#。
+
+        背景:计划项并行核查时每个 worker 持自己的 EvidenceRecorder(线程边界:
+        worker 不碰主台账);fan-in 主线程收养各 worker 的条目,否则
+        submit_review_item 的 call_ref 指向的局部 ref 在主台账里查无此人,
+        score_review_item 会把所有并行结论压成 assertion_only。
+
+        body 原样保留(quote 子串匹配对齐的是台账正文,不碰 ref 编号);
+        verify 类条目的 verify_ok/outcome 一并搬入,定论口径不变。
+
+        返回 旧 ref → 新 ref 映射(含未搬入的非法条目跳过);调用方据此改写
+        结论文本里的引用号(见 remap_refs_in_text)。
+        """
+        mapping: dict[str, str] = {}
+        for old_ref, entry in (entries or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            new_ref = self._next_ref()
+            adopted = dict(entry)
+            adopted["call_id"] = (
+                f"{entry.get('call_id') or ''}|adopted:{old_ref}" or entry.get("call_id")
+            )
+            self.ledger[new_ref] = adopted
+            mapping[str(old_ref)] = new_ref
+        return mapping
+
+
+# 结论/信封文本里的证据引用号(\b 不单独适用于 CJK 语境,E 前紧邻字母/数字不算引用)
+_EVIDENCE_REF_RE = re.compile(r"(?<![A-Za-z0-9_])E(\d+)(?![A-Za-z0-9_])")
+
+
+def remap_refs_in_text(text: str, mapping: dict[str, str]) -> str:
+    """把文本里的 E# 引用号按映射改写(映射外的引用号原样保留)。
+
+    并行 worker 结论里的 E1/E2… 是局部台账编号,收养后主台账重新编号;
+    不改写则 call_ref 对不上主台账(命中校验①直接 mismatch)。
+    """
+    if not text or not mapping:
+        return text or ""
+    return _EVIDENCE_REF_RE.sub(
+        lambda m: mapping.get(m.group(0), m.group(0)), text
+    )
+
 
 def _lookup(ledger: dict[str, dict[str, Any]], call_ref: Any) -> dict[str, Any] | None:
     if not call_ref or not isinstance(call_ref, str):

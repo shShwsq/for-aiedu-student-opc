@@ -41,6 +41,8 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
 from uuid import UUID, uuid4
@@ -64,7 +66,12 @@ from app.llm.client import LLMClient
 from app.models.task import Conversation, Result, Task
 
 # 证据台账 + 置信度派生(纯函数,见 app/agents/evidence.py)
-from app.agents.evidence import EvidenceRecorder, derive_confidence_column, score_review_item
+from app.agents.evidence import (
+    EvidenceRecorder,
+    derive_confidence_column,
+    remap_refs_in_text,
+    score_review_item,
+)
 
 # 动态验证结论档位(只认"定论"给「已动态验证」档,见 verification_outcome.py)
 from app.agents.verification_outcome import OUTCOME_UNKNOWN, outcome_note, parse_outcome_line
@@ -86,6 +93,7 @@ from app.models.audit import (
 # agent2 的 LLM 文本资产(审查 system prompt + 三类工具定义)
 # 集中管理于 app/prompts/agent2.py,本模块只留执行逻辑
 from app.prompts.agent2 import (
+    AGENT2_PLAN_ITEM_FINALIZE_PROMPT,
     AGENT2_REVIEW_PROMPT,
     AGENT2_SYSTEM_PROMPT,
     _READ_ONLY_TOOL_DEFINITIONS,
@@ -95,6 +103,8 @@ from app.prompts.agent2 import (
     _SUBMIT_REVIEW_ITEM_TOOL,
     _SUBMIT_KNOWLEDGE_POINT_TOOL,
     _SUBMIT_SUGGESTION_TOOL,
+    build_agent2_plan_item_instruction,
+    build_agent2_plan_result_messages,
 )
 
 logger = logging.getLogger(__name__)
@@ -521,6 +531,9 @@ def run_agent2(
         "tool_counts": {"read": 0, "verify": 0, "reference": 0},
         # 本轮验证额度(按计划项现算,供对账判"额度是否触顶"用同一个口径)
         "verify_budget": MIN_VERIFY_CALLS,
+        # 计划项并行只扇出一次(首次 submit_review_plan 命中门控时);
+        # 重发全量修订不再二次扇出
+        "parallel_done": False,
     }
     # 被审 agent1 对话 id 集(校验 submit_review_item.agent1_ref 归属;空集=不校验)
     agent1_conv_ids: set[UUID] = set()
@@ -562,6 +575,118 @@ def run_agent2(
         if review_max_seconds > 0 and (time.monotonic() - loop_started) >= review_max_seconds:
             return "timeout"
         return None
+
+    def _fan_out_plan_items(plan_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """合格计划项扇出并行只读核查;主线程 fan-in 收养证据/落库/回灌。
+
+        返回要注入 messages 的信封消息列表(空列表=不注入)。本函数完成的
+        副作用全部在主线程:evidence.adopt_entries(主台账重编号)、各 worker
+        pending_rows 落库("落库必 publish"铁律)、取证计数并入主循环总池。
+        扇出期间命中用户终止:部分结果整批丢弃(不落库不回灌)——调用方
+        在循环边界会检查到 stopped,整个审查作废,保留部分只会造成半截对账。
+        """
+        nonlocal read_tool_count, reference_count
+
+        from app.agents.react_agent import _clip_to_tokens
+        from app.config import settings as _s
+
+        max_workers = min(
+            len(plan_items),
+            max(1, int(getattr(_s, "AGENT2_PARALLEL_MAX_CONCURRENCY", 4) or 4)),
+        )
+        max_iter = max(1, int(getattr(_s, "AGENT2_PLAN_ITEM_MAX_ITERATIONS", 8) or 8))
+        item_timeout = max(1, int(getattr(_s, "AGENT2_PLAN_ITEM_TIMEOUT_SECONDS", 240) or 240))
+        read_cap = max(1, int(getattr(_s, "AGENT2_PLAN_ITEM_MAX_READ_CALLS", 25) or 25))
+        max_summary_tokens = max(
+            1, int(getattr(_s, "AGENT2_PLAN_ITEM_SUMMARY_MAX_TOKENS", 3000) or 3000)
+        )
+        # 统一算一次扇出基准 deadline(墙钟预算),同时受审查总硬时限约束
+        deadline = time.monotonic() + item_timeout
+        if review_max_seconds > 0:
+            deadline = min(deadline, loop_started + review_max_seconds)
+        # worker 基础上下文:只取 system/user(agent2 的 messages 本就是无状态的
+        # system + user;此刻本轮 submit_review_plan 的工具交换尚未收口,
+        # 悬挂的 assistant tool_calls 消息不能带进子循环)
+        base_messages = [
+            dict(m) for m in messages if m.get("role") in ("system", "user")
+        ]
+
+        logger.info(
+            f"[task={task_id}] agent2 计划项并行核查启动:{len(plan_items)} 项"
+            f"(max_workers={max_workers},max_iter/项={max_iter},"
+            f"timeout/项={item_timeout}s,取证额度/项={read_cap})"
+        )
+        results: list[_PlanItemResult] = []
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix=f"agent2-plan-{str(task_id)[:8]}",
+        ) as pool:
+            futures = [
+                pool.submit(
+                    _run_plan_item_pass, it, base_messages, client,
+                    task_id, round_idx, repo_path,
+                    read_cap=read_cap, max_iter=max_iter,
+                    deadline=deadline, stop_check=stop_check,
+                )
+                for it in plan_items
+            ]
+            # 按计划项顺序收集,保证 fan-in 落库/展示顺序确定(与完成顺序无关)
+            for fut in futures:
+                results.append(fut.result())
+
+        if stop_check is not None and stop_check():
+            logger.info(
+                f"[task={task_id}] agent2 并行核查被用户终止,"
+                f"丢弃 {len(results)} 项部分结果(不落库不回灌)"
+            )
+            return []
+
+        env_items: list[tuple[str, str, str]] = []
+        for pr in results:
+            # 证据收养:worker 局部台账 → 主台账(重新编号),再改写结论里的引用号
+            mapping = evidence.adopt_entries(pr.evidence_entries)
+            if pr.error:
+                status, text = "error", pr.error
+            elif pr.timed_out:
+                status, text = "timed_out", remap_refs_in_text(pr.summary, mapping)
+            else:
+                status, text = "ok", remap_refs_in_text(pr.summary, mapping)
+            text = _clip_to_tokens(text, max_summary_tokens)
+            env_items.append((pr.pid, status, text))
+            # 取证计数并入主循环总池(全局上限与 fan-in 后的补查共享额度口径)
+            read_tool_count += pr.read_calls
+            reference_count += pr.ref_calls
+            # pending_rows 落库(主线程串行逐条;tool_result 按邻接补 tool_call_id)
+            if db is None or task is None:
+                continue
+            last_call_id: str | None = None
+            for row in pr.pending_rows:
+                tool_call_id = last_call_id if row["type"] == "tool_result" else None
+                try:
+                    conv = record_conversation(
+                        db, task,
+                        round_idx=round_idx, role="agent2", type=row["type"],
+                        content=row.get("content") or "",
+                        reasoning=row.get("reasoning") or None,
+                        tool_call_id=tool_call_id,
+                        stream_conv_id=row.get("stream_conv_id"),
+                        extra_payload={"facet": f"计划项 {pr.pid}", "parallel": True},
+                    )
+                    if row["type"] == "tool_call":
+                        last_call_id = str(conv.id)
+                except Exception as e:
+                    logger.warning(
+                        f"[task={task_id}][并行 fan-in] 落库 agent2 "
+                        f"{row['type']} 行失败(忽略): {e}"
+                    )
+        emit_state["parallel_done"] = True
+        logger.info(
+            f"[task={task_id}] agent2 计划项并行核查 fan-in 完成:"
+            f"{len(env_items)} 项结论已回灌,累计取证 "
+            f"read={sum(p.read_calls for p in results)} "
+            f"reference={sum(p.ref_calls for p in results)}"
+        )
+        return build_agent2_plan_result_messages(env_items)
 
     while True:
         # 终止/超时检查点(循环顶):上一次工具回灌后用户按了终止,不再多付一次 LLM 往返
@@ -650,8 +775,16 @@ def run_agent2(
                 publish(task_id, "review_plan_update", {
                     "items": plan_items, "note": args.get("note"), "planned": len(plan_items),
                 })
+                # 计划项并行核查(门控不满足/已扇出过→空列表,串行行为不变)
+                envelopes: list[dict[str, Any]] = []
+                if not emit_state["parallel_done"]:
+                    eligible = _plan_item_gate(
+                        plan_items, repo_path, reference_check_enabled,
+                    )
+                    if eligible:
+                        envelopes = _fan_out_plan_items(eligible)
                 # 把 id 表回灌给模型:它得知道 P1/P2 才能用 plan_item_id 对上账
-                _append_tool_receipt(messages, tc, {
+                receipt: dict[str, Any] = {
                     "ok": True, "planned": len(plan_items),
                     "plan_items": [
                         {"id": p["id"], "target": p["target"]} for p in plan_items
@@ -660,7 +793,18 @@ def run_agent2(
                         "发射审查项时用 plan_item_id 指明它核实的是哪条计划项(P1/P2…),"
                         "结束时系统按 id 对账"
                     ),
-                })
+                }
+                if envelopes:
+                    receipt["parallel_verified"] = [p["id"] for p in eligible]
+                    receipt["hint"] += (
+                        ";系统已对合格计划项完成并行只读核查,结论(含证据引用号)"
+                        "已按 system 信封回灌——直接逐项发射审查项并引用信封里的"
+                        "证据号,不要重跑这些核查;planned_evidence=verify 或需补查的"
+                        "项再按原流程自行调用工具"
+                    )
+                _append_tool_receipt(messages, tc, receipt)
+                # 信封排在回执之后注入:assistant 工具调用与 tool 结果保持相邻
+                messages.extend(envelopes)
                 continue
 
             if fn_name == "submit_review_item":
@@ -1238,6 +1382,260 @@ def _execute_reference_tool(
             + f"\n...(工具结果过长已截断,共 {len(result_str)} 字符)"
         )
     return result_str
+
+
+# ============================================================
+# 计划项并行核查(读阶段并发 / 写阶段主线程串行)
+#
+# 审查计划发射后,合格项(planned_evidence 非 verify)扇出成 N 条有界只读
+# ReAct 子循环并行核实。形状复用 react_agent 分面并行:worker 只跑 LLM +
+# 只读工具 + 内存缓冲,绝不碰共享 db session / publish / 证据台账 / emit_state;
+# 收养证据、落库、发射全部在 fan-in 后由主线程逐条做。verify 项仍走主循环
+# 串行路径(PoC 会写沙箱状态、与新轮 agent1 争抢端口/进程,不可并发)。
+# 子循环带原生身份(thinking_delta extra 带 "计划项 Pn" + parallel),前端按
+# conv_id 分桶,规避 ACP 侧不带身份导致的并行 chunk 交织乱码。
+# 门控(_plan_item_gate)不满足/显式关闭时,submit_review_plan 分支原样返回,
+# 串行循环逐字节不变。
+# ============================================================
+
+# 收尾轮(跑满迭代/超时)的墙钟宽限(秒):对已到期的 deadline 再叠一段,
+# 保证收尾这一发 LLM 能真正吐出总结而非被 stop_check 秒停
+# (镜像 react_agent._FACET_FINALIZE_GRACE_SECONDS)。
+_PLAN_ITEM_FINALIZE_GRACE_SECONDS = 90
+
+@dataclass
+class _PlanItemResult:
+    """单个计划项子循环的产物(纯内存,由 fan-in 主线程负责落库/收养)。
+
+    pending_rows: 待落库对话行 {type, content, reasoning?, stream_conv_id?},
+        tool_call/tool_result 相邻成对(fan-in 按邻接补 tool_call_id);
+    evidence_entries: worker 自己的台账(局部 E ref,fan-in 收养时重新编号);
+    aborted: 命中用户终止(fan-in 边界整批丢弃,不落库不回灌)。
+    """
+    pid: str
+    summary: str = ""
+    pending_rows: list[dict[str, Any]] = field(default_factory=list)
+    evidence_entries: dict[str, Any] = field(default_factory=dict)
+    error: str = ""
+    timed_out: bool = False
+    aborted: bool = False
+    read_calls: int = 0
+    ref_calls: int = 0
+
+
+def _plan_item_gate(
+    plan_items: list[dict[str, Any]],
+    repo_path: str | None,
+    reference_check_enabled: bool,
+) -> list[dict[str, Any]]:
+    """是否走计划项并行;返回合格计划项列表(空列表 = 原串行路径)。
+
+    门控:开关关 / 无工作区(只读工具不可用) / 合格项数 < MIN_ITEMS → 空列表。
+    合格 = planned_evidence 非 verify(reference 关闭时 reference 项降级为纯
+    只读——读档核查仍成立)。项少时并行反而亏(每子循环 bootstrap + 上下文
+    复制成本高于串行收益),同 REACT_PARALLEL_MIN_FACETS 的理由。
+    """
+    from app.config import settings as _s
+
+    if not getattr(_s, "AGENT2_PARALLEL_ENABLED", False):
+        return []
+    if not repo_path:
+        return []
+    eligible: list[dict[str, Any]] = []
+    for it in plan_items or []:
+        if not isinstance(it, dict):
+            continue
+        planned = str(it.get("planned_evidence") or "source").strip()
+        if planned == "verify":
+            continue
+        if planned == "reference" and not reference_check_enabled:
+            it = {**it, "planned_evidence": "source"}
+        eligible.append(it)
+    min_items = max(2, int(getattr(_s, "AGENT2_PARALLEL_MIN_ITEMS", 3) or 3))
+    if len(eligible) < min_items:
+        return []
+    return eligible
+
+
+def _run_plan_item_pass(
+    plan_item: dict[str, Any],
+    base_messages: list[dict[str, Any]],
+    client: LLMClient,
+    task_id: UUID | str,
+    round_idx: int,
+    repo_path: str,
+    *,
+    read_cap: int,
+    max_iter: int,
+    deadline: float,
+    stop_check: Callable[[], bool] | None = None,
+) -> _PlanItemResult:
+    """跑单个计划项的有界只读 ReAct 子循环(worker 线程执行,全程无共享副作用)。
+
+    与 react_agent._run_facet_pass 同机制(LLM→只读工具→再思考直到停),但:
+    - 不落库不 publish:工具执行走 _execute_read_tool/_execute_reference_tool
+      的 db=None 形态(只执行),对话行进 pending_rows 缓冲等 fan-in;
+    - 证据入 worker 自己的 EvidenceRecorder(局部 E ref,fan-in 收养);
+    - 不注入发射工具:模型若仍请求 submit_*/verify 会被拒并如实回告(镜像
+      分面只读白名单硬约束);
+    - thinking 实时流式带计划项身份,厂商闸门(_review_provider_gate,懒导入
+      避开循环依赖)限并发;deadline/stop_check 逐迭代边界 + 逐 chunk 协作式
+      检查;单 worker 异常 catch 后置 error,不拖垮整轮。
+    """
+    from app.agents.react_agent import _review_provider_gate
+
+    pid = str(plan_item.get("id") or "(未编号)").strip()
+    planned = str(plan_item.get("planned_evidence") or "source").strip()
+    facet_label = f"计划项 {pid}"
+    result = _PlanItemResult(pid=pid)
+
+    worker_evidence = EvidenceRecorder()
+    item_tools = list(_READ_ONLY_TOOL_DEFINITIONS)
+    allowed_names = {(t.get("function") or {}).get("name") for t in item_tools}
+    if planned == "reference":
+        item_tools.append(_REFERENCE_TOOL_DEFINITION)
+        allowed_names.add("check_reference")
+
+    def _stream_turn(msgs: list[dict[str, Any]], it: int, turn_deadline: float):
+        """一次带闸门/身份/协作式收流的流式调用(返回 StreamResult)"""
+        with _review_provider_gate(client):
+            return stream_llm(
+                client, msgs,
+                task_id=task_id, round_idx=round_idx, role="agent2",
+                tools=item_tools, max_tokens=UA_EVAL_MAX_TOKENS,
+                publish_content=False, iteration=it,
+                extra={"facet": facet_label, "parallel": True},
+                stop_check=lambda: (
+                    time.monotonic() > turn_deadline
+                    or (stop_check is not None and stop_check())
+                ),
+            )
+
+    try:
+        messages = [dict(m) for m in base_messages]
+        # 本项角色/约束作为独立 system 指令层(不污染真实上下文)
+        messages.append({
+            "role": "system",
+            "content": build_agent2_plan_item_instruction(plan_item),
+        })
+        summary = ""
+
+        def _finalize_turn(notice: str | None) -> None:
+            """预算耗尽后的收尾轮:注入收尾提示,再跑一发取总结。
+
+            用独立宽限 deadline(time.monotonic()+90)保证即便主预算已到期
+            这一发也能真正吐出总结而非被 stop_check 秒停(镜像分面收尾轮)。
+            """
+            nonlocal summary
+            if notice:
+                result.pending_rows.append({
+                    "type": "thinking", "content": notice, "reasoning": "",
+                })
+            messages.append({"role": "user", "content": AGENT2_PLAN_ITEM_FINALIZE_PROMPT})
+            grace_deadline = time.monotonic() + _PLAN_ITEM_FINALIZE_GRACE_SECONDS
+            try:
+                res = _stream_turn(messages, max_iter + 1, grace_deadline)
+            except Exception:
+                return
+            if res.content or res.reasoning:
+                if res.content:
+                    summary = res.content
+                result.pending_rows.append({
+                    "type": "thinking", "content": res.content,
+                    "reasoning": res.reasoning, "stream_conv_id": res.conv_id,
+                })
+
+        for _it in range(1, max_iter + 1):
+            # 终止/超时检查点(循环顶):终止整批丢弃;超时转总结收尾(部分结论可用)
+            if stop_check is not None and stop_check():
+                result.aborted = True
+                break
+            if time.monotonic() > deadline:
+                result.timed_out = True
+                _finalize_turn("检测到达到时间预算,强制转入本计划项总结")
+                break
+            try:
+                res = _stream_turn(messages, _it, deadline)
+            except Exception as e:
+                # 单发流式失败不重试(主循环串行路径仍是后手),记项内错误
+                logger.warning(f"[task={task_id}] 计划项 {pid} 子循环流式调用失败: {e}")
+                result.error = str(e)
+                break
+            if res.stopped or (stop_check is not None and stop_check()):
+                result.aborted = True
+                break
+            content = res.content
+            tool_calls = res.tool_calls
+            # Hermes 风格文本 tool_call 兜底(与主循环同一解析,部分模型把调用写进正文)
+            if not tool_calls and content:
+                text_tool_calls = extract_text_tool_calls(content)
+                if text_tool_calls:
+                    tool_calls = text_tool_calls
+                    content = strip_tool_call_blocks(content)
+            result.pending_rows.append({
+                "type": "thinking", "content": content,
+                "reasoning": res.reasoning, "stream_conv_id": res.conv_id,
+            })
+            messages.append({"role": "assistant", "content": content})
+
+            if not tool_calls:
+                if content:
+                    summary = content
+                break
+
+            for tc in tool_calls:
+                fn = tc["name"]
+                try:
+                    fn_args = json.loads(tc.get("arguments_str") or "{}")
+                except json.JSONDecodeError:
+                    fn_args = {}
+                intent = build_tool_intent(fn, fn_args, prefix="[agent2 质检]")
+                result.pending_rows.append({
+                    "type": "tool_call",
+                    "content": f"{intent}\n{json.dumps(fn_args, ensure_ascii=False, indent=2)}",
+                })
+                tc_id = tc["id"] or f"call_{tc['index']}"
+                # 只读白名单硬约束:模型若仍请求 verify/发射类工具,拒绝并如实告知(不执行)
+                if fn not in allowed_names:
+                    blocked = f"计划项并行核查只允许只读取证工具,已禁用: {fn}"
+                    result.pending_rows.append({"type": "tool_result", "content": blocked})
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": blocked})
+                    continue
+                if fn == "check_reference":
+                    if result.ref_calls >= read_cap:
+                        capped = f"已达本计划项引用复核额度({read_cap}),跳过,请基于已有证据收尾。"
+                        result.pending_rows.append({"type": "tool_result", "content": capped})
+                        messages.append({"role": "tool", "tool_call_id": tc_id, "content": capped})
+                        continue
+                    result.ref_calls += 1
+                    out = _execute_reference_tool(fn_args, str(task_id))
+                    out = worker_evidence.record_reference(
+                        out,
+                        args_brief=f"check_reference:{str(fn_args.get('url', ''))[:120]}",
+                    )
+                else:
+                    if result.read_calls >= read_cap:
+                        capped = f"已达本计划项只读工具调用额度({read_cap}),跳过,请基于已有证据收尾。"
+                        result.pending_rows.append({"type": "tool_result", "content": capped})
+                        messages.append({"role": "tool", "tool_call_id": tc_id, "content": capped})
+                        continue
+                    result.read_calls += 1
+                    out = _execute_read_tool(fn, fn_args, repo_path, str(task_id))
+                    out = worker_evidence.record_read(
+                        out,
+                        args_brief=f"{fn}:{json.dumps(fn_args, ensure_ascii=False)[:120]}",
+                    )
+                result.pending_rows.append({"type": "tool_result", "content": out})
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": out})
+        else:
+            # 跑满迭代:请模型就本计划项输出总结
+            _finalize_turn(None)
+        result.summary = summary
+        result.evidence_entries = dict(worker_evidence.ledger)
+    except Exception as e:  # 单项失败不拖垮整轮(fan-in 会把该项标 error 回灌)
+        logger.exception(f"[task={task_id}] 计划项 {pid} 子循环失败")
+        result.error = str(e)
+    return result
 
 
 # ============================================================

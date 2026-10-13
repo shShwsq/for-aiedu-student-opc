@@ -18,6 +18,7 @@
 import queue as queue_mod
 import threading
 import time
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
@@ -223,6 +224,14 @@ class _FakeDb:
     def commit(self):
         self.commits += 1
 
+    def rollback(self):
+        pass
+
+    def get(self, *args, **kwargs):
+        # 按轮会话替身:返回 None → 循环回退到传入的 task 对象(行为等价旧路径),
+        # 从而 executor.run 对 task.params 的改写可被 _consume_paused_interrupt_flag 读到
+        return None
+
 
 def test_consume_paused_flag_absent_returns_false_no_commit():
     """builtin 任务不写标志 → 返回 False 且不落库(行为无变化)"""
@@ -255,23 +264,52 @@ from app.prompts.executor import AUTO_CONTINUE_FOLLOWUP
 
 
 def _stub_loop_env(monkeypatch, *, auto_continue=True, max_rounds=8):
-    """屏蔽续跑循环的外部副作用(埋点/落库/阻塞),保留循环本身逻辑。"""
+    """屏蔽续跑循环的外部副作用(埋点/落库/阻塞/按轮真实会话),保留循环本身逻辑。
+
+    重构后循环每轮走真实 SessionLocal(_round_session)——测试环境无 DB,故用替身
+    拦截:既避免连库挂起,又能记录"同时开启的会话数",供断言轮间 park 时不持有会话。
+    返回 (parks, rec):parks 为 park 次数的 tids 列表;rec 携 open_at_park/会话计数。
+    """
     monkeypatch.setattr(orchestrator, "perf_log", lambda *a, **k: None)
     monkeypatch.setattr(orchestrator, "emit", lambda *a, **k: None)
     monkeypatch.setattr(orchestrator, "_save_plan_to_task", lambda *a, **k: None)
     monkeypatch.setattr(orchestrator, "drain_user_messages", lambda tid: [])
-    parks = []
+    # 续轮前的工作区探活+重克隆:测试不涉仓库,直接返回 None(续轮 repo_ctx=None)
+    monkeypatch.setattr(
+        orchestrator, "_ensure_workspace_for_continuation", lambda *a, **k: None,
+    )
+    parks: list = []
+    open_at_park: list[int] = []
+    session_state = {"open": 0, "max_open": 0}
+
     monkeypatch.setattr(
         orchestrator, "wait_if_paused",
-        lambda tid: parks.append(tid),
+        lambda tid, db=None: (
+            parks.append(tid),
+            open_at_park.append(session_state["open"]),
+        ),
     )
+
+    @contextmanager
+    def _fake_round_session():
+        session_state["open"] += 1
+        session_state["max_open"] = max(
+            session_state["max_open"], session_state["open"],
+        )
+        try:
+            yield _FakeDb()
+        finally:
+            session_state["open"] -= 1
+
+    monkeypatch.setattr(orchestrator, "_round_session", _fake_round_session)
     monkeypatch.setattr(
         orchestrator.settings, "ACP_AUTO_CONTINUE_ON_RESUME", auto_continue,
     )
     monkeypatch.setattr(
         orchestrator.settings, "ACP_AUTO_CONTINUE_MAX_ROUNDS", max_rounds,
     )
-    return parks
+    rec = {"open_at_park": open_at_park, "session": session_state}
+    return parks, rec
 
 
 class _RecordingExecutor:
@@ -292,7 +330,7 @@ class _RecordingExecutor:
 
 def test_auto_continue_interrupt_then_completes_next_round(monkeypatch):
     """第1轮被中断 → 恢复后同会话自动补发第2轮 → 第2轮正常完成才收尾。"""
-    parks = _stub_loop_env(monkeypatch)
+    parks, rec = _stub_loop_env(monkeypatch)
     executor = _RecordingExecutor(interrupt_rounds={1})
     task = _FakeTask({})
     summaries: list[dict] = []
@@ -311,11 +349,15 @@ def test_auto_continue_interrupt_then_completes_next_round(monkeypatch):
     assert len(summaries) == 2
     # 被中断轮阻塞过一次等恢复
     assert len(parks) == 1
+    # Fix2.1 核心保证:轮间 wait_if_paused 时不持有任何会话(会话数=0)
+    assert rec["open_at_park"] == [0]
+    # 会话同时开启数始终≤1(每轮各开各关,无跨轮泄漏)
+    assert rec["session"]["max_open"] == 1
 
 
 def test_auto_continue_disabled_finalizes_partial(monkeypatch):
     """开关关闭:被中断 → 阻塞等恢复 → 退回旧行为,对半截当前轮收尾(不续跑)。"""
-    parks = _stub_loop_env(monkeypatch, auto_continue=False)
+    parks, _ = _stub_loop_env(monkeypatch, auto_continue=False)
     executor = _RecordingExecutor(interrupt_rounds={1})
     task = _FakeTask({})
 
@@ -333,7 +375,7 @@ def test_auto_continue_disabled_finalizes_partial(monkeypatch):
 
 def test_builtin_never_continues(monkeypatch):
     """builtin(不写中断标志):首轮返回即收尾,不 park 不续跑(行为零变化)。"""
-    parks = _stub_loop_env(monkeypatch)
+    parks, _ = _stub_loop_env(monkeypatch)
     executor = _RecordingExecutor(interrupt_rounds=set())
     task = _FakeTask({})
 
