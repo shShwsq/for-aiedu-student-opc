@@ -52,3 +52,6 @@ backend/user_skills/
 # 参考资料
 references/
 
+# 临时 git worktree 审查目录(不应入库)
+_review_wt*/
+
