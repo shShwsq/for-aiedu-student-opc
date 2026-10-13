@@ -10,10 +10,15 @@
 - _fan_in:主线程串行落库 —— 分面顺序、tool_result 邻接补 tool_call_id、facet 标签、
   stream_conv_id 透传(实时卡退役)、超时分面小标题
 - _parallel_gate:开关关闭 / 追问轮 / 分面数不足 → 回落串行(返回 None)
+- 合成回合(REACT_PARALLEL_SYNTHESIS_ENABLED,默认开):fan-in 后把各面结论按"每面
+  一条 system 信封"回灌 messages 并续跑主循环,写工具解禁;显式关闭时行为与改造前一致
+- _facet_result_items / _clip_to_tokens:状态映射与单面结论 token 截断
 """
+import json
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import app.agents.react_agent as R
 from app.config import settings
@@ -462,3 +467,237 @@ def test_fan_in_labels_timed_out_facet(monkeypatch):
     fr = R._FacetResult(facet="T", summary="部分结论", timed_out=True)
     summary = R._fan_in(_Task(), object(), 1, [fr])
     assert "部分结论,已超时收尾" in summary
+
+
+# ============================================================
+# 合成回合:fan-in 后把各面结论回灌主循环并续跑
+# ============================================================
+
+
+class _RoundTask:
+    """run_react_agent 需要的最小 task 替身(与 _Task 区分:后者只测组件)"""
+
+    def __init__(self):
+        from uuid import uuid4
+        self.id = uuid4()
+        self.scenario = "general"
+        self.user_id = None
+        self.params = {}
+        self.user_input = "审一下这个仓库"
+        self.allowed_skills = None
+
+
+def _mk_round_env(monkeypatch, *, synthesis: bool,
+                  results: list[R._FacetResult], stream=None):
+    """驱动一整回合 run_react_agent(分面并行必然命中)
+
+    返回 (task, db, seen);seen 逐次记录主循环 _stream_llm_response 收到的
+    (iteration, messages, 工具名列表),据此断言回灌信封、工具集与迭代上限。
+
+    分面子循环用 stub 替身(只关心它产出的 _FacetResult),fan-in 落库与
+    主循环都是真代码 —— 要测的正是那条接入点。
+    """
+    task = _RoundTask()
+    db = MagicMock()
+    # question 幂等查询返回非 None → 跳过重复落库;drain 查询返回空
+    db.query.return_value.filter.return_value.first.return_value = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = []
+
+    monkeypatch.setattr(settings, "REACT_PARALLEL_ENABLED", True)
+    monkeypatch.setattr(settings, "REACT_PARALLEL_MIN_FACETS", 3)
+    monkeypatch.setattr(settings, "REACT_PARALLEL_SYNTHESIS_ENABLED", synthesis)
+    monkeypatch.setattr(
+        R, "_resolve_facets",
+        lambda t: [SimpleNamespace(name=fr.facet, body="b") for fr in results],
+    )
+    by_name = {fr.facet: fr for fr in results}
+    monkeypatch.setattr(
+        R, "_run_facet_pass", lambda facet, *a, **k: by_name[facet.name],
+    )
+    monkeypatch.setattr(
+        R, "_add_conversation", lambda *a, **k: SimpleNamespace(id="c-x"),
+    )
+    monkeypatch.setattr(R, "set_current_task", lambda *a, **k: None)
+    monkeypatch.setattr(R, "wait_if_paused", lambda *a, **k: None)
+    monkeypatch.setattr(R, "perf_log", lambda *a, **k: None)
+    monkeypatch.setattr(R, "publish", lambda *a, **k: None)
+
+    seen: list[dict] = []
+
+    def _default_stream(client, t, db_, round_idx, iteration, messages, tools):
+        return ("", "合成完毕", [], "stop", f"conv-{iteration}")
+
+    def fake_stream(client, t, db_, round_idx, iteration, messages, tools):
+        seen.append({
+            "iteration": iteration,
+            "messages": list(messages),
+            "tool_names": [(x.get("function") or {}).get("name") for x in tools],
+        })
+        return (stream or _default_stream)(
+            client, t, db_, round_idx, iteration, messages, tools
+        )
+
+    monkeypatch.setattr(R, "_stream_llm_response", fake_stream)
+    return task, db, seen
+
+
+def _run_round(task, db):
+    return R.run_react_agent(
+        task, db, round_idx=1, followup_query=None,
+        client=MagicMock(), repo_context=None, previous_plan=None,
+    )
+
+
+def _facet_envelopes(messages: list[dict]) -> dict[str, str]:
+    """从主循环上下文里挑出各分面信封,返回 {facet: content}"""
+    out: dict[str, str] = {}
+    for m in messages:
+        content = m.get("content") or ""
+        if m.get("role") != "system" or "分面结论|" not in content:
+            continue
+        name = content.split("分面结论|", 1)[1].split("]", 1)[0]
+        out[name] = content
+    return out
+
+
+def test_synthesis_off_returns_fan_in_and_skips_main_loop(monkeypatch):
+    """开关显式关闭(回退旧行为):命中并行即以 fan-in 拼接串收尾,不发起任何主循环调用"""
+    results = [R._FacetResult(facet=f"f{i}", summary=f"f{i}结论") for i in (1, 2, 3)]
+    task, db, seen = _mk_round_env(monkeypatch, synthesis=False, results=results)
+
+    _res, summary, _plan = _run_round(task, db)
+
+    assert seen == []
+    assert summary.startswith("### f1")
+    assert "f3结论" in summary
+
+
+def test_synthesis_on_injects_per_facet_system_envelopes(monkeypatch):
+    """开关开:每面一条独立 system 信封(按分面顺序),然后主循环续跑"""
+    results = [R._FacetResult(facet=f"f{i}", summary=f"f{i}结论") for i in (1, 2, 3)]
+    task, db, seen = _mk_round_env(monkeypatch, synthesis=True, results=results)
+
+    _res, summary, _plan = _run_round(task, db)
+
+    assert seen, "回灌后必须继续跑主循环"
+    msgs = seen[0]["messages"]
+    assert list(_facet_envelopes(msgs)) == ["f1", "f2", "f3"]
+    env = _facet_envelopes(msgs)["f2"]
+    assert env.startswith(f"{R.SYSTEM_INJECT_MARKER}分面结论|f2]")
+    assert "f2结论" in env
+    # 行动指引整批只附一份
+    guidances = [
+        m for m in msgs if (m.get("content") or "").startswith(
+            f"{R.SYSTEM_INJECT_MARKER}合成回合]"
+        )
+    ]
+    assert len(guidances) == 1
+    # 信封用 system 而非 user:注入内容不能冒充用户原话(间接注入面)
+    assert not any(
+        "分面结论|" in (m.get("content") or "")
+        for m in msgs if m.get("role") == "user"
+    )
+    assert summary == "合成完毕"  # 主循环的自然总结覆盖兜底的拼接串
+
+
+def test_synthesis_round_gets_write_tools(monkeypatch):
+    """合成回合拿得到写工具(run_command / write_file)—— 并行期仍严格只读"""
+    results = [R._FacetResult(facet=f"f{i}", summary=f"f{i}结论") for i in (1, 2, 3)]
+    task, db, seen = _mk_round_env(monkeypatch, synthesis=True, results=results)
+
+    _run_round(task, db)
+
+    names = seen[0]["tool_names"]
+    assert "run_command" in names and "write_file" in names
+    readonly = R._facet_allowed_tool_names(
+        R._facet_readonly_tools(R.get_all_tools())
+    )
+    assert "run_command" not in readonly and "write_file" not in readonly
+
+
+def test_synthesis_envelopes_carry_status_wording(monkeypatch):
+    """单面 error / timed_out 只影响自己的信封,不拖累其他面注入"""
+    results = [
+        R._FacetResult(facet="f1", summary="正常结论"),
+        R._FacetResult(facet="f2", error="provider 500"),
+        R._FacetResult(facet="f3", summary="部分结论", timed_out=True),
+    ]
+    task, db, seen = _mk_round_env(monkeypatch, synthesis=True, results=results)
+
+    _run_round(task, db)
+
+    envs = _facet_envelopes(seen[0]["messages"])
+    assert "正常结论" in envs["f1"]
+    assert "该分面审查失败:provider 500" in envs["f2"]
+    assert "部分结论" in envs["f3"] and "已超时收尾" in envs["f3"]
+
+
+def test_synthesis_silence_falls_back_to_fan_in_summary(monkeypatch):
+    """合成回合全程无 content → summary 用 fan-in 拼接串兜底(不退化成"执行完成")"""
+    results = [R._FacetResult(facet=f"f{i}", summary=f"f{i}结论") for i in (1, 2, 3)]
+    task, db, seen = _mk_round_env(
+        monkeypatch, synthesis=True, results=results,
+        stream=lambda *a: ("", "", [], "stop", "conv-silent"),
+    )
+
+    _res, summary, _plan = _run_round(task, db)
+
+    assert seen, "仍然续跑了主循环"
+    assert summary.startswith("### f1") and "f3结论" in summary
+
+
+def test_synthesis_iteration_cap_uses_loop_limit(monkeypatch):
+    """合成回合用 REACT_SYNTHESIS_MAX_ITERATIONS 而非常量 30:跑满后走总结提示"""
+    monkeypatch.setattr(settings, "REACT_SYNTHESIS_MAX_ITERATIONS", 3)
+    monkeypatch.setattr(R, "execute_tool", lambda fn, args: {"hits": []})
+    results = [R._FacetResult(facet=f"f{i}", summary=f"f{i}结论") for i in (1, 2, 3)]
+
+    def never_stop(client, t, db_, round_idx, iteration, messages, tools):
+        # 参数逐次不同,不触发连续/交替循环检测,确保跑到迭代上限
+        call = [{
+            "id": f"tc-{iteration}",
+            "name": "search_code",
+            "arguments_str": json.dumps({"pattern": f"p{iteration}"}),
+        }]
+        return ("", "", call, "tool_calls", f"conv-{iteration}")
+
+    task, db, seen = _mk_round_env(
+        monkeypatch, synthesis=True, results=results, stream=never_stop,
+    )
+
+    _run_round(task, db)
+
+    # 3 次迭代 + 跑满后的总结调用(传入的 iteration 位就是 loop_limit)
+    assert [s["iteration"] for s in seen] == [1, 2, 3, 3]
+    last_msgs = seen[-1]["messages"]
+    assert last_msgs[-1]["content"] == R.MAX_ITERATION_PROMPT
+
+
+def test_facet_result_items_maps_status_and_clips(monkeypatch):
+    """状态映射与 _fan_in 小标题同源;结论按单面 token 上限截断"""
+    monkeypatch.setattr(settings, "REACT_FACET_SUMMARY_MAX_TOKENS", 50)
+    items = R._facet_result_items([
+        R._FacetResult(facet="E", error="provider 500"),
+        R._FacetResult(facet="T", summary="部分结论", timed_out=True),
+        R._FacetResult(facet="L", summary="漏" * 400),
+        R._FacetResult(facet="S", summary="短结论"),
+    ])
+
+    assert [(n, st) for n, st, _ in items] == [
+        ("E", "error"), ("T", "timed_out"), ("L", "ok"), ("S", "ok"),
+    ]
+    assert items[0][2] == "provider 500"          # 错误短注不裁
+    assert items[3][2] == "短结论"                  # 未超限原样
+    long_body = items[2][2]
+    assert len(long_body) < 400 and "结论过长已截断" in long_body
+    assert "原文 400 字符" in long_body
+
+
+def test_clip_to_tokens_passthrough_and_truncate():
+    assert R._clip_to_tokens("", 10) == ""
+    assert R._clip_to_tokens("abc", 10) == "abc"
+    assert R._clip_to_tokens("短", 0) == "短"  # max_tokens<=0 视为不限制
+    text = "洞" * 4000
+    out = R._clip_to_tokens(text, 3000)
+    assert out.startswith("洞") and "结论过长已截断" in out
+    assert R._estimate_tokens(out.split("\n…(")[0]) <= 3000

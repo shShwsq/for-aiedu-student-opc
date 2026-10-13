@@ -100,6 +100,25 @@ class Settings(BaseSettings):
     # 单个分面子循环的墙钟预算(秒):循环每次迭代边界与收 chunk 时协作式检查,
     # 超时则转入本分面总结收尾(部分结论)并隔离,不拖垮 fan-in 整轮
     REACT_FACET_TIMEOUT_SECONDS: int = 240
+    # ---- fan-in 之后的"合成回合"(默认开) ----
+    # 开:分面扇出/扇入完成后不直接收尾,而是把各面结论按"每面一条 system
+    # 注入消息"回灌 messages,继续跑既有串行主循环 —— 父模型得以针对单面追问、
+    # 补只读核查、落产物。
+    # 此刻只有主线程一个执行体在跑,不存在"并发写共享工作区"的问题,因此串行
+    # 循环的全量工具(run_command / write_file 等)天然可用,无需改分面侧的只读
+    # 黑名单 _FACET_MUTATING_TOOLS(分面期仍严格只读)。危险命令仍由
+    # _classify_command + command_confirm_mode 按原有口径把关。
+    # 代价要说清:命中并行的那一轮多出最多 REACT_SYNTHESIS_MAX_ITERATIONS 次
+    # LLM 调用(各面证据已在上下文,常态是一两次就收尾)。配额吃紧或想回到
+    # 改造前的"fan-in 拼接串即终态"时,在 .env 显式置 False。
+    REACT_PARALLEL_SYNTHESIS_ENABLED: bool = True
+    # 合成回合的迭代上限(不复用主循环的 MAX_ITERATIONS=30):各面结论已就位,
+    # 父回合只做集成/补缺,给小预算即可,防止在已完成的证据上反复打转。
+    REACT_SYNTHESIS_MAX_ITERATIONS: int = 8
+    # 单个分面结论注入前的 token 上限(CJK 感知粗估,见 _clip_to_tokens)。
+    # 借鉴 codex 对子 agent 回灌消息设上限的做法:并行放大的是"份数",
+    # 每份必须有界,否则父上下文会被 N 份长结论撑爆。
+    REACT_FACET_SUMMARY_MAX_TOKENS: int = 3000
     # 审查链路同厂商(provider+model 归组)全局并发天花板,跨任务共享:
     # 置于分面子循环的 LLM 调用外层,防并行放大并发把配额打爆(本次真凶是 403)
     REACT_PROVIDER_MAX_CONCURRENCY: int = 4

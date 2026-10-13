@@ -662,6 +662,61 @@ def build_facet_instruction(facet_name: str, facet_body: str) -> str:
     )
 
 
+# 合成回合的行动指引(整批只附一份,不逐面重复):各面结论已就位,父回合的职责
+# 是集成而非重做。措辞集中在这一处,便于后续调参。
+FACET_SYNTHESIS_GUIDANCE = (
+    "上一阶段已完成分面并行核查,以下是各分面的结论(逐条独立注入)。\n"
+    "请在此基础上继续本轮工作:\n"
+    "- 只做集成、补缺与落产物,不要重跑各分面已完成的核查(证据已在结论里)\n"
+    "- 需要交叉验证或针对某一面追问时,再调用只读工具\n"
+    "- 现在可以使用写类工具:需要执行命令或产出文件(如把二进制文档提取成"
+    "文本后再 read_file),直接用 run_command / write_file\n"
+    "完成后给出本轮的总结(自然语言,无需 JSON)。"
+)
+
+
+def build_facet_result_messages(
+    items: list[tuple[str, str, str]],
+) -> list[dict[str, str]]:
+    """把各分面结论装配成回灌主循环上下文的 system 消息序列。
+
+    背景:分面并行 fan-in 后不再直接收尾,而是把结论喂回主 react 循环(合成回合)。
+    借鉴 codex 的子 agent 结果回灌(带发信方身份的信封 + 每份限量截断),但本仓
+    并行是同进程一次性扇出,不需要 mailbox / 等待原语。
+
+    参数:
+        items: 按分面顺序的 (facet_name, status, summary) 列表;
+            status 取 "ok" / "error" / "timed_out";
+            summary 为已截断的结论文本,status="error" 时传该面的错误信息。
+
+    返回: [{"role": "system", "content": ...}] —— 首条为行动指引,随后每面一条
+    独立信封。刻意用 system 角色而非 user:注入内容不能被模型当成用户原话
+    (见 SYSTEM_INJECT_MARKER 注释)。空输入返回空列表(不注入行动指引)。
+
+    本函数零 app.* 依赖(见 tests/test_prompts_purity.py),只做文本拼装。
+    """
+    if not items:
+        return []
+
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": f"{SYSTEM_INJECT_MARKER}合成回合]\n{FACET_SYNTHESIS_GUIDANCE}"}
+    ]
+    for facet_name, status, summary in items:
+        name = (facet_name or "").strip() or "(未命名分面)"
+        body = (summary or "").strip()
+        if status == "error":
+            text = f"(该分面审查失败:{body or '未知错误'})"
+        elif status == "timed_out":
+            text = f"{body or '(本分面无明确结论)'}\n(部分结论,已超时收尾)"
+        else:
+            text = body or "(本分面无明确结论)"
+        messages.append({
+            "role": "system",
+            "content": f"{SYSTEM_INJECT_MARKER}分面结论|{name}]\n{text}",
+        })
+    return messages
+
+
 # ============================================================
 # 跨轮历史记忆:Level 2 LLM 压缩
 # ============================================================

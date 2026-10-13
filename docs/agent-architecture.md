@@ -369,7 +369,28 @@ def run_react_agent(
 "run_command":     ["执行", "运行", "跑", "测试", "构建", "build", "test", "run", "shell"],
 ```
 
-### 3.7 返回值
+### 3.7 分面并行与合成回合
+
+首轮(非追问轮)的 ReAct 循环可以按 skill 分面扇出为多个只读子循环并发核查，结构分三层：
+
+| 层 | 执行体 | 工具集 | 落库 |
+|----|--------|--------|------|
+| ① 分面扇出 | `ThreadPoolExecutor`，每面一条有界只读子循环(`_run_facet_pass`) | `_facet_readonly_tools` 剔除 `_FACET_MUTATING_TOOLS`(clone_repo / write_file / run_python_code / run_command / str_replace_editor)，执行层再按 `allowed_names` 硬拒一道 | 只进内存缓冲 `pending_rows`，worker 不碰共享 db session / publish / current_plan |
+| ② fan-in | 主线程串行(`_fan_in`) | 无 | 逐条落库带 `extra_payload={"facet":…, "parallel":True}` + 透传 `stream_conv_id`(前端分面分桶与实时卡退役依赖它)，并拼出小标题式的汇总串 |
+| ③ 合成回合 | 主线程跑既有串行主循环(`REACT_PARALLEL_SYNTHESIS_ENABLED`，默认开) | 全量 `get_all_tools()`(含 run_command / write_file) | 普通主循环行，无 facet 标签 |
+
+门控(`_parallel_gate`)：开关关 / `round_idx>1`(追问轮) / 分面数 < `REACT_PARALLEL_MIN_FACETS` → 返回 None，串行原路径逐字节不变。
+
+**合成回合**(对齐 Codex 的子 agent 结果回灌，见 `core/src/agent/control/completion.rs` 与 `session_prefix.rs` 的 `COMPLETION_MESSAGE_MAX_TOKENS`)：
+
+- fan-in 后不再直接收尾，而是把各面结论经 `build_facet_result_messages`(prompts/executor.py，纯函数)装配成【首一条行动指引 + 每面一条独立信封】注入 `messages`，继续跑主循环；信封以 `[系统注入|分面结论|<facet>]` 开头，故意用 `role=system` 而非 `user`(区分“用户原话”与“系统注入”，防间接注入面把结论当指令)
+- 单面结论注入前按 `REACT_FACET_SUMMARY_MAX_TOKENS`(默认 3000，CJK 感知粗估，`_clip_to_tokens`)截断：并行放大的是“份数”，每份必须有界，否则父上下文被 N 份长结论撑爆。分面的工具调用细节只进数据库，不进 `messages`
+- 迭代上限用 `REACT_SYNTHESIS_MAX_ITERATIONS`(默认 8)而非 `MAX_ITERATIONS=30`；跑满同样走 `MAX_ITERATION_PROMPT` 总结分支。合成回合没产出自然语言时，`summary` 兜底为 fan-in 拼接串(与改造前出口等价，不退化成“执行完成”)
+- **为何并行期之后放开写工具是安全的**：此刻只有一个主线程在跑，不存在并发写共享工作区的问题，因此不改分面侧只读黑名单即可拿到写能力；危险命令仍由 `_classify_command` + `command_confirm_mode` 按原有口径把关。这一改动顺带解开了“首轮全程无 shell”这道门：二进制文档(docx/pdf)提取成文本后再 `read_file` 的路径在同一个回合里就能走通(提取工具本身另案：镜像预装 CLI + `read_documents` skill)
+
+已知代价与限制(接受的设计取舍)：合成回合默认开，命中并行的那一轮多出最多 `REACT_SYNTHESIS_MAX_ITERATIONS`(8)次 LLM 调用——各面证据已回灌，常态一两次就收尾；配额吃紧时在 `.env` 显式置 `REACT_PARALLEL_SYNTHESIS_ENABLED=false` 回到“fan-in 拼接串即终态”的旧行为。合成回合不设独立墙钟 deadline(串行主循环一贯如此，只靠迭代上限与协作式暂停检查点)；信封不落库，跨轮追问(`round_idx>1` 走串行)时父模型看不到上一轮的分面信封(分面的 thinking/tool 行已按 facet 标签落库，将来可作重建数据源)；`recent_calls` 在合成回合从零开始，父模型可能重复分面已做的调用，靠既有的连续/交替循环检测兜底。
+
+### 3.8 返回值
 
 ```python
 return [], summary, current_plan

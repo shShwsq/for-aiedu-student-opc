@@ -71,3 +71,29 @@ def test_build_facet_instruction_is_pure_and_tool_neutral():
         assert mutating not in text
     # 空入参不抛(健壮性)
     assert executor.build_facet_instruction("", "").strip()
+
+
+def test_build_facet_result_messages_shape():
+    """合成回合回灌装配:纯函数、system 角色、空入参不注入行动指引。"""
+    from app.prompts import executor
+
+    msgs = executor.build_facet_result_messages([
+        ("check_sqli", "ok", "结论正文"),
+        ("check_dep", "error", "provider 500"),
+        ("check_secret", "timed_out", "部分结论"),
+    ])
+    # 首条行动指引 + 每面一条独立信封
+    assert len(msgs) == 4
+    assert all(m["role"] == "system" for m in msgs)
+    assert all(m["content"].startswith(executor.SYSTEM_INJECT_MARKER) for m in msgs)
+    assert msgs[1]["content"].startswith(
+        f"{executor.SYSTEM_INJECT_MARKER}分面结论|check_sqli]"
+    )
+    assert "结论正文" in msgs[1]["content"]
+    assert "该分面审查失败" in msgs[2]["content"]
+    assert "已超时收尾" in msgs[3]["content"]
+    # 指引里明示可以解禁写工具(与分面只读指令相反方向,两处措辞不能写歪)
+    assert "run_command" in msgs[0]["content"]
+    assert executor.build_facet_result_messages([]) == []
+    # 空字段不抛
+    assert executor.build_facet_result_messages([("", "ok", "")])[1]["content"]

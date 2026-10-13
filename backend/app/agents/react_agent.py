@@ -65,6 +65,7 @@ from app.prompts.executor import (
     SYSTEM_INJECT_MARKER,
     _has_creation_upload,
     build_facet_instruction,
+    build_facet_result_messages,
     build_first_round_question,
     build_history_compress_segments,
     build_repo_context_section,
@@ -325,13 +326,35 @@ def run_react_agent(
     # ---- 分面并行分支(默认开;门控不满足(含追问轮)/显式关闭时
     #      _maybe_run_parallel 返回 None,下方串行循环完全不变) ----
     parallel_outcome = _maybe_run_parallel(
-        task, db, round_idx, client, tools, messages, current_plan,
+        task, db, round_idx, client, tools, messages,
         executor_command_confirm,
     )
+    # 合成回合的迭代上限:常态串行用 MAX_ITERATIONS,回灌后用小预算
+    # (各面证据已就位,父回合只做集成/补缺,不给它 30 次在已完成结论上打转)
+    loop_limit = MAX_ITERATIONS
     if parallel_outcome is not None:
-        return parallel_outcome
+        facet_results, fan_in_summary = parallel_outcome
+        if not getattr(settings, "REACT_PARALLEL_SYNTHESIS_ENABLED", True):
+            # 开关关(显式置 False):保持改造前行为 —— 命中并行即以 fan-in 拼接串
+            # 收尾,下方串行循环整段不执行
+            return [], fan_in_summary, [dict(s) for s in (current_plan or [])]
+        # 开关开:各面结论按"每面一条 system 信封"回灌上下文,继续跑主循环。
+        # 此刻只有主线程一个执行体,tools 是全量定义(含 run_command/write_file),
+        # 无需改分面侧只读黑名单即可拿到写能力(并行期仍严格只读)。
+        # 先把拼接串当作兜底 summary:合成回合没产出自然语言时不至于退化成
+        # "执行完成",本轮仍有可用总结(与改造前出口等价)
+        summary = fan_in_summary
+        result_items = _facet_result_items(facet_results)
+        messages.extend(build_facet_result_messages(result_items))
+        loop_limit = max(
+            1, int(getattr(settings, "REACT_SYNTHESIS_MAX_ITERATIONS", 8) or 8)
+        )
+        logger.info(
+            f"[task={task.id}] 分面并行后进入合成回合:"
+            f"{len(result_items)} 个分面结论已回灌,迭代上限 {loop_limit}"
+        )
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
+    for iteration in range(1, loop_limit + 1):
         logger.info(f"[task={task.id}] react_agent 第 {round_idx} 轮 / 迭代 {iteration}")
 
         # 暂停检查点 1:迭代边界(若用户已暂停,在此阻塞直到恢复)
@@ -683,14 +706,17 @@ def run_react_agent(
             })
     else:
         # 循环跑满了,让 react_agent 输出自然语言总结
-        logger.warning(f"[task={task.id}] react_agent 达到最大迭代次数")
+        # 上限用 loop_limit 而非常量:合成回合的预算比常态串行小,标签要如实
+        logger.warning(
+            f"[task={task.id}] react_agent 达到最大迭代次数({loop_limit})"
+        )
         messages.append({
             "role": "user",
             "content": MAX_ITERATION_PROMPT,
         })
         try:
             reasoning_full, content_full, tool_calls_full, finish_reason, _conv_id = _stream_llm_response(
-                client, task, db, round_idx, MAX_ITERATIONS, messages, tools
+                client, task, db, round_idx, loop_limit, messages, tools
             )
             # content 作为 summary(自然语言总结)
             if content_full:
@@ -1027,6 +1053,37 @@ def _fan_in(
     return "\n\n".join(summaries) if summaries else "执行完成"
 
 
+def _facet_result_items(results: list["_FacetResult"]) -> list[tuple[str, str, str]]:
+    """把分面结果映射成 (facet, status, 已截断结论),供合成回合回灌装配。
+
+    status 判定与 _fan_in 的小标题分支同源(error / timed_out / ok),两处不要写歪。
+    结论按 REACT_FACET_SUMMARY_MAX_TOKENS 截断:并行放大的是"份数",每份必须有界,
+    否则 N 面长结论会把父上下文撑爆。
+
+    注入总量只记一条 info 日志,不设聚合闸门(P0 先取数,后续再定是否补上限)。
+    """
+    max_tokens = max(
+        1, int(getattr(settings, "REACT_FACET_SUMMARY_MAX_TOKENS", 3000) or 3000)
+    )
+    items: list[tuple[str, str, str]] = []
+    total_tokens = 0
+    for fr in results:
+        if fr.error:
+            status, raw = "error", fr.error
+        elif fr.timed_out:
+            status, raw = "timed_out", fr.summary
+        else:
+            status, raw = "ok", fr.summary
+        clipped = _clip_to_tokens(raw or "", max_tokens)
+        total_tokens += _estimate_tokens(clipped)
+        items.append((fr.facet, status, clipped))
+    logger.info(
+        f"[分面回灌] {len(items)} 面结论合计粗估 {total_tokens} token"
+        f"(单面上限 {max_tokens})"
+    )
+    return items
+
+
 def _maybe_run_parallel(
     task: Task,
     db: Session,
@@ -1034,12 +1091,14 @@ def _maybe_run_parallel(
     client: LLMClient,
     tools: list[dict[str, Any]],
     messages: list[dict[str, Any]],
-    current_plan: list[dict[str, Any]],
     executor_command_confirm: str,
-) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]] | None:
-    """门控 + 扇出/扇入。命中并行返回 (results, summary, final_plan);
-    否则返回 None(调用方继续走原串行循环)。final_plan 沿用入参 current_plan
-    (Phase 1:分面专注只读分析,不驱动 plan 推进)。"""
+) -> "tuple[list[_FacetResult], str] | None":
+    """门控 + 扇出/扇入。命中并行返回 (分面结果列表, fan-in 拼接串);
+    否则返回 None(调用方继续走原串行循环)。
+
+    本函数不再返回 plan,也不直接充当本轮出口:分面仍不改 plan(Phase 1 只读
+    分析),但 plan 推进与 <plan> 合并由调用方的主循环负责 —— 合成回合就跑在
+    那里,分面不改 / 父回合可改是刻意的分层。"""
     facets = _parallel_gate(task, round_idx)
     if not facets:
         return None
@@ -1076,12 +1135,12 @@ def _maybe_run_parallel(
         for fut in futures:
             results.append(fut.result())
 
-    summary = _fan_in(task, db, round_idx, results)
+    fan_in_summary = _fan_in(task, db, round_idx, results)
     # fan-in 后再检查一次暂停
     wait_if_paused(task.id)
-    # 沿用入参 current_plan 的深拷贝(Phase 1 分面不改 plan)
-    return [], summary, [dict(s) for s in (current_plan or [])]
-
+    # 不在此收尾:把结果与拼接串交回调用方,由其决定直接返回(开关关)
+    # 还是回灌上下文继续跑主循环(开关开)
+    return results, fan_in_summary
 
 
 # ============================================================
@@ -1275,6 +1334,28 @@ def _estimate_tokens(text: str) -> int:
         ):
             cjk += 1
     return cjk + (len(text) - cjk) // 4 + 1
+
+
+def _clip_to_tokens(text: str, max_tokens: int) -> str:
+    """按 CJK 感知粗估把文本裁到 max_tokens 以内(未超限原样返回)
+
+    换算直接以 _estimate_tokens 为单一事实来源:先用整段的"字符/token"比例算出
+    目标字符数,再逐步回退直到确实不超预算 —— 不在这里抄一遍 CJK 字符区间,
+    否则两处口径会漂移。
+
+    尾部的截断提示本身不计入预算(十几个 token,可接受)。
+    """
+    if not text:
+        return ""
+    if max_tokens <= 0 or _estimate_tokens(text) <= max_tokens:
+        return text
+    total = _estimate_tokens(text)
+    chars_per_token = len(text) / max(1, total - 1)
+    keep = max(1, int(max_tokens * chars_per_token))
+    while keep > 1 and _estimate_tokens(text[:keep]) > max_tokens:
+        keep = max(1, int(keep * 0.9))
+    clipped = text[:keep].rstrip()
+    return f"{clipped}\n…(结论过长已截断,原文 {len(text)} 字符)"
 
 
 def _build_history_messages(
