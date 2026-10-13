@@ -223,6 +223,49 @@ watch(
   },
 )
 
+// ---- 正文渲染成本闸门 ----
+//
+// 本面板的渲染效应会随每个 thinking_delta token 重跑(实时卡的字数/正文读的是
+// 响应式 reasoning)。重跑会把整段 v-for 里的表达式重新求值一遍,所以正文必须
+// 满足两条:"折叠着不渲染" + "渲染过就不再解析"。
+
+/**
+ * 思考链/总结正文的 markdown 缓存(key = 条目 key,即落库记录 id)。
+ *
+ * 为什么必须缓存:renderMarkdown = marked.parse + DOMPurify.sanitize,实测
+ * 1KB 要 1.5-6ms;一轮审查落库 16 条思考(共 4.4 万字)后,"一次面板重渲染"
+ * 光解析正文就要 70ms,叠在 20-30 条/秒的增量上就是把主线程占满——界面表现为
+ * 卡死十几秒。缓存后每个 token 只剩一次 Map 命中。
+ *
+ * 按 id 缓存是安全的:落库行的 content/reasoning 写入后不再变
+ * (onConversationUpdate 只刷 tool_call 的 content,而工具行走等宽纯文本)。
+ * 上限只是防整页快照反复堆积,超出按插入序淘汰最早一条。
+ */
+const MD_CACHE_MAX = 400
+const mdCache = new Map<string, string>()
+
+function mdHtml(key: string, text: string | null | undefined): string {
+  const hit = mdCache.get(key)
+  if (hit !== undefined) return hit
+  const html = renderMarkdown(text)
+  if (mdCache.size >= MD_CACHE_MAX) {
+    const oldest = mdCache.keys().next()
+    if (!oldest.done) mdCache.delete(oldest.value)
+  }
+  mdCache.set(key, html)
+  return html
+}
+
+/** 已被用户展开的历史条目(key 集);未展开的正文不进 DOM */
+const openEntries = ref<Set<string>>(new Set())
+
+/** <details> 开合只记录意图,正文由 v-if 决定渲染与否 */
+function onEntryToggle(key: string, ev: Event): void {
+  const open = (ev.target as HTMLDetailsElement).open
+  if (open) openEntries.value.add(key)
+  else openEntries.value.delete(key)
+}
+
 // ---- 展示辅助 ----
 
 function firstLine(text: string | null | undefined): string {
@@ -373,7 +416,11 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
              绝不能拆成多个 v-for(那等于回到分桶),否则思考又会整体脱离工具。 -->
         <template v-for="e in g.entries" :key="e.key">
           <!-- 工具核查(读码核对 / PoC / 引用复核):紧跟触发它的那段思考 -->
-          <details v-if="e.kind === 'tool'" class="panel-item panel-tool">
+          <details
+            v-if="e.kind === 'tool'"
+            class="panel-item panel-tool"
+            @toggle="onEntryToggle(e.key, $event)"
+          >
             <summary>
               <span
                 v-if="dynamicVerifyLabel(e.call)"
@@ -381,8 +428,10 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
                 title="动态验证:向测试环境发起真实请求 / 在沙箱执行取证代码"
               >{{ dynamicVerifyLabel(e.call) }}</span>{{ toolIntent(e.call) }}
             </summary>
-            <div v-if="e.result" class="panel-tool-result">{{ truncate(e.result.content, 1500) }}</div>
-            <div v-else class="panel-tool-pending">执行中…</div>
+            <template v-if="openEntries.has(e.key)">
+              <div v-if="e.result" class="panel-tool-result">{{ truncate(e.result.content, 1500) }}</div>
+              <div v-else class="panel-tool-pending">执行中…</div>
+            </template>
           </details>
 
           <!-- 实时流式思考(SSE thinking_delta):流式中自动展开、结束后折叠,
@@ -409,34 +458,50 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
             />
           </details>
 
-          <!-- 历史思考链(刷新页面后由落库记录接管) -->
-          <details v-else-if="e.kind === 'thinking'" class="panel-item">
+          <!-- 历史思考链(刷新页面后由落库记录接管):折叠时不解析正文 -->
+          <details
+            v-else-if="e.kind === 'thinking'"
+            class="panel-item"
+            @toggle="onEntryToggle(e.key, $event)"
+          >
             <summary>思考链 · {{ charCount(e.conv.reasoning || e.conv.content) }} 字</summary>
-            <div class="markdown-body panel-md" v-html="renderMarkdown(e.conv.reasoning || e.conv.content)" />
+            <div
+              v-if="openEntries.has(e.key)"
+              class="markdown-body panel-md"
+              v-html="mdHtml(e.key, e.conv.reasoning || e.conv.content)"
+            />
           </details>
 
           <!-- 审查结论(后台审查模式):结论行 + 展开完整审查 -->
-          <details v-else-if="e.kind === 'review'" class="panel-item panel-review">
+          <details
+            v-else-if="e.kind === 'review'"
+            class="panel-item panel-review"
+            @toggle="onEntryToggle(e.key, $event)"
+          >
             <summary>{{ firstLine(e.conv.content) || '审查结论' }}</summary>
-            <pre class="panel-full-text">{{ e.conv.reasoning || e.conv.content }}</pre>
+            <pre v-if="openEntries.has(e.key)" class="panel-full-text">{{ e.conv.reasoning || e.conv.content }}</pre>
           </details>
 
           <!-- 评估(resume 消息分析):结论行 + 展开完整评估 -->
-          <details v-else-if="e.kind === 'evaluation'" class="panel-item panel-eval">
+          <details
+            v-else-if="e.kind === 'evaluation'"
+            class="panel-item panel-eval"
+            @toggle="onEntryToggle(e.key, $event)"
+          >
             <summary>{{ evalDigest(e.conv) }}</summary>
-            <pre class="panel-full-text">{{ e.conv.reasoning || e.conv.content }}</pre>
+            <pre v-if="openEntries.has(e.key)" class="panel-full-text">{{ e.conv.reasoning || e.conv.content }}</pre>
           </details>
 
-          <!-- 最终总结(高亮) -->
+          <!-- 最终总结(高亮,平铺常显:走缓存,不随 token 重复解析) -->
           <div v-else-if="e.kind === 'summary'" class="panel-summary">
             <span class="panel-summary-label">最终结论</span>
-            <div class="markdown-body panel-md" v-html="renderMarkdown(e.conv.content)" />
+            <div class="markdown-body panel-md" v-html="mdHtml(e.key, e.conv.content)" />
           </div>
 
           <!-- 未知类型 / 孤儿 tool_result 容错(老数据形态) -->
-          <details v-else class="panel-item">
+          <details v-else class="panel-item" @toggle="onEntryToggle(e.key, $event)">
             <summary>{{ e.conv.type }} · {{ truncate(firstLine(e.conv.content), 50) }}</summary>
-            <pre class="panel-full-text">{{ e.conv.content }}</pre>
+            <pre v-if="openEntries.has(e.key)" class="panel-full-text">{{ e.conv.content }}</pre>
           </details>
         </template>
       </div>
