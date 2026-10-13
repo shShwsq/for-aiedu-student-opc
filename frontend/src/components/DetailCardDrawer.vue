@@ -30,6 +30,8 @@ const props = defineProps<{
   type: 'review' | 'result'
   /** 正在发送的追问文本(与侧栏建议卡共用同一把防重复锁);非空时本抽屉的追问按钮置灰 */
   digging?: string | null
+  /** 宿主的全量审查项:知识点抽屉用 source_review_item_id 回指证据(可溯源) */
+  reviewItems?: ReviewItem[]
 }>()
 
 const emit = defineEmits<{
@@ -83,6 +85,19 @@ const diggingThis = computed(
 function renderContent(content: string | null | undefined): string {
   return renderMarkdown(content)
 }
+
+/**
+ * 知识点的来源审查项(metadata_.source_review_item_id 回链)
+ *
+ * 知识点讲解正文里按契约不得虚构文件路径/行号,溯源证据改由这里展示:
+ * 从宿主传入的审查项里按 id 解析,拿不到(旧数据/跨轮回收)则整块不渲染。
+ */
+const sourceReviewItem = computed<ReviewItem | null>(() => {
+  if (isReview.value || !props.item || !props.reviewItems?.length) return null
+  const rid = (props.item as TaskResult).metadata_?.source_review_item_id
+  if (typeof rid !== 'string' || !rid) return null
+  return props.reviewItems.find((r) => r.id === rid) ?? null
+})
 </script>
 
 <template>
@@ -187,6 +202,22 @@ function renderContent(content: string | null | undefined): string {
               class="result-content markdown-body"
               v-html="renderContent((item as TaskResult).content)"
             />
+            <!-- 来源证据:正文不含路径行号,靠回链的审查项证据溯源(可点文件名跳工作区) -->
+            <div
+              v-if="sourceReviewItem && (sourceReviewItem.evidence?.source?.file_path || sourceReviewItem.evidence?.source?.quote)"
+              class="kp-source-ref"
+            >
+              <strong class="kp-source-label">来源证据</strong>
+              <code
+                v-if="sourceReviewItem?.evidence?.source?.file_path"
+                class="rv-file"
+                @click="sourceReviewItem && emit('open-file', sourceReviewItem)"
+              >{{ sourceReviewItem?.evidence?.source?.file_path }}<span v-if="sourceReviewItem?.evidence?.source?.line">:{{ sourceReviewItem?.evidence?.source?.line }}</span></code>
+              <pre
+                v-if="sourceReviewItem?.evidence?.source?.quote"
+                class="rv-quote"
+              >{{ sourceReviewItem?.evidence?.source?.quote }}</pre>
+            </div>
           </template>
         </div>
       </aside>
@@ -414,6 +445,20 @@ function renderContent(content: string | null | undefined): string {
 
 .result-content.markdown-body pre {
   overflow-x: auto;
+}
+
+/* 知识点来源证据块:正文之后的溯源区,内部复用 rv-file/rv-quote 样式 */
+.kp-source-ref {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--color-border);
+}
+
+.kp-source-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
 }
 
 /* ---- Transition: slide-in from right ---- */

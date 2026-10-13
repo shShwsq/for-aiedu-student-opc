@@ -138,6 +138,25 @@ def test_submit_tool_definitions_shape():
     assert "plan_item_id" in _SUBMIT_REVIEW_PLAN_TOOL["function"]["description"]
 
 
+def test_knowledge_point_content_adopts_explanation_contract():
+    """知识点讲解统一:agent2 的 content 按练习侧四段式契约输出。
+
+    回归点:任务侧 content 会被出题收尾**直接采用**为看板讲解(见
+    explainer.sync_knowledge_explanations),两侧格式分家会让同一讲解
+    出现两种排版 —— 故工具描述与审查 prompt 都锁定共享契约。
+    """
+    from app.prompts.practice import EXPLANATION_FORMAT_CONTRACT
+
+    kp_props = _SUBMIT_KNOWLEDGE_POINT_TOOL["function"]["parameters"]["properties"]
+    content_desc = kp_props["content"]["description"]
+    # 工具描述内嵌共享契约(四段标题 + 不虚构路径行号)
+    assert EXPLANATION_FORMAT_CONTRACT in content_desc
+    assert "直接采用" in content_desc
+    # 审查 prompt 的「提炼知识点」段同样要求四段式且不是结论复述
+    assert "### 是什么 / ### 为什么会踩 / ### 怎么判断与修复 / ### 易错点" in AGENT2_REVIEW_PROMPT
+    assert "不是审查结论复述" in AGENT2_REVIEW_PROMPT
+
+
 def test_review_prompt_ship_conclusion_is_conditional():
     """落地决策结论:仅当用户意图涉及采用/发布/签署等决策时才附,且措辞场景中立。
 

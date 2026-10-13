@@ -358,8 +358,10 @@ export interface KnowledgePointCard {
   explanation: string
   /** 讲解来源:auto=模型生成 / manual=手工编辑(不会被自动覆盖)/ 空=未生成 */
   explanation_source: string
-  /** 生成所用模型名(手工编辑为空) */
+  /** 生成所用模型名(手工编辑为空;任务侧直接采用为 task_side) */
   explanation_model: string
+  /** 贡献这段讲解的任务数(1=单任务直采,≥2=跨任务合并,0=练习侧重建) */
+  explanation_contributor_count: number
   /** 最近一次更新讲解的时间(展示「更新于」) */
   explanation_updated_at: string | null
   /** 是否有可供模型依据的题(无题时不亮「生成讲解」) */

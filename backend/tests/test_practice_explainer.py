@@ -86,13 +86,17 @@ def test_make_source_digest_keeps_metadata_whitelist_and_clips():
     src = make_source_digest(
         "标题", "很长" * 2000,
         {"cwe": "CWE-89", "learning_note": "记住参数化", "内部字段": "_grouping",
-         "severity": "high", "noise": "x" * 500},
+         "severity": "high", "noise": "x" * 500,
+         "source_review_item_id": "ri-1"},
         [{"path": "a.py", "lines": "1-2", "content": "y" * 5000}],
         [{"stem": "题", "code_snippet": "c", "options": ["甲", "乙"],
           "answer_idx": 1, "explanation": "解析", "origin": "repo",
           "source_file": "a.py", "source_lines": "1"}],
     )
-    assert set(src["metadata"]) == {"cwe", "learning_note", "severity"}
+    # 白名单外的字段(内部字段/noise)不进 prompt;source_review_item_id
+    # 在白名单内:兜底路径才能回指原始审查项(可溯源证据)
+    assert set(src["metadata"]) == {"cwe", "learning_note", "severity",
+                                    "source_review_item_id"}
     assert len(src["finding_content"]) <= ex._FINDING_CONTENT_CHARS
     assert len(src["materials"][0]["content"]) <= ex._MATERIAL_CHARS
     # 题目摘要用"正确项文本"而不是下标,模型不必再猜答案位置

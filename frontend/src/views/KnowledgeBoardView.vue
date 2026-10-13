@@ -378,11 +378,30 @@ function htmlOf(key: string): string {
   return explanationHtml.value.get(key) ?? ''
 }
 
-/** 讲解来源徽章文本(manual 额外提示不会被自动覆盖) */
-function explainSourceLabel(source: string): string {
-  if (source === 'manual') return '已编辑'
-  if (source === 'auto') return 'AI'
-  return ''
+/**
+ * 讲解来源徽章文本
+ *
+ * 任务侧驱动的三种形态(explainer.sync_knowledge_explanations):
+ * 单任务直接采用(model=task_side)→「来自任务」;
+ * 跨任务合并(N≥2)→「由 N 个任务合并」;
+ * 其余 AI 生成→「AI」;manual 额外提示不会被自动覆盖。
+ */
+function explainSourceLabel(c: KnowledgePointCard): string {
+  if (c.explanation_source === 'manual') return '已编辑'
+  if (c.explanation_source !== 'auto') return ''
+  if (c.explanation_model === 'task_side') return '来自任务'
+  if (c.explanation_contributor_count >= 2) return `由 ${c.explanation_contributor_count} 个任务合并`
+  return 'AI'
+}
+
+/** 徽章悬浮解释:说清这段讲解怎么来的,能否被「更新讲解」重写 */
+function explainBadgeTitle(c: KnowledgePointCard): string {
+  if (c.explanation_source === 'manual') return '你自己编辑过:自动生成不会覆盖'
+  if (c.explanation_model === 'task_side') return '直接采用审查任务里的知识点正文,未经模型重写'
+  if (c.explanation_contributor_count >= 2) {
+    return `由 ${c.explanation_contributor_count} 个任务的知识点讲解合并生成${c.explanation_model ? `(${c.explanation_model})` : ''}`
+  }
+  return `模型生成${c.explanation_model ? `(${c.explanation_model})` : ''}`
 }
 
 /** 缺讲解但有题可依据的知识点(批量生成候选) */
@@ -763,12 +782,10 @@ onMounted(() => {
                     <!-- 知识点讲解:卡片只留一行紧凑入口,正文改到右侧栏查看 / 编辑 -->
                     <div class="kp-explain-cta">
                       <span
-                        v-if="explainSourceLabel(c.explanation_source)"
+                        v-if="explainSourceLabel(c)"
                         :class="['explain-badge', c.explanation_source === 'manual' ? 'explain-badge-manual' : 'explain-badge-auto']"
-                        :title="c.explanation_source === 'manual'
-                          ? '你自己编辑过:自动生成不会覆盖'
-                          : `模型生成${c.explanation_model ? '(' + c.explanation_model + ')' : ''}`"
-                      >{{ explainSourceLabel(c.explanation_source) }}</span>
+                        :title="explainBadgeTitle(c)"
+                      >{{ explainSourceLabel(c) }}</span>
                       <span v-else class="kp-muted kp-no-explain">{{ c.can_generate_explanation ? '可生成讲解' : '暂无讲解' }}</span>
                       <button
                         class="btn-secondary kp-open-btn"
@@ -823,12 +840,10 @@ onMounted(() => {
         <div class="panel-subhead">
           <span class="panel-kp-key">{{ selectedCard?.knowledge_key }}</span>
           <span
-            v-if="selectedCard && explainSourceLabel(selectedCard.explanation_source)"
+            v-if="selectedCard && explainSourceLabel(selectedCard)"
             :class="['explain-badge', selectedCard.explanation_source === 'manual' ? 'explain-badge-manual' : 'explain-badge-auto']"
-            :title="selectedCard.explanation_source === 'manual'
-              ? '你自己编辑过：自动生成不会覆盖'
-              : `模型生成${selectedCard.explanation_model ? '(' + selectedCard.explanation_model + ')' : ''}`"
-          >{{ explainSourceLabel(selectedCard.explanation_source) }}</span>
+            :title="explainBadgeTitle(selectedCard)"
+          >{{ explainSourceLabel(selectedCard) }}</span>
           <span v-if="selectedCard?.explanation_updated_at" class="panel-time">更新于 {{ formatDate(selectedCard.explanation_updated_at) }}</span>
           <span v-if="panelError" class="panel-error">{{ panelError }}</span>
         </div>

@@ -82,6 +82,7 @@ from app.services.practice.difficulty import (
 from app.services.practice.explainer import (
     build_digests_from_db,
     explain_knowledge_points,
+    sync_knowledge_explanations,
 )
 from app.services.practice.generator import (
     PracticeGenerateCancelled,
@@ -1237,6 +1238,10 @@ def list_knowledge_points(
             explanation_source=kp.explanation_source or "",
             explanation_model=kp.explanation_model or "",
             explanation_updated_at=kp.explanation_updated_at,
+            # 讲解来源信息:任务侧贡献任务数(1=来自任务,≥2=合并版,0=非任务侧)
+            explanation_contributor_count=len(
+                [t for t in (kp.explanation_contributor_tasks or []) if t]
+            ),
             # 有入库题才有讲解素材可依据(无题时不亮生成按钮,避免模型凭空编)
             can_generate_explanation=(q_counts.get(kp.id, 0) or 0) > 0,
         ))
@@ -1265,8 +1270,10 @@ def explain_knowledge_points_endpoint(
 ) -> ExplainKnowledgePointsResponse:
     """按需生成/更新知识点讲解(异步 job,前端轮询 GET /practice/generate/{job_id})
 
-    讲解素材由 explainer 从 DB 重建:该知识点最近的题目(含 code_snippet
-    与源码定位)+ 题目关联的审计发现原文,不是让模型凭空背概念。
+    语义 = 强制重跑任务侧同步(单任务采用/跨任务合并):
+    有任务来源的知识点直接用各任务的审查侧讲解(≥2 任务时合并一次),
+    无任务来源的(对话降级伪发现/老数据)回落由 DB 重建出题上下文
+    (最近的题目 + 关联审计发现原文)重写,不是让模型凭空背概念。
     已有 auto 讲解只在 force=True 时重写;manual(用户自己写的)永不覆盖。
     """
     keys = [k.strip() for k in (req.knowledge_keys or []) if k.strip()]
@@ -1298,6 +1305,9 @@ def explain_knowledge_points_endpoint(
 def _run_explain_job(job_id: str, user_id: UUID, keys: list[str], force: bool) -> None:
     """后台线程:独立 Session 批量生成讲解,进度/结果写回 job
 
+    两条路径依次执行:
+    1) 任务侧驱动 sync(采用/合并;force 透传,手动更新必重跑合并);
+    2) 无任务来源的 key 回落旧的题干+发现重建路径。
     job 的 done/total 语义复用出题 job 结构:total=待处理知识点数,
     done=已写入讲解数;skipped_findings = 没产出讲解的知识点数。
     """
@@ -1306,24 +1316,37 @@ def _run_explain_job(job_id: str, user_id: UUID, keys: list[str], force: bool) -
         settings_row = db.query(PracticeSettings).filter(
             PracticeSettings.user_id == user_id
         ).first()
-        digests = build_digests_from_db(db, user_id, keys)
-        if not digests:
-            # 全部知识点都没题可依据 → 直接收口,不白跑一次 LLM
-            gen_jobs.update_job(
-                job_id, status="done", done=0,
-                skipped_findings=len(keys),
+        client = resolve_explain_client_for_user(db, user_id, settings_row)
+        custom_defs = user_custom_topic_defs(db, user_id)
+        event_cb = lambda etype, data: gen_jobs.append_event(job_id, etype, data)  # noqa: E731
+        written = 0
+        # 1) 任务侧驱动:单任务采用 / 跨任务合并
+        kp_ids = [
+            kp.id for kp in db.query(KnowledgePoint).filter(
+                KnowledgePoint.user_id == user_id,
+                KnowledgePoint.key.in_(keys),
+            ).all()
+        ]
+        no_source_keys: list[str] = list(keys)
+        if kp_ids:
+            stats = sync_knowledge_explanations(
+                db, user_id, kp_ids,
+                client=client, custom_defs=custom_defs,
+                force=force, event_callback=event_cb,
             )
-            logger.info("[explain] job=%s 无可用题素材,未生成讲解", job_id)
-            return
-        written = explain_knowledge_points(
-            db, user_id, digests,
-            client=resolve_explain_client_for_user(db, user_id, settings_row),
-            force=force,
-            custom_defs=user_custom_topic_defs(db, user_id),
-            event_callback=lambda etype, data: gen_jobs.append_event(
-                job_id, etype, data
-            ),
-        )
+            written += stats["adopted"] + stats["merged"]
+            no_source_keys = stats["no_source_keys"]
+        # 2) 无任务来源的回落旧路径(全部无来源且无题可依据时不白跑 LLM)
+        if no_source_keys:
+            digests = build_digests_from_db(db, user_id, no_source_keys)
+            if digests:
+                written += explain_knowledge_points(
+                    db, user_id, digests,
+                    client=client, force=force,
+                    custom_defs=custom_defs, event_callback=event_cb,
+                )
+            else:
+                logger.info("[explain] job=%s 无题来源知识点无可用题素材", job_id)
         gen_jobs.update_job(
             job_id, status="done", done=written, created_count=written,
             skipped_findings=max(0, len(keys) - written),

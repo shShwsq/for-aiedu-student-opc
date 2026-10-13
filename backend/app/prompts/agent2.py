@@ -6,6 +6,8 @@ LLM 工具描述(只读核查 / verify / check_reference)。
 """
 from typing import Any
 
+from app.prompts.practice import EXPLANATION_FORMAT_CONTRACT
+
 # ============================================================
 # agent2 的只读核查工具定义(工作区可用时启用,repo_path 由后端注入)
 # ============================================================
@@ -357,7 +359,10 @@ _SUBMIT_KNOWLEDGE_POINT_TOOL: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "一句话知识点"},
-                "content": {"type": "string", "description": "详细说明(大白话)"},
+                "content": {"type": "string", "description": (
+                    "知识点讲解正文(大白话;这段正文会被直接采用为练习看板的知识点讲解,"
+                    "按以下格式契约输出:" + EXPLANATION_FORMAT_CONTRACT + ")"
+                )},
                 "learning_note": {"type": "string", "description": "为什么值得学/记住(必有)"},
                 "practice_worthy": {"type": "boolean", "description": "是否有出题价值(默认 true)"},
                 "source_review_item_id": {"type": "string", "description": "派生它的审查项 id(可选)"},
@@ -463,6 +468,8 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
    - `evidence.source.line` 统一用字符串(如 "42")。
 3. **提炼知识点**:有学习价值的结论调 `submit_knowledge_point`(3-8 条精选,见"结果整理原则");
    用 `submit_review_item` 回执里的 `review_item_id` 作 `source_review_item_id` 回指派生它的审查项。
+   `content` 是知识点讲解正文(不是审查结论复述):它会被直接采用为练习看板的讲解,
+   按四段式输出(### 是什么 / ### 为什么会踩 / ### 怎么判断与修复 / ### 易错点,200~400 字);
 4. **建议追问**:agent1 未覆盖、需补查才能闭环的方向,逐条 `submit_suggestion`(见"建议追问原则")。
 
 ## 用户可读性硬约束(写 title / conclusion / follow_up / suggestion 时逐条遵)

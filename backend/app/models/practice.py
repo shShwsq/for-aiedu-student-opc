@@ -226,6 +226,14 @@ class KnowledgePoint(Base):
     explanation_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True, default=None
     )
+    # 生成本次 explanation 所依据的任务 id 有序列表(str(uuid),按贡献任务首次
+    # 参与顺序)。出题收尾重算贡献集合,与列内集合一致则跳过(幂等去重);
+    # 空列表 = 尚未由任务侧生成过(老数据/仅练习侧重建讲解)。详见
+    # services/practice/explainer.py sync_knowledge_explanations。
+    # 存量老列升级见 migrate_practice_learning_columns(knowledge_points 段)。
+    explanation_contributor_tasks: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -710,6 +718,10 @@ def migrate_practice_learning_columns() -> None:
                                       "NOT NULL DEFAULT ''"),
                 ("explanation_updated_at", "ADD COLUMN explanation_updated_at "
                                            "TIMESTAMP WITH TIME ZONE"),
+                # 任务侧讲解贡献任务集合(幂等判定用;存量 = 尚未由任务侧生成)
+                ("explanation_contributor_tasks", "ADD COLUMN "
+                                                   "explanation_contributor_tasks JSONB "
+                                                   "NOT NULL DEFAULT '[]'"),
             ):
                 if col_name not in cols:
                     conn.execute(text(f"ALTER TABLE knowledge_points {ddl}"))

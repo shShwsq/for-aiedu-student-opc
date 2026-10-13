@@ -38,7 +38,9 @@ describe('分面并行:实时流式按 facet 身份分桶', () => {
   })
 
   it('onConversation 把落库 facet 写入历史卡,退役仍按 stream_conv_id 对账', () => {
-    const fn = sliceFrom(VIEW, 'onConversation: (data) => {')
+    // 切片放宽到 3500:头部新增的「用户补充消息转入」块把 facet 行顶出了
+    // 默认 2000 窗口(仍在 onConversationUpdate 之前,断言对象不变)
+    const fn = sliceFrom(VIEW, 'onConversation: (data) => {', 3500)
     expect(fn).toContain('facet: data.facet ?? null,')
     expect(fn).toContain('findRetiredCardConvId(streamingItems.values(), data)')
   })

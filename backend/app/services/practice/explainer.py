@@ -1,14 +1,19 @@
-"""知识点讲解生成:复用出题上下文,为知识点批量写讲解
+"""知识点讲解生成:任务侧为主、练习侧兜底,为知识点写/同步讲解
 
-来源路径(唯一一条,均为"带出题上下文",而不是只给 key/name 让模型背概念):
-- 看板按需:由 DB 重建上下文(该知识点最近的题目 + 题目关联的发现原文),
-  存量知识点也能回填;出题 job 不再顺带生成讲解(已废弃该自动路径)
+两条来源路径(均为"带上下文"而不是只给 key/name 让模型背概念):
+- 任务侧驱动(sync_knowledge_explanations,出题收尾触发):
+  单贡献任务直接采用 agent2 写的 Result.content(零额外 LLM);
+  跨任务(≥2)调一次 LLM 把各任务解释合并为通用看板讲解;
+  无任务来源(对话降级伪发现/老数据)不在收尾跑 LLM,交给按需路径。
+- 看板按需(explain_knowledge_points,用户点「生成/更新讲解」):
+  由 DB 重建上下文(该知识点最近的题目 + 题目关联的发现原文)重建讲解,
+  存量知识点也能回填。
 
 成本控制:一次 LLM 调用最多覆盖 MAX_KP_PER_BATCH 个知识点(超出分批),
-不是每个知识点一次往返。
+不是每个知识点一次往返;出题收尾只在跨任务合并时才产生 LLM 调用。
 
 覆盖规则:explanation_source=manual(用户自己写的总结)永不被自动写入;
-已有 auto 讲解也只在 force=True(用户点「更新讲解」)时重写。
+任务侧驱动的幂等靠 explanation_contributor_tasks 集合判定(详见 sync)。
 
 失败策略:任何异常只记日志,不抛出到调用方 —— 讲解是增益,不能拖垮出题。
 """
@@ -27,8 +32,13 @@ from app.models.practice import (
     KnowledgePoint,
     Question,
 )
-from app.models.task import Result
-from app.prompts.practice import build_explain_system_prompt, build_explain_user_prompt
+from app.models.task import Result, Task
+from app.prompts.practice import (
+    build_explain_system_prompt,
+    build_explain_user_prompt,
+    build_merge_explain_system_prompt,
+    build_merge_explain_user_prompt,
+)
 from app.services.practice.parse_utils import salvage_json_array
 
 logger = logging.getLogger(__name__)
@@ -70,11 +80,13 @@ def make_source_digest(
 ) -> dict:
     """一条发现在某知识点上的一份上下文(发现原文 + 真实材料 + 题目)"""
     meta = metadata or {}
-    # 只带对讲解有用的元信息(全量 metadata 会把无关字段也喂进模型)
+    # 只带对讲解有用的元信息(全量 metadata 会把无关字段也喂进模型);
+    # source_review_item_id 让兜底路径能回指原始审查项(可溯源证据)
     keep = {
         k: v for k, v in meta.items()
         if k in ("cwe", "severity", "file_path", "line_range", "line",
-                 "learning_note", "origin", "verified", "suggestion")
+                 "learning_note", "origin", "verified", "suggestion",
+                 "source_review_item_id")
     }
     return {
         "finding_title": _clip(finding_title, 200),
@@ -386,6 +398,278 @@ def _explain_one_batch(
         kp.explanation_model = model_name[:64]
         kp.explanation_updated_at = now
         written += 1
+    db.flush()
+    return written
+
+
+# ============================================================
+# 任务侧驱动的看板讲解(出题收尾采用/跨任务合并)
+# ============================================================
+
+# 单任务采用时 explanation_model 的取值(未经模型,标记来源为任务侧);
+# 看板 badge 按 explanation_contributor_tasks 数量区分「来自任务/合并」
+_ADOPTED_MODEL = "task_side"
+
+
+def _is_knowledge_result(r: Result) -> bool:
+    """Result 是否为知识点行(而非 agent1 summary 临时行)
+
+    知识点 Result 的 metadata 由 agent2 整理时写入(learning_note /
+    practice_worthy / learning_topic 至少其一);临时汇总行 metadata=None。
+    """
+    meta = r.metadata_
+    return isinstance(meta, dict) and any(
+        k in meta for k in ("learning_note", "practice_worthy", "learning_topic")
+    )
+
+
+def _task_contributions(db: Session, kp: KnowledgePoint) -> list[dict]:
+    """该 KP 的贡献任务及各自的任务侧讲解(采用/合并规则的依据)
+
+    取数优先走 results.knowledge_point_id 正式链接(出题收尾回写,题目
+    删除/归档仍稳健);链接列为 NULL 的老数据回落 Question.source_result_id。
+    同一任务取最新非空正文(多轮审查可能留多条同 key 知识点)。
+    对话降级伪发现无 Result 行 → 自然为空(落「无任务来源」分支)。
+    返回 [{task_id, task_title, explanation}],按任务首次参与顺序。
+    """
+    rows = (
+        db.query(Result)
+        .filter(Result.knowledge_point_id == kp.id)
+        .order_by(Result.created_at)
+        .all()
+    )
+    if not rows:
+        rids = [
+            rid
+            for (rid,) in db.query(Question.source_result_id).filter(
+                Question.knowledge_point_id == kp.id,
+                Question.source_result_id.isnot(None),
+            ).all()
+        ]
+        if rids:
+            rows = (
+                db.query(Result)
+                .filter(Result.id.in_(rids))
+                .order_by(Result.created_at)
+                .all()
+            )
+    by_task: dict[str, str] = {}  # task_id -> 讲解(created_at 升序逐条覆盖 → 最新胜出)
+    order: list[str] = []
+    task_ids: list = []  # 原始 UUID 形态,供 Task 标题查询(不做 str 往返解析)
+    for r in rows:
+        if r.task_id is None or not _is_knowledge_result(r):
+            continue
+        text = (r.content or "").strip()
+        if not text:
+            continue
+        tid = str(r.task_id)
+        if tid not in by_task:
+            order.append(tid)
+            task_ids.append(r.task_id)
+        by_task[tid] = text
+    if not order:
+        return []
+    titles: dict[str, str] = {}
+    for t in db.query(Task).filter(Task.id.in_(task_ids)).all():
+        titles[str(t.id)] = (t.title or (t.user_input or "")[:60] or "").strip()
+    return [
+        {"task_id": tid, "task_title": titles.get(tid, ""), "explanation": by_task[tid]}
+        for tid in order
+    ]
+
+
+def _write_explanation(
+    db: Session, kp: KnowledgePoint, text: str, model_name: str,
+    contributor_ids: list[str], now: datetime,
+) -> bool:
+    """讲解落库(含贡献任务集合);DB 层原子守卫 manual,并发手工编辑不覆盖"""
+    new_explanation = (text or "").strip()[:MAX_EXPLANATION_CHARS]
+    if not new_explanation:
+        return False
+    result = db.execute(
+        update(KnowledgePoint)
+        .where(
+            KnowledgePoint.id == kp.id,
+            KnowledgePoint.explanation_source != EXPLANATION_SOURCE_MANUAL,
+        )
+        .values(
+            explanation=new_explanation,
+            explanation_source=EXPLANATION_SOURCE_AUTO,
+            explanation_model=model_name[:64],
+            explanation_updated_at=now,
+            explanation_contributor_tasks=list(contributor_ids),
+        )
+    )
+    if not getattr(result, "rowcount", 0):
+        return False  # 并发下用户刚改成 manual → 挡下,也不回写贡献集合
+    # 条件 UPDATE 绕过了 ORM 脏标记,手动同步身份映射避免后续读到陈值
+    kp.explanation = new_explanation
+    kp.explanation_source = EXPLANATION_SOURCE_AUTO
+    kp.explanation_model = model_name[:64]
+    kp.explanation_updated_at = now
+    kp.explanation_contributor_tasks = list(contributor_ids)
+    db.flush()
+    return True
+
+
+def _sync_needed(kp: KnowledgePoint, contributor_ids: list[str], force: bool) -> bool:
+    """幂等判定:贡献任务集合与已落库集合一致且讲解非空 → 跳过(否则动作)
+
+    注:任务侧驱动对已有 auto 讲解也重写(新来源集 = 素材变了);manual
+    在调用方已预先筛除,DB 层另有条件 UPDATE 兜底。
+    """
+    if force:
+        return True
+    if not (kp.explanation or "").strip():
+        return True
+    return {str(x) for x in (kp.explanation_contributor_tasks or [])} != set(contributor_ids)
+
+
+def sync_knowledge_explanations(
+    db: Session, user_id, knowledge_point_ids, *,
+    client: LLMClient | None = None,
+    custom_defs: list[dict] | None = None,
+    force: bool = False,
+    event_callback=None,
+) -> dict:
+    """任务侧驱动看板讲解:单任务采用 / 跨任务合并
+
+    返回 {adopted, merged, skipped, no_source_keys}:
+    no_source_keys 为规则 3 命中的知识点 key(无任务来源,由调用方决定
+    是否走题干+发现重建的按需路径)。
+
+    逐 KP 三条规则:
+    1. 单贡献任务 → 直接采用该任务的 Result.content(零额外 LLM 调用);
+    2. ≥2 贡献任务 → 调一次 LLM 合并为通用看板讲解(去掉具体文件路径行号);
+    3. 无贡献任务(对话降级伪发现/老数据)→ 不在此处理,留给看板按需
+       「生成讲解」(题干+发现重建),避免出题收尾白跑 LLM。
+    覆盖规则:manual 永不覆盖;非 force 且贡献集合未变且已有讲解 → 跳过。
+    调用方出题收尾必须包 try/except:讲解是增益,不得影响出题结果。
+    custom_defs 为合并路径预留的主题词表参数(合并输入已是成品讲解,当前未用)。
+    """
+    stats = {"adopted": 0, "merged": 0, "skipped": 0, "no_source_keys": []}
+    ids = [i for i in (knowledge_point_ids or []) if i]
+    if not ids:
+        return stats
+    kps = db.query(KnowledgePoint).filter(
+        KnowledgePoint.user_id == user_id,
+        KnowledgePoint.id.in_(ids),
+    ).all()
+    now = datetime.now(timezone.utc)
+    merge_items: list[tuple[KnowledgePoint, list[dict]]] = []
+    for kp in kps:
+        if (kp.explanation_source or "") == EXPLANATION_SOURCE_MANUAL:
+            stats["skipped"] += 1
+            continue
+        contributions = _task_contributions(db, kp)
+        if not contributions:
+            stats["skipped"] += 1
+            stats["no_source_keys"].append(kp.key)  # 规则 3:按需路径负责
+            continue
+        contributor_ids = [c["task_id"] for c in contributions]
+        if not _sync_needed(kp, contributor_ids, force):
+            stats["skipped"] += 1
+            continue
+        if len(contributions) == 1:
+            # 规则 1:采用不走模型,explanation_model 记 task_side
+            if _write_explanation(
+                db, kp, contributions[0]["explanation"], _ADOPTED_MODEL,
+                contributor_ids, now,
+            ):
+                stats["adopted"] += 1
+            else:
+                stats["skipped"] += 1
+            continue
+        merge_items.append((kp, contributions))
+    if merge_items:
+        if client is None:
+            logger.info(
+                "[explain] user=%s %d 个知识点待跨任务合并,但讲解模型不可用,留待下次同步",
+                user_id, len(merge_items),
+            )
+            stats["skipped"] += len(merge_items)
+        else:
+            stats["merged"] += _merge_batches(
+                db, user_id, merge_items, client=client, event_callback=event_callback,
+            )
+    db.commit()
+    logger.info(
+        "[explain] user=%s 任务侧讲解同步: 采用 %d, 合并 %d, 跳过 %d",
+        user_id, stats["adopted"], stats["merged"], stats["skipped"],
+    )
+    return stats
+
+
+def _merge_batches(
+    db: Session, user_id, merge_items: list[tuple[KnowledgePoint, list[dict]]], *,
+    client: LLMClient,
+    event_callback=None,
+) -> int:
+    """跨任务合并:一次调用覆盖 ≤MAX_KP_PER_BATCH 个知识点(口径同 explain)"""
+    model_name = getattr(client, "model", "") or ""
+    batches = [
+        merge_items[i:i + MAX_KP_PER_BATCH]
+        for i in range(0, len(merge_items), MAX_KP_PER_BATCH)
+    ]
+    _emit(event_callback, "start", total=len(merge_items), batches=len(batches),
+          model=model_name)
+    written = 0
+    for batch in batches:
+        try:
+            written += _merge_one_batch(
+                db, user_id, batch, client=client, model_name=model_name,
+            )
+        except Exception as e:
+            # 单批失败不阻断其它批次,更不牵连出题主流程
+            logger.warning(
+                "[explain] user=%s 合并批次失败(keys=%s): %s",
+                user_id, [kp.key for kp, _ in batch][:3], e,
+            )
+    _emit(event_callback, "done", written=written, total=len(merge_items))
+    return written
+
+
+def _merge_one_batch(
+    db: Session, user_id, batch: list[tuple[KnowledgePoint, list[dict]]], *,
+    client: LLMClient, model_name: str,
+) -> int:
+    """一批跨任务知识点的合并:拼提示词 → 调模型 → 解析 → 落库(不 commit)"""
+    items = [
+        {
+            "knowledge_key": kp.key,
+            "knowledge_name": kp.name,
+            "entries": [
+                {
+                    "task_title": c["task_title"],
+                    "explanation": _clip(c["explanation"], _FINDING_CONTENT_CHARS),
+                }
+                for c in contributions
+            ],
+        }
+        for kp, contributions in batch
+    ]
+    messages = [
+        {"role": "system", "content": build_merge_explain_system_prompt()},
+        {"role": "user", "content": build_merge_explain_user_prompt(items)},
+    ]
+    content = _collect_llm_text(client, messages)
+    parsed = _parse_explanations(content)
+    if not parsed:
+        logger.warning(
+            "[explain] user=%s 合并批次无有效输出,样例: %r",
+            user_id, (content or "")[:200],
+        )
+        return 0
+    written = 0
+    for kp, contributions in batch:
+        markdown = parsed.get(kp.key)
+        if not markdown:
+            continue
+        if _write_explanation(
+            db, kp, markdown, model_name,
+            [c["task_id"] for c in contributions], datetime.now(timezone.utc),
+        ):
+            written += 1
     db.flush()
     return written
 

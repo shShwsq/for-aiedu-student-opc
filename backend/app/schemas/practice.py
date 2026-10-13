@@ -336,10 +336,12 @@ class KnowledgePointCardItem(BaseModel):
     explanation: str = ""
     # 来源:auto=模型生成 / manual=手工编辑(不会被自动覆盖)/ ""=未生成
     explanation_source: str = ""
-    # 生成所用模型(手工编辑不记)
+    # 生成所用模型(手工编辑不记;任务侧直接采用时为 "task_side")
     explanation_model: str = ""
     # 最近一次更新讲解的时间(前端展示「更新于」)
     explanation_updated_at: datetime | None = None
+    # 任务侧贡献任务数(0=非任务侧生成;1=来自单任务;≥2=跨任务合并版)
+    explanation_contributor_count: int = 0
     # 该知识点是否有可供模型出讲解的题素材(无题时前端不亮「生成讲解」)
     can_generate_explanation: bool = False
 

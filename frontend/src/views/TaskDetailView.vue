@@ -3938,6 +3938,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
       :item="drawerItem"
       :type="drawerType"
       :digging="diggingSuggestion"
+      :review-items="reviewItems"
       @close="drawerOpen = false"
       @open-file="handleDrawerOpenFile"
       @dig="handleSuggestionDig"

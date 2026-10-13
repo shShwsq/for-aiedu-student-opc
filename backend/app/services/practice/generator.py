@@ -1614,6 +1614,33 @@ def _effective_concurrency(settings_row: PracticeSettings | None, pending_count:
     return max(1, min(cap, max(1, pending_count)))
 
 
+def _sync_explanations_after_generate(
+    db: Session, user_id, created: list[Question],
+    settings_row: PracticeSettings | None,
+    event_callback: Callable[[str, dict], None] | None,
+) -> None:
+    """出题收尾:把本轮题目命中的知识点做任务侧讲解同步(单任务采用/跨任务合并)
+
+    采用路径不走模型(零额外 LLM 调用);仅出现新贡献任务的跨知识点才
+    合并一次。讲解模型解析失败不阻断:采用照常,合并留待下次同步。
+    """
+    from app.services.practice.explainer import sync_knowledge_explanations
+
+    kp_ids = list(dict.fromkeys(
+        q.knowledge_point_id for q in created if q.knowledge_point_id
+    ))
+    if not kp_ids:
+        return
+    client = None
+    try:
+        client = resolve_explain_client_for_user(db, user_id, settings_row)
+    except Exception as e:
+        logger.info("[practice] 讲解模型解析失败(跨任务合并留待下次): %s", e)
+    sync_knowledge_explanations(
+        db, user_id, kp_ids, client=client, event_callback=event_callback,
+    )
+
+
 def generate_questions_for_task(
     db: Session,
     task: Task,
@@ -1637,7 +1664,7 @@ def generate_questions_for_task(
       任务详情页「重新出题」显式传 True 才允许重出。
     should_stop:可选回调() -> bool,用户已点「停止出题」时返回 True。命中时
       在检查点退出:题目循环内停止走正常返回路径(**已生成的 draft 先
-      commit 再返回**,不白烧已付 token,收尾讲解阶段跳过);题开始前
+      commit 再返回**,不白烧已付 token;收尾讲解同步照常执行);题开始前
       (克隆/预读)命中则抛 PracticeGenerateCancelled(此时无题可保留)。
       不传时与旧版行为一致。
     """
@@ -2064,6 +2091,17 @@ def generate_questions_for_task(
     db.commit()
     for q in created:
         db.refresh(q)
+
+    # 任务侧驱动的看板讲解同步(知识点采用/合并):讲解是增益,
+    # 任何异常只记日志,不得影响出题结果(手动 job / 自动 job 共用本 hook);
+    # 部分停止也照常同步 —— 已落库的题对应的新增贡献任务不应当被漏掉
+    if created:
+        try:
+            _sync_explanations_after_generate(
+                db, user_id, created, settings_row, event_callback,
+            )
+        except Exception as e:
+            logger.warning("[practice] task=%s 收尾讲解同步失败(忽略): %s", task.id, e)
 
     logger.info(
         "[practice] 出题结束 task=%s: 生成 %d 题, %d/%d 条 finding 未出题%s",

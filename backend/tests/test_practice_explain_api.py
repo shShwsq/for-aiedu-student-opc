@@ -176,6 +176,18 @@ def _seed(
     app.include_router(practice_router.router)
     # 讲解 job 在后台线程里用 SessionLocal 建会话,必须指向测试 schema
     monkeypatch.setattr(practice_router, "SessionLocal", factory)
+    # 默认把任务侧同步桩成「全部无任务来源」,让本文件既有用例继续覆盖
+    # 旧的题干+发现重建路径;任务侧采用/合并本身有专门的 sync 用例验证
+    def _sync_as_no_source(db, user_id, kp_ids, **kw):
+        ks = [
+            kp.key for kp in db.query(KnowledgePoint).filter(
+                KnowledgePoint.id.in_(list(kp_ids))
+            ).all()
+        ]
+        return {"adopted": 0, "merged": 0, "skipped": len(ks), "no_source_keys": ks}
+    monkeypatch.setattr(
+        practice_router, "sync_knowledge_explanations", _sync_as_no_source,
+    )
 
     def override_get_db():
         s = factory()
@@ -316,6 +328,34 @@ def test_explain_without_question_material_skips_llm(monkeypatch, db_factory):
     assert job["status"] == "done"
     assert job["done"] == 0 and job["skipped_findings"] == 1
     assert called == []
+
+
+def test_explain_endpoint_runs_task_sync(monkeypatch, db_factory):
+    """讲解端点优先走任务侧同步(采用/合并);有任务来源时不再重建"""
+    client, keys, _, _, _ = _seed(monkeypatch, db_factory, n_questions=1, n_results=1)
+    seen = {}
+
+    def fake_sync(db, user_id, kp_ids, **kw):
+        seen["kp_ids"] = list(kp_ids)
+        seen["force"] = kw.get("force")
+        # 本 KP 有任务来源 → 采用成功,不产生 no_source_keys
+        return {"adopted": len(kp_ids), "merged": 0, "skipped": 0, "no_source_keys": []}
+
+    monkeypatch.setattr(practice_router, "sync_knowledge_explanations", fake_sync)
+    rebuild_called = []
+    monkeypatch.setattr(
+        practice_router, "explain_knowledge_points",
+        lambda *a, **k: rebuild_called.append(1) or 0,
+    )
+    body = client.post(
+        "/practice/knowledge-points/explain",
+        json={"knowledge_keys": keys, "force": True},
+    ).json()
+    job = _wait_job(client, body["job_id"])
+    assert job["status"] == "done" and job["done"] == len(keys)
+    assert len(seen["kp_ids"]) == len(keys) and seen["force"] is True
+    # 全部有任务来源 → 旧重建路径一次也不调
+    assert rebuild_called == []
 
 
 def test_explain_jobs_are_filtered_out_of_generate_jobs_by_default(monkeypatch, db_factory):
