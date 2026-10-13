@@ -6,7 +6,7 @@
  * 1. 主区协作对话流:按 round_idx 分组,展示 agent2 与 agent1 的来回
  * 2. 右侧「核查与结果」:常驻竖向 rail(概览 / 核查过程 / 审查结果 /
  *    重点与知识点),点 rail 按钮展开对应段面板(rail 即折叠态);
- *    概览含当前阶段/对话模型/任务清单/动态验证/建议追问方向
+ *    概览含当前阶段/对话模型/执行计划/动态验证/建议追问方向
  *
  * 实时更新:SSE 接收每条对话/状态变更 + thinking_delta(流式 token 增量)。
  * 初始加载 GET /tasks/{id} 拿快照(补历史),然后 SSE 接收增量。
@@ -306,7 +306,7 @@ const activeSectionLabel = computed<string>(() =>
 /**
  * 标题行跟随的计数:段名上移到标题行后,段内原来的同名 h2 只剩「(N) + 状态」,
  * 于是把计数一并接到标题上,段内那一行收敛为纯状态/动作。
- * 概览是混合区块(任务清单/动态验证/建议追问),没有单一计数;核查过程的时间线
+ * 概览是混合区块(执行计划/动态验证/建议追问),没有单一计数;核查过程的时间线
  * 条数不是用户关心的“规模”,也不给。0 不显示——空态由段内 empty hint 交代。
  */
 const activeSectionCount = computed<number>(() => {
@@ -2155,7 +2155,7 @@ const userDirective = computed<DisplayItem | null>(() => {
   }
 })
 
-/** 侧栏"任务清单":取有 plan 的最大 round(计划随轮次更新,最新一轮即当前进度);
+/** 侧栏"执行计划":取有 plan 的最大 round(计划随轮次更新,最新一轮即当前进度);
  *  数据来自 SSE plan 事件与历史对话提取(extractPlanFromHistory),均写入 planPerRound */
 const latestPlanSteps = computed<PlanStep[]>(() => {
   let best: PlanStep[] = []
@@ -3129,7 +3129,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
         <RouterLink to="/tasks/new">提交新任务</RouterLink>
       </div>
 
-      <!-- 任务详情(主区聚焦协作对话流;任务概览/任务清单/动态验证/检查助手核查/重点与知识点均在右侧栏) -->
+      <!-- 任务详情(主区聚焦协作对话流;任务概览/执行计划/动态验证/检查助手核查/重点与知识点均在右侧栏) -->
       <template v-else-if="task">
         <!-- 协作对话流(无外框,顶部仅在运行时显示实时徽标) -->
         <section
@@ -3146,7 +3146,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
           </div>
 
           <div v-for="group in roundGroups" :key="group.roundIdx" class="round-group">
-            <!-- 计划清单已移至右侧栏"任务清单"(latestPlanSteps),主对话流只保留消息流 -->
+            <!-- 计划清单已移至右侧栏"执行计划"(latestPlanSteps),主对话流只保留消息流 -->
             <div class="messages">
               <template
                 v-for="seg in group.segments"
@@ -3546,7 +3546,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
         role="region"
         :aria-label="activeSectionLabel"
       >
-        <!-- 段: 概览(阶段 + 对话模型 + 任务清单 + 动态验证 + 建议追问方向) -->
+        <!-- 段: 概览(阶段 + 对话模型 + 执行计划 + 动态验证 + 建议追问方向) -->
         <div v-show="activeSection === 'overview'" class="sidebar-panel">
           <section
             v-if="(isRunning && task.current_stage) || task.error_message"
@@ -3572,7 +3572,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
       
           <section v-if="latestPlanSteps.length > 0" class="plan-section">
             <h2 class="plan-section-title">
-              任务清单
+              执行计划
               <span class="plan-progress">{{ planProgress(latestPlanSteps) }}</span>
             </h2>
             <div class="plan-steps">
@@ -4977,7 +4977,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   margin-bottom: 0;
 }
 
-/* ---- 任务清单(右侧栏,原主对话流"计划清单"卡迁入) ---- */
+/* ---- 执行计划(右侧栏,原主对话流"计划清单"卡迁入) ---- */
 .plan-section {
   display: flex;
   flex-direction: column;
