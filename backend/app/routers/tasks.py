@@ -1027,7 +1027,7 @@ def retry_failed_task_endpoint(
     # 前端会把这次正常续跑也标成"已中断")。
     task.status = TaskStatus.RUNNING
     task.interrupted_at = None
-    task.current_stage = "重试失败任务,恢复执行"
+    task.current_stage = "继续执行中"
     db.commit()
 
     thread = threading.Thread(

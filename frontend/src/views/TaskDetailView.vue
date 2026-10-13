@@ -70,6 +70,7 @@ import { itemFacetOf, type AgentBlockRowLike } from '@/utils/toolRows'
 import { isAgentBlockOpen, toggleAgentBlock } from '@/utils/agentBlock'
 import { COLLAPSE_GRACE_MS, isThinkingExpanded, shouldLatchAutoExpand } from '@/utils/thinkingExpand'
 import { findRetiredCardConvId } from '@/utils/thinkingReconcile'
+import { createDeltaBuffer } from '@/utils/thinkingDeltaBuffer'
 import {
   bucketizeReviewItems,
   confidenceClass,
@@ -875,6 +876,9 @@ function applyTaskSnapshot(fresh: TaskDetail, clearStreaming: boolean): void {
     if (c.role === 'user' && c.type === 'question') continue
     convCountPerRound.set(c.round_idx, (convCountPerRound.get(c.round_idx) ?? 0) + 1)
   }
+  // 先冲在途增量再动卡片:待写入的文本属于"将被快照替掉的那张卡",
+  // 清完再冲就写不进去(整页快照带着全文来,不会丢内容)
+  deltaBuffer.flush()
   if (clearStreaming) {
     streamingItems.clear()
   } else {
@@ -882,6 +886,7 @@ function applyTaskSnapshot(fresh: TaskDetail, clearStreaming: boolean): void {
       if (s.role === 'agent1') streamingItems.delete(key)
     }
   }
+  deltaBuffer.clear()
 }
 
 function connectSSE(taskId: string): void {
@@ -924,6 +929,9 @@ function connectSSE(taskId: string): void {
     },
     onConversation: (data) => {
       if (!task.value) return
+      // 落库行一到,先把在途增量冲进实时卡:下面的退役对账要按全文比对
+      // (findRetiredCardConvId 拿缓冲里少了尾巴的文本去认,会认不出同一张卡)
+      deltaBuffer.flush()
       // 用户补充消息被 agent1 消费(drain 注入):待处理条目转入对话流
       if (data.role === 'user' && data.type === 'message') {
         pendingUserMessages.value = pendingUserMessages.value.filter(
@@ -1010,8 +1018,8 @@ function connectSSE(taskId: string): void {
       skipClonePending.value = false
     },
     onThinkingDelta: (data) => {
+      // 不再逐条置底:滚动由 deltaBuffer 的 afterFlush 按帧触发
       handleThinkingDelta(data)
-      nextTick(scrollToBottom)
     },
     onCloneProgress: (data) => {
       cloneProgress.value = data
@@ -1159,6 +1167,38 @@ function connectSSE(taskId: string): void {
 
 // ---- 流式增量处理 ----
 
+/**
+ * thinking_delta 合帧缓冲:每帧最多往响应式状态写一次。
+ *
+ * 后端每个 LLM chunk 推一条增量(实测 20-30 条/秒),每条都直接写 streamingItems
+ * 就让整个对话面板逐 token 重渲染;而重渲染成本按"本轮已落库思考条数"叠加,
+ * 审查阶段实测单次 45-70ms —— 主线程被占满就是"看检查助手核查时界面卡死十几秒"。
+ *
+ * 卡片仍在 handleThinkingDelta 里**同步**建好(收帧时按 conv_id 找卡,卡必须先在场);
+ * 卡被 conversation 事件退役后,残留增量在 sink 里按"找不到卡"作废 —— 那条落库行
+ * 带着全文接管展示,不会丢内容。
+ */
+const deltaBuffer = createDeltaBuffer({
+  appendReasoning(convId, text) {
+    const item = streamingItems.get(convId)
+    if (!item) return
+    item.reasoning += text
+    // 跨过阈值才置自动展开闩锁(单调):短思考保持单行标题,
+    // 避免一次任务里几十个迭代各自"闪一下收起"
+    if (!item.reasoning_auto && shouldLatchAutoExpand(item)) item.reasoning_auto = true
+  },
+  appendContent(convId, text) {
+    const item = streamingItems.get(convId)
+    if (!item) return
+    item.content += text
+  },
+  afterFlush() {
+    // 置底降频到"每帧一次":本来每条增量一次 nextTick + 读 scrollHeight,
+    // 等于把强制重排也扣在每个 token 上
+    nextTick(scrollToBottom)
+  },
+})
+
 function handleThinkingDelta(data: ThinkingDeltaEventData): void {
   const { conv_id, round_idx, role, phase, delta, verify, facet } = data
 
@@ -1210,23 +1250,26 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
 
   const cur = streamingItems.get(conv_id)!
   if (phase === 'reasoning') {
-    cur.reasoning += delta
-    // 跨过阈值才置自动展开闩锁(单调):短思考保持单行标题,
-    // 避免一次任务里几十个迭代各自"闪一下收起"
-    if (!cur.reasoning_auto && shouldLatchAutoExpand(cur)) cur.reasoning_auto = true
+    // 不逐 token 写响应式状态:攒进缓冲,每帧合一次(见 utils/thinkingDeltaBuffer)
+    deltaBuffer.push(conv_id, 'reasoning', delta)
   } else if (phase === 'content') {
-    cur.content += delta
+    deltaBuffer.push(conv_id, 'content', delta)
   } else if (phase === 'notice') {
     // 系统提示(如"已回收后台子任务结果"):归入思考卡并收尾,但不标错误态。
     // 后端在整轮 flush 之后才发这个相位,卡片可能已被 conversation 事件退役,
     // 所以必须自带结束态,否则会留下一张永远"正在生成"的孤儿卡
+    // 先冲缓冲再直接改卡:否则在途增量会排在提示后面写入(时序倒挂)
+    deltaBuffer.flush()
     cur.reasoning += `\n${delta}`
     finishThinking(cur, conv_id, 'done')
   } else if (phase === 'error') {
     // 错误文本仍归入思考卡(整项失败的完整提示由任务级 error_message 承担)
+    deltaBuffer.flush()
     cur.reasoning += `\n[错误] ${delta}`
     finishThinking(cur, conv_id, 'error')
   } else if (phase === 'end') {
+    // 收完最后一批增量再收尾:finishThinking 读 reasoning 长度算展开意图
+    deltaBuffer.flush()
     finishThinking(cur, conv_id, 'done')
   }
 }
@@ -1451,6 +1494,8 @@ onUnmounted(() => {
   unmountedFlag = true
   if (eventSource) eventSource.close()
   clearGraceTimers()
+  // 视图已卸载:缓冲里的增量不再有人接,直接丢(排到的 rAF 回调也只会空跑)
+  deltaBuffer.clear()
 })
 
 /**
@@ -1463,6 +1508,7 @@ function resetTaskState(): void {
     eventSource = null
   }
   // 清空流式/计划/对话计数等运行态
+  deltaBuffer.clear()
   streamingItems.clear()
   planPerRound.clear()
   convCountPerRound.clear()
@@ -2975,7 +3021,7 @@ async function handleRetry(): Promise<void> {
     if (resp.accepted) {
       task.value.status = 'running'
       task.value.error_message = null
-      task.value.current_stage = '重试失败任务...'
+      task.value.current_stage = '继续执行中'
       // 标记 resume 窗口(同 handleMessageSent:onDone 校验竞态误推)
       resumingRef.value = true
       connectSSE(String(task.value.id))

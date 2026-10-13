@@ -2388,7 +2388,7 @@ def resume_audit_with_message(
 
     task.status = TaskStatus.RUNNING
     task.current_stage = (
-        "重试失败任务,恢复执行" if retry else "用户追加消息,重启执行"
+        "继续执行中" if retry else "用户追加消息,重启执行"
     )
     task.error_message = None  # 清除之前的错误信息(若有)
     db.commit()
@@ -2718,7 +2718,7 @@ def retry_failed_task(task: Task, db: Session) -> None:
             f"[task={task.id}] 重试:沙箱会话已回收,重新克隆仓库恢复工作区"
         )
         task.status = TaskStatus.RUNNING
-        task.current_stage = "重试失败任务,正在恢复工作区..."
+        task.current_stage = "正在恢复工作区..."
         task.error_message = None
         db.commit()
         _publish_status(task)

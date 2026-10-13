@@ -260,7 +260,7 @@ def test_retry_syncs_running(monkeypatch):
     assert task.status == TaskStatus.RUNNING
     # error_message 保留:retry_failed_task 需在进入时读取真实失败原因拼进续跑消息
     assert task.error_message == "原错误信息"
-    assert task.current_stage == "重试失败任务,恢复执行"
+    assert task.current_stage == "继续执行中"
     assert len(_FakeThread.instances) == 1
     assert _FakeThread.instances[0].kwargs["name"] == f"task-{task_id}-retry"
     assert resp.accepted is True
