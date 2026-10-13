@@ -322,6 +322,8 @@ export interface TaskDetail {
   error_message: string | null
   created_at: string
   completed_at: string | null
+  /** 执行被进程中断的持久标记:status==='failed' 且非空 → 显示"已中断(可继续)" */
+  interrupted_at?: string | null
   results: TaskResult[]
   conversations: Conversation[]
   /** 审查项(证据驱动可信审查;老任务为空数组,前端不显示审查结果区) */
@@ -352,6 +354,8 @@ export interface TaskListItem {
   error_message: string | null
   created_at: string
   completed_at: string | null
+  /** 执行被进程中断的持久标记:status==='failed' 且非空 → 侧栏显示"已中断" */
+  interrupted_at?: string | null
 }
 
 // ============================================================

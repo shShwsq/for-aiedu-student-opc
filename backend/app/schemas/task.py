@@ -186,6 +186,9 @@ class TaskResponse(BaseModel):
     error_message: str | None
     created_at: datetime
     completed_at: datetime | None
+    # 执行被进程中断的持久标记:后端重启/崩溃丢失执行线程时写入。
+    # status=='failed' 且此字段非空 → 前端显示"已中断(可继续)",与真失败区分。
+    interrupted_at: datetime | None = None
     results: list[ResultResponse] = []
     conversations: list[ConversationResponse] = []
     # 审查项(证据驱动可信审查;老任务无 ReviewItem → 空数组,前端不显示审查结果区)
@@ -208,6 +211,8 @@ class TaskListItem(BaseModel):
     error_message: str | None
     created_at: datetime
     completed_at: datetime | None
+    # 执行被进程中断的持久标记(侧栏据此把 failed 显示为"已中断")
+    interrupted_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

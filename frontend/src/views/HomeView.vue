@@ -66,8 +66,14 @@ const STATUS_LABELS: Record<TaskStatus, string> = {
   failed: '已失败',
 }
 
+/** 被进程中断的失败(后端重启丢失执行线程):与"真失败"区分,显示为琥珀"已中断" */
+function isInterrupted(t: TaskListItem): boolean {
+  return t.status === 'failed' && Boolean(t.interrupted_at)
+}
+
 function statusLabel(t: TaskListItem): string {
   if (t.review_status === 'running') return '检查中'
+  if (isInterrupted(t)) return '已中断'
   return STATUS_LABELS[t.status] ?? t.status
 }
 
@@ -82,6 +88,8 @@ const STATUS_DOTS: Record<TaskStatus, string> = {
 
 function statusDotClass(t: TaskListItem): string {
   if (t.review_status === 'running') return 'dot-review'
+  // 中断态取琥珀(与暂停近似),而非红色"已失败",提示"可继续"
+  if (isInterrupted(t)) return 'dot-paused'
   return STATUS_DOTS[t.status] ?? 'dot-pending'
 }
 

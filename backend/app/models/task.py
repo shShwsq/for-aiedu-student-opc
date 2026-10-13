@@ -103,6 +103,15 @@ class Task(Base):
         String(16), nullable=True, default=None
     )
 
+    # 执行被进程中断的持久标记:后端重启/崩溃导致执行线程丢失时写入当时时刻。
+    # NULL = 未被中断(正常执行/正常失败)。前端据此把 FAILED 显示为"已中断(可继续)",
+    # 与真正的失败区分开(见 migrate_stale_task_status 的启动对账)。
+    # 升级时需手动执行:ALTER TABLE tasks ADD COLUMN interrupted_at TIMESTAMPTZ;
+    # (幂等迁移见 migrate_task_add_interrupted_column)
+    interrupted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -390,6 +399,89 @@ def migrate_stale_review_status() -> None:
         log.warning(
             f"启动清理: {result.rowcount} 个任务的遗留 running 审查状态已置为 failed"
         )
+
+
+def migrate_task_add_interrupted_column() -> None:
+    """幂等给 tasks 加 interrupted_at 列(执行被进程中断的持久标记)
+
+    背景:后端重启/崩溃会丢失 in-memory 的暂停门控与执行线程,任务会永远卡在
+    running/paused 的假死状态。新增可空列标记"被中断",使重启后仍可判定并让前端
+    把这类 FAILED 显示为"已中断(可继续)"。
+    项目用 Base.metadata.create_all(无 Alembic),已存在的表不会自动加新列,
+    启动时检查缺失列并 ALTER TABLE ADD COLUMN。全新库(create_all 已建好)或
+    已迁过 → 直接返回;老库已有行为 NULL(未被中断),语义与"正常执行/真失败"一致。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("tasks"):
+            return  # 全新库,create_all 会建好新列
+        cols = {c["name"] for c in insp.get_columns("tasks")}
+        if "interrupted_at" in cols:
+            return  # 已迁过
+        conn.execute(
+            text("ALTER TABLE tasks ADD COLUMN interrupted_at TIMESTAMPTZ")
+        )
+        conn.commit()
+    log.info("tasks.interrupted_at 列迁移完成")
+
+
+def migrate_stale_task_status(bind=None) -> None:
+    """启动对账:上一进程遗留的 running/paused 任务必为孤儿 → 标为可继续的中断失败
+
+    原理:进程刚起、内存必空(pause_controller._states / 执行线程 /
+    orchestrator._event_scopes 全为空),故 DB 中处于 running/paused 的任务,其执行
+    线程一定已随上一进程消失。落地为 FAILED + interrupted_at,使前端出现"继续/重试"
+    入口;真正续跑由 retry_failed_task 的断点续跑分支完成(有 agent1/agent2 对话 →
+    不重做已完成部分)。
+
+    用 ORM 读写(而非裸 SQL 的状态字面量):status 是 Enum(TaskStatus),
+    SQLAlchemy 默认按成员 **名称**(大写 RUNNING/PAUSED/FAILED)落 PG 原生枚举,
+    与 Python 侧小写 value 不一致,手写 SQL 字面量极易错配;交给 ORM 编码则无此歧义。
+
+    幂等:无 running/paused 记录时查询为空,不写库。
+    仅单 worker 部署成立:多实例下各 worker 各自对账会误杀其它 worker 在跑的任务,
+    需改 DB 级租约/共享暂停状态(对齐 pause_controller 顶部既有的单机部署声明)。
+
+    bind: 可选引擎/连接,默认用 app.database.engine(生产启动路径无需传参);
+    测试可传入独立 schema 的 engine,避免触达开发/生产数据。
+    """
+    import logging
+    from datetime import datetime, timezone
+
+    from sqlalchemy.orm import Session
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    note = "服务重启,执行线程已丢失(可从断点继续)"
+    with Session(bind or engine) as db:
+        stale = (
+            db.query(Task)
+            .filter(Task.status.in_([TaskStatus.RUNNING, TaskStatus.PAUSED]))
+            .all()
+        )
+        if not stale:
+            return
+        now = datetime.now(timezone.utc)
+        for t in stale:
+            # 保留既有失败原因(若有)再追加中断说明,供 retry_failed_task 拼续跑消息
+            t.error_message = f"{t.error_message} | {note}" if t.error_message else note
+            t.status = TaskStatus.FAILED
+            t.interrupted_at = now
+        db.commit()
+    log.warning(
+        f"启动对账: {len(stale)} 个遗留 running/paused 孤儿任务已置为 "
+        f"FAILED + interrupted_at(可从断点继续)"
+    )
 
 
 class Result(Base):

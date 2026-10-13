@@ -3500,10 +3500,14 @@ const showKnowledgeToolbar = computed<boolean>(() => {
         @error="handleMessageError"
       />
 
-      <!-- 失败任务重试条(failed 状态替换输入框位置) -->
+      <!-- 失败/中断任务重试条(failed 状态替换输入框位置)
+           被进程中断(后端重启丢失执行线程)时,主按钮显示"继续执行"(点它即
+           断点续跑,复用 retryTask);真失败则显示"重试"。二者调同一 /retry 端点。 -->
       <div v-if="task && task.status === 'failed'" class="retry-bar">
         <div class="retry-bar-text">
-          <span class="retry-bar-label">任务执行失败,可重试</span>
+          <span class="retry-bar-label">
+            {{ task.interrupted_at ? '任务已中断(服务重启),可从断点继续' : '任务执行失败,可重试' }}
+          </span>
           <span
             v-if="task.error_message"
             class="retry-bar-error"
@@ -3511,7 +3515,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
           >{{ truncateInput(task.error_message, 80) }}</span>
         </div>
         <button class="retry-btn" :disabled="retrying" @click="handleRetry">
-          {{ retrying ? '重试启动中...' : '重试' }}
+          {{ retrying ? '启动中...' : (task.interrupted_at ? '继续执行' : '重试') }}
         </button>
       </div>
     </main>

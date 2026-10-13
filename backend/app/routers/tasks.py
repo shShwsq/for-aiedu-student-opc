@@ -18,7 +18,7 @@ import os
 import threading
 import uuid
 from collections.abc import Generator
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from app.agents.orchestrator import (
     _err_detail,
     force_cleanup_event_scopes,
+    has_active_scope,
     launch_resume_thread,
     resume_audit_with_message,
     retry_failed_task,
@@ -1022,7 +1023,10 @@ def retry_failed_task_endpoint(
     # (前端重连 SSE 时 stream_task_events 会按旧快照直接推 error 关闭连接)。
     # 注意:不清空 error_message —— retry_failed_task 需在进入时读取真实
     # 失败原因拼进续跑消息,清空由后台线程内部分流处理。
+    # 清空 interrupted_at:重试真正开始后,该"被进程中断"标记不再适用(否则
+    # 前端会把这次正常续跑也标成"已中断")。
     task.status = TaskStatus.RUNNING
+    task.interrupted_at = None
     task.current_stage = "重试失败任务,恢复执行"
     db.commit()
 
@@ -1199,7 +1203,9 @@ def resume_task_endpoint(
 ) -> dict[str, Any]:
     """恢复已暂停的任务
 
-    唤醒在检查点阻塞的后台线程,task.status 改回 RUNNING。
+    先探存活:仍有存活执行流(线程阻塞在 wait_if_paused)→ 唤醒它、状态回 RUNNING。
+    否则为孤儿任务(服务重启/线程异常使执行线程已死):不再静默 set 一个无人等待的
+    Event 假装恢复,而是落地中断标记并复用 retry_failed_task 从断点复活续跑。
     current_stage 恢复到暂停前的描述不现实(已覆盖),改为通用提示。
     """
     task = db.get(Task, task_id)
@@ -1215,13 +1221,31 @@ def resume_task_endpoint(
             detail=f"任务状态为 {task.status.value},仅 PAUSED 可恢复",
         )
 
-    # 唤醒后台线程(若已阻塞在 wait_if_paused)
-    resume_task(task.id)
-    task.status = TaskStatus.RUNNING
-    task.current_stage = "已恢复,继续执行"
+    # 存活探针:线程还活着 → 原逻辑(唤醒阻塞在 wait_if_paused 中的线程)
+    if has_active_scope(task.id):
+        resume_task(task.id)
+        task.status = TaskStatus.RUNNING
+        task.current_stage = "已恢复,继续执行"
+        db.commit()
+        _publish_task_status(task)
+        return {"status": task.status.value, "message": "任务已恢复"}
+
+    # 孤儿:线程已死(服务重启 / 线程异常)。不再假装恢复 —— 落地"可继续的中断失败"
+    # 标记,再复用单一复活入口 retry_failed_task 从断点续跑(有进度不重做已完成部分)。
+    # 先落 FAILED + interrupted_at(而非直接 RUNNING):复活后台线程早期若崩溃,任务停在
+    # FAILED + interrupted_at(前端仍显示"已中断,可继续"),不会假死在"运行中"。
+    task.status = TaskStatus.FAILED
+    task.interrupted_at = datetime.now(timezone.utc)
+    task.error_message = "执行线程已丢失(服务重启或异常),已从断点继续"
+    task.current_stage = "已中断,从断点续跑"
     db.commit()
     _publish_task_status(task)
-    return {"status": task.status.value, "message": "任务已恢复"}
+    # 与 /retry 同理:清旧 done/finished 标记,让续跑事件能推送、前端重连 SSE 可接收
+    reset_task_bus(task.id)
+    # 复用带崩溃兜底(persist_task_failure_fresh + force_cleanup_event_scopes)的
+    # 既有后台线程,避免自起线程导致 scope 泄漏 → SSE 永久悬挂。
+    _run_retry_in_background(str(task.id))
+    return {"status": "running", "message": "已从中断处继续执行(断点续跑)"}
 
 
 @router.post("/tasks/{task_id}/review/stop")

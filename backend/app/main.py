@@ -185,6 +185,8 @@ async def lifespan(app: FastAPI):
         migrate_conversation_tool_call_id,
         migrate_result_add_knowledge_point_id_column,
         migrate_stale_review_status,
+        migrate_stale_task_status,
+        migrate_task_add_interrupted_column,
         migrate_task_add_review_status_column,
         migrate_task_drop_checklist_column,
     )
@@ -203,6 +205,11 @@ async def lifespan(app: FastAPI):
     # (后端重启后审查线程已死,启动时置 failed,避免前端永远"检查中")
     migrate_task_add_review_status_column()
     migrate_stale_review_status()
+    # 暂停/执行中遭遇后端重启:加 tasks.interrupted_at 列 + 启动对账
+    # (上一进程遗留的 running/paused 任务其执行线程已随进程消失,启动时统一
+    #  置为 FAILED + interrupted_at,前端显示"已中断(可继续)",点继续即断点续跑)
+    migrate_task_add_interrupted_column()
+    migrate_stale_task_status()
     # 审查项字段语义收敛:review_items 列改名(description→conclusion 审查结论、
     # suggestion→follow_up 可追问内容)+ 补 plan_item_id(规划对账 id 链路);幂等
     from app.models.audit import (

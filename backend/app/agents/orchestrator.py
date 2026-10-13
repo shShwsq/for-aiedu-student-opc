@@ -168,6 +168,16 @@ def _has_active_scope(task_id) -> bool:
         return bool(_event_scopes.get(str(task_id)))
 
 
+def has_active_scope(task_id) -> bool:
+    """任务是否仍有存活执行流(公开探针,供 API 端点跨模块判定孤儿任务)。
+
+    是"线程活着"的可靠探针:真正阻塞在 wait_if_paused 的线程会一直持有 scope
+    (_end_event_scope 只在执行流 finally 注销);线程死亡(服务重启/异常)→ scope
+    被清 → 返回 False。/resume 端点据此区分"唤醒阻塞中的线程"与"孤儿任务需复活"。
+    """
+    return _has_active_scope(task_id)
+
+
 def _is_latest_generation(task_id, gen: int) -> bool:
     """本流是否为最新世代(重下游:记忆归纳/练习题/预压缩 仅最新流执行)"""
     with _review_lock:
