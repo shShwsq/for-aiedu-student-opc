@@ -1884,7 +1884,8 @@ def _prepare_repo_context(
     branch = params.get("branch")
 
     # 主动 clone(协议回退:HTTPS+token → SSH → HTTPS 匿名,含分支回退)
-    task.current_stage = "正在克隆仓库(HTTPS+token → SSH → 匿名)..."
+    # 阶段文案只给"在做什么",回退链是内部实现细节,不塞进用户可见文案
+    task.current_stage = "正在克隆仓库..."
     db.commit()
     _publish_status(task)
 
