@@ -781,12 +781,19 @@ def _review_provider_gate(client: LLMClient):
 # allowed_skills=[] 当"全部可用",空列表无法表达"不可见",剔工具最干净)
 _SKILL_TOOLS: frozenset[str] = frozenset({"list_skills", "skill"})
 
+# 子任务子循环禁用集 = 会改动工作区的工具 ∪ 只在主循环有 handler 的派发工具。
+# dispatch_review_subtasks 既不能被嵌套派发,留在子循环清单里只会让子模型误以为
+# 可用(工具定义 + 共享 prompt 的"仅当工具列表里有…适用"同时成立),调用即「未知工具」。
+_SUBTASK_FORBIDDEN_TOOLS: frozenset[str] = _SUBTASK_MUTATING_TOOLS | frozenset({
+    "dispatch_review_subtasks",
+})
+
 
 def _subtask_readonly_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """从全量工具定义里剔除会改动的工具,得到子任务可用的只读基集。"""
+    """从全量工具定义里剔除子循环不可用的工具(改动类 + 嵌套派发),得到只读基集。"""
     return [
         t for t in tools
-        if (t.get("function") or {}).get("name") not in _SUBTASK_MUTATING_TOOLS
+        if (t.get("function") or {}).get("name") not in _SUBTASK_FORBIDDEN_TOOLS
     ]
 
 

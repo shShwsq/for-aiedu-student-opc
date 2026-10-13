@@ -2,10 +2,10 @@
 
 覆盖"子任务按需派发"重构的承重件:
 - _subtask_readonly_tools / _subtask_tools / _subtask_allowed_tool_names:
-  只读基集剔除改动工具;skills 为空时剔除 list_skills/skill
+  只读基集剔除改动工具与嵌套派发工具;skills 为空时剔除 list_skills/skill
 - _review_provider_gate:按 provider+model 归组的并发天花板
 - _run_subtask_pass:有界只读子循环 —— spec{label,instruction,skills}、只读工具执行、
-  改动工具被拒、pending_rows 形状、summary 捕获、单子任务异常隔离(不抛)、
+  改动工具与臆造的嵌套派发调用被拒、pending_rows 形状、summary 捕获、单子任务异常隔离(不抛)、
   墙钟超时转总结收尾(timed_out)、子任务角色作为独立 system 指令层(不注入 skill 正文)
 - _subtask_stream_turn:发布 label-tagged thinking_delta + conv_id 每次调用唯一
 - _fan_in:主线程串行落库 —— 子任务顺序、tool_result 邻接补 tool_call_id、facet 列写 label、
@@ -107,6 +107,32 @@ def test_subtask_tools_drops_skill_tools_when_no_skills():
     assert "list_skills" not in names_without and "skill" not in names_without
     # 其余只读工具保留(剔除范围只针对 skill 工具)
     assert "read_file" in names_without
+
+
+def test_subtask_readonly_tools_excludes_dispatch_tool():
+    """回归:派发工具不得泄漏进子循环工具清单(线上任务 4ead4ea1 / 4a9c1719)。
+
+    主循环把工具集交给 _dispatch_subtasks 时含 dispatch_review_subtasks,而该工具
+    只在主循环有 handler(特判走 _dispatch_subtasks),子循环走 execute_tool 注册表
+    必报「未知工具」。子模型看到工具定义 + 共享 prompt 的"仅当工具列表里有…
+    适用"同时成立,就会在自己的子循环里再派发一次。
+    """
+    # 用主循环同一拼法现构全集(不硬编码工具名以外的结构假设)
+    parent_tools = R.get_all_tools() + [R._build_subtask_dispatch_tool([])]
+    assert "dispatch_review_subtasks" in R._subtask_allowed_tool_names(parent_tools)
+
+    readonly = R._subtask_readonly_tools(parent_tools)
+    names = R._subtask_allowed_tool_names(readonly)
+    assert "dispatch_review_subtasks" not in names
+    # 两条裁剪路径都要覆盖:skills 非空时直接返回 readonly 基集,为空时再剔 skill 工具
+    assert "dispatch_review_subtasks" not in R._subtask_allowed_tool_names(
+        R._subtask_tools(readonly, ["review_concurrency"])
+    )
+    assert "dispatch_review_subtasks" not in R._subtask_allowed_tool_names(
+        R._subtask_tools(readonly, [])
+    )
+    # 剔除范围只多了一项派发工具:只读分析工具照常保留
+    assert "read_file" in names and "search_code" in names
 
 
 # ============================================================
@@ -218,6 +244,42 @@ def test_subtask_pass_blocks_mutating_tool(monkeypatch):
     assert executed == []  # 改动工具从未执行
     tool_results = [r for r in fr.pending_rows if r["type"] == "tool_result"]
     assert tool_results and "禁用" in tool_results[0]["content"]
+
+
+def test_subtask_pass_blocks_nested_dispatch_call(monkeypatch):
+    """子模型臆造嵌套派发 → 走只读白名单拦截分支(诚实告知),不进 execute_tool。"""
+    monkeypatch.setattr(R, "set_current_task", lambda *a, **k: None)
+    executed = []
+    monkeypatch.setattr(
+        R, "execute_tool",
+        lambda fn, args: executed.append(fn) or {"ok": 1},
+    )
+
+    turns = [
+        [
+            _chunk(deltas=[_delta(0, "d1", "dispatch_review_subtasks",
+                                  '{"subagents": [{"label": "子子任务", "instruction": "x"}]}')],
+                   finish="tool_calls"),
+        ],
+        [_chunk(content="改为自行只读核查后收尾", finish="stop")],
+    ]
+    client = FakeClient(turns)
+    # 与主循环一致:交给派发的全集含派发工具,子循环基集必须把它剔除
+    parent_tools = R.get_all_tools() + [R._build_subtask_dispatch_tool([])]
+    readonly = R._subtask_readonly_tools(parent_tools)
+
+    fr = R._run_subtask_pass(
+        _spec(label="并行测试-A"), [{"role": "system", "content": "s"}],
+        readonly, client, _Task(),
+        round_idx=1, max_iter=5, executor_command_confirm="always_approve",
+        deadline=time.monotonic() + 60,
+    )
+
+    assert executed == []  # 派发从不由子循环执行
+    tool_results = [r for r in fr.pending_rows if r["type"] == "tool_result"]
+    assert tool_results and "禁用" in tool_results[0]["content"]
+    # 不能把旧的「未知工具」报错透传给子模型(它会把子任务推向越权/降级结论)
+    assert all("未知工具" not in r["content"] for r in tool_results)
 
 
 def test_subtask_pass_isolates_llm_error(monkeypatch):
