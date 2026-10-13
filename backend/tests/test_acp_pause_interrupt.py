@@ -11,6 +11,9 @@
 - 未暂停时行为与现状一致(pause_probe 恒 False)
 - orchestrator._consume_paused_interrupt_flag:读取并清除 _round_paused_interrupt
   (builtin 不写标志 → 恒 False,行为无变化)
+- orchestrator._resolve_continuation_message:无排队消息用默认文案,有则用用户原文
+- orchestrator._run_agent1_rounds_with_auto_continue:被中断轮→恢复后同会话自动
+  续跑下一轮;开关关/达上限则对当前轮收尾
 """
 import queue as queue_mod
 import threading
@@ -237,3 +240,158 @@ def test_consume_paused_flag_true_clears_and_commits():
     assert "_round_paused_interrupt" not in task.params
     assert task.params.get("_plan") == []  # 其它键保留
     assert db.commits == 1
+
+
+# ============================================================
+# orchestrator 恢复即自动续跑(CLI/ACP)
+# ============================================================
+
+import app.agents.orchestrator as orchestrator
+from app.agents.orchestrator import (
+    _resolve_continuation_message,
+    _run_agent1_rounds_with_auto_continue,
+)
+from app.prompts.executor import AUTO_CONTINUE_FOLLOWUP
+
+
+def _stub_loop_env(monkeypatch, *, auto_continue=True, max_rounds=8):
+    """屏蔽续跑循环的外部副作用(埋点/落库/阻塞),保留循环本身逻辑。"""
+    monkeypatch.setattr(orchestrator, "perf_log", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "emit", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "_save_plan_to_task", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "drain_user_messages", lambda tid: [])
+    parks = []
+    monkeypatch.setattr(
+        orchestrator, "wait_if_paused",
+        lambda tid: parks.append(tid),
+    )
+    monkeypatch.setattr(
+        orchestrator.settings, "ACP_AUTO_CONTINUE_ON_RESUME", auto_continue,
+    )
+    monkeypatch.setattr(
+        orchestrator.settings, "ACP_AUTO_CONTINUE_MAX_ROUNDS", max_rounds,
+    )
+    return parks
+
+
+class _RecordingExecutor:
+    """按脚本驱动 executor.run:每次调用按 rounds 配置产出,并按需置中断标志。"""
+
+    def __init__(self, interrupt_rounds: set[int]):
+        self.name = "qoder_cli"
+        self._interrupt = interrupt_rounds
+        self.calls: list[dict] = []
+
+    def run(self, task, db, *, round_idx, followup_query, client,
+            repo_context, previous_plan):
+        self.calls.append({"round_idx": round_idx, "followup_query": followup_query})
+        if round_idx in self._interrupt:
+            task.params = {**(task.params or {}), "_round_paused_interrupt": True}
+        return ([], f"summary-r{round_idx}", [])
+
+
+def test_auto_continue_interrupt_then_completes_next_round(monkeypatch):
+    """第1轮被中断 → 恢复后同会话自动补发第2轮 → 第2轮正常完成才收尾。"""
+    parks = _stub_loop_env(monkeypatch)
+    executor = _RecordingExecutor(interrupt_rounds={1})
+    task = _FakeTask({})
+    summaries: list[dict] = []
+
+    results, summary, plan, final_round = _run_agent1_rounds_with_auto_continue(
+        executor=executor, task=task, db=_FakeDb(), react_client=object(),
+        start_round_idx=1, first_followup=None, first_repo_context=None,
+        first_previous_plan=None, react_summaries=summaries,
+    )
+
+    assert final_round == 2
+    assert summary == "summary-r2"
+    assert [c["round_idx"] for c in executor.calls] == [1, 2]
+    # 第2轮是续跑:同会话补发默认继续文案,且不重传仓库上下文
+    assert executor.calls[1]["followup_query"] == AUTO_CONTINUE_FOLLOWUP
+    assert len(summaries) == 2
+    # 被中断轮阻塞过一次等恢复
+    assert len(parks) == 1
+
+
+def test_auto_continue_disabled_finalizes_partial(monkeypatch):
+    """开关关闭:被中断 → 阻塞等恢复 → 退回旧行为,对半截当前轮收尾(不续跑)。"""
+    parks = _stub_loop_env(monkeypatch, auto_continue=False)
+    executor = _RecordingExecutor(interrupt_rounds={1})
+    task = _FakeTask({})
+
+    _, summary, _, final_round = _run_agent1_rounds_with_auto_continue(
+        executor=executor, task=task, db=_FakeDb(), react_client=object(),
+        start_round_idx=1, first_followup=None, first_repo_context=None,
+        first_previous_plan=None, react_summaries=[],
+    )
+
+    assert final_round == 1
+    assert summary == "summary-r1"
+    assert len(executor.calls) == 1
+    assert len(parks) == 1  # 仍阻塞等恢复,只是不补发新轮
+
+
+def test_builtin_never_continues(monkeypatch):
+    """builtin(不写中断标志):首轮返回即收尾,不 park 不续跑(行为零变化)。"""
+    parks = _stub_loop_env(monkeypatch)
+    executor = _RecordingExecutor(interrupt_rounds=set())
+    task = _FakeTask({})
+
+    _, summary, _, final_round = _run_agent1_rounds_with_auto_continue(
+        executor=executor, task=task, db=_FakeDb(), react_client=object(),
+        start_round_idx=1, first_followup=None, first_repo_context=None,
+        first_previous_plan=None, react_summaries=[],
+    )
+
+    assert final_round == 1
+    assert len(executor.calls) == 1
+    assert len(parks) == 0
+
+
+def test_auto_continue_respects_max_rounds(monkeypatch):
+    """每轮都被中断:达续跑上限后停止补发,对最后一轮收尾(防无限起新轮)。"""
+    _stub_loop_env(monkeypatch, auto_continue=True, max_rounds=2)
+    # 1..9 都会中断,期望跑到 round_idx=1+2=3 因达上限而收尾
+    executor = _RecordingExecutor(interrupt_rounds=set(range(1, 10)))
+    task = _FakeTask({})
+
+    _, summary, _, final_round = _run_agent1_rounds_with_auto_continue(
+        executor=executor, task=task, db=_FakeDb(), react_client=object(),
+        start_round_idx=1, first_followup=None, first_repo_context=None,
+        first_previous_plan=None, react_summaries=[],
+    )
+
+    # start=1,续跑 cont_rounds = round_idx-1;上限2 → 最多补发到 round_idx=3
+    assert final_round == 3
+    assert summary == "summary-r3"
+    assert [c["round_idx"] for c in executor.calls] == [1, 2, 3]
+
+
+def test_resolve_continuation_message_default_when_no_pending(monkeypatch):
+    """无排队消息(用户只点了恢复)→ 用系统默认继续文案。"""
+    monkeypatch.setattr(orchestrator, "drain_user_messages", lambda tid: [])
+    msg = _resolve_continuation_message(_FakeTask({}), _FakeDb(), round_idx=1)
+    assert msg == AUTO_CONTINUE_FOLLOWUP
+
+
+def test_resolve_continuation_message_uses_queued_user_text(monkeypatch):
+    """有排队消息 → 用用户原文(而非默认),并补推入对话流。"""
+    import uuid as _uuid
+
+    mid = str(_uuid.uuid4())
+    monkeypatch.setattr(
+        orchestrator, "drain_user_messages",
+        lambda tid: [{"content": "改成只审 src/", "message_id": mid}],
+    )
+    published = []
+    monkeypatch.setattr(
+        orchestrator, "publish",
+        lambda tid, ev, data: published.append((ev, data)),
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = []
+
+    msg = _resolve_continuation_message(_FakeTask({}), db, round_idx=2)
+    assert msg == "改成只审 src/"
+    # 查库定位待入流消息(即便 .all() 为空也不报错)
+    db.query.assert_called_once()

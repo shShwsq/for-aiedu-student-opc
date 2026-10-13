@@ -378,6 +378,18 @@ class Settings(BaseSettings):
     # 单轮最多补发几次续轮 prompt(防子 Agent 迟迟不回报时无限循环)。
     # 3 → 2:补发一次的回报增量最有用,再补只会让模型把同一份报告重复堆进 summary
     ACP_ASYNC_AGENT_MAX_CONTINUE: int = 2
+    # ---- 暂停真中断:恢复即自动续跑(CLI/ACP) ----
+    # 用户点"暂停"后,CLI 本轮已被 session/cancel 真中断(半截结果)。
+    # 开启时:点"恢复"→ 在同一活跃 ACP session 自动补发一轮"继续",让 agent1
+    # 接着被中断的活往下做(符合用户对"恢复=继续"的直觉),直到某轮正常跑完
+    # 才收尾进审查;关闭时退回旧行为(恢复即对半截结果收尾 + 审查)。
+    # 仅 CLI/ACP 生效:中断标志 _round_paused_interrupt 只由 acp_base 写,
+    # builtin react_agent 走原有"同轮冻结续跑",恒不触发此路径。
+    ACP_AUTO_CONTINUE_ON_RESUME: bool = True
+    # 单次"运行"内最多自动续跑几轮(防用户反复暂停→恢复时无限起新轮)。
+    # 达上限后不补发,直接对最后一轮收尾;每轮续跑都需用户真实点一次恢复,
+    # 正常不会触顶,此项仅为兜底护栏。
+    ACP_AUTO_CONTINUE_MAX_ROUNDS: int = 8
     # 每次补发前等待秒数(给后台子 Agent 完成时间),按 factor 递增。
     # 20 → 30:实测子 Agent 完成多在 1~5 分钟窗口,20s 首探大概率空手而归白耗一次
     ACP_ASYNC_AGENT_CONTINUE_WAIT_SECONDS: int = 30

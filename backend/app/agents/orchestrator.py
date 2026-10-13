@@ -64,6 +64,7 @@ from app.pause_controller import clear_pause_state, wait_if_paused
 from app.perf import perf_log
 from app.prompts.executor import (
     ATTACHMENT_UNAVAILABLE_NOTE,
+    AUTO_CONTINUE_FOLLOWUP,
     RETRY_MSG_LABEL,
     USER_FOLLOWUP_MSG_LABEL,
     build_first_round_question,
@@ -488,37 +489,19 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
         db.commit()
         _publish_status(task)
 
-        _t0 = time.perf_counter()
-        _results, summary, current_plan = executor.run(
-            task, db,
-            round_idx=1,
-            followup_query=None,
-            client=react_client,
-            repo_context=repo_context,
-            previous_plan=None,
+        _results, summary, current_plan, active_round = (
+            _run_agent1_rounds_with_auto_continue(
+                executor=executor, task=task, db=db, react_client=react_client,
+                start_round_idx=1, first_followup=None,
+                first_repo_context=repo_context, first_previous_plan=None,
+                react_summaries=react_summaries,
+            )
         )
-        perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=1, executor=executor.name)
-        emit(
-            AGENT1_ROUND_COMPLETED, task.id,
-            round_idx=1, executor=executor.name,
-            results_count=len(_results),
-        )
-        react_summaries.append({"round": 1, "summary": summary})
-        # plan 状态持久化(resume 跨轮续接)
-        _save_plan_to_task(task, db, current_plan)
-
-        # ---- 暂停真中断:agent1(CLI/ACP)本轮被 session/cancel 中断 ----
-        # 本轮结果是半截的,不在本线程直接推进"完成 + 审查":阻塞在暂停门控,
-        # 等用户恢复(pause 端点已置 Event 放行)后再对已产出部分收尾。
-        # 只阻塞不回写 status/current_stage(PAUSED 由端点在其会话落库,回写会覆盖)。
-        if _consume_paused_interrupt_flag(task, db):
-            logger.info(f"[task={task.id}] agent1 本轮被暂停中断,阻塞等待恢复后再收尾")
-            wait_if_paused(task.id)
 
         # ===== 轮次类型判定:纯对话轮(如问候/纯问答)跳过审查与重下游 =====
         # 本轮无任何工具调用 → agent1 未触碰工作区,无新证据可审;
         # 保留既有结果与审查状态(首轮即对话则任务无结果,回答在对话流)
-        if not _round_has_tool_calls(db, task.id, 1):
+        if not _round_has_tool_calls(db, task.id, active_round):
             _finish_conversation_round(
                 task, db, rounds=len(react_summaries), mode="dual_agent",
                 flow_gen=flow_gen,
@@ -528,7 +511,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
 
         # agent1 summary 作为临时结果:审查完成前给前端可展示的结果
         # (审查完成后会被 agent2 的重点与知识点整体替换)
-        all_results_count = _replace_interim_results(db, task, 1, summary)
+        all_results_count = _replace_interim_results(db, task, active_round, summary)
 
         # ---------- agent1 结束即任务完成 ----------
         task.status = TaskStatus.COMPLETED
@@ -541,7 +524,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
         # 登记必须排在 commit 之前:否则"库里已可见 running、登记还没落地"的窗口
         # 里同样的误判照样发生(窗口只剩几毫秒也不能留)。登记后 commit 失败
         # 只残留一条无害记录(任务删除时 clear_review_stop_state 会清)
-        _begin_review_state(task_id_str, 1)
+        _begin_review_state(task_id_str, active_round)
         db.commit()
         _publish_status(task)
 
@@ -552,7 +535,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
             results_count=all_results_count,
         )
         # [perf] agent1 完成锚点:用户感知的任务完成时刻(对照实验的完成时延以此为准)
-        perf_log(task.id, "agent1_done", rounds=1, results_count=all_results_count)
+        perf_log(task.id, "agent1_done", rounds=len(react_summaries), results_count=all_results_count)
 
         # 推送 agent1_done:主界面收尾(拉快照展示临时结果+完成态),
         # 事件总线保持打开 —— 后台审查的 conversation/thinking_delta 继续送达前端侧栏
@@ -593,7 +576,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
             task_id_str=task_id_str,
             react_client=react_client,
             flow_gen=flow_gen,
-            round_idx=1,
+            round_idx=active_round,
         )
 
     except Exception as e:
@@ -707,6 +690,131 @@ def _consume_paused_interrupt_flag(task: Task, db: Session) -> bool:
     except Exception as e:
         logger.warning(f"[task={task.id}] 清除暂停中断标志失败(忽略): {e}")
     return True
+
+
+def _resolve_continuation_message(task: Task, db: Session, round_idx: int) -> str:
+    """恢复后自动续跑的补发文案:优先用户在暂停期间排队的补充消息,否则系统默认。
+
+    暂停/运行期间用户发的消息由 API 端点落库为 Conversation(role=user)并
+    push_user_message 入队(仅推 user_message_pending,未入对话流)。CLI/ACP 的
+    prompt 循环内不 drain,故这些排队消息不会像 builtin 那样在迭代边界被消费;
+    自动续跑是唯一的消费时机,在此补推 conversation 事件让它们进入对话流
+    (与 react_agent 的 drain 处理一致),并用其原文作为续跑输入。
+    无排队消息(用户只点了恢复)→ 用 AUTO_CONTINUE_FOLLOWUP 默认文案。
+    """
+    pending = drain_user_messages(task.id)
+    if not pending:
+        return AUTO_CONTINUE_FOLLOWUP
+    # 补推入对话流(待处理条目 → 对话流;失败仅记录,不影响续跑)
+    try:
+        msg_ids = [
+            uuid.UUID(m["message_id"]) for m in pending if m.get("message_id")
+        ]
+        drained = (
+            db.query(Conversation).filter(Conversation.id.in_(msg_ids)).all()
+            if msg_ids else []
+        )
+        for c in drained:
+            publish(task.id, "conversation", {
+                "id": str(c.id),
+                "round_idx": c.round_idx,
+                "role": c.role,
+                "type": c.type,
+                "content": c.content,
+                "reasoning": c.reasoning,
+                "attachments": c.attachments,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            })
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 续跑消费消息入流失败(忽略): {e}")
+    # 多条合并为一段(按入队顺序),避免上下文碎片化
+    merged = "\n\n".join(
+        m["content"] for m in pending if m.get("content")
+    )
+    return merged or AUTO_CONTINUE_FOLLOWUP
+
+
+def _run_agent1_rounds_with_auto_continue(
+    *, executor, task: Task, db: Session, react_client, start_round_idx: int,
+    first_followup: "str | None", first_repo_context,
+    first_previous_plan, react_summaries: list[dict],
+) -> tuple[list, str, list[dict], int]:
+    """跑 agent1 并在"被暂停真中断"时自动续跑,直到某轮正常完成或达上限。
+
+    背景:CLI/ACP 轮被 session/cancel 真中断后本轮是半截的。旧行为是恢复即
+    对半截结果收尾 + 审查;本函数改为"恢复=在同一活跃 ACP session 自动补发
+    一轮继续"(acp_base 已置 _record_prompt_accepted,bridge/session 存活 →
+    天然同会话续跑,不重复注入系统段、不文本回放)。
+
+    每轮流程与原 executor.run 路径一致:执行 → perf/emit → summary 计入
+    react_summaries → plan 落库。轮后被中断时:
+    1. 阻塞 wait_if_paused 等用户恢复(保持"暂停冻结"体验,输出不会自动往下);
+    2. 恢复后:开关关闭或达续跑上限 → 退回旧行为,直接对本轮收尾;
+    3. 否则取续跑文案(优先用户排队消息)→ 递增轮次、同会话补发下一轮。
+    仅 CLI/ACP 会写中断标志,builtin 首轮返回即 return,行为零变化。
+
+    返回 (最后轮 results, 最后轮 summary, 最后轮 plan, 最后轮 round_idx);
+    收尾/审查针对最后轮(调用方据此定位本轮工具调用/临时结果/审查)。
+    """
+    round_idx = start_round_idx
+    followup = first_followup
+    repo_ctx = first_repo_context
+    prev_plan = first_previous_plan
+    while True:
+        _t0 = time.perf_counter()
+        results, summary, plan = executor.run(
+            task, db,
+            round_idx=round_idx,
+            followup_query=followup,
+            client=react_client,
+            repo_context=repo_ctx,
+            previous_plan=prev_plan,
+        )
+        perf_log(
+            task.id, "executor_run", time.perf_counter() - _t0,
+            round_idx=round_idx, executor=executor.name,
+        )
+        emit(
+            AGENT1_ROUND_COMPLETED, task.id,
+            round_idx=round_idx, executor=executor.name,
+            results_count=len(results),
+        )
+        react_summaries.append({"round": round_idx, "summary": summary})
+        # plan 状态持久化(resume/续轮跨轮续接)
+        _save_plan_to_task(task, db, plan)
+
+        if not _consume_paused_interrupt_flag(task, db):
+            return results, summary, plan, round_idx
+
+        # 本轮被暂停真中断:先阻塞等用户恢复(保持冻结体验),再决定是否续跑
+        logger.info(
+            f"[task={task.id}] agent1 第 {round_idx} 轮被暂停中断,"
+            f"阻塞等待恢复后决定续跑/收尾"
+        )
+        wait_if_paused(task.id)
+
+        cont_rounds = round_idx - start_round_idx
+        if (
+            not settings.ACP_AUTO_CONTINUE_ON_RESUME
+            or cont_rounds >= settings.ACP_AUTO_CONTINUE_MAX_ROUNDS
+        ):
+            logger.info(
+                f"[task={task.id}] 不自动续跑(开关="
+                f"{'开' if settings.ACP_AUTO_CONTINUE_ON_RESUME else '关'},"
+                f"已续 {cont_rounds}/{settings.ACP_AUTO_CONTINUE_MAX_ROUNDS} 轮),"
+                f"对第 {round_idx} 轮收尾"
+            )
+            return results, summary, plan, round_idx
+
+        # 自动续跑:同一活跃 ACP session 补发一轮"继续"
+        followup = _resolve_continuation_message(task, db, round_idx)
+        round_idx += 1
+        repo_ctx = None  # 续轮不重传仓库上下文(仓库已在工作区)
+        prev_plan = plan
+        logger.info(
+            f"[task={task.id}] 恢复后自动续跑 agent1 → 第 {round_idx} 轮"
+            f"(同会话补发继续)"
+        )
 
 
 def _save_plan_to_task(task: Task, db: Session, plan: list[dict]) -> None:
@@ -2204,39 +2312,21 @@ def resume_audit_with_message(
         db.commit()
         _publish_status(task)
 
-        _t0 = time.perf_counter()
-        _results, summary, current_plan = executor.run(
-            task, db,
-            round_idx=start_round_idx,
-            followup_query=followup_text,
-            client=react_client,
-            repo_context=None,  # 重启不传 repo_context(仓库已 clone,react_agent 自行从 sandbox 取)
-            previous_plan=previous_plan,  # plan 跨轮续接(见上方加载注释)
-        )
-        perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=start_round_idx, executor=executor.name)
-        emit(
-            AGENT1_ROUND_COMPLETED, task.id,
-            round_idx=start_round_idx, executor=executor.name,
-            results_count=len(_results),
-        )
-        react_summaries.append({"round": start_round_idx, "summary": summary})
-        # plan 状态持久化(供下一次 resume 续接)
-        _save_plan_to_task(task, db, current_plan)
-
-        # ---- 暂停真中断:agent1(CLI/ACP)本轮被 session/cancel 中断 ----
-        # 同初始运行路径:阻塞在暂停门控等恢复,不对半截结果直接进完成/审查;
-        # 只阻塞不回写 status/current_stage(PAUSED 由 pause 端点落库)。
-        if _consume_paused_interrupt_flag(task, db):
-            logger.info(
-                f"[task={task.id}] resume:agent1 本轮被暂停中断,阻塞等待恢复后再收尾"
+        _results, summary, current_plan, active_round = (
+            _run_agent1_rounds_with_auto_continue(
+                executor=executor, task=task, db=db, react_client=react_client,
+                start_round_idx=start_round_idx, first_followup=followup_text,
+                first_repo_context=None,  # 重启不传 repo_context(仓库已 clone)
+                first_previous_plan=previous_plan,  # plan 跨轮续接
+                react_summaries=react_summaries,
             )
-            wait_if_paused(task.id)
+        )
 
         # ===== 轮次类型判定:纯对话轮(启用检查助手时)跳过审查与重下游 =====
         # 本轮无任何工具调用 → agent1 回答完全来自历史上下文,无新证据可审;
         # 保留既有整理结果与审查状态,不触发练习题/记忆归纳。
         # 单 agent 模式本就无审查链,保持原行为(结果替换为 summary)
-        if ua_enabled and not _round_has_tool_calls(db, task.id, start_round_idx):
+        if ua_enabled and not _round_has_tool_calls(db, task.id, active_round):
             _finish_conversation_round(
                 task, db, rounds=len(react_summaries), mode="resume",
                 flow_gen=flow_gen,
@@ -2245,7 +2335,7 @@ def resume_audit_with_message(
             return  # finally 块仍会执行清理
 
         # 本轮 summary 落临时结果(按轮追加:仅替换本轮,跨轮知识点保留)
-        _replace_interim_results(db, task, start_round_idx, summary)
+        _replace_interim_results(db, task, active_round, summary)
 
         # ===== 单 agent 模式:agent2 已禁用,执行完直接收尾(无审查) =====
         if not ua_enabled:
@@ -2253,7 +2343,7 @@ def resume_audit_with_message(
             _finish_resume(
                 task, db, react_summaries,
                 react_client=react_client, flow_gen=flow_gen,
-                round_idx=start_round_idx,
+                round_idx=active_round,
             )
             normal_completed = True  # 正常完成:finally 不再兑底推 error(见 finally 注释)
             return  # finally 块仍会执行清理
@@ -2265,7 +2355,7 @@ def resume_audit_with_message(
         task.review_status = "running"
         # 先登记再 commit(同初始运行路径):不让终止请求在 diff 捕获窗口里落空,
         # 也不留"库里已 running 而注册表为空"的亚毫秒尾巴
-        _begin_review_state(task_id_str, start_round_idx)
+        _begin_review_state(task_id_str, active_round)
         db.commit()
         _publish_status(task)
 
@@ -2312,7 +2402,7 @@ def resume_audit_with_message(
             task_id_str=task_id_str,
             react_client=react_client,
             flow_gen=flow_gen,
-            round_idx=start_round_idx,
+            round_idx=active_round,
         )
 
     except Exception as e:

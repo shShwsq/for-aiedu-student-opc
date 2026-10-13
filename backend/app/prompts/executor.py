@@ -409,6 +409,14 @@ def format_resume_attachment_note(added_paths: list[str], work_root: str = "") -
 RETRY_MSG_LABEL = "[重试续跑]"
 USER_FOLLOWUP_MSG_LABEL = "[用户追加消息]"
 
+# 暂停恢复后自动续跑的系统默认文案:仅当用户未在暂停期间排队真实补充
+# 消息时使用(有排队消息则用用户原文,见 orchestrator._resolve_continuation_message)。
+# 走同一活跃 ACP session,故不重述任务背景,只要求"从中断处接着做"。
+AUTO_CONTINUE_FOLLOWUP = (
+    "(系统)上轮执行已被用户暂停中断。请在当前会话上下文中从中断处继续完成"
+    "尚未做完的任务,不要重复已完成的部分,直接接着往下推进。"
+)
+
 
 # ============================================================
 # CLI 侧记忆注入段包装(acp_base 消费;数据加载在 memory_injection)
