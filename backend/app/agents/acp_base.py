@@ -3680,7 +3680,11 @@ def run_acp_agent(
                 "reason": description,
             }
             request_command_confirm(task.id, command_desc)
-            approved = wait_for_command_confirm(task.id, command_desc["command_id"])
+            # 用户授权可能无限久等:传入本轮 db,阻塞前释放其连接(避免
+            # 久等期间被 RDS 掐断 → 唤醒后首查炸);不阻塞时零开销
+            approved = wait_for_command_confirm(
+                task.id, command_desc["command_id"], db,
+            )
             if approved:
                 # 用户同意:返回 allow_once(不记忆,下次再问)
                 return {"outcome": "selected", "option_id": "allow_once"}

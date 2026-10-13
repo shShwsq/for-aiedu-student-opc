@@ -35,7 +35,7 @@ from app.agents.orchestrator import (
     retry_failed_task,
     run_pipeline_audit,
 )
-from app.database import SessionLocal, get_db
+from app.database import SessionLocal, get_db, persist_task_failure_fresh
 from app.deps import get_optional_user, get_optional_user_sse
 from app.event_bus import (
     is_task_finished,
@@ -1017,21 +1017,17 @@ def _run_retry_in_background(task_id: str) -> None:
         retry_failed_task(task, db)
     except Exception as e:
         logger.exception(f"[task={task_id}] 重试后台执行失败")
-        # 兜底:确保 task 状态被标记为失败
+        # 兜底:主连接可能已断(正是崩溃元凶),不复用上面的 db 写状态,
+        # 改用全新独立会话落 FAILED(内部防覆盖已完成/已失败终态)。
+        persist_task_failure_fresh(task_id, str(e), "重试执行失败")
+        # 兜底推送终止事件:走内存总线,防止 SSE 订阅者因线程在进入
+        # resume 主 try 块前崩溃收不到 error 而永久挂起
         try:
-            task = db.get(Task, uuid.UUID(task_id))
-            if task and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                task.status = TaskStatus.FAILED
-                task.error_message = str(e)[:1000]
-                task.current_stage = "重试执行失败"
-                db.commit()
-                # 兜底推送终止事件:防止 SSE 订阅者因线程在进入
-                # resume 主 try 块前崩溃收不到 error 而永久挂起
-                publish(task.id, "error", {
-                    "status": "failed",
-                    "error_message": str(e)[:1000],
-                })
-        except Exception:
+            publish(uuid.UUID(task_id), "error", {
+                "status": "failed",
+                "error_message": str(e)[:1000],
+            })
+        except Exception:  # noqa: BLE001 - 事件推送失败不得影响下方 scope 清理
             pass
         # 强制清空事件活跃期:retry 链路可能在崩溃前注册了 scope
         # (resume 前置段异常上抛)——泄漏会让该任务之后所有流被误判
@@ -2195,16 +2191,24 @@ def _run_task_in_background(task_id: str) -> None:
         run_pipeline_audit(task, db)
     except Exception as e:
         logger.exception(f"[task={task_id}] 后台执行失败")
-        # 兜底:确保 task 状态被标记为失败
+        # 兜底:主连接可能已断(正是崩溃元凶),不复用上面的 db 写状态,
+        # 改用全新独立会话落 FAILED(内部防覆盖已完成/已失败终态)。
         try:
-            task = db.get(Task, uuid.UUID(task_id))
-            if task and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                task.status = TaskStatus.FAILED
-                task.error_message = _err_detail(e)[:1000]
-                task.current_stage = "执行失败"
-                db.commit()
-        except Exception:
+            db.rollback()  # 尽力归还主 session 事务,不影响下方独立会话兜底
+        except Exception:  # noqa: BLE001
             pass
+        persist_task_failure_fresh(task_id, _err_detail(e), "执行失败")
+        # 兜底推送终止事件:走内存总线(不碰 DB),前端据此显示失败横幅而非永久等待
+        try:
+            publish(uuid.UUID(task_id), "error", {
+                "status": "failed",
+                "error_message": _err_detail(e)[:1000],
+            })
+        except Exception:  # noqa: BLE001 - 事件推送失败不得影响下方 scope 清理
+            pass
+        # 强制清空事件活跃期:若 run_pipeline_audit 在注册 scope 后、进 finally
+        # 前崩溃,scope 会泄漏 → 该任务后续所有流被误判"并行中"(SSE 永久悬挂)。
+        force_cleanup_event_scopes(task_id)
     finally:
         db.close()
 

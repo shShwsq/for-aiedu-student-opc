@@ -35,6 +35,8 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -54,7 +56,7 @@ from app.domain_events import (
     TASK_STARTED,
     emit,
 )
-from app.database import SessionLocal
+from app.database import SessionLocal, persist_task_failure_fresh
 from app.event_bus import finish_task, is_task_finished, publish, reset_task_bus
 from app.llm.client import LLMClient
 from app.models.task import Conversation, Result, Task, TaskStatus
@@ -243,21 +245,17 @@ def _run_resume_in_background(
         )
     except Exception as e:
         logger.exception(f"[task={task_id}] 重启后台执行失败")
-        # 兜底:确保 task 状态被标记为失败
+        # 兜底:主连接可能正是崩溃元凶(已断),不再复用上面的 db 写状态,
+        # 改用全新独立会话落 FAILED(内部已防覆盖已完成/已失败终态)。
+        persist_task_failure_fresh(task_id, _err_detail(e), "重启执行失败")
+        # 兜底推送终止事件:走内存总线,即使 DB 已不可用前端也能收到终态
+        # (并行流在跑时仅推事件,不动总线)
         try:
-            task = db.get(Task, uuid.UUID(task_id))
-            if task and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                task.status = TaskStatus.FAILED
-                task.error_message = _err_detail(e)[:1000]
-                task.current_stage = "重启执行失败"
-                db.commit()
-            # 兜底推送终止事件:防止 SSE 订阅者因线程在主 try 块前崩溃
-            # 收不到 error 而永久挂起(并行流在跑时仅推事件,不动总线)
             publish(task_id, "error", {
                 "status": "failed",
                 "error_message": _err_detail(e)[:1000],
             })
-        except Exception:
+        except Exception:  # noqa: BLE001 - 事件推送失败不应影响 scope 清理
             pass
         finally:
             # error 已在上方推送(先推后关,防静默丢弃);清 scope 防泄漏
@@ -483,7 +481,8 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
         # ---------- 启用检查助手:agent1 单轮 → 任务完成 → 后台审查 ----------
         # 初始运行只有 1 轮 agent1(协作循环已移除,多轮由用户 resume 驱动)
         # 暂停检查点:agent1 执行前(react_agent 内部还有细粒度检查点)
-        wait_if_paused(task.id)
+        # 传入 db:若命中暂停阻塞,先释放连接(避免暂停期被 RDS 掐断)
+        wait_if_paused(task.id, db)
 
         task.current_stage = "AI助手执行"
         db.commit()
@@ -494,7 +493,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
                 executor=executor, task=task, db=db, react_client=react_client,
                 start_round_idx=1, first_followup=None,
                 first_repo_context=repo_context, first_previous_plan=None,
-                react_summaries=react_summaries,
+                react_summaries=react_summaries, git_tokens=git_tokens,
             )
         )
 
@@ -584,18 +583,33 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
         logger.exception(f"[task={task.id}] 任务流水线执行失败")
         # 错误详情增强:消息为空时补异常类型名,避免 UI 显示"未知错误"
         err_detail = _err_detail(e)
+        # ---- 顺序纪律:先置内存终态并推送终止事件(走 event_bus,不碰 DB),
+        # 再尝试落库。崩溃常见元凶正是主 db 连接被服务端掐断(见初因),若先
+        # commit 抛错就会跳过事件推送、令前端收不到终态而永久等待。----
         task.status = TaskStatus.FAILED
         task.error_message = err_detail[:1000]
         task.current_stage = "执行失败"
-        db.commit()
         _publish_status(task)
         # 领域事件:任务失败(主流程 except 路径)
         emit(TASK_FAILED, task.id, error=err_detail[:500], stage="run")
-        _add_conversation(
-            db, task, round_idx=0,
-            role="agent2", type="error",
-            content=f"执行失败: {err_detail}",
-        )
+        # 落库:主连接可能已死,失败则用全新会话兜底(必落 FAILED)
+        try:
+            db.commit()
+        except Exception as commit_err:  # noqa: BLE001 - 终态落库失败须兜底,不可上抛
+            logger.warning(
+                f"[task={task.id}] 崩溃时主连接落库失败,改用新会话兜底: {commit_err}"
+            )
+            persist_task_failure_fresh(task.id, err_detail, "执行失败")
+        # 错误对话落库(补充信息):单独兜底,失败不得影响上面已落的终态/事件
+        try:
+            _add_conversation(
+                db, task, round_idx=0,
+                role="agent2", type="error",
+                content=f"执行失败: {err_detail}",
+            )
+            db.commit()
+        except Exception as conv_err:  # noqa: BLE001 - 补充信息,失败仅告警
+            logger.warning(f"[task={task.id}] 错误对话落库失败(忽略): {conv_err}")
         # 失败也尽量捕获:工作区 diff + 仓库树快照(失败兜底;沙箱通常仍存活,
         # 会话已死则自然返回 None,不影响失败处理)
         try:
@@ -735,10 +749,67 @@ def _resolve_continuation_message(task: Task, db: Session, round_idx: int) -> st
     return merged or AUTO_CONTINUE_FOLLOWUP
 
 
+@contextmanager
+def _round_session() -> Iterator[Session]:
+    """续跑循环每轮用独立短会话:with 退出即 close 把连接归还池。
+
+    目的:轮与轮之间(尤其 wait_if_paused 的长时间 park)不持有任何 DB 连接,
+    从根上避免"暂停期空闲过久 → RDS 掐断连接 → 恢复首查炸"。醒来后下一轮在
+    全新会话上执行,首查经 pool_pre_ping 取到活连接。
+    """
+    round_db = SessionLocal()
+    try:
+        yield round_db
+    finally:
+        round_db.close()
+
+
+def _ensure_workspace_for_continuation(
+    task: Task, db: Session, task_id_str: str, git_tokens: dict | None,
+) -> "str | None":
+    """恢复续跑前确保工作区可用,返回新的 repo_context(需重克隆时)或 None。
+
+    背景:暂停可能长达数十分钟,沙箱容器按 SANDBOX_TIMEOUT_MINUTES(默认 30min)
+    被 Server 回收,工作区随之清空且会话层不接管自动重 clone(见
+    sandbox_tools._get_or_create_session 注释)。续跑轮若沿用"仓库已在工作区"的
+    假设(repo_ctx=None)会在空目录上乱跑,故此处主动探活+重克隆,把 repo_context
+    交回续轮。
+
+    返回:
+    - None:无仓库(纯上传任务)/ 工作区健在 / 重克隆失败(降级,续轮由 CLI 自主 clone);
+    - 非空 str:重新克隆得到的仓库上下文,续轮据此跳过自主 clone。
+    """
+    repo_url = (task.params or {}).get("repo_url")
+    if not repo_url:
+        return None
+    if sandbox_tools.workspace_has_files(task_id_str):
+        return None  # 工作区健在,续轮照旧不重传 repo_context
+    logger.warning(
+        f"[task={task.id}] 续跑前检测到工作区已被回收,重新克隆仓库后再续"
+    )
+    try:
+        task.current_stage = "工作区已过期,正在重新克隆…"
+        db.commit()
+        _publish_status(task)
+    except Exception:  # noqa: BLE001 - 阶段提示失败不阻断重克隆
+        pass
+    try:
+        _repo_path, repo_context = _prepare_repo_context(
+            task, db, task_id_str, git_tokens,
+        )
+        return repo_context or None
+    except Exception as e:  # noqa: BLE001 - 重克隆失败降级,续轮由 CLI 侧自主 clone
+        logger.warning(
+            f"[task={task.id}] 续跑前重克隆失败(降级为无仓库上下文,交 CLI 自主 clone): {e}"
+        )
+        return None
+
+
 def _run_agent1_rounds_with_auto_continue(
     *, executor, task: Task, db: Session, react_client, start_round_idx: int,
     first_followup: "str | None", first_repo_context,
     first_previous_plan, react_summaries: list[dict],
+    git_tokens: dict | None = None,
 ) -> tuple[list, str, list[dict], int]:
     """跑 agent1 并在"被暂停真中断"时自动续跑,直到某轮正常完成或达上限。
 
@@ -747,52 +818,64 @@ def _run_agent1_rounds_with_auto_continue(
     一轮继续"(acp_base 已置 _record_prompt_accepted,bridge/session 存活 →
     天然同会话续跑,不重复注入系统段、不文本回放)。
 
+    DB 会话纪律(去脆化,2026-10):每轮执行 + 轮后簿记走 _round_session 的独立
+    短会话,with 退出即 close 归还连接;轮与轮之间的 wait_if_paused 长 park 期间
+    不持有任何连接 → 规避"暂停期空闲过久被 RDS 掐断 → 恢复首查炸"。入参 db
+    仅为签名兼容保留(实际不再用于轮执行)。
+
     每轮流程与原 executor.run 路径一致:执行 → perf/emit → summary 计入
     react_summaries → plan 落库。轮后被中断时:
     1. 阻塞 wait_if_paused 等用户恢复(保持"暂停冻结"体验,输出不会自动往下);
     2. 恢复后:开关关闭或达续跑上限 → 退回旧行为,直接对本轮收尾;
-    3. 否则取续跑文案(优先用户排队消息)→ 递增轮次、同会话补发下一轮。
+    3. 否则先确保工作区可用(容器可能已回收 → 重克隆)、取续跑文案(优先用户
+       排队消息)→ 递增轮次、同会话补发下一轮。
     仅 CLI/ACP 会写中断标志,builtin 首轮返回即 return,行为零变化。
 
     返回 (最后轮 results, 最后轮 summary, 最后轮 plan, 最后轮 round_idx);
     收尾/审查针对最后轮(调用方据此定位本轮工具调用/临时结果/审查)。
     """
+    task_id = task.id
     round_idx = start_round_idx
     followup = first_followup
     repo_ctx = first_repo_context
     prev_plan = first_previous_plan
     while True:
-        _t0 = time.perf_counter()
-        results, summary, plan = executor.run(
-            task, db,
-            round_idx=round_idx,
-            followup_query=followup,
-            client=react_client,
-            repo_context=repo_ctx,
-            previous_plan=prev_plan,
-        )
-        perf_log(
-            task.id, "executor_run", time.perf_counter() - _t0,
-            round_idx=round_idx, executor=executor.name,
-        )
+        # ---- 轮内:独立短会话执行 + 落 plan + 读中断标志;with 退出即归还连接 ----
+        with _round_session() as round_db:
+            round_task = round_db.get(Task, task_id) or task
+            _t0 = time.perf_counter()
+            results, summary, plan = executor.run(
+                round_task, round_db,
+                round_idx=round_idx,
+                followup_query=followup,
+                client=react_client,
+                repo_context=repo_ctx,
+                previous_plan=prev_plan,
+            )
+            perf_log(
+                task_id, "executor_run", time.perf_counter() - _t0,
+                round_idx=round_idx, executor=executor.name,
+            )
+            # plan 状态持久化(resume/续轮跨轮续接)
+            _save_plan_to_task(round_task, round_db, plan)
+            interrupted = _consume_paused_interrupt_flag(round_task, round_db)
         emit(
-            AGENT1_ROUND_COMPLETED, task.id,
+            AGENT1_ROUND_COMPLETED, task_id,
             round_idx=round_idx, executor=executor.name,
             results_count=len(results),
         )
         react_summaries.append({"round": round_idx, "summary": summary})
-        # plan 状态持久化(resume/续轮跨轮续接)
-        _save_plan_to_task(task, db, plan)
 
-        if not _consume_paused_interrupt_flag(task, db):
+        if not interrupted:
             return results, summary, plan, round_idx
 
-        # 本轮被暂停真中断:先阻塞等用户恢复(保持冻结体验),再决定是否续跑
+        # 本轮被暂停真中断:先阻塞等用户恢复(保持冻结体验),再决定是否续跑。
+        # 此刻本轮 round_db 已 close,不持有任何连接 → 长时间 park 安全。
         logger.info(
-            f"[task={task.id}] agent1 第 {round_idx} 轮被暂停中断,"
+            f"[task={task_id}] agent1 第 {round_idx} 轮被暂停中断,"
             f"阻塞等待恢复后决定续跑/收尾"
         )
-        wait_if_paused(task.id)
+        wait_if_paused(task_id)
 
         cont_rounds = round_idx - start_round_idx
         if (
@@ -800,20 +883,25 @@ def _run_agent1_rounds_with_auto_continue(
             or cont_rounds >= settings.ACP_AUTO_CONTINUE_MAX_ROUNDS
         ):
             logger.info(
-                f"[task={task.id}] 不自动续跑(开关="
+                f"[task={task_id}] 不自动续跑(开关="
                 f"{'开' if settings.ACP_AUTO_CONTINUE_ON_RESUME else '关'},"
                 f"已续 {cont_rounds}/{settings.ACP_AUTO_CONTINUE_MAX_ROUNDS} 轮),"
                 f"对第 {round_idx} 轮收尾"
             )
             return results, summary, plan, round_idx
 
-        # 自动续跑:同一活跃 ACP session 补发一轮"继续"
-        followup = _resolve_continuation_message(task, db, round_idx)
+        # 自动续跑:恢复后先确保工作区可用(容器可能已回收),再取续跑文案。
+        # 这段同样用独立短会话,决不与上面的 wait_if_paused 交叉持有连接。
+        with _round_session() as cont_db:
+            cont_task = cont_db.get(Task, task_id) or task
+            repo_ctx = _ensure_workspace_for_continuation(
+                cont_task, cont_db, str(task_id), git_tokens,
+            )
+            followup = _resolve_continuation_message(cont_task, cont_db, round_idx)
         round_idx += 1
-        repo_ctx = None  # 续轮不重传仓库上下文(仓库已在工作区)
         prev_plan = plan
         logger.info(
-            f"[task={task.id}] 恢复后自动续跑 agent1 → 第 {round_idx} 轮"
+            f"[task={task_id}] 恢复后自动续跑 agent1 → 第 {round_idx} 轮"
             f"(同会话补发继续)"
         )
 
@@ -2321,7 +2409,7 @@ def resume_audit_with_message(
         # ===== 用户消息直接交给 agent1(不经 agent2 转述) =====
         # agent2 职责收敛为后台审查:追问/重试消息原文直传 agent1,
         # 跨轮历史由 react_agent._build_history_messages 注入
-        wait_if_paused(task.id)
+        wait_if_paused(task.id, db)
         task.current_stage = "AI助手执行" if ua_enabled else "AI助手执行(单 agent)"
         db.commit()
         _publish_status(task)
@@ -2332,7 +2420,7 @@ def resume_audit_with_message(
                 start_round_idx=start_round_idx, first_followup=followup_text,
                 first_repo_context=None,  # 重启不传 repo_context(仓库已 clone)
                 first_previous_plan=previous_plan,  # plan 跨轮续接
-                react_summaries=react_summaries,
+                react_summaries=react_summaries, git_tokens=git_tokens,
             )
         )
 

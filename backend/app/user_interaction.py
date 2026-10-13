@@ -275,13 +275,20 @@ def request_command_confirm(
     logger.info(f"[task={task_id_str}] 等待用户确认危险命令: {command_desc.get('command', '?')[:80]}")
 
 
-def wait_for_command_confirm(task_id: str | UUID, command_id: str) -> bool:
+def wait_for_command_confirm(task_id: str | UUID, command_id: str, db: object | None = None) -> bool:
     """阻塞等待用户确认决议(后台线程调用)
 
     返回 True=用户同意执行,False=用户拒绝或任务被取消。
+
+    db: 可选 SQLAlchemy Session。用户授权可能无限久等,阻塞前先释放其连接
+    (见 pause_controller.release_connection),避免久等期间连接被服务端回收。
     """
     task_id_str = str(task_id)
     pc = _get_or_create_command(task_id_str)
+    if db is not None:
+        # 延迟导入避免循环依赖(pause_controller 不顶层依赖本模块)
+        from app.pause_controller import release_connection
+        release_connection(db)
     pc.event.wait()
     with pc.lock:
         approved = pc.resolution is True

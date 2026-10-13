@@ -358,7 +358,7 @@ def run_react_agent(
         logger.info(f"[task={task.id}] react_agent 第 {round_idx} 轮 / 迭代 {iteration}")
 
         # 暂停检查点 1:迭代边界(若用户已暂停,在此阻塞直到恢复)
-        wait_if_paused(task.id)
+        wait_if_paused(task.id, db)
 
         # 用户补充消息检查点:drain 队列,若有则注入到 LLM 上下文
         # 用户在对话界面输入框发的消息(运行中/暂停中场景),已由 API 端点
@@ -581,7 +581,7 @@ def run_react_agent(
                 fn_args = {}
 
             # 暂停检查点 2:工具调用前(细粒度,长工具链中也能及时响应暂停)
-            wait_if_paused(task.id)
+            wait_if_paused(task.id, db)
 
             # 记录工具调用签名(循环检测)
             call_sig = f"{fn_name}:{json.dumps(fn_args, sort_keys=True)}"
@@ -1116,7 +1116,7 @@ def _maybe_run_parallel(
         f"timeout/面={settings.REACT_FACET_TIMEOUT_SECONDS}s"
     )
     # 扇出前暂停检查点(长工具链中也能及时响应暂停)
-    wait_if_paused(task.id)
+    wait_if_paused(task.id, db)
 
     results: list[_FacetResult] = []
     with ThreadPoolExecutor(
@@ -1137,7 +1137,7 @@ def _maybe_run_parallel(
 
     fan_in_summary = _fan_in(task, db, round_idx, results)
     # fan-in 后再检查一次暂停
-    wait_if_paused(task.id)
+    wait_if_paused(task.id, db)
     # 不在此收尾:把结果与拼接串交回调用方,由其决定直接返回(开关关)
     # 还是回灌上下文继续跑主循环(开关开)
     return results, fan_in_summary

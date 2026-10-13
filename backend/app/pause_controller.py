@@ -97,14 +97,40 @@ def resume_task(task_id: str | UUID) -> None:
         logger.info(f"[task={task_id}] 已恢复")
 
 
-def wait_if_paused(task_id: str | UUID) -> None:
+def wait_if_paused(task_id: str | UUID, db: object | None = None) -> None:
     """后台线程调用:若已暂停则阻塞,直到恢复
 
     在 agent 的检查点(iteration 边界、工具调用前)调用。
     未暂停时立即返回,几乎零开销(Event.wait() 内部仅检查标志位)。
+
+    db: 可选的 SQLAlchemy Session。传入且确实需要阻塞时,会先释放其连接
+    (见 release_connection),避免长时间暂停期间连接被服务端掐断。
+    不传(未持有 session 的调用方)则行为与原先完全一致。
     """
     state = _get_or_create(str(task_id))
+    if state.is_paused():
+        # 即将进入无上限阻塞:先把连接归还池(未暂停走上面直接返回,零开销)
+        release_connection(db)
     state.wait_if_paused()
+
+
+def release_connection(db: object | None) -> None:
+    """阻塞等待前把 session 事务落定、归还底层连接(去脆化)。
+
+    commit 会把已 checkout 的连接还给池;唤醒后首查会重新取连接并经
+    pool_pre_ping 校验,规避"长时间 park 期间连接被服务端掐断 → 醒来首查炸"。
+    连接若已死 commit 会抛 → 退回 rollback(同样释放连接)。全程吞异常:
+    这只是阻塞前的预防性动作,不得因其失败影响等待/执行主流程。db 为 None 直接跳过。
+    """
+    if db is None:
+        return
+    try:
+        db.commit()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - 主连接可能已断,回退同样归还连接
+        try:
+            db.rollback()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def is_paused(task_id: str | UUID) -> bool:
