@@ -59,16 +59,6 @@ export function getSkills(): Promise<SkillSummary[]> {
   return client.get('/skills').then((r) => r.data)
 }
 
-/** 查看 skill 详情(含 body) */
-export function getSkillDetail(
-  scenarioId: string,
-  skillName: string,
-): Promise<SkillDetail> {
-  return client
-    .get(`/skills/${encodeURIComponent(scenarioId)}/${encodeURIComponent(skillName)}`)
-    .then((r) => r.data)
-}
-
 /**
  * 上传 zip 格式的 skill
  *

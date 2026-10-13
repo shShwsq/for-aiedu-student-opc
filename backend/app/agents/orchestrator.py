@@ -458,32 +458,11 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
             # 预压缩早期历史:用户下一轮追问直接命中缓存(失败兜底)
             _precompress_history_safely(task, db, len(react_summaries), react_client)
 
-            # 记忆归纳(失败兜底,不影响任务完成;模型/结构走用户「记忆设置」独立解析)
-            try:
-                from app.services.memory_summarize import summarize_and_save_memory
-                summarize_and_save_memory(task, db)
-            except Exception as mem_err:
-                logger.warning(f"[task={task.id}] 归纳写入记忆失败(忽略): {mem_err}")
-
-            # 自动生成练习题 draft(失败兜底,不影响任务完成;产出仍需用户确认)
-            if settings.PRACTICE_ENABLED:
-                try:
-                    from app.services.practice.auto_generate import auto_generate_practice_for_task
-                    auto_generate_practice_for_task(task, db)
-                except Exception as practice_err:
-                    logger.warning(f"[task={task.id}] 自动生成练习题失败(忽略): {practice_err}")
+            # 成功副作用:记忆归纳 + 自动出题 draft(均失败兜底)
+            _run_task_success_side_effects(task, db)
 
             # 捕获工作区 diff(失败兜底,不影响任务完成)
-            try:
-                from app.services.workspace_diff import (
-                    save_repo_tree_artifact,
-                    save_workspace_diff_artifact,
-                )
-                save_workspace_diff_artifact(task, db, task_id_str)
-                # 树快照:更新为最终态(含新建文件),供不可用时兜底展示
-                save_repo_tree_artifact(task, db, task_id_str)
-            except Exception as diff_err:
-                logger.warning(f"[task={task.id}] 捕获工作区 diff 失败(忽略): {diff_err}")
+            _capture_workspace_diff_safely(task, db, task_id_str)
 
             return  # 单 agent 模式结束,finally 块仍会执行清理
 
@@ -552,15 +531,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
 
         # 捕获工作区 diff(agent2 只读审查不影响工作区,此时即可捕获;
         # 失败兜底,不影响后续审查)
-        try:
-            from app.services.workspace_diff import (
-                save_repo_tree_artifact,
-                save_workspace_diff_artifact,
-            )
-            save_workspace_diff_artifact(task, db, task_id_str)
-            save_repo_tree_artifact(task, db, task_id_str)
-        except Exception as diff_err:
-            logger.warning(f"[task={task.id}] 捕获工作区 diff 失败(忽略): {diff_err}")
+        _capture_workspace_diff_safely(task, db, task_id_str)
 
         # 任务本体已完成:finally 不再兜底推 error
         # (审查失败属于 review_status=failed,不是任务失败)
@@ -627,66 +598,15 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
             db.commit()
         except Exception as conv_err:  # noqa: BLE001 - 补充信息,失败仅告警
             logger.warning(f"[task={task.id}] 错误对话落库失败(忽略): {conv_err}")
-        # 失败也尽量捕获:工作区 diff + 仓库树快照(失败兜底;沙箱通常仍存活,
-        # 会话已死则自然返回 None,不影响失败处理)
-        try:
-            from app.services.workspace_diff import (
-                save_repo_tree_artifact,
-                save_workspace_diff_artifact,
-            )
-            save_workspace_diff_artifact(task, db, task_id_str)
-            save_repo_tree_artifact(task, db, task_id_str)
-        except Exception as diff_err:
-            logger.warning(f"[task={task.id}] 失败时捕获工作区产物失败(忽略): {diff_err}")
+        # 失败也尽量捕获:工作区 diff + 仓库树快照(失败兜底)
+        _capture_workspace_diff_safely(task, db, task_id_str)
         # 事件活跃期收尾移交 finally 统一处理:error 事件必须在
         # finish_task 之前推送(总线关闭后 publish 会被静默丢弃)
     finally:
-        # 通知事件总线:任务结束。
-        # done 事件已在各收尾点经 _end_event_scope 推送(正常路径)。
-        # 此处仅兜底:异常路径(本轮未正常完成)推送 error 事件。
-        # 注意:判定必须用本轮执行的内存标志 normal_completed,不能用 task.status ——
-        # 任务完成后用户发追问会把状态改回 RUNNING(API 端点同步落库),若按状态判定,
-        # 已正常完成的任务会被误判为"未完成"而推送 error(前端显示"未知错误"失败横幅)。
-        if not normal_completed:
-            # [诊断] error 事件推送日志:前端 onError 的唯一事件源,全量记录
-            logger.warning(
-                f"[task={task.id}] finally 兜底推送 error 事件 "
-                f"(status={task.status.value}, error_message={task.error_message!r})"
-            )
-            # error 无条件推送(并行流失败也须通知前端);必须在 end-scope 之前
-            # (总线关闭后 publish 会被静默丢弃,前端将永远收不到错误横幅)
-            publish(task.id, "error", {
-                "status": "failed",
-                "error_message": task.error_message or "未知错误(无异常详情,请查看服务日志)",
-            })
-        # 无条件收尾(幂等):正常路径已在各收尾点 end 过(discard 无副作用),
-        # 此处兜底 ① 异常路径的 scope 注销 ② "正常完成后仍抛异常"的边角泄漏。
-        # 若此时尚有并行流在跑则静默返回,不动总线
-        _end_event_scope(task.id, flow_gen)
-        # ---- 状态清理组:仅当本任务无活跃流时执行 ----
-        # (审查与新一轮 resume 并行时,老线程 finally 不得清掉新流正在用的
-        #  运行时状态:用户消息队列/暂停标志/沙箱 completed 标记等。
-        #  必须在 end-scope 之后:异常路径下自身 scope 尚未注销,
-        #  先查会被误判"并行中"而永久跳过清理)
-        if not _has_active_scope(task.id):
-            for cleanup_fn, name in [
-                (clear_pause_state, "暂停状态"),
-                (clear_skip_state, "跳过预克隆标志"),
-                (clear_review_stop_state, "审查终止标志"),
-                (clear_user_messages, "用户消息队列"),
-                (clear_pending_verify_action, "验证待授权状态"),
-                (clear_pending_command_confirm, "命令待确认状态"),
-                (sandbox_tools.mark_task_completed, "沙箱完成标记"),
-            ]:
-                try:
-                    cleanup_fn(task_id_str)
-                except Exception as cleanup_err:
-                    logger.warning(f"[task={task.id}] 清理{name}失败: {cleanup_err}")
-        else:
-            logger.info(
-                f"[task={task.id}] 并行流仍在运行,跳过状态清理"
-                f"(gen={flow_gen})"
-            )
+        # 统一收尾:error 事件推送 + end-scope + 状态清理链(详见 _finalize_task_cleanup)
+        _finalize_task_cleanup(
+            task, task_id_str, flow_gen, normal_completed, log_prefix="finally",
+        )
 
 
 # ============================================================
@@ -1049,6 +969,107 @@ def _followup_recommendations_safely(task: Task, db: Session, round_idx: int) ->
         recommend_followups(task, db, round_idx)
     except Exception as fu_err:  # noqa: BLE001 - 兜底再包一层,绝不影响收尾
         logger.warning(f"[task={task.id}] 探索性追问推荐失败(忽略): {fu_err}")
+
+
+def _capture_workspace_diff_safely(
+    task: Task, db: Session, task_id_str: str,
+) -> None:
+    """捕获工作区 diff + 仓库树快照(失败兜底,不影响任务收尾)
+
+    四处调用点共用:单 agent 成功/失败、resume 成功(审查前)/失败。
+    沙箱通常仍存活;会话已死则内部自然返回 None。
+    树快照作为 diff 不可用时的兜底展示源,每次一并更新为最终态。
+    """
+    try:
+        from app.services.workspace_diff import (
+            save_repo_tree_artifact,
+            save_workspace_diff_artifact,
+        )
+        save_workspace_diff_artifact(task, db, task_id_str)
+        save_repo_tree_artifact(task, db, task_id_str)
+    except Exception as diff_err:  # noqa: BLE001 - 兜底失败仅告警
+        logger.warning(f"[task={task.id}] 捕获工作区 diff 失败(忽略): {diff_err}")
+
+
+def _run_task_success_side_effects(task: Task, db: Session) -> None:
+    """任务成功收尾的下游副作用:记忆归纳 + 自动出题 draft(均失败兜底)
+
+    两处调用点共用:单 agent 成功路径、后台审查成功路径。
+    调用方需自行完成「仅最新流执行」门控(避免并行流重复归纳/出题);
+    本函数只负责执行,不做世代判定。
+    """
+    # 记忆归纳(失败兜底,不影响任务完成;模型/结构走用户「记忆设置」独立解析)
+    try:
+        from app.services.memory_summarize import summarize_and_save_memory
+        summarize_and_save_memory(task, db)
+    except Exception as mem_err:  # noqa: BLE001 - 兜底失败仅告警
+        logger.warning(f"[task={task.id}] 归纳写入记忆失败(忽略): {mem_err}")
+
+    # 自动生成练习题 draft(失败兜底,不影响任务完成;产出仍需用户确认)
+    if settings.PRACTICE_ENABLED:
+        try:
+            from app.services.practice.auto_generate import auto_generate_practice_for_task
+            auto_generate_practice_for_task(task, db)
+        except Exception as practice_err:  # noqa: BLE001 - 兜底失败仅告警
+            logger.warning(f"[task={task.id}] 自动生成练习题失败(忽略): {practice_err}")
+
+
+def _finalize_task_cleanup(
+    task: Task,
+    task_id_str: str,
+    flow_gen: int,
+    normal_completed: bool,
+    *,
+    log_prefix: str = "finally",
+) -> None:
+    """任务 finally 块的统一收尾:error 事件推送 + end-scope + 状态清理链
+
+    两处调用点共用:run_pipeline_audit / resume_audit_with_message。
+
+    判定必须用内存标志 normal_completed,不能用 task.status ——
+    任务完成后用户发追问会把状态改回 RUNNING(API 端点同步落库),若按
+    状态判定,已正常完成的任务会被误判为"未完成"而推送 error(前端显示
+    "未知错误"失败横幅),并重新标记总线结束导致新流事件被静默丢弃。
+
+    清理链的执行条件是「本任务无活跃流」:审查与新一轮 resume 并行时,老线程
+    finally 不得清掉新流正在用的运行时状态(用户消息队列/暂停标志/沙箱
+    completed 标记等)。必须在 end-scope 之后调用:异常路径下自身 scope
+    尚未注销,先查会被误判"并行中"而永久跳过清理。
+    """
+    if not normal_completed:
+        # [诊断] error 事件推送日志:前端 onError 的唯一事件源,全量记录
+        logger.warning(
+            f"[task={task.id}] {log_prefix} 兜底推送 error 事件 "
+            f"(status={task.status.value}, error_message={task.error_message!r})"
+        )
+        # error 无条件推送(并行流失败也须通知前端);必须在 end-scope 之前
+        # (总线关闭后 publish 会被静默丢弃,前端将永远收不到错误横幅)
+        publish(task.id, "error", {
+            "status": "failed",
+            "error_message": task.error_message or "未知错误(无异常详情,请查看服务日志)",
+        })
+    # 无条件收尾(幂等):正常路径已在各收尾点 end 过(discard 无副作用),
+    # 此处兜底 ① 异常路径的 scope 注销 ② "正常完成后仍抛异常"的边角泄漏。
+    # 若此时尚有并行流在跑则静默返回,不动总线
+    _end_event_scope(task.id, flow_gen)
+    if not _has_active_scope(task.id):
+        for cleanup_fn, name in [
+            (clear_pause_state, "暂停状态"),
+            (clear_skip_state, "跳过预克隆标志"),
+            (clear_review_stop_state, "审查终止标志"),
+            (clear_user_messages, "用户消息队列"),
+            (clear_pending_verify_action, "验证待授权状态"),
+            (clear_pending_command_confirm, "命令待确认状态"),
+            (sandbox_tools.mark_task_completed, "沙箱完成标记"),
+        ]:
+            try:
+                cleanup_fn(task_id_str)
+            except Exception as cleanup_err:  # noqa: BLE001 - 单项清理失败仅告警
+                logger.warning(f"[task={task.id}] 清理{name}失败: {cleanup_err}")
+    else:
+        logger.info(
+            f"[task={task.id}] 并行流仍在运行,跳过状态清理(gen={flow_gen})"
+        )
 
 
 def _round_has_tool_calls(db: Session, task_id, round_idx: int) -> bool:
@@ -1566,20 +1587,8 @@ def _run_background_review(
             )
             return
 
-        # 任务成功完成:自动归纳写入长期记忆(失败兜底,不影响任务完成;模型/结构走用户「记忆设置」)
-        try:
-            from app.services.memory_summarize import summarize_and_save_memory
-            summarize_and_save_memory(task, db)
-        except Exception as mem_err:
-            logger.warning(f"[task={task.id}] 归纳写入记忆失败(忽略): {mem_err}")
-
-        # 自动生成练习题 draft(失败兜底,不影响任务完成;产出仍需用户确认)
-        if settings.PRACTICE_ENABLED:
-            try:
-                from app.services.practice.auto_generate import auto_generate_practice_for_task
-                auto_generate_practice_for_task(task, db)
-            except Exception as practice_err:
-                logger.warning(f"[task={task.id}] 自动生成练习题失败(忽略): {practice_err}")
+        # 任务成功完成:归纳记忆 + 自动出题 draft(均失败兜底)
+        _run_task_success_side_effects(task, db)
 
         # 预压缩早期历史:用户下一轮追问直接命中缓存,消除追问路径上的
         # 同步 LLM 压缩延迟(失败兜底,内部已捕获)
@@ -2556,15 +2565,7 @@ def resume_audit_with_message(
         publish(task.id, "agent1_done", {"status": "completed"})
 
         # 捕获工作区 diff(agent2 只读审查不影响工作区;失败兜底)
-        try:
-            from app.services.workspace_diff import (
-                save_repo_tree_artifact,
-                save_workspace_diff_artifact,
-            )
-            save_workspace_diff_artifact(task, db, task_id_str)
-            save_repo_tree_artifact(task, db, task_id_str)
-        except Exception as diff_err:
-            logger.warning(f"[task={task.id}] 捕获工作区 diff 失败(忽略): {diff_err}")
+        _capture_workspace_diff_safely(task, db, task_id_str)
 
         # 任务本体已完成:finally 不再兜底推 error(审查失败≠任务失败)
         normal_completed = True
@@ -2608,60 +2609,15 @@ def resume_audit_with_message(
             role="agent2", type="error",
             content=f"{err_stage}: {err_detail}",
         )
-        # 失败也尽量捕获:工作区 diff + 仓库树快照(失败兜底;沙箱通常仍存活,
-        # 会话已死则自然返回 None,不影响失败处理)
-        try:
-            from app.services.workspace_diff import (
-                save_repo_tree_artifact,
-                save_workspace_diff_artifact,
-            )
-            save_workspace_diff_artifact(task, db, task_id_str)
-            save_repo_tree_artifact(task, db, task_id_str)
-        except Exception as diff_err:
-            logger.warning(f"[task={task.id}] 失败时捕获工作区产物失败(忽略): {diff_err}")
+        # 失败也尽量捕获:工作区 diff + 仓库树快照(失败兜底)
+        _capture_workspace_diff_safely(task, db, task_id_str)
         # 事件活跃期收尾移交 finally 统一处理:error 事件必须在
         # finish_task 之前推送(总线关闭后 publish 会被静默丢弃)
     finally:
-        # 推送终止事件
-        # done 事件已在各收尾点经 _end_event_scope 推送(正常路径)。
-        # 此处仅兑底:异常路径(本轮未正常完成)推送 error 事件。
-        # 判定必须用内存标志 normal_completed,不能用 task.status ——
-        # 本轮完成后用户又发新追问会把状态改回 RUNNING,按状态判定会误推 error
-        # 并重新标记总线结束,导致新 resume 线程事件全被静默丢弃。
-        if not normal_completed:
-            # [诊断] error 事件推送日志:前端 onError 的唯一事件源,全量记录
-            logger.warning(
-                f"[task={task.id}] resume finally 兑底推送 error 事件 "
-                f"(status={task.status.value}, error_message={task.error_message!r})"
-            )
-            # error 无条件推送(并行流失败也须通知前端);必须在 end-scope 之前
-            # (总线关闭后 publish 会被静默丢弃,前端将永远收不到错误横幅)
-            publish(task.id, "error", {
-                "status": "failed",
-                "error_message": task.error_message or "未知错误(无异常详情,请查看服务日志)",
-            })
-        # 无条件收尾(幂等):正常路径已在各收尾点 end 过(discard 无副作用),
-        # 此处兜底 ① 异常路径的 scope 注销 ② "正常完成后仍抛异常"的边角泄漏。
-        # 若此时尚有并行流在跑则静默返回,不动总线
-        _end_event_scope(task.id, flow_gen)
-        # ---- 状态清理组:仅当本任务无活跃流时执行 ----
-        # (老审查与本流并行时,不得清掉并行流正在用的运行时状态。
-        #  必须在 end-scope 之后:异常路径下自身 scope 尚未注销,
-        #  先查会被误判"并行中"而永久跳过清理)
-        if not _has_active_scope(task.id):
-            for cleanup_fn, name in [
-                (clear_pause_state, "暂停状态"),
-                (clear_skip_state, "跳过预克隆标志"),
-                (clear_review_stop_state, "审查终止标志"),
-                (clear_user_messages, "用户消息队列"),
-                (clear_pending_verify_action, "验证待授权状态"),
-                (clear_pending_command_confirm, "命令待确认状态"),
-                (sandbox_tools.mark_task_completed, "沙箱完成标记"),
-            ]:
-                try:
-                    cleanup_fn(task_id_str)
-                except Exception as cleanup_err:
-                    logger.warning(f"[task={task.id}] 清理{name}失败: {cleanup_err}")
+        # 统一收尾:error 事件推送 + end-scope + 状态清理链(详见 _finalize_task_cleanup)
+        _finalize_task_cleanup(
+            task, task_id_str, flow_gen, normal_completed, log_prefix="resume finally",
+        )
 
 
 # ============================================================
@@ -2775,24 +2731,18 @@ def _finish_resume(
     # 预压缩早期历史:用户下一轮追问直接命中缓存(失败兜底)
     _precompress_history_safely(task, db, round_idx, react_client)
 
-    # 重启完成:自动归纳写入长期记忆(失败兑底,不影响;模型/结构走用户「记忆设置」独立解析)
+    # 重启完成:自动归纳写入长期记忆(失败兜底,不影响;模型/结构走用户「记忆设置」独立解析)
+    # 注意:本路径(resume 单 agent 模式)历史上未含自动出题,与单 agent 初始路径
+    # (line 462 附近 _run_task_success_side_effects)不一致。保持原行为,
+    # 仅归纳记忆;如需补出题请单独评估。
     try:
         from app.services.memory_summarize import summarize_and_save_memory
         summarize_and_save_memory(task, db)
-    except Exception as mem_err:
+    except Exception as mem_err:  # noqa: BLE001 - 兜底失败仅告警
         logger.warning(f"[task={task.id}] 归纳写入记忆失败(忽略): {mem_err}")
 
     # 捕获工作区 diff(失败兜底,不影响任务完成;容器仍存活)
-    try:
-        from app.services.workspace_diff import (
-            save_repo_tree_artifact,
-            save_workspace_diff_artifact,
-        )
-        save_workspace_diff_artifact(task, db, str(task.id))
-        # 树快照:更新为最终态(含新建文件),供不可用时兜底展示
-        save_repo_tree_artifact(task, db, str(task.id))
-    except Exception as diff_err:
-        logger.warning(f"[task={task.id}] 捕获工作区 diff 失败(忽略): {diff_err}")
+    _capture_workspace_diff_safely(task, db, str(task.id))
 
 
 def _load_react_summaries(db: Session, task_id) -> list[dict]:

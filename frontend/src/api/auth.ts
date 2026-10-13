@@ -25,10 +25,6 @@ export function verifyEmail(token: string): Promise<MessageResponse> {
   return client.post('/auth/verify-email', { token }).then((r) => r.data)
 }
 
-export function resendVerification(email: string): Promise<MessageResponse> {
-  return client.post('/auth/resend-verification', { email }).then((r) => r.data)
-}
-
 // ---- 登录 + 刷新 ----
 
 export function login(email: string, password: string): Promise<TokenResponse> {

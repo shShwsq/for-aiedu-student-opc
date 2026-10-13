@@ -12,7 +12,6 @@
  * - 版本号 ONBOARDING_VERSION:引导文案/步骤结构有大改时递增,老用户的 completed 标记作废,
  *   下次登录会重新看到引导(只影响"已读过"状态,不影响其他数据)。
  */
-import type { RouteLocationRaw } from 'vue-router'
 
 import { practiceEnabled } from '@/composables/useFeatures'
 
@@ -259,12 +258,4 @@ export function getStepsForRoute(routeName: string): OnboardingStep[] {
           : s,
       )
   )
-}
-
-/**
- * 用于 router.push 的路由跳转目标(从步骤定义派生)。
- * 预留扩展:当前主流程不跨页面跳转(改为按路由分组播放),此函数保留供"重看引导"等场景使用。
- */
-export function toRouteLocation(step: OnboardingStep): RouteLocationRaw {
-  return { name: step.route }
 }

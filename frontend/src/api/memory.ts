@@ -7,7 +7,6 @@
  * - GET    /memory/global              全局长期记忆(未配置返回空)
  * - PUT    /memory/global              保存全局长期记忆(get_or_create)
  * - GET    /memory/projects            项目记忆列表(按 updated_at 倒序)
- * - GET    /memory/projects/{id}       单个项目记忆详情
  * - PUT    /memory/projects/{id}       更新 alias/note/memory_content
  * - DELETE /memory/projects/{id}       删除项目记忆(返回剩余列表)
  *
@@ -87,11 +86,6 @@ export function saveGlobalMemory(body: SaveUserMemoryRequest): Promise<UserMemor
 /** 获取当前用户的所有项目记忆列表(按 updated_at 倒序) */
 export function listProjects(): Promise<ProjectListResponse> {
   return client.get('/memory/projects').then((r) => r.data)
-}
-
-/** 获取单个项目记忆详情 */
-export function getProject(projectId: string): Promise<ProjectOut> {
-  return client.get(`/memory/projects/${projectId}`).then((r) => r.data)
 }
 
 /** 更新项目记忆的 alias/note/memory_content(用户手动编辑) */
