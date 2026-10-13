@@ -139,20 +139,31 @@ def test_submit_tool_definitions_shape():
 
 
 def test_knowledge_point_content_adopts_explanation_contract():
-    """知识点讲解统一:agent2 的 content 按练习侧「两必选+两可选」契约输出。
+    """知识点讲解统一:**注入给模型那份** content 描述按练习侧契约输出。
 
     回归点:任务侧 content 会被出题收尾**直接采用**为看板讲解(见
     explainer.sync_knowledge_explanations),两侧格式分家会让同一讲解
-    出现两种排版 —— 故工具描述内嵌共享契约,审查 prompt 只指向工具契约
-    不再手抄段名(结构定义只保留常量一处)。
+    出现两种排版 —— 契约正文只保留一处(app.prompts.practice)。
+    装配位置:prompts 层零 app.* 依赖(test_prompts_purity),文本层只留
+    {explanation_contract} 占位,由 app/agents/agent2.py 组装 _SUBMIT_TOOLS 时填,
+    故断言要盯注入用的那份,不是文本层模板。
     """
+    from app.agents.agent2 import _SUBMIT_TOOLS
+    from app.prompts.agent2 import KNOWLEDGE_CONTENT_DESCRIPTION_TEMPLATE
     from app.prompts.practice import EXPLANATION_FORMAT_CONTRACT
 
-    kp_props = _SUBMIT_KNOWLEDGE_POINT_TOOL["function"]["parameters"]["properties"]
-    content_desc = kp_props["content"]["description"]
-    # 工具描述内嵌共享契约(新段名 + 不虚构路径行号)
+    kp_tool = next(
+        t for t in _SUBMIT_TOOLS if t["function"]["name"] == "submit_knowledge_point"
+    )
+    content_desc = kp_tool["function"]["parameters"]["properties"]["content"]["description"]
+    # 装配后内嵌共享契约(新段名 + 不虚构路径行号),且不残留占位符
     assert EXPLANATION_FORMAT_CONTRACT in content_desc
+    assert "{explanation_contract}" not in content_desc
     assert "直接采用" in content_desc
+    # 文本层只留占位(不跨模块取常量),未装配的原工具不该携契约正文
+    assert "{explanation_contract}" in KNOWLEDGE_CONTENT_DESCRIPTION_TEMPLATE
+    raw_desc = _SUBMIT_KNOWLEDGE_POINT_TOOL["function"]["parameters"]["properties"]["content"]["description"]
+    assert EXPLANATION_FORMAT_CONTRACT not in raw_desc
     # 审查 prompt 的「提炼知识点」段指向工具契约,不再重复定义段名
     assert "内嵌的格式契约输出" in AGENT2_REVIEW_PROMPT
     assert "### 是什么 / ### 为什么会踩 / ### 怎么判断与修复 / ### 易错点" not in AGENT2_REVIEW_PROMPT
@@ -251,8 +262,14 @@ def test_review_prompt_has_architecture_but_delegates_scope_broadening():
 
 
 def test_review_prompt_announces_parallel_plan_verification():
-    """主 prompt 补段:告知模型计划后系统会自动并行核查,不要重跑。"""
-    assert "并行只读核查" in AGENT2_REVIEW_PROMPT
+    """主 prompt 把并行核查说成模型自己的按需派发决定,并约束派发后不重跑。
+
+    旧断言盯的是"发射计划即系统自动扇出"时代的措辞("并行只读核查");按需派发
+    落地后该词只剩 fan-in 信封(见 test_plan_result_messages_envelope_shape),主
+    prompt 改成"是否派发由你决定 + 回灌后不必重跑这些核查"。此处按新契约锁:
+    工具名在(模型才知道能派)、不重跑纪律在(不会白耗取证额度)。
+    """
+    assert "dispatch_review_subagents" in AGENT2_REVIEW_PROMPT
     assert "不必重跑" in AGENT2_REVIEW_PROMPT
 
 

@@ -42,6 +42,7 @@ import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
@@ -97,6 +98,7 @@ from app.prompts.agent2 import (
     AGENT2_PLAN_ITEM_FINALIZE_PROMPT,
     AGENT2_REVIEW_PROMPT,
     AGENT2_SYSTEM_PROMPT,
+    KNOWLEDGE_CONTENT_DESCRIPTION_TEMPLATE,
     _READ_ONLY_TOOL_DEFINITIONS,
     _REFERENCE_TOOL_DEFINITION,
     _VERIFY_TOOL_DEFINITION,
@@ -108,6 +110,7 @@ from app.prompts.agent2 import (
     build_agent2_plan_item_instruction,
     build_agent2_plan_result_messages,
 )
+from app.prompts.practice import EXPLANATION_FORMAT_CONTRACT
 
 logger = logging.getLogger(__name__)
 
@@ -149,10 +152,20 @@ MAX_VERIFY_CALLS = MIN_VERIFY_CALLS
 MAX_REFERENCE_CALLS = 3
 
 # 四发射工具(始终注入):结构化落库 + 流式的"发射器",不进 sandbox
+# 知识点工具先装好讲解格式契约再注入:契约正文只在 app.prompts.practice 里定义一份
+# (任务侧 content 会被出题收尾直接采用为看板讲解,两侧分家会出两种排版),而
+# prompts 层必须零 app.* 依赖(test_prompts_purity),所以文本层留 {explanation_contract}
+# 占位、由装配处填。拷一份再改:模块级常量被多处共享,就地改会污染其它调用方。
+_SUBMIT_KNOWLEDGE_POINT_TOOL_FILLED = deepcopy(_SUBMIT_KNOWLEDGE_POINT_TOOL)
+_SUBMIT_KNOWLEDGE_POINT_TOOL_FILLED["function"]["parameters"]["properties"]["content"][
+    "description"
+] = KNOWLEDGE_CONTENT_DESCRIPTION_TEMPLATE.format(
+    explanation_contract=EXPLANATION_FORMAT_CONTRACT,
+)
 _SUBMIT_TOOLS: list[dict[str, Any]] = [
     _SUBMIT_REVIEW_PLAN_TOOL,
     _SUBMIT_REVIEW_ITEM_TOOL,
-    _SUBMIT_KNOWLEDGE_POINT_TOOL,
+    _SUBMIT_KNOWLEDGE_POINT_TOOL_FILLED,
     _SUBMIT_SUGGESTION_TOOL,
 ]
 # 发射类硬上限(prompt 约定之外的最后防线):主循环靠"不再发工具"退出,
@@ -495,10 +508,11 @@ def run_agent2(
     )
     tools = []
     # 发射工具注入(结构化落库 + 流式,不依赖 repo_path / 环境);
-    # 关闭提炼知识点时剔除 submit_knowledge_point
+    # 关闭提炼知识点时剔除 submit_knowledge_point(按 name 滤:注入的是填好
+    # 格式契约的副本,拿原常量做 is 比会剩下来)
     tools.extend(
         _SUBMIT_TOOLS if extract_kp
-        else [t for t in _SUBMIT_TOOLS if t is not _SUBMIT_KNOWLEDGE_POINT_TOOL]
+        else [t for t in _SUBMIT_TOOLS if t["function"]["name"] != "submit_knowledge_point"]
     )
     if repo_path:
         tools.extend(_READ_ONLY_TOOL_DEFINITIONS)

@@ -18,10 +18,13 @@ import json
 import uuid
 from unittest.mock import MagicMock
 
+import pytest
+
 import app.models.task_artifact  # noqa: F401  (mapper 依赖)
 import app.models.user_git_binding  # noqa: F401
 
 import app.agents.orchestrator as orchestrator
+import app.database as app_database
 from app.models.task import Conversation, Result, TaskStatus
 from app.user_messages import clear_user_messages, push_user_message
 
@@ -29,6 +32,49 @@ from app.user_messages import clear_user_messages, push_user_message
 # ============================================================
 # 测试环境构造(参考 test_agent2_stream_degrade 的屏蔽模式)
 # ============================================================
+
+# 本文件被测 task 登记表(按 task.id 键):供下方按轮会话替身取回同一个对象。
+_TASK_UNDER_TEST: dict[str, object] = {}
+
+
+def _register_task(task):
+    _TASK_UNDER_TEST[str(task.id)] = task
+    return task
+
+
+def _task_for(task_id):
+    """按 id 取回本用例的 task;取不到直接 fail(不返回 None 也不给假对象)。
+
+    返回 None 会被流水线当成"任务已删"提前收尾,返回新 MagicMock 则把轮内写
+    操作用到另一个对象上 —— 两者都是静默错测。pytest.fail 抛的 Failed 继承自
+    BaseException,不会被 orchestrator 的 except Exception 吞掉,能原样报出来。
+    """
+    task = _TASK_UNDER_TEST.get(str(task_id))
+    if task is None:
+        pytest.fail(
+            f"按轮会话替身取不到 task_id={task_id}:用例未用本文件的 _mk_task() 造 task"
+        )
+    return task
+
+
+@pytest.fixture(autouse=True)
+def _stub_round_session(monkeypatch):
+    """把按轮短会话的 SessionLocal 换成替身,测试全程不连库。
+
+    背景:orchestrator._run_agent1_rounds_with_auto_continue 每轮走
+    _round_session() 的独立短会话(commit 87bebcc "DB 会话纪律",为规避暂停期长
+    park 被 RDS 掐断),它直连 SessionLocal。测试环境连不到库时会一路等到
+    connect_timeout 才炸,流水线把任务判成 failed,本文件所有时序/状态断言全部错位。
+    跟 test_pause_resume_hardening 同样手法把 SessionLocal 换成替身工厂;替身的
+    get(Task, id) 返回本用例正在断言的 task,轮内写(plan 落库/中断标志)才落在
+    同一个对象上。_round_session 本体不改,退出时的 close() 由 MagicMock 自接。
+    """
+    def _fake_session():
+        round_db = MagicMock(name="round_db")
+        round_db.get.side_effect = lambda model, pk, *a, **k: _task_for(pk)
+        return round_db
+
+    monkeypatch.setattr(orchestrator, "SessionLocal", _fake_session)
 
 
 def _mk_task():
@@ -46,7 +92,7 @@ def _mk_task():
     task.allowed_skills = None
     task.executor = "builtin"
     task.review_status = None
-    return task
+    return _register_task(task)
 
 
 def _mk_review_result(**overrides):
@@ -439,6 +485,10 @@ def test_resume_wrapper_fallback_clears_scope(monkeypatch):
     db = MagicMock()
     db.get = lambda *a, **k: task
     monkeypatch.setattr(orchestrator, "SessionLocal", lambda: db)
+    # 终态兜底走 app.database.persist_task_failure_fresh 的全新独立会话(87bebcc):
+    # 它从 app.database 命名空间取 SessionLocal,只换 orchestrator 里的同名引用拦不到,
+    # 不补这一刀会真连库等到 connect_timeout,任务留在 RUNNING。
+    monkeypatch.setattr(app_database, "SessionLocal", lambda: db)
 
     def _raise(task, db, message, **kwargs):
         raise RuntimeError("前置段崩溃")

@@ -6,7 +6,9 @@ LLM 工具描述(只读核查 / verify / check_reference)。
 """
 from typing import Any
 
-from app.prompts.practice import EXPLANATION_FORMAT_CONTRACT
+# 本模块零 app.* 依赖(含 prompts 包内互相 import):格式契约等跨模块正文
+# 由装配方注入(见 app/agents/agent2.py 的 _SUBMIT_TOOLS),守卫见
+# tests/test_prompts_purity.py。
 
 # ============================================================
 # agent2 的只读核查工具定义(工作区可用时启用,repo_path 由后端注入)
@@ -348,6 +350,14 @@ _SUBMIT_REVIEW_ITEM_TOOL: dict[str, Any] = {
     },
 }
 
+# 知识点 content 参数描述模板:{explanation_contract} 由装配方填成练习侧
+# app.prompts.practice.EXPLANATION_FORMAT_CONTRACT(任务侧 content 会被出题收尾直接
+# 采用为看板讲解,两侧必须同一结构)——文本层不跨模块取常量,故留占位符。
+KNOWLEDGE_CONTENT_DESCRIPTION_TEMPLATE = (
+    "知识点讲解正文(大白话;这段正文会被直接采用为练习看板的知识点讲解,"
+    "按以下格式契约输出:{explanation_contract})"
+)
+
 _SUBMIT_KNOWLEDGE_POINT_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -361,10 +371,7 @@ _SUBMIT_KNOWLEDGE_POINT_TOOL: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "一句话知识点"},
-                "content": {"type": "string", "description": (
-                    "知识点讲解正文(大白话;这段正文会被直接采用为练习看板的知识点讲解,"
-                    "按以下格式契约输出:" + EXPLANATION_FORMAT_CONTRACT + ")"
-                )},
+                "content": {"type": "string", "description": KNOWLEDGE_CONTENT_DESCRIPTION_TEMPLATE},
                 "learning_note": {"type": "string", "description": "为什么值得学/记住(必有)"},
                 "practice_worthy": {"type": "boolean", "description": "是否有出题价值(默认 true)"},
                 "source_review_item_id": {"type": "string", "description": "派生它的审查项 id(可选)"},

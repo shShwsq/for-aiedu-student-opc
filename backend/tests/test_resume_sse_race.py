@@ -24,6 +24,7 @@ import app.models.task_artifact  # noqa: F401
 import app.models.user_git_binding  # noqa: F401
 
 import app.agents.orchestrator as orchestrator
+import app.database as app_database
 import app.event_bus as event_bus
 import app.routers.tasks as tasks_module
 from app.models.task import TaskStatus
@@ -292,6 +293,10 @@ def _mk_background_crash_env(monkeypatch, module, main_fn_name):
     db = MagicMock()
     db.get.return_value = task
     monkeypatch.setattr(module, "SessionLocal", lambda: db)
+    # 终态兜底走 app.database.persist_task_failure_fresh 的全新独立会话(87bebcc):
+    # 它从 app.database 命名空间取 SessionLocal,只换上面那个模块里的同名引用拦不到,
+    # 不补这一刀会真连库等到 connect_timeout,任务留在 RUNNING。
+    monkeypatch.setattr(app_database, "SessionLocal", lambda: db)
     monkeypatch.setattr(module, main_fn_name, lambda *a, **k: (_ for _ in ()).throw(RuntimeError("早期崩溃")))
     monkeypatch.setattr(module, "clear_pause_state", lambda *a, **k: None)
     events = []
