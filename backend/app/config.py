@@ -92,41 +92,32 @@ class Settings(BaseSettings):
     # 防两个 job 各自 4 并行把厂商配额扫光
     PRACTICE_PROVIDER_MAX_CONCURRENCY: int = 4
 
-    # ---- 内置 react_agent 分面并行(读阶段并发 / 写阶段主线程串行) ----
-    # 把内置执行器从单条串行 ReAct 循环升级为"按 code_review 分面扇出 N 条
-    # 有界只读 ReAct 子循环 → 主线程串行 fan-in 落库/汇总"。复用出题侧
-    # 已验证的 provider 闸门 + ThreadPoolExecutor 形状,但 worker 不碰共享
+    # ---- 内置 react_agent 分面按需派发(主循环内工具驱动扇出) ----
+    # 执行器通过 dispatch_review_facets 工具**按需**把审查分面扇出成 N 条有界只读
+    # ReAct 子循环 → 主线程串行 fan-in 落库 → 各面结论作为 tool_result 回灌主循环
+    # 继续集成。派发决策由模型自己做(先理解任务再决定派哪些面),而非编排器在
+    # 循环开始前无差别全量扇出 —— 轻量输入("hi?")不再为 7 个分面付 14 发 LLM 调用。
+    # 复用出题侧已验证的 provider 闸门 + ThreadPoolExecutor 形状,worker 不碰共享
     # session/publish(只跑 LLM + 只读工具 + 内存缓冲),fan-in 在主线程逐条做。
     # 真优势:子智能体带原生身份(ACP 侧不带身份导致并行 chunk 交织乱码)。
-    # 默认开;仍受分面阈值(MIN_FACETS)/并发闸门(PROVIDER_MAX_CONCURRENCY)/
-    # 追问轮守卫约束。配额吃紧时运维可在 .env 显式置 False 回退串行。
-    REACT_PARALLEL_ENABLED: bool = True
-    # 分面扇出线程数上限(实际取 min(本项, 可见分面数))
+    # 默认开;关闭 = 不注册派发工具(纯串行主循环,而非回退全量扇出)。
+    REACT_FACET_DISPATCH_ENABLED: bool = True
+    # 分面扇出线程数上限(实际取 min(本项, 本次派发分面数))
     REACT_PARALLEL_MAX_CONCURRENCY: int = 4
-    # 可见分面数低于此阈值走原串行路径(小仓库并行反而亏:每子循环 bootstrap
-    # + 上下文复制成本高于串行收益)
-    REACT_PARALLEL_MIN_FACETS: int = 3
+    # 注册派发工具所需的最低可见技能数(低于此数不出现该工具:单维度任务模型自己
+    # 用只读工具查即可,扇出的 bootstrap + 上下文复制成本高于串行收益)
+    REACT_FACET_DISPATCH_MIN_FACETS: int = 2
+    # 单次派发可调用的分面上限(0/留空 = 不额外限制,取可见技能总数)
+    REACT_FACET_DISPATCH_MAX_FACETS: int = 0
+    # 单轮(一次 run_react_agent)内派发调用次数上限:对标 Codex "同一未决线程
+    # 避免重复派发",防反复扇出烧配额;超限直接报错让模型基于已有结论集成。
+    REACT_FACET_DISPATCH_MAX_CALLS: int = 1
     # 单个分面子循环的最大迭代次数(有界,防止某一分面跑飞拖垮整轮)
     REACT_FACET_MAX_ITERATIONS: int = 12
     # 单个分面子循环的墙钟预算(秒):循环每次迭代边界与收 chunk 时协作式检查,
     # 超时则转入本分面总结收尾(部分结论)并隔离,不拖垮 fan-in 整轮
     REACT_FACET_TIMEOUT_SECONDS: int = 240
-    # ---- fan-in 之后的"合成回合"(默认开) ----
-    # 开:分面扇出/扇入完成后不直接收尾,而是把各面结论按"每面一条 system
-    # 注入消息"回灌 messages,继续跑既有串行主循环 —— 父模型得以针对单面追问、
-    # 补只读核查、落产物。
-    # 此刻只有主线程一个执行体在跑,不存在"并发写共享工作区"的问题,因此串行
-    # 循环的全量工具(run_command / write_file 等)天然可用,无需改分面侧的只读
-    # 黑名单 _FACET_MUTATING_TOOLS(分面期仍严格只读)。危险命令仍由
-    # _classify_command + command_confirm_mode 按原有口径把关。
-    # 代价要说清:命中并行的那一轮多出最多 REACT_SYNTHESIS_MAX_ITERATIONS 次
-    # LLM 调用(各面证据已在上下文,常态是一两次就收尾)。配额吃紧或想回到
-    # 改造前的"fan-in 拼接串即终态"时,在 .env 显式置 False。
-    REACT_PARALLEL_SYNTHESIS_ENABLED: bool = True
-    # 合成回合的迭代上限(不复用主循环的 MAX_ITERATIONS=30):各面结论已就位,
-    # 父回合只做集成/补缺,给小预算即可,防止在已完成的证据上反复打转。
-    REACT_SYNTHESIS_MAX_ITERATIONS: int = 8
-    # 单个分面结论注入前的 token 上限(CJK 感知粗估,见 _clip_to_tokens)。
+    # 单个分面结论回灌 tool_result 前的 token 上限(CJK 感知粗估,见 _clip_to_tokens)。
     # 借鉴 codex 对子 agent 回灌消息设上限的做法:并行放大的是"份数",
     # 每份必须有界,否则父上下文会被 N 份长结论撑爆。
     REACT_FACET_SUMMARY_MAX_TOKENS: int = 3000
@@ -225,7 +216,7 @@ class Settings(BaseSettings):
     # 计划项扇出线程数上限(实际取 min(本项, 合格计划项数))
     AGENT2_PARALLEL_MAX_CONCURRENCY: int = 4
     # 合格计划项低于此阈值走原串行路径(项少时并行 bootstrap + 上下文
-    # 复制成本高于串行收益,同 REACT_PARALLEL_MIN_FACETS 的理由)
+    # 复制成本高于串行收益,同 REACT_FACET_DISPATCH_MIN_FACETS 的理由)
     AGENT2_PARALLEL_MIN_ITEMS: int = 3
     # 单个计划项子循环的最大迭代次数(有界,防止某一项跑飞拖垮整轮 fan-in)
     AGENT2_PLAN_ITEM_MAX_ITERATIONS: int = 8

@@ -378,26 +378,29 @@ def run_react_agent(
 "run_command":     ["执行", "运行", "跑", "测试", "构建", "build", "test", "run", "shell"],
 ```
 
-### 3.7 分面并行与合成回合
+### 3.7 分面按需派发(工具驱动扇出)
 
-首轮(非追问轮)的 ReAct 循环可以按 skill 分面扇出为多个只读子循环并发核查，结构分三层：
+ReAct 主循环可按 skill 分面扇出为多个只读子循环并发核查。**派发时机由模型自己定**(对齐 Codex 主 agent `spawn_agent` 按需派发),而非编排器在循环前无差别全量扇出——轻量输入("hi?")不再为 7 个分面付 14 发 LLM 调用。达标时主循环注册 `dispatch_review_facets` 工具,模型先理解任务、自行决定派发哪些分面(或全部、或不派),派发结果作为 `tool_result` 回灌主循环继续集成。结构分三层:
 
 | 层 | 执行体 | 工具集 | 落库 |
 |----|--------|--------|------|
-| ① 分面扇出 | `ThreadPoolExecutor`，每面一条有界只读子循环(`_run_facet_pass`) | `_facet_readonly_tools` 剔除 `_FACET_MUTATING_TOOLS`(clone_repo / write_file / run_python_code / run_command / str_replace_editor)，执行层再按 `allowed_names` 硬拒一道 | 只进内存缓冲 `pending_rows`，worker 不碰共享 db session / publish / current_plan |
-| ② fan-in | 主线程串行(`_fan_in`) | 无 | 逐条落库带 `extra_payload={"facet":…, "parallel":True}` + 透传 `stream_conv_id`(前端分面分桶与实时卡退役依赖它)，并拼出小标题式的汇总串 |
-| ③ 合成回合 | 主线程跑既有串行主循环(`REACT_PARALLEL_SYNTHESIS_ENABLED`，默认开) | 全量 `get_all_tools()`(含 run_command / write_file) | 普通主循环行，无 facet 标签 |
+| ① 分面扇出 | `_dispatch_facets` 内 `ThreadPoolExecutor`,每面一条有界只读子循环(`_run_facet_pass`) | `_facet_readonly_tools` 剔除 `_FACET_MUTATING_TOOLS`(clone_repo / write_file / run_python_code / run_command / str_replace_editor),执行层再按 `allowed_names` 硬拒一道;`dispatch_review_facets` 本身不在只读白名单里,分面无法再派发(结构性保证派生深度=1) | 只进内存缓冲 `pending_rows`,worker 不碰共享 db session / publish / current_plan |
+| ② fan-in | 主线程串行(`_fan_in`) | 无 | 逐条落库带 `extra_payload={"facet":…, "parallel":True}` + 透传 `stream_conv_id`(前端分面分桶与实时卡退役依赖它),并拼出小标题式的汇总串 |
+| ③ 回灌集成 | fan-in 后各面结论组装成 `tool_result` 回灌 `messages`,主循环自然继续(无独立合成回合) | 主循环全量 `get_all_tools()`(含 run_command / write_file) | 普通主循环行,无 facet 标签 |
 
-门控(`_parallel_gate`)：开关关 / `round_idx>1`(追问轮) / 分面数 < `REACT_PARALLEL_MIN_FACETS` → 返回 None，串行原路径逐字节不变。
+注册门控(`_facet_dispatch_names`):`REACT_FACET_DISPATCH_ENABLED` 关 / 可见技能数 < `REACT_FACET_DISPATCH_MIN_FACETS`(下界固定 2) → 返回空列表 = 不注册工具(纯串行主循环)。不再区分追问轮——`dispatch_review_facets` 在追问轮同样可用(是否派发交给模型)。
 
-**合成回合**(对齐 Codex 的子 agent 结果回灌，见 `core/src/agent/control/completion.rs` 与 `session_prefix.rs` 的 `COMPLETION_MESSAGE_MAX_TOKENS`)：
+**派发纪律与参数**(对齐 Codex 把纪律写进 `spawn_agent` 描述,见 `multi_agents_spec.rs`):
 
-- fan-in 后不再直接收尾，而是把各面结论经 `build_facet_result_messages`(prompts/executor.py，纯函数)装配成【首一条行动指引 + 每面一条独立信封】注入 `messages`，继续跑主循环；信封以 `[系统注入|分面结论|<facet>]` 开头，故意用 `role=system` 而非 `user`(区分“用户原话”与“系统注入”，防间接注入面把结论当指令)
-- 单面结论注入前按 `REACT_FACET_SUMMARY_MAX_TOKENS`(默认 3000，CJK 感知粗估，`_clip_to_tokens`)截断：并行放大的是“份数”，每份必须有界，否则父上下文被 N 份长结论撑爆。分面的工具调用细节只进数据库，不进 `messages`
-- 迭代上限用 `REACT_SYNTHESIS_MAX_ITERATIONS`(默认 8)而非 `MAX_ITERATIONS=30`；跑满同样走 `MAX_ITERATION_PROMPT` 总结分支。合成回合没产出自然语言时，`summary` 兜底为 fan-in 拼接串(与改造前出口等价，不退化成“执行完成”)
-- **为何并行期之后放开写工具是安全的**：此刻只有一个主线程在跑，不存在并发写共享工作区的问题，因此不改分面侧只读黑名单即可拿到写能力；危险命令仍由 `_classify_command` + `command_confirm_mode` 按原有口径把关。这一改动顺带解开了“首轮全程无 shell”这道门：二进制文档(docx/pdf)提取成文本后再 `read_file` 的路径在同一个回合里就能走通(提取工具本身另案：镜像预装 CLI + `read_documents` skill)
+- 工具描述模板 `DISPATCH_FACETS_TOOL_DESCRIPTION_TEMPLATE`(prompts/executor.py,纯函数)含"适合/不适合/先计划后派发/一次任务通常只派 1 次/派发后集成不重跑"文案;`{facet_names}` 占位符由调用侧按当前可见技能名动态填(`_build_facet_dispatch_tool`),模型只能从这些名字里选,写错直接报错。
+- 参数 `facets`(必填,分面名数组)+ `focus`(可选,主 agent 给定的共享审查重点/已知上下文,各分面共享,对标 `spawn_agent` 的 `message`)。`focus` 经 `build_facet_instruction` 并入分面 system 指令层,入参前按 `FACET_FOCUS_MAX_CHARS`(默认 2000)截断。
+- `_dispatch_facets` 校验:空列表 / 未知分面 / 超 `REACT_FACET_DISPATCH_MAX_FACETS`(默认 0=不限)→ 抛 `ValueError`,由主循环特判当工具失败回灌;请求分面去重保序后按可见分面对象保留原始 skill 对象(需 `body` 进指令层)。
+- 单轮派发调用次数上限 `REACT_FACET_DISPATCH_MAX_CALLS`(默认 1):超限直接报错"请基于已有分面结论集成,不要重复派发",对标 Codex"同一未决线程避免重复派发"。
+- 单面结论回灌 `tool_result` 前按 `REACT_FACET_SUMMARY_MAX_TOKENS`(默认 3000,`_clip_to_tokens` CJK 感知粗估)截断,`status`(ok / error / timed_out)与错误措辞保留在回灌 payload 里,供模型如实汇报哪些维度未覆盖。
 
-已知代价与限制(接受的设计取舍)：合成回合默认开，命中并行的那一轮多出最多 `REACT_SYNTHESIS_MAX_ITERATIONS`(8)次 LLM 调用——各面证据已回灌，常态一两次就收尾；配额吃紧时在 `.env` 显式置 `REACT_PARALLEL_SYNTHESIS_ENABLED=false` 回到“fan-in 拼接串即终态”的旧行为。合成回合不设独立墙钟 deadline(串行主循环一贯如此，只靠迭代上限与协作式暂停检查点)；信封不落库，跨轮追问(`round_idx>1` 走串行)时父模型看不到上一轮的分面信封(分面的 thinking/tool 行已按 facet 标签落库，将来可作重建数据源)；`recent_calls` 在合成回合从零开始，父模型可能重复分面已做的调用，靠既有的连续/交替循环检测兜底。
+**为何回灌后主循环拿得到写工具是安全的**:派发是同步"扇出—等待—回灌",fan-in 之后此刻只有一个主线程在跑,不存在并发写共享工作区的问题,因此不改分面侧只读黑名单即可拿到写能力;危险命令仍由 `_classify_command` + `command_confirm_mode` 按原有口径把关。
+
+已知代价与限制(接受的设计取舍):分面子循环的 thinking/tool 行按 facet 标签落库(实时流式),但工具调用细节不进主循环 `messages`(只回灌结论),避免 N 面长上下文撑爆父线程;`focus` 是主 agent 已积累任务理解的摘要,过长会把每份分面子循环的上下文都撑胖,故入指令层前截断。
 
 ### 3.8 返回值
 

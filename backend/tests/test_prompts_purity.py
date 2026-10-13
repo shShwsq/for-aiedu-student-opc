@@ -73,27 +73,34 @@ def test_build_facet_instruction_is_pure_and_tool_neutral():
     assert executor.build_facet_instruction("", "").strip()
 
 
-def test_build_facet_result_messages_shape():
-    """合成回合回灌装配:纯函数、system 角色、空入参不注入行动指引。"""
+def test_build_facet_instruction_injects_shared_focus():
+    """focus 非空时并入指令层(主 agent 给定的共享审查重点);空则不注入该段。"""
     from app.prompts import executor
 
-    msgs = executor.build_facet_result_messages([
-        ("check_sqli", "ok", "结论正文"),
-        ("check_dep", "error", "provider 500"),
-        ("check_secret", "timed_out", "部分结论"),
-    ])
-    # 首条行动指引 + 每面一条独立信封
-    assert len(msgs) == 4
-    assert all(m["role"] == "system" for m in msgs)
-    assert all(m["content"].startswith(executor.SYSTEM_INJECT_MARKER) for m in msgs)
-    assert msgs[1]["content"].startswith(
-        f"{executor.SYSTEM_INJECT_MARKER}分面结论|check_sqli]"
+    with_focus = executor.build_facet_instruction(
+        "check_ssrf", "body", "重点核对鉴权与注入"
     )
-    assert "结论正文" in msgs[1]["content"]
-    assert "该分面审查失败" in msgs[2]["content"]
-    assert "已超时收尾" in msgs[3]["content"]
-    # 指引里明示可以解禁写工具(与分面只读指令相反方向,两处措辞不能写歪)
-    assert "run_command" in msgs[0]["content"]
-    assert executor.build_facet_result_messages([]) == []
-    # 空字段不抛
-    assert executor.build_facet_result_messages([("", "ok", "")])[1]["content"]
+    assert "本次审查重点" in with_focus
+    assert "重点核对鉴权与注入" in with_focus
+    # 空 focus 不出现重点段
+    without_focus = executor.build_facet_instruction("check_ssrf", "body", "")
+    assert "本次审查重点" not in without_focus
+    # 超长 focus 按 FACET_FOCUS_MAX_CHARS 截断,不把子循环上下文撑胖
+    long_focus = "点" * (executor.FACET_FOCUS_MAX_CHARS + 500)
+    clipped = executor.build_facet_instruction("f", "b", long_focus)
+    assert len(clipped) < len(long_focus)
+
+
+def test_dispatch_facets_tool_description_is_disciplined():
+    """派发工具描述模板:含纪律文案与 {facet_names} 占位符,纯函数零依赖。"""
+    from app.prompts import executor
+
+    tmpl = executor.DISPATCH_FACETS_TOOL_DESCRIPTION_TEMPLATE
+    assert "{facet_names}" in tmpl
+    # 纪律核心措辞(与 system prompt 派发段同一口径)
+    assert "按需派发" in tmpl
+    assert "不适合" in tmpl
+    # 填充分面名后不残留占位符
+    filled = tmpl.format(facet_names="check_ssrf, review_concurrency")
+    assert "{facet_names}" not in filled
+    assert "check_ssrf" in filled

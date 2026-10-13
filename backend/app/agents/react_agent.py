@@ -57,6 +57,7 @@ from app.agents.runtime.tool_intent import build_tool_intent as _build_tool_inte
 # 历史压缩 prompt 等)集中管理于 app/prompts/executor.py,本模块只留执行逻辑
 from app.prompts.executor import (
     ATTACHMENT_UNAVAILABLE_NOTE,
+    DISPATCH_FACETS_TOOL_DESCRIPTION_TEMPLATE,
     FOLLOWUP_GUIDANCE,
     HISTORY_COMPRESS_PROMPT,
     LOOP_BREAK_PROMPT,
@@ -65,7 +66,6 @@ from app.prompts.executor import (
     SYSTEM_INJECT_MARKER,
     _has_creation_upload,
     build_facet_instruction,
-    build_facet_result_messages,
     build_first_round_question,
     build_history_compress_segments,
     build_repo_context_section,
@@ -164,6 +164,13 @@ def run_react_agent(
     # 场景降级后:用通用 prompt,工具全部开放(不再按场景过滤)
     system_prompt = REACT_AGENT_SYSTEM_PROMPT
     tools = get_all_tools()
+
+    # 分面按需派发:开关开且可见技能数达标时,注册 dispatch_review_facets 工具
+    # (分面名注入工具描述供模型选面);否则不注册 = 纯串行主循环。
+    # facet_dispatch_names 同时供工具执行分支做分面校验(与描述里列出的同一集)。
+    facet_dispatch_names = _facet_dispatch_names(task)
+    if facet_dispatch_names:
+        tools = tools + [_build_facet_dispatch_tool(facet_dispatch_names)]
 
     # 分项目记忆注入:基于 task.params.repo_url 查 Project.memory_content,
     # 追加到 system prompt 末尾,影响审计方向(优先检查已知问题)。
@@ -323,36 +330,15 @@ def run_react_agent(
                 "steps": current_plan,
             })
 
-    # ---- 分面并行分支(默认开;门控不满足(含追问轮)/显式关闭时
-    #      _maybe_run_parallel 返回 None,下方串行循环完全不变) ----
-    parallel_outcome = _maybe_run_parallel(
-        task, db, round_idx, client, tools, messages,
-        executor_command_confirm,
-    )
-    # 合成回合的迭代上限:常态串行用 MAX_ITERATIONS,回灌后用小预算
-    # (各面证据已就位,父回合只做集成/补缺,不给它 30 次在已完成结论上打转)
+    # ---- 分面按需派发:不再在循环前无条件全量扇出,改由模型在主循环里
+    #      按需调用 dispatch_review_facets 工具(见下方工具执行分支的特判)。
+    #      派发结果作为 tool_result 回灌 messages,集成由模型在后续迭代自然完成。 ----
     loop_limit = MAX_ITERATIONS
-    if parallel_outcome is not None:
-        facet_results, fan_in_summary = parallel_outcome
-        if not getattr(settings, "REACT_PARALLEL_SYNTHESIS_ENABLED", True):
-            # 开关关(显式置 False):保持改造前行为 —— 命中并行即以 fan-in 拼接串
-            # 收尾,下方串行循环整段不执行
-            return [], fan_in_summary, [dict(s) for s in (current_plan or [])]
-        # 开关开:各面结论按"每面一条 system 信封"回灌上下文,继续跑主循环。
-        # 此刻只有主线程一个执行体,tools 是全量定义(含 run_command/write_file),
-        # 无需改分面侧只读黑名单即可拿到写能力(并行期仍严格只读)。
-        # 先把拼接串当作兜底 summary:合成回合没产出自然语言时不至于退化成
-        # "执行完成",本轮仍有可用总结(与改造前出口等价)
-        summary = fan_in_summary
-        result_items = _facet_result_items(facet_results)
-        messages.extend(build_facet_result_messages(result_items))
-        loop_limit = max(
-            1, int(getattr(settings, "REACT_SYNTHESIS_MAX_ITERATIONS", 8) or 8)
-        )
-        logger.info(
-            f"[task={task.id}] 分面并行后进入合成回合:"
-            f"{len(result_items)} 个分面结论已回灌,迭代上限 {loop_limit}"
-        )
+    # 本轮已用派发次数(对标 Codex "避免对同一未决线程重复派发",额度见配置)
+    facet_dispatch_calls = 0
+    facet_dispatch_max_calls = max(
+        0, int(getattr(settings, "REACT_FACET_DISPATCH_MAX_CALLS", 1) or 0)
+    )
 
     for iteration in range(1, loop_limit + 1):
         logger.info(f"[task={task.id}] react_agent 第 {round_idx} 轮 / 迭代 {iteration}")
@@ -562,6 +548,64 @@ def run_react_agent(
                 content=f"{intent}\n{call_detail}",
             )
 
+            # 分面派发工具:循环内特判(需要 db/client/messages 上下文,不走
+            # execute_tool 注册表)。同步派发—等待—回灌:扇出各分面子循环,fan-in
+            # 落库后把各面结论当普通 tool_result 回灌 messages,集成由后续迭代自然完成。
+            if fn_name == "dispatch_review_facets":
+                if facet_dispatch_calls >= facet_dispatch_max_calls:
+                    err_msg = (
+                        f"本轮派发次数已达上限({facet_dispatch_max_calls}),"
+                        "请基于已有分面结论集成,不要重复派发"
+                    )
+                    logger.warning(f"[task={task.id}] {err_msg}")
+                    _add_conversation(
+                        db, task, round_idx=round_idx,
+                        role="agent1", type="tool_result",
+                        content=err_msg, tool_call_id=str(call_conv.id),
+                    )
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc["id"], "content": err_msg,
+                    })
+                    continue
+                facet_dispatch_calls += 1
+                try:
+                    results, fan_in_summary = _dispatch_facets(
+                        task, db, round_idx, client, tools, messages,
+                        executor_command_confirm,
+                        fn_args.get("facets") or [],
+                        str(fn_args.get("focus") or ""),
+                        facet_dispatch_names,
+                    )
+                    result_items = _facet_result_items(results)
+                    payload = {
+                        "facets": [
+                            {"facet": n, "status": s, "summary": t}
+                            for n, s, t in result_items
+                        ],
+                        "summary": fan_in_summary,
+                    }
+                    result_str = json.dumps(payload, ensure_ascii=False, default=str)
+                    _add_conversation(
+                        db, task, round_idx=round_idx,
+                        role="agent1", type="tool_result",
+                        content=result_str, tool_call_id=str(call_conv.id),
+                    )
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc["id"], "content": result_str,
+                    })
+                except Exception as e:
+                    err_msg = f"分面派发失败: {e}"
+                    logger.error(f"[task={task.id}] {err_msg}")
+                    _add_conversation(
+                        db, task, round_idx=round_idx,
+                        role="agent1", type="tool_result",
+                        content=err_msg, tool_call_id=str(call_conv.id),
+                    )
+                    messages.append({
+                        "role": "tool", "tool_call_id": tc["id"], "content": err_msg,
+                    })
+                continue
+
             # 普通工具:执行(submit_results 已移除,react_agent 不再提交结构化结果)
             try:
                 result = execute_tool(fn_name, fn_args)
@@ -677,14 +721,14 @@ def run_react_agent(
 
 
 # ============================================================
-# 分面并行(读阶段并发 / 写阶段主线程串行)
+# 分面按需派发(主循环内工具驱动扇出 / fan-in 主线程串行落库)
 #
 # 形状复用 practice/generator.py 已验证的 provider 闸门 + ThreadPoolExecutor,
 # 但把并行边界收得更紧:worker 只跑 LLM + 只读工具 + 内存缓冲,绝不碰共享
 # db session / publish / current_plan(全在 fan-in 主线程逐条做)。子智能体
 # 带原生身份(facet 标签),规避 ACP 侧不带身份导致的并行 chunk 交织乱码。
-# 默认由 REACT_PARALLEL_ENABLED 开启,门控不满足(开关关/追问轮/分面数不足)时
-# 原串行循环完全不变。
+# 派发时机由模型自己定(在主循环里按需调 dispatch_review_facets 工具),而非
+# 编排器在循环前无差别全量扇出;开关关闭/可见技能数不足时不注册该工具(纯串行)。
 # ============================================================
 
 # 会改动工作区/沙箱物理状态的工具:并行分面一律禁用(共享工作区不可并发写)。
@@ -870,6 +914,7 @@ def _run_facet_pass(
     max_iter: int,
     executor_command_confirm: str,
     deadline: float,
+    focus: str = "",
 ) -> _FacetResult:
     """跑一个分面的有界只读 ReAct 子循环(在 worker 线程执行,全程无共享副作用)。
 
@@ -892,10 +937,11 @@ def _run_facet_pass(
             executor_command_confirm=executor_command_confirm,
         )
         messages: list[dict[str, Any]] = [dict(m) for m in base_messages]
-        # 分面角色/约束作为独立 system 指令层(不污染真实用户问题)
+        # 分面角色/约束作为独立 system 指令层(不污染真实用户问题);focus 为
+        # 主 agent 传来的共享审查重点/已知上下文(并入指令层)
         messages.append({
             "role": "system",
-            "content": build_facet_instruction(facet_name, facet_body),
+            "content": build_facet_instruction(facet_name, facet_body, focus),
         })
 
         recent_calls: list[str] = []
@@ -1031,21 +1077,58 @@ def _resolve_facets(task: Task) -> list[Any]:
     return list(skill_loader.resolve_visible_skills(task.user_id, task.allowed_skills))
 
 
-def _parallel_gate(task: Task, round_idx: int) -> list[Any] | None:
-    """是否走分面并行;返回分面列表或 None(None=走原串行路径)。
+def _facet_dispatch_names(task: Task) -> list[str]:
+    """可派发的分面名列表(决定是否注册 dispatch_review_facets 工具)。
 
-    门控:开关关 / 追问轮(round_idx>1)/ 分面数 < MIN_FACETS → None。追问轮走
-    定向串行作答(不重新全量扇出);小仓库并行 bootstrap 与上下文
-    复制成本高于串行收益,故按分面数阈值降级。
+    返回空列表 = 不注册工具(纯串行):开关关 / 可见技能数 < MIN_FACETS。
+    不再区分追问轮 —— 是否派发交给模型(工具在追问轮同样可用)。
+    小仓库/单技能扇出的 bootstrap 与上下文复制成本高于串行收益,故按分面数阈值降级。
     """
-    if not getattr(settings, "REACT_PARALLEL_ENABLED", False):
-        return None
-    if round_idx > 1:
-        return None
+    if not getattr(settings, "REACT_FACET_DISPATCH_ENABLED", True):
+        return []
     facets = _resolve_facets(task)
-    if len(facets) < max(2, getattr(settings, "REACT_PARALLEL_MIN_FACETS", 3)):
-        return None
-    return facets
+    min_facets = max(2, int(getattr(settings, "REACT_FACET_DISPATCH_MIN_FACETS", 2) or 2))
+    if len(facets) < min_facets:
+        return []
+    return [getattr(f, "name", str(f)) for f in facets]
+
+
+def _build_facet_dispatch_tool(facet_names: list[str]) -> dict[str, Any]:
+    """构造 dispatch_review_facets 的 function-calling 定义。
+
+    分面名动态注入描述与 facets 参数说明(对标 Codex 把角色 description 注入
+    spawn 工具供模型选角色):模型只能从这些名字里选,写错直接报错。
+    本工具不在分面只读白名单里,分面子循环无法再派发(结构性保证派生深度=1)。
+    """
+    names_text = ", ".join(facet_names)
+    from app.prompts.executor import FACET_FOCUS_MAX_CHARS
+    return {
+        "type": "function",
+        "function": {
+            "name": "dispatch_review_facets",
+            "description": DISPATCH_FACETS_TOOL_DESCRIPTION_TEMPLATE.format(
+                facet_names=names_text
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "facets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": f"要派发的分面名列表,取值只能从这些名字里选:{names_text}",
+                    },
+                    "focus": {
+                        "type": "string",
+                        "description": (
+                            f"本次审查的整体重点/已知上下文,各分面共享"
+                            f"(≤ {FACET_FOCUS_MAX_CHARS} 字)"
+                        ),
+                    },
+                },
+                "required": ["facets"],
+            },
+        },
+    }
 
 
 def _fan_in(
@@ -1116,7 +1199,7 @@ def _facet_result_items(results: list["_FacetResult"]) -> list[tuple[str, str, s
     return items
 
 
-def _maybe_run_parallel(
+def _dispatch_facets(
     task: Task,
     db: Session,
     round_idx: int,
@@ -1124,27 +1207,57 @@ def _maybe_run_parallel(
     tools: list[dict[str, Any]],
     messages: list[dict[str, Any]],
     executor_command_confirm: str,
-) -> "tuple[list[_FacetResult], str] | None":
-    """门控 + 扇出/扇入。命中并行返回 (分面结果列表, fan-in 拼接串);
-    否则返回 None(调用方继续走原串行循环)。
+    requested_facets: list[str],
+    focus: str,
+    available_names: list[str],
+) -> "tuple[list[_FacetResult], str]":
+    """工具驱动的扇出/扇入(同步派发—等待—回灌)。
 
-    本函数不再返回 plan,也不直接充当本轮出口:分面仍不改 plan(Phase 1 只读
-    分析),但 plan 推进与 <plan> 合并由调用方的主循环负责 —— 合成回合就跑在
-    那里,分面不改 / 父回合可改是刻意的分层。"""
-    facets = _parallel_gate(task, round_idx)
-    if not facets:
-        return None
+    与旧前置全量扇出的差异:分面列表来自工具参数(而非 _resolve_facets 全集);
+    messages 基底 = 主循环当前 messages(模型已积累的任务理解随派发传递);
+    focus 并入分面 system 指令层。扇出主体(_run_facet_pass 的 deadline/厂商闸门/
+    只读白名单/收尾宽限、wait_if_paused 检查点、fan-in 落库)全部原样保留。
+
+    返回 (分面结果列表, fan-in 拼接串);调用方把结果组装成 tool_result 回灌。
+    校验失败(空列表/未知分面/超分面数上限)抛 ValueError,由调用方当工具失败处理。
+    """
+    names = [
+        (n or "").strip() for n in (requested_facets or [])
+    ]
+    # 去重保序
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            ordered.append(n)
+    if not ordered:
+        raise ValueError("facets 不能为空")
+    unknown = [n for n in ordered if n not in available_names]
+    if unknown:
+        raise ValueError(
+            f"未知分面: {unknown};可用分面: {available_names}"
+        )
+    max_facets = int(getattr(settings, "REACT_FACET_DISPATCH_MAX_FACETS", 0) or 0)
+    if max_facets and len(ordered) > max_facets:
+        raise ValueError(f"单次派发分面数超过上限 {max_facets}")
+
+    # 按可见分面对象保留原始 skill 对象(需 body 进指令层)
+    by_name = {
+        getattr(f, "name", str(f)): f for f in _resolve_facets(task)
+    }
+    facet_objs = [by_name[n] for n in ordered]
 
     facet_tools = _facet_readonly_tools(tools)
     allowed_names = _facet_allowed_tool_names(facet_tools)
-    max_workers = min(len(facets), max(1, settings.REACT_PARALLEL_MAX_CONCURRENCY))
+    max_workers = min(len(facet_objs), max(1, settings.REACT_PARALLEL_MAX_CONCURRENCY))
     max_iter = max(1, settings.REACT_FACET_MAX_ITERATIONS)
-    # 统一算一次扇出基准 deadline(墙钟预算),贯穿所有分面
+    # 统一算一次扇出基准 deadline(墙钟预算),贯穿本次派发的所有分面
     deadline = time.monotonic() + max(1, settings.REACT_FACET_TIMEOUT_SECONDS)
 
     logger.info(
-        f"[task={task.id}] react_agent 分面并行启动:{len(facets)} 分面,"
-        f"max_workers={max_workers},max_iter/面={max_iter},"
+        f"[task={task.id}] react_agent 按需派发 {len(facet_objs)} 分面:"
+        f"{ordered},max_workers={max_workers},max_iter/面={max_iter},"
         f"timeout/面={settings.REACT_FACET_TIMEOUT_SECONDS}s"
     )
     # 扇出前暂停检查点(长工具链中也能及时响应暂停)
@@ -1160,9 +1273,9 @@ def _maybe_run_parallel(
             pool.submit(
                 _run_facet_pass, f, messages, facet_tools, allowed_names,
                 client, task, round_idx, max_iter, executor_command_confirm,
-                deadline,
+                deadline, focus,
             )
-            for f in facets
+            for f in facet_objs
         ]
         for fut in futures:
             results.append(fut.result())
@@ -1170,8 +1283,6 @@ def _maybe_run_parallel(
     fan_in_summary = _fan_in(task, db, round_idx, results)
     # fan-in 后再检查一次暂停
     wait_if_paused(task.id, db)
-    # 不在此收尾:把结果与拼接串交回调用方,由其决定直接返回(开关关)
-    # 还是回灌上下文继续跑主循环(开关开)
     return results, fan_in_summary
 
 

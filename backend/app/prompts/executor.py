@@ -67,7 +67,8 @@ REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(AI助手),负责执行实际�
 2. **行动**:调用工具(clone_repo / list_files / find_files / read_file /
    search_code / run_semgrep / query_cve / list_dependencies / write_file /
    run_python_code / git_log / git_blame / git_diff / run_command / run_lint /
-   run_coverage / str_replace_editor / list_skills / skill 等)
+   run_coverage / str_replace_editor / list_skills / skill,以及按需派发的
+   dispatch_review_facets 等)
 3. **观察**:查看工具返回的结果
 4. 重复以上步骤,直到完成分析
 
@@ -79,7 +80,7 @@ REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(AI助手),负责执行实际�
 - search_code:正则搜索代码,支持 content/files_with_matches/count 三种输出模式
 - run_semgrep:运行 Semgrep 静态分析(local 模式需宿主机已装 semgrep,sandbox 模式自动安装)
 - query_cve:查询指定包+版本的已知 CVE 漏洞(OSV API,按依赖逐个查)
-- list_dependencies:扫描仓库清单文件返回结构化依赖清单(依赖审计先调它,再逐个 query_cve)
+- list_dependencies:扫描仓库清单文件返回结构化依赖清单(依赖审计先调它拿清单,再逐个 query_cve)
 - write_file:在工作区写产物(PoC 脚本、报告等);改仓库代码用 str_replace_editor
 - run_python_code:在沙箱执行 Python 代码,验证 PoC / 跑分析脚本 / 执行测试
 - run_command:在沙箱执行任意 shell 命令(构建/测试/脚本,如 pytest、npm test),与 CLI 的 bash 对齐
@@ -90,6 +91,8 @@ REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(AI助手),负责执行实际�
 - git_blame:追溯某文件每行的最后修改提交/作者,定位"这行是谁/哪次提交改的"(需完整克隆)
 - git_diff:查看两个 ref 间的结构化 diff(增量审查;默认最近一次提交,大区间先用 stat_only 总览)
 - list_skills / skill:查看并加载专家技能(获取 SKILL.md 指令后按其指引执行)
+- dispatch_review_facets(仅在存在多个可用技能时出现):按需派发并行只读审查
+  分面,调用会等待全部分面完成后返回各面结论(详见下方"分面按需派发")
 
 ## 工作原则
 - **自适应任务类型**:根据用户意图判断任务性质(安全审计/代码审查/质量分析/
@@ -100,6 +103,19 @@ REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(AI助手),负责执行实际�
 - **高效执行**:优先用 search_code 定位关键代码,再 read_file 确认细节,
   避免盲目遍历所有文件。
 - **计划性**:复杂任务先输出 <plan> 步骤清单,逐步推进。
+
+## 分面按需派发(仅当工具列表里有 dispatch_review_facets 时适用)
+并行审查分面 = 每个技能一条独立的只读核查子循环,由你按需派发。
+**先计划后派发**:先看清任务与仓库结构,列出需要核查的维度和关键路径;
+只把互不依赖的独立核查维度交给分面,关键路径(定性判断、跨面交叉验证、
+产物输出)自己做。
+**何时派**:全量/多维度审计 → 一次派发全部相关分面;多维度定向核查 →
+只派相关分面。一次任务通常只派发 1 次。
+**何时不派**:单一具体问题(自己用 read_file / search_code 查)、纯对话或
+澄清(直接回答)、结论已在手(不重复派发)。
+**派发后**:基于各面结论集成、补缺、交叉验证,不重跑已完成的分面;
+某面失败或超时时,先判断能否自行补查,再如实汇报哪些维度未覆盖。
+派发调用会等待全部分面完成才返回,返回的就是各面的结论(含失败/超时状态)。
 
 ## 计划格式(可选,复杂任务建议)
 在思考内容中输出 <plan> 标签包裹的计划:
@@ -644,77 +660,53 @@ MAX_ITERATION_PROMPT = (
 )
 
 
-def build_facet_instruction(facet_name: str, facet_body: str) -> str:
+def build_facet_instruction(
+    facet_name: str, facet_body: str, focus: str = "",
+) -> str:
     """构造单个分面的只读核查指令(作为分面子循环的独立 system 指令层,不落库不展示)。
 
-    背景:内置 react_agent 分面并行时,每个分面跑一条有界只读 ReAct 子循环。
+    背景:按需派发时,每个分面跑一条有界只读 ReAct 子循环。
     借鉴 codex 的 subagent_developer_instructions 将子 agent 的角色/约束作为独立
     指令层而非塞进 user 消息 —— 不污染真实用户问题,且便于集中管理/去重。
+
+    focus:主 agent 传来的本次审查整体重点/已知上下文(各分面共享,
+    对标 Codex spawn_agent 的 message 参数)。空则不注入该段。
     本函数零 app.* 依赖(见 tests/test_prompts_purity.py),措辞工具中立。
     """
+    focus_text = (focus or "").strip()[:FACET_FOCUS_MAX_CHARS]
+    focus_section = (
+        f"\n[本次审查重点(主 agent 给定,各分面共享)]\n{focus_text}\n" if focus_text else ""
+    )
     return (
         f"[审查分面:{(facet_name or '').strip()}]\n"
         "本轮只针对该分面深入核查,不要覆盖其他维度:\n"
         f"{(facet_body or '').strip()}\n"
+        f"{focus_section}"
         "只使用只读工具(list_files/read_file/search_code/find_files/"
         "run_semgrep/run_lint/git_*/query_cve/list_dependencies 等),"
         "定位到具体文件:行号后给出该分面的完整结论(证据+修复建议)。"
     )
 
 
-# 合成回合的行动指引(整批只附一份,不逐面重复):各面结论已就位,父回合的职责
-# 是集成而非重做。措辞集中在这一处,便于后续调参。
-FACET_SYNTHESIS_GUIDANCE = (
-    "上一阶段已完成分面并行核查,以下是各分面的结论(逐条独立注入)。\n"
-    "请在此基础上继续本轮工作:\n"
-    "- 只做集成、补缺与落产物,不要重跑各分面已完成的核查(证据已在结论里)\n"
-    "- 需要交叉验证或针对某一面追问时,再调用只读工具\n"
-    "- 现在可以使用写类工具:需要执行命令或产出文件(如把二进制文档提取成"
-    "文本后再 read_file),直接用 run_command / write_file\n"
-    "完成后给出本轮的总结(自然语言,无需 JSON)。"
+# focus 入指令层前的字符上限:它是主 agent 已积累的任务理解摘要,过长会把
+# 每份分面子循环的上下文都撑胖(工具定义侧同步告知模型该约束)
+FACET_FOCUS_MAX_CHARS = 2000
+
+
+# dispatch_review_facets 工具描述的模板(派发纪律写进工具本体,对标 Codex
+# multi_agents_spec.rs 把纪律放在 spawn_agent 描述里)。{facet_names} 由调用侧
+# 按当前可见技能名填(信息链路已有:list_skills 给 name+description,模型据此选面)。
+# 纪律正文与 system prompt 里的"分面按需派发"段同一口径,两处改动要同步。
+DISPATCH_FACETS_TOOL_DESCRIPTION_TEMPLATE = (
+    "按需派发并行只读审查分面(每个分面 = 一个技能的独立只读核查子循环)。\n"
+    "适合:全量/多维度代码审计(一次派发全部相关分面)、多个独立维度的定向核查。\n"
+    "不适合:单一具体问题(自己用 read_file/search_code 查)、纯对话或澄清"
+    "(直接回答)、结论已在手(不重复派发)。\n"
+    "先形成高层计划再派发:只把互不依赖的独立核查维度交给分面,关键路径自己做。\n"
+    "一次任务通常只派发 1 次;调用会等待全部分面完成后返回各面结论"
+    "(含失败/超时状态),拿到后请集成与交叉验证,不要重跑已完成的分面。\n"
+    "可用分面名(取值只能从这里面选):{facet_names}。"
 )
-
-
-def build_facet_result_messages(
-    items: list[tuple[str, str, str]],
-) -> list[dict[str, str]]:
-    """把各分面结论装配成回灌主循环上下文的 system 消息序列。
-
-    背景:分面并行 fan-in 后不再直接收尾,而是把结论喂回主 react 循环(合成回合)。
-    借鉴 codex 的子 agent 结果回灌(带发信方身份的信封 + 每份限量截断),但本仓
-    并行是同进程一次性扇出,不需要 mailbox / 等待原语。
-
-    参数:
-        items: 按分面顺序的 (facet_name, status, summary) 列表;
-            status 取 "ok" / "error" / "timed_out";
-            summary 为已截断的结论文本,status="error" 时传该面的错误信息。
-
-    返回: [{"role": "system", "content": ...}] —— 首条为行动指引,随后每面一条
-    独立信封。刻意用 system 角色而非 user:注入内容不能被模型当成用户原话
-    (见 SYSTEM_INJECT_MARKER 注释)。空输入返回空列表(不注入行动指引)。
-
-    本函数零 app.* 依赖(见 tests/test_prompts_purity.py),只做文本拼装。
-    """
-    if not items:
-        return []
-
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": f"{SYSTEM_INJECT_MARKER}合成回合]\n{FACET_SYNTHESIS_GUIDANCE}"}
-    ]
-    for facet_name, status, summary in items:
-        name = (facet_name or "").strip() or "(未命名分面)"
-        body = (summary or "").strip()
-        if status == "error":
-            text = f"(该分面审查失败:{body or '未知错误'})"
-        elif status == "timed_out":
-            text = f"{body or '(本分面无明确结论)'}\n(部分结论,已超时收尾)"
-        else:
-            text = body or "(本分面无明确结论)"
-        messages.append({
-            "role": "system",
-            "content": f"{SYSTEM_INJECT_MARKER}分面结论|{name}]\n{text}",
-        })
-    return messages
 
 
 # ============================================================

@@ -1437,7 +1437,7 @@ def _plan_item_gate(
     门控:开关关 / 无工作区(只读工具不可用) / 合格项数 < MIN_ITEMS → 空列表。
     合格 = planned_evidence 非 verify(reference 关闭时 reference 项降级为纯
     只读——读档核查仍成立)。项少时并行反而亏(每子循环 bootstrap + 上下文
-    复制成本高于串行收益),同 REACT_PARALLEL_MIN_FACETS 的理由。
+    复制成本高于串行收益),同 REACT_FACET_DISPATCH_MIN_FACETS 的理由。
     """
     from app.config import settings as _s
 

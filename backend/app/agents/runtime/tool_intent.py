@@ -66,6 +66,13 @@ def _b_http_request(a: dict[str, Any]) -> str:
     return f"验证请求: {method} {a.get('path', '/')}"
 
 
+def _b_dispatch_review_facets(a: dict[str, Any]) -> str:
+    facets = [str(f).strip() for f in (a.get("facets") or []) if str(f).strip()]
+    if not facets:
+        return "派发审查分面"
+    return f"派发 {len(facets)} 个审查分面:{'/'.join(facets)}"
+
+
 _TOOL_INTENT_BUILDERS: dict[str, IntentBuilder] = {
     "clone_repo": lambda a: f"克隆仓库 {a.get('repo_url', '?')}",
     "list_files": lambda a: f"查看目录结构: {a.get('subdir') or '根目录'}",
@@ -93,6 +100,8 @@ _TOOL_INTENT_BUILDERS: dict[str, IntentBuilder] = {
     "check_reference": _b_check_reference,
     # verifier 动态验证
     "http_request": _b_http_request,
+    # agent1 分面按需派发
+    "dispatch_review_facets": _b_dispatch_review_facets,
 }
 
 

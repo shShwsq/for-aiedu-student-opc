@@ -663,8 +663,8 @@ def build_agent2_plan_result_messages(
 ) -> list[dict[str, str]]:
     """把各计划项结论装配成回灌主循环上下文的 system 消息序列。
 
-    镜像 executor.build_facet_result_messages:首条行动指引,随后每项一条
-    独立信封(刻意用 system 角色:注入内容不能被当成用户原话)。
+    与 executor.build_facet_instruction 分面只读回灌同思路:首条行动指引,
+    随后每项一条独立信封(刻意用 system 角色:注入内容不能被当成用户原话)。
 
     参数:
         items: 按计划项顺序的 (pid, status, summary) 列表;
