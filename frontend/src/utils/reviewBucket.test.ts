@@ -3,7 +3,6 @@ import {
   bucketizeReviewItems,
   confidenceClass,
   confidenceLabel,
-  formatConfidenceScore,
   isLegacyReviewSummary,
   originLabel,
   pendingVerifyBadge,
@@ -88,7 +87,7 @@ describe('originLabel', () => {
   })
 })
 
-describe('confidenceLabel / confidenceClass / formatConfidenceScore', () => {
+describe('confidenceLabel / confidenceClass', () => {
   it('档位映射与后端 TIER_LABELS 对齐', () => {
     expect(confidenceLabel('verified')).toBe('已动态验证')
     expect(confidenceLabel('source_confirmed')).toBe('源码取证')
@@ -101,11 +100,6 @@ describe('confidenceLabel / confidenceClass / formatConfidenceScore', () => {
     expect(confidenceLabel(null)).toBe('无证据')
     expect(confidenceClass('assertion_only')).toBe('assertion')
     expect(confidenceClass(undefined)).toBe('assertion')
-  })
-
-  it('score 百分比格式化', () => {
-    expect(formatConfidenceScore(0.78)).toBe('78%')
-    expect(formatConfidenceScore(null)).toBe('—')
   })
 })
 

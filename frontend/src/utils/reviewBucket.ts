@@ -78,12 +78,6 @@ export function confidenceClass(tier: ConfidenceTier | undefined | null): string
   return 'assertion'
 }
 
-/** 0-1 score → 百分比字符串;无 → '—' */
-export function formatConfidenceScore(score: number | undefined | null): string {
-  if (score == null || Number.isNaN(score)) return '—'
-  return `${Math.round(score * 100)}%`
-}
-
 /**
  * 审查项的状态徽章:待核实档不显示置信档位(它没有证据,分数无意义),
  * 改显示"为什么还没核实"。

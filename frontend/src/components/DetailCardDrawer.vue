@@ -20,7 +20,6 @@ import { renderMarkdown } from '@/utils/markdown'
 import {
   confidenceClass,
   confidenceLabel,
-  formatConfidenceScore,
   originLabel,
   pendingVerifyBadge,
 } from '@/utils/reviewBucket'
@@ -108,7 +107,6 @@ function renderContent(content: string | null | undefined): string {
             :class="['conf-badge', `conf-${confidenceClass((item as ReviewItem).confidence?.tier)}`]"
           >
             {{ confidenceLabel((item as ReviewItem).confidence?.tier) }}
-            · {{ formatConfidenceScore((item as ReviewItem).confidence?.score) }}
           </span>
           <!-- 知识点:学习点徽标 -->
           <span

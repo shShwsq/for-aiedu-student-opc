@@ -74,7 +74,6 @@ import {
   bucketizeReviewItems,
   confidenceClass,
   confidenceLabel,
-  formatConfidenceScore,
   originLabel,
   pendingVerifyBadge,
   REVIEW_BUCKET_ORDER,
@@ -501,6 +500,8 @@ interface StreamingItem {
   insertSeq: number
   /** 是否为动态验证的思考流(verifier_agent 产生,显示"正在验证"而非"正在思考") */
   verify?: boolean
+  /** 仅内置 react 分面并行有:分面名(多路思考卡据此标注区分) */
+  facet?: string
 }
 
 const streamingItems = reactive<Map<string, StreamingItem>>(new Map())
@@ -962,6 +963,7 @@ function connectSSE(taskId: string): void {
         reasoning: data.reasoning ?? null,
         tool_call_id: data.tool_call_id ?? null,
         attachments: data.attachments ?? null,
+        facet: data.facet ?? null,
         created_at: data.created_at || new Date().toISOString(),
       }
       task.value.conversations.push(conv)
@@ -1147,7 +1149,7 @@ function connectSSE(taskId: string): void {
 // ---- 流式增量处理 ----
 
 function handleThinkingDelta(data: ThinkingDeltaEventData): void {
-  const { conv_id, round_idx, role, phase, delta, verify } = data
+  const { conv_id, round_idx, role, phase, delta, verify, facet } = data
 
   if (phase === 'start') {
     // 创建新的流式项:思考链按生命周期自动展开(过阈值后),完成后折叠
@@ -1168,6 +1170,7 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
       seq: streamingSeqCounter++,
       insertSeq,
       verify,
+      facet,
     })
     return
   }
@@ -1190,6 +1193,7 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
       seq: streamingSeqCounter++,
       insertSeq,
       verify,
+      facet,
     })
   }
 
@@ -2052,6 +2056,7 @@ const roundGroups = computed<RoundGroup[]>(() => {
         reasoning_pin: historyReasoningPins.get(historyConvId) ?? null,
         seq: 0,
         insertSeq: localIdx,
+        facet: c.facet ?? undefined,
       }
       if (!groups.has(c.round_idx)) groups.set(c.round_idx, [])
       groups.get(c.round_idx)!.push({
@@ -2498,7 +2503,7 @@ function reviewBadge(it: ReviewItem): { label: string; cls: string; title?: stri
   const pending = pendingVerifyBadge(it)
   if (pending) return { label: pending.label, cls: 'conf-assertion', title: pending.title }
   return {
-    label: `${confidenceLabel(it.confidence?.tier)} · ${formatConfidenceScore(it.confidence?.score)}`,
+    label: confidenceLabel(it.confidence?.tier),
     cls: `conf-${confidenceClass(it.confidence?.tier)}`,
   }
 }
