@@ -532,6 +532,7 @@ def test_put_defaults_empty_request_is_noop(no_llm):
 # 数据库集成:迁移、旧端点写穿、preferences 投影
 # ============================================================
 
+pytestmark = pytest.mark.db  # 库不可达时由 tests/conftest.py 统一跳过
 TEST_SCHEMA = f"pytest_model_slot_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 _TABLES = (
     "model_slot_defaults", "practice_settings", "memory_settings",

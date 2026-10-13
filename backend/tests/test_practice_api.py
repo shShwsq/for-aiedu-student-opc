@@ -47,6 +47,7 @@ from app.routers import practice as practice_router
 
 # schema 名含 PID + 随机后缀:并发 pytest 进程(多会话/前后台任务)各自
 # 独立建 schema,session 开始的 DROP SCHEMA 不会误删他人正在用的 schema
+pytestmark = pytest.mark.db  # 库不可达时由 tests/conftest.py 统一跳过
 TEST_SCHEMA = f"pytest_practice_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 _TABLES = (
     "practice_attempts", "practice_sessions", "practice_questions",

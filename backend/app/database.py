@@ -11,6 +11,8 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # 连接池配置:阿里云 PostgreSQL 推荐配置
+# connect_args.connect_timeout:握手层硬超时(秒),库不可达时快速失败而非阻塞到
+# OS TCP 超时(60–130s)——那会把 pytest / 服务启动拖成"卡死无输出"。健康库远低于此。
 # connect_args keepalives:让空闲连接在 TCP 层周期性探活,降低被 RDS 读写分离
 # 代理(rwlb)按 idle 超时主动关闭的概率。注:pool_pre_ping / pool_recycle 只在
 # 从池 checkout 时生效,对"已被 session 借出、长时间持有"的连接无效 —— 那种场景
@@ -22,6 +24,7 @@ engine = create_engine(
     max_overflow=10,  # 超出 pool_size 后还能创建的连接数
     pool_recycle=600,  # 连接回收时间(秒);取低于 RDS 代理 idle 阈值的经验值,缩短坏连接驻池
     connect_args={
+        "connect_timeout": max(1, int(settings.DB_CONNECT_TIMEOUT_SECONDS or 5)),
         "keepalives": 1,
         "keepalives_idle": 30,
         "keepalives_interval": 10,

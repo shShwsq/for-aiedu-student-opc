@@ -42,6 +42,7 @@ from app.models.task import Result, Task
 from app.models.user import User
 from app.routers import practice as practice_router
 
+pytestmark = pytest.mark.db  # 库不可达时由 tests/conftest.py 统一跳过
 TEST_SCHEMA = f"pytest_topic_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 _TABLES = (
     "practice_attempts", "practice_sessions", "practice_questions",

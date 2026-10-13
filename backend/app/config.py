@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+psycopg://localhost/secondlook"
     # 显式开启才会 drop_all + create_all 重建表,避免每次启动丢数据
     DB_REBUILD_ON_START: bool = False
+    # 建立数据库连接的最长等待(秒):库不可达时快速失败,而不是阻塞到 OS 层 TCP
+    # 超时(常见 60–130s)把整轮 pytest / 启动拖成"卡死无输出"。健康库连上远小于此
+    # 值(localhost 亚毫秒、远端 RDS 通常 <1s),5s 是宽裕的护栏。测试基建(conftest)
+    # 的同名探测也读这一值,保持口径一致。
+    DB_CONNECT_TIMEOUT_SECONDS: int = 5
 
     # 应用
     APP_ENV: str = "development"

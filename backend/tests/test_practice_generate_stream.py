@@ -44,6 +44,7 @@ from app.services.practice import jobs as gen_jobs
 
 # schema 名含 PID + 随机后缀:并发 pytest 进程各自独立建 schema,
 # session 开始的 DROP SCHEMA 不会误删他人正在用的 schema(同 test_practice_api)
+pytestmark = pytest.mark.db  # 库不可达时由 tests/conftest.py 统一跳过
 TEST_SCHEMA = f"pytest_practice_stream_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 _TABLES = (
     "practice_attempts", "practice_sessions", "practice_questions",

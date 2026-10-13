@@ -48,6 +48,7 @@ from app.routers import auth as auth_router
 from app.routers import git_provider as git_router
 
 # schema 名含 PID + 随机后缀:并发 pytest 进程各自独立建 schema
+pytestmark = pytest.mark.db  # 库不可达时由 tests/conftest.py 统一跳过
 TEST_SCHEMA = f"pytest_git_oauth_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 _TABLES = ("user_git_bindings", "users")
 
