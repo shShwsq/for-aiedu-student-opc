@@ -46,6 +46,8 @@ interface DisplayItem {
 
 const props = defineProps<{
   item: DisplayItem
+  /** 子任务块内隐藏身份标:块标题已承载"子任务 · X",块内思考卡不重复标注 */
+  hideFacetBadge?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -254,9 +256,9 @@ function formatSize(bytes: number): string {
   <div v-if="showCard" class="msg-group">
     <!-- 流式思考项:reasoning 卡片 + content 卡片,两者独立 -->
     <template v-if="item.is_streaming && item.streaming">
-      <!-- 分面并行身份标(多路思考卡据此区分;无 facet 时不渲染) -->
-      <div v-if="item.streaming.facet" class="msg-facet-badge">
-        分面 · {{ item.streaming.facet }}
+      <!-- 子任务并行身份标(多路思考卡据此区分;无 facet 或块内已标身份时不渲染) -->
+      <div v-if="item.streaming.facet && !hideFacetBadge" class="msg-facet-badge">
+        子任务 · {{ item.streaming.facet }}
       </div>
       <!-- reasoning 独立卡片(流式中自动展开,结束后折叠) -->
       <div

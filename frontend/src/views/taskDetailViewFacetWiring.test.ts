@@ -1,5 +1,5 @@
 /**
- * 回归守卫:内置 react 分面并行的前端接线(静态扫描源码)。
+ * 回归守卫:内置 react 子任务并行的前端接线(静态扫描源码)。
  *
  * 视图不挂载测试(约定见 taskDetailViewSuggestionWiring.test.ts),这里钉住
  * "后端加了 facet 字段,前端不接就等于没改"的几处形状:
@@ -8,8 +8,10 @@
  *    实时卡(多路并行天然隔离,不串扰);
  * 2. conversation 落库事件携带 facet → onConversation 把 facet 落到历史卡;
  * 3. 历史卡退役仍走 findRetiredCardConvId(按 stream_conv_id 精确匹配);
- * 4. 思考卡在 facet 存在时渲染"分面 · X"标签,无 facet(串行/老任务)不渲染;
- * 5. 类型契约:ThinkingDeltaEventData / ConversationEventData 均带可选 facet。
+ * 4. 思考卡在 facet 存在且块内未标身份时渲染"子任务 · X"标签,无 facet(串行/老任务)不渲染;
+ * 5. 类型契约:ThinkingDeltaEventData / ConversationEventData 均带可选 facet;
+ * 6. 每个子任务聚合成一个可折叠块:运行中默认展开(正文 max-height 内滚),
+ *    fan-in 落库后整块自动折叠,手动点标题可覆盖自动规则。
  */
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -26,7 +28,7 @@ function sliceFrom(src: string, anchor: string, chars = 2000): string {
   return src.slice(at, at + chars)
 }
 
-describe('分面并行:实时流式按 facet 身份分桶', () => {
+describe('子任务并行:实时流式按 facet 身份分桶', () => {
   it('handleThinkingDelta 解构 facet,并按 conv_id 建卡时写入 facet', () => {
     const fn = sliceFrom(VIEW, 'function handleThinkingDelta(')
     expect(fn).toContain('const { conv_id, round_idx, role, phase, delta, verify, facet } = data')
@@ -46,20 +48,73 @@ describe('分面并行:实时流式按 facet 身份分桶', () => {
   })
 })
 
-describe('分面并行:思考卡渲染身份标签', () => {
-  it('facet 存在才渲染"分面 · X"标签;无 facet 不渲染', () => {
-    expect(MSG).toContain('v-if="item.streaming.facet"')
-    expect(MSG).toContain('分面 · {{ item.streaming.facet }}')
+describe('子任务并行:思考卡渲染身份标签', () => {
+  it('facet 存在且块内未标身份时才渲染"子任务 · X";块内隐藏(身份由块标题承载)', () => {
+    expect(MSG).toContain('v-if="item.streaming.facet && !hideFacetBadge"')
+    expect(MSG).toContain('子任务 · {{ item.streaming.facet }}')
+    expect(sliceFrom(MSG, 'const props = defineProps<{', 400)).toContain('hideFacetBadge?: boolean')
     // 本地 StreamingItem 也声明 facet(可选)
     expect(sliceFrom(MSG, 'interface StreamingItem {', 700)).toContain('facet?: string')
   })
 })
 
-describe('分面并行:类型契约带可选 facet', () => {
+describe('子任务并行:类型契约带可选 facet', () => {
   it('ThinkingDeltaEventData / ConversationEventData 均有 facet', () => {
     expect(sliceFrom(TYPES, 'interface ThinkingDeltaEventData', 900)).toContain('facet?: string')
     const convEvent = sliceFrom(TYPES, 'interface ConversationEventData', 900)
     expect(convEvent).toContain('facet?: string | null')
     expect(convEvent).toContain('parallel?: boolean')
+  })
+})
+
+describe('子任务块:整块聚合 + 运行中展开 / 完成自动折叠', () => {
+  it('双轨分流:facet 项不进主轨,聚合为 SubtaskSegment', () => {
+    expect(VIEW).toContain('const facetTracks = new Map<string, FacetTrack>()')
+    expect(VIEW).toContain('const facet = itemFacetOf(item)')
+    expect(VIEW).toContain("kind: 'subtask',")
+    // 主轨变量名保持 iterations(结论提取/plain 定位仍只认主轨)
+    expect(VIEW).toContain('const iterations: IterationSegment[] = []')
+    // 放置锚点取该子任务首现时的主轨迭代序号
+    expect(sliceFrom(VIEW, 'const ensureTrack = (label: string): FacetTrack', 600))
+      .toContain('afterMainIdx: iterCounter')
+  })
+
+  it('派发工具的 tool_result 按 tool_call_id 认领回主轨(否则漏进子任务块)', () => {
+    const fn = sliceFrom(VIEW, 'function claimBackByToolCallId(')
+    expect(fn).toContain('item.tool_call_id')
+    expect(fn).toContain('iter.toolItems.push(item)')
+    // 调用点存在(漏调 = 永远走兜底)
+    expect(VIEW).toContain(
+      'claimBackByToolCallId(item, current ? [...iterations, current] : iterations)',
+    )
+  })
+
+  it('模板新增 subtask 分支:标题「子任务 · X」+ max-height 内滚正文', () => {
+    const tpl = sliceFrom(VIEW, `v-else-if="seg.kind === 'subtask'"`, 1400)
+    expect(tpl).toContain('子任务 · {{ seg.label }}')
+    expect(tpl).toContain('class="subtask-body"')
+    expect(VIEW).toContain('max-height: min(60vh, 560px)')
+  })
+
+  it('v-for key 对 subtask 单独分支(否则 seg.item 为 undefined 会崩)', () => {
+    expect(VIEW).toContain(':key="segmentKey(seg)"')
+    const fn = sliceFrom(VIEW, 'function segmentKey(seg: RoundSegment)')
+    expect(fn).toContain('subtask-${seg.id}')
+  })
+
+  it('展开状态机复用子智能体块:运行中展开 / 完成折叠 + 手动意图优先', () => {
+    const open = sliceFrom(VIEW, 'function subtaskOpen(')
+    expect(open).toContain('isAgentBlockOpen(')
+    expect(open).toContain('seg.hasResult')
+    const toggle = sliceFrom(VIEW, 'function toggleSubtask(')
+    expect(toggle).toContain('toggleAgentBlock(')
+    // hasResult 判据取"块内有非流式行"(不用 hasStreaming,工具空档不频闪)
+    expect(sliceFrom(VIEW, 'interface SubtaskSegment {', 1400)).toContain('hasResult: boolean')
+    // 状态 key 带 round,避免同名子任务跨轮串键
+    expect(sliceFrom(VIEW, 'function subtaskKey(')).toContain('subtask:${seg.roundIdx}:${seg.label}')
+  })
+
+  it('roundGroups 普通行带 facet(否则子任务落库行认不出身份)', () => {
+    expect(VIEW).toContain('facet: c.facet ?? undefined,')
   })
 })

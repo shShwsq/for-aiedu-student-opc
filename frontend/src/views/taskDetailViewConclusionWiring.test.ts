@@ -19,17 +19,26 @@ import { describe, expect, it } from 'vitest'
 
 // vitest 的工作目录是 frontend 根
 const SRC = readFileSync(resolve(process.cwd(), 'src/views/TaskDetailView.vue'), 'utf-8')
+// 工具渲染行构造纯函数上移到 utils/toolRows;agent 卡片展开判定移入 IterationBody 子组件
+// —— 相关锚点随迁移换文件读(其余接线仍在 SRC)
+const ITER = readFileSync(resolve(process.cwd(), 'src/components/IterationBody.vue'), 'utf-8')
+const ROWS = readFileSync(resolve(process.cwd(), 'src/utils/toolRows.ts'), 'utf-8')
 
-/** 取定位串之后的一段源码(找不到定位串就直接失败,免得断言空跑) */
-function sliceFrom(anchor: string, chars = 900): string {
-  const at = SRC.indexOf(anchor)
+/** 取指定源文件中定位串之后的一段源码(找不到定位串就直接失败,免得断言空跑) */
+function sliceFromIn(src: string, anchor: string, chars = 900): string {
+  const at = src.indexOf(anchor)
   expect(at, `源码中找不到定位串: ${anchor}`).toBeGreaterThanOrEqual(0)
-  return SRC.slice(at, at + chars)
+  return src.slice(at, at + chars)
+}
+
+/** 默认从 TaskDetailView(SRC)取切片(对外语义、签名不变) */
+function sliceFrom(anchor: string, chars = 900): string {
+  return sliceFromIn(SRC, anchor, chars)
 }
 
 describe('子智能体卡片:后台未回报的诚实态', () => {
   it('回执形状标"后台未回报",不再走"已完成"分支', () => {
-    const block = sliceFrom("if (seg.kind === 'agent') {")
+    const block = sliceFromIn(ROWS, "if (seg.kind === 'agent') {")
     expect(block).toContain('const asyncPending = !!trace?.asyncPending')
     expect(block).toContain("else if (asyncPending) tags.push(")
     expect(block).toContain("'后台未回报'")
@@ -38,15 +47,15 @@ describe('子智能体卡片:后台未回报的诚实态', () => {
   })
 
   it('未回报卡片不被自动折叠(展开判定用 hasResult && !agentAsync)', () => {
-    const open = sliceFrom('function agentBlockOpen(')
+    const open = sliceFromIn(ITER, 'function agentBlockOpen(')
     const toggle = sliceFrom('function toggleAgentBlockRow(')
     expect(open).toContain('row.hasResult && !row.agentAsync')
     expect(toggle).toContain('row.hasResult && !row.agentAsync')
   })
 
   it('回执不折叠成空壳:agentAsync 进入渲染行字段并有默认值', () => {
-    expect(sliceFrom('interface ToolRenderRow {', 1400)).toContain('agentAsync: boolean')
-    expect(sliceFrom('const empty = {', 600)).toContain('agentAsync: false')
+    expect(sliceFromIn(ROWS, 'interface ToolRenderRow', 1400)).toContain('agentAsync: boolean')
+    expect(sliceFromIn(ROWS, 'const empty = {', 600)).toContain('agentAsync: false')
   })
 })
 

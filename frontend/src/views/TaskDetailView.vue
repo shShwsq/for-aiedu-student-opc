@@ -30,6 +30,7 @@ import Agent2Panel from '@/components/Agent2Panel.vue'
 import DetailCardDrawer from '@/components/DetailCardDrawer.vue'
 import SuggestionCards from '@/components/SuggestionCards.vue'
 import ConversationMessage from '@/components/ConversationMessage.vue'
+import IterationBody from '@/components/IterationBody.vue'
 import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
 import UserMessageInput from '@/components/UserMessageInput.vue'
 import TaskRuntimeSettings from '@/components/TaskRuntimeSettings.vue'
@@ -65,8 +66,7 @@ import { clientLog } from '@/utils/clientLog'
 import { extractErrorMessage } from '@/utils/error'
 import { parseDiffFileSegments } from '@/utils/diffFiles'
 import { triggerBlobDownload } from '@/utils/download'
-import { renderMarkdown } from '@/utils/markdown'
-import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
+import { itemFacetOf, type AgentBlockRowLike } from '@/utils/toolRows'
 import { isAgentBlockOpen, toggleAgentBlock } from '@/utils/agentBlock'
 import { COLLAPSE_GRACE_MS, isThinkingExpanded, shouldLatchAutoExpand } from '@/utils/thinkingExpand'
 import { findRetiredCardConvId } from '@/utils/thinkingReconcile'
@@ -1532,6 +1532,8 @@ interface DisplayItem {
   tool_call_id?: string | null
   /** 仅 user 追问消息有:附带上传文件展示信息(只读渲染 chip) */
   attachments?: AttachmentInfo[] | null
+  /** 仅内置 react 子任务并行的落库行有:子任务名(与流式卡上的 facet 同义) */
+  facet?: string
   /** 流式项字段 */
   streaming?: StreamingItem
 }
@@ -1588,7 +1590,32 @@ interface ConclusionSegment {
   item: DisplayItem
 }
 
-type RoundSegment = PlainSegment | StepGroup | ConclusionSegment
+/** 子任务段:内置 react 并行派发的每个子任务 = 一个可折叠块,
+ *  块内聚合该子任务的全部产物(思考流 + 工具调用/结果)。
+ *  运行中默认展开(正文 max-height 内滚),fan-in 落库后整块自动折叠 */
+interface SubtaskSegment {
+  kind: 'subtask'
+  /** 唯一标识:${roundIdx}-subtask-${label} */
+  id: string
+  roundIdx: number
+  /** 子任务名(label,即 conversations.facet) */
+  label: string
+  /** 块内迭代(该子任务的各轮 ReAct 产物) */
+  iterations: IterationSegment[]
+  /** 思考段数(标题概览用) */
+  thinkingCount: number
+  /** 工具调用条数(标题概览用) */
+  toolCount: number
+  /** 是否仍在运行(块内存在流式项:打字动画 / 高亮) */
+  live: boolean
+  /** 是否已有落库产物(块内存在非流式行)→ 自动折叠的判据:
+   *  子任务思考间隙(思考已结束、工具行未实时下发)只有流式卡,不会误判为完成而频闪 */
+  hasResult: boolean
+  /** 归属锚点:该子任务首现时已完成的主轨迭代序号(放置到对应 step 组之后) */
+  afterMainIdx: number
+}
+
+type RoundSegment = PlainSegment | StepGroup | ConclusionSegment | SubtaskSegment
 
 interface RoundGroup {
   roundIdx: number
@@ -1666,6 +1693,29 @@ function liftConclusionByConvId(
 function isReactAgentItem(item: DisplayItem): boolean {
   if (item.is_streaming) return item.streaming?.role === 'agent1'
   return item.role === 'agent1'
+}
+
+/** 认领派发工具(dispatch_review_subtasks)的 tool_result 归主轨。
+ *  后端先落派发的 tool_call,扇出+fan-in 落完全部子任务行之后才落它的 tool_result,
+ *  该结果因此在时间线上排在所有子任务行之后;若不认领,它会被当成"当前迭代"的
+ *  工具项误挂进某个子任务块(或末次迭代)。按 tool_call_id 找回它所属的迭代并追加。
+ *  就地修改传入的 candidates(调用方传 [...iterations, current]),命中返回 true。 */
+function claimBackByToolCallId(
+  item: DisplayItem,
+  candidates: IterationSegment[],
+): boolean {
+  if (item.type !== 'tool_result' || !item.tool_call_id) return false
+  for (const iter of candidates) {
+    if (
+      iter.toolItems.some(
+        (t) => !t.is_streaming && t.type === 'tool_call' && t.id === item.tool_call_id,
+      )
+    ) {
+      iter.toolItems.push(item)
+      return true
+    }
+  }
+  return false
 }
 
 /** 判断 DisplayItem 是否正在流式 */
@@ -1765,7 +1815,10 @@ function segmentRoundItems(
   roundClosed: boolean,
   conclusionConvId = '',
 ): RoundSegment[] {
-  // 第一阶段:按 thinking 起点切迭代(原逻辑)
+  // 第一阶段:按 thinking 起点切迭代。
+  // 内置 react 并行子任务的行(带 facet,即子任务名)不进主轨 —— 另走一条"子任务轨"
+  // 聚合成独立块;主轨的变量名与计数语义保持不变(结论提取 / plain 定位只认主轨,
+  // 子任务迭代天然不参与)。
   const iterations: IterationSegment[] = []
   const plains: PlainSegment[] = []
   let current: IterationSegment | null = null
@@ -1778,43 +1831,105 @@ function segmentRoundItems(
     }
   }
 
+  /** 子任务轨:label → 该子任务的迭代聚合(轮内键) */
+  interface FacetTrack {
+    label: string
+    /** 首现时已完成的主轨迭代序号:块放置锚点(该子任务紧跟的主迭代) */
+    afterMainIdx: number
+    /** 本轨序号(构造唯一迭代 id,避免 label 里的字符进 id) */
+    tkey: number
+    /** 本轨迭代计数 */
+    n: number
+    iters: IterationSegment[]
+    current: IterationSegment | null
+  }
+  const facetTracks = new Map<string, FacetTrack>()
+
+  const ensureTrack = (label: string): FacetTrack => {
+    let t = facetTracks.get(label)
+    if (!t) {
+      t = {
+        label,
+        afterMainIdx: iterCounter,
+        tkey: facetTracks.size,
+        n: 0,
+        iters: [],
+        current: null,
+      }
+      facetTracks.set(label, t)
+    }
+    return t
+  }
+
+  /** 收尾所有子任务轨(与主轨 closeCurrent 同拍调用,避免漏收) */
+  const closeTracks = () => {
+    for (const t of facetTracks.values()) {
+      if (t.current) {
+        t.iters.push(t.current)
+        t.current = null
+      }
+    }
+  }
+
+  const newIteration = (
+    idx: number,
+    id: string,
+    item?: DisplayItem,
+  ): IterationSegment => ({
+    kind: 'iteration',
+    iterationIdx: idx,
+    id,
+    thinkingItems: item ? [item] : [],
+    toolItems: [],
+    otherItems: [],
+    hasStreaming: !!item && isStreamingActive(item),
+  })
+
+  const pushIntoIteration = (iter: IterationSegment, item: DisplayItem): void => {
+    if (item.is_streaming) {
+      iter.thinkingItems.push(item)
+    } else if (item.type === 'tool_call' || item.type === 'tool_result') {
+      iter.toolItems.push(item)
+    } else {
+      iter.otherItems.push(item)
+    }
+    if (isStreamingActive(item)) iter.hasStreaming = true
+  }
+
   for (const item of items) {
+    const facet = itemFacetOf(item)
     if (isReactThinkingItem(item)) {
-      closeCurrent()
-      iterCounter++
-      current = {
-        kind: 'iteration',
-        iterationIdx: iterCounter,
-        id: `${roundIdx}-${iterCounter}`,
-        thinkingItems: [item],
-        toolItems: [],
-        otherItems: [],
-        hasStreaming: isStreamingActive(item),
+      if (facet) {
+        // 子任务:开新迭代;主轨挂起(其后落库的派发 tool_result 由认领逻辑归位)
+        closeCurrent()
+        const t = ensureTrack(facet)
+        t.n++
+        t.current = newIteration(t.n, `${roundIdx}-sub${t.tkey}-${t.n}`, item)
+      } else {
+        closeCurrent()
+        iterCounter++
+        current = newIteration(iterCounter, `${roundIdx}-${iterCounter}`, item)
       }
     } else if (isReactAgentItem(item)) {
-      if (!current) {
-        // 缺失 thinking 锚点(空 thinking 未落库 / CLI agent 未发文本直接工具调用 /
-        // 前面的非 react 消息关闭了迭代):开一个无 thinking 的兜底迭代承接,
-        // 避免工具项退化为 plain 段被追加到"执行过程"折叠块末尾
-        iterCounter++
-        current = {
-          kind: 'iteration',
-          iterationIdx: iterCounter,
-          id: `${roundIdx}-${iterCounter}`,
-          thinkingItems: [],
-          toolItems: [],
-          otherItems: [],
-          hasStreaming: false,
+      if (facet) {
+        // 子任务:归当前迭代(无 thinking 锚点时开兜底迭代承接)
+        closeCurrent()
+        const t = ensureTrack(facet)
+        if (!t.current) {
+          t.n++
+          t.current = newIteration(t.n, `${roundIdx}-sub${t.tkey}-${t.n}`)
         }
+        pushIntoIteration(t.current, item)
+      } else if (!claimBackByToolCallId(item, current ? [...iterations, current] : iterations)) {
+        if (!current) {
+          // 缺失 thinking 锚点(空 thinking 未落库 / CLI agent 未发文本直接工具调用 /
+          // 前面的非 react 消息关闭了迭代):开一个无 thinking 的兜底迭代承接,
+          // 避免工具项退化为 plain 段被追加到"执行过程"折叠块末尾
+          iterCounter++
+          current = newIteration(iterCounter, `${roundIdx}-${iterCounter}`)
+        }
+        pushIntoIteration(current, item)
       }
-      if (item.is_streaming) {
-        current.thinkingItems.push(item)
-      } else if (item.type === 'tool_call' || item.type === 'tool_result') {
-        current.toolItems.push(item)
-      } else {
-        current.otherItems.push(item)
-      }
-      if (isStreamingActive(item)) current.hasStreaming = true
     } else {
       closeCurrent()
       // 记录消息在轮内的原始位置(已完成迭代数),第二阶段按位置穿插,
@@ -1823,6 +1938,7 @@ function segmentRoundItems(
     }
   }
   closeCurrent()
+  closeTracks()
 
   // 一阶段半:轮闭合时提取该轮最终结论
   // 两条路径(优先前者):
@@ -1989,15 +2105,66 @@ function segmentRoundItems(
     }
   }
 
+  // 子任务块:把子任务轨的迭代聚合成可折叠块(运行中展开、fan-in 落库后折叠)。
+  // 放置锚点 = 该子任务首现时已完成的主轨迭代 → 排到它所属 step 组之后;
+  // 轮首(afterMainIdx=0)排到 headPlains 之后、step 组之前;找不到落末尾(理论不可达)。
+  const headSubtasks: SubtaskSegment[] = []
+  const tailSubtasks: SubtaskSegment[] = []
+  const afterGroupSubtasks = new Map<StepGroup, SubtaskSegment[]>()
+  for (const t of facetTracks.values()) {
+    if (!t.iters.length) continue
+    let toolCount = 0
+    let live = false
+    let hasResult = false
+    for (const it of t.iters) {
+      toolCount += it.toolItems.filter((x) => x.type === 'tool_call').length
+      for (const x of [...it.thinkingItems, ...it.toolItems, ...it.otherItems]) {
+        if (x.is_streaming) live = true
+        else hasResult = true
+      }
+    }
+    const seg: SubtaskSegment = {
+      kind: 'subtask',
+      id: `${roundIdx}-subtask-${t.tkey}`,
+      roundIdx,
+      label: t.label,
+      iterations: t.iters,
+      thinkingCount: t.iters.length,
+      toolCount,
+      live,
+      hasResult,
+      afterMainIdx: t.afterMainIdx,
+    }
+    if (seg.afterMainIdx <= 0) {
+      headSubtasks.push(seg)
+      continue
+    }
+    const group = groupByIterIdx.get(seg.afterMainIdx)
+    if (group) {
+      let list = afterGroupSubtasks.get(group)
+      if (!list) {
+        list = []
+        afterGroupSubtasks.set(group, list)
+      }
+      list.push(seg)
+    } else {
+      tailSubtasks.push(seg)
+    }
+  }
+
   segments.push(...headPlains)
+  segments.push(...headSubtasks)
   for (const g of orderedGroups) {
     segments.push(g)
     const after = afterGroupPlains.get(g)
     if (after) segments.push(...after)
+    const afterSub = afterGroupSubtasks.get(g)
+    if (afterSub) segments.push(...afterSub)
   }
   // 结论段排在所有过程组之后、轮末平铺消息(如修正指令卡)之前:
-  // 时间顺序上 agent1 总结 → agent2 评估/追问,视觉上"过程(折叠) → 结论 → 修正指令"
+  // 时间顺序上 agent1 总结 → agent2 评估/追问,视觉上"过程(折叠) → 子任务 → 结论 → 修正指令"
   if (conclusion) segments.push({ kind: 'conclusion', item: conclusion })
+  segments.push(...tailSubtasks)
   segments.push(...tailPlains)
 
   return segments
@@ -2093,6 +2260,7 @@ const roundGroups = computed<RoundGroup[]>(() => {
         reasoning: c.reasoning,
         tool_call_id: c.tool_call_id,
         attachments: c.attachments,
+        facet: c.facet ?? undefined,
       })
     }
   })
@@ -2207,6 +2375,36 @@ function toggleStep(group: StepGroup): void {
   }
 }
 
+/** 段唯一 key(模板 v-for 用):subtask 段没有 item 字段,必须单独分支
+ *  (否则 seg.item 为 undefined → 运行时 TypeError + vue-tsc TS2339) */
+function segmentKey(seg: RoundSegment): string {
+  if (seg.kind === 'step') return `step-${seg.id}`
+  if (seg.kind === 'subtask') return `subtask-${seg.id}`
+  return `${seg.kind}-${seg.item.id}`
+}
+
+/** 子任务块状态 key(带 round,避免同名子任务跨轮串键) */
+function subtaskKey(seg: SubtaskSegment): string {
+  return `subtask:${seg.roundIdx}:${seg.label}`
+}
+
+/** 子任务块是否展开:运行中(尚无落库产物)默认展开,完成默认折叠,手动意图优先。
+ *  复用子智能体块的状态机;hasResult 判据是"块内有非流式行",子任务思考间隙
+ *  (工具在跑、工具行未实时下发)只有流式卡,块不会反复收起/展开 */
+function subtaskOpen(seg: SubtaskSegment): boolean {
+  return isAgentBlockOpen(subtaskKey(seg), seg.hasResult, {
+    expanded: expandedToolRows,
+    collapsed: collapsedToolRows,
+  })
+}
+
+function toggleSubtask(seg: SubtaskSegment): void {
+  toggleAgentBlock(subtaskKey(seg), seg.hasResult, {
+    expanded: expandedToolRows,
+    collapsed: collapsedToolRows,
+  })
+}
+
 /** step 组的状态图标:done=✓,in_progress=◌,pending=○,none=· */
 function stepStatusIcon(status: PlanStep['status'] | 'none'): string {
   switch (status) {
@@ -2217,11 +2415,7 @@ function stepStatusIcon(status: PlanStep['status'] | 'none'): string {
   }
 }
 
-/** 工具渲染行是否展开(默认折叠,由用户控制;key 支持 `${callId}-think` 复合键) */
-function isRowExpanded(key: string): boolean {
-  return expandedToolRows.has(key)
-}
-
+/** 点击工具渲染行标题(由 IterationBody emit 上来):翻转该 key 的展开态 */
 function toggleRow(key: string): void {
   if (expandedToolRows.has(key)) {
     expandedToolRows.delete(key)
@@ -2230,154 +2424,13 @@ function toggleRow(key: string): void {
   }
 }
 
-/** 子智能体折叠块是否展开:运行中默认展开、完成默认折叠,手动展开/折叠优先
- *  (状态机在 utils/agentBlock,与主展开集 expandedToolRows 共用“手动展开”语义)。
- *  只拿到后台派生回执的卡片算"未完成":结果从没回来过,折叠等于把唯一可见的
- *  诚实信号藏起来 */
-function agentBlockOpen(row: ToolRenderRow): boolean {
-  return isAgentBlockOpen(row.callId, row.hasResult && !row.agentAsync, {
-    expanded: expandedToolRows,
-    collapsed: collapsedToolRows,
-  })
-}
-
-/** 点击子智能体标题:翻转并记入手动集(展开进 expanded,折叠进 collapsed) */
-function toggleAgentBlockRow(row: ToolRenderRow): void {
+/** 点击子智能体卡片标题(由 IterationBody emit 上来):翻转并记入手动集
+ *  (展开进 expanded,折叠进 collapsed)。只拿到后台派生回执的卡片算"未完成":
+ *  结果从没回来过,折叠等于把唯一可见的诚实信号藏起来 */
+function toggleAgentBlockRow(row: AgentBlockRowLike): void {
   toggleAgentBlock(row.callId, row.hasResult && !row.agentAsync, {
     expanded: expandedToolRows,
     collapsed: collapsedToolRows,
-  })
-}
-
-/** 工具渲染行:compact 单行摘要 / agent 子智能体卡片 / toolpair 普通工具卡片 / plain 兜底。
- * 字段扁平化避免模板内联合类型收窄 */
-interface ToolRenderRow {
-  key: string
-  kind: 'compact' | 'agent' | 'toolpair' | 'plain'
-  /** compact/agent/toolpair:tool_call id(展开状态 key) */
-  callId: string
-  /** compact:单行摘要;agent/toolpair:卡片标题 */
-  summary: string
-  /** compact:可跳转的文件路径(工作区相对路径,无则空串) */
-  filePath: string
-  /** compact:摘要中展示的文件路径文本 */
-  fileDisplay: string
-  /** compact:摘要拆分前后缀(filePath 非空时,摘要 = prefix + fileDisplay + suffix) */
-  summaryPrefix: string
-  summarySuffix: string
-  /** 是否已有结果(执行中为 false) */
-  hasResult: boolean
-  /** agent 卡片专用:只拿到"后台已启动"回执(结果尚未回报)。
-   *  它不该按"已完成"折叠,也不能被当成报告正文渲染 */
-  agentAsync: boolean
-  /** 结果文本(compact 轻量展开 / toolpair 结果块) */
-  resultContent: string
-  /** agent/toolpair:调用参数 detail(展开后等宽块) */
-  callDetail: string
-  /** agent:内部思考(<think> 块内容) */
-  agentThink: string
-  /** agent:Markdown 渲染的报告正文 HTML */
-  agentBodyHtml: string
-  /** plain:该段内的工具项(兜底原渲染) */
-  items: DisplayItem[]
-}
-
-/** tool_call content 拆分为 intent(首行,剥 [tool_name] 标签)与 detail(其后内容) */
-function callPartsOf(call: DisplayItem): { intent: string; detail: string } {
-  const content = call.content || ''
-  const idx = content.indexOf('\n')
-  const rawIntent = idx < 0 ? content : content.slice(0, idx)
-  return {
-    intent: rawIntent.replace(/\s*\[\w+\]$/, ''),
-    detail: idx < 0 ? '' : content.slice(idx + 1),
-  }
-}
-
-/**
- * 迭代内工具项拆分为渲染行:
- * compact(浏览型单行摘要)、agent(子智能体卡片,Markdown 报告)、
- * toolpair(普通工具,调用+结果整体一张折叠卡)。
- */
-function toolRowsOf(iter: IterationSegment): ToolRenderRow[] {
-  const empty = {
-    resultContent: '',
-    callDetail: '',
-    agentThink: '',
-    agentBodyHtml: '',
-    agentAsync: false,
-    filePath: '',
-    fileDisplay: '',
-    summaryPrefix: '',
-    summarySuffix: '',
-    items: [] as DisplayItem[],
-  }
-  return buildToolSegments(iter.toolItems).map((seg, idx) => {
-    if (seg.kind === 'plain') {
-      return {
-        key: `${iter.id}-plain-${idx}`,
-        kind: 'plain' as const,
-        callId: '',
-        summary: '',
-        hasResult: false,
-        ...empty,
-        items: seg.items,
-      }
-    }
-    const callId = seg.call.id
-    const parts = callPartsOf(seg.call)
-    if (seg.kind === 'compact') {
-      // 读文件工具提取跳转目标:摘要中路径文本包成链接,点击在工作区文件树打开
-      const target = toolFileTargetOf(seg.call, seg.result)
-      return {
-        key: callId,
-        kind: 'compact' as const,
-        callId,
-        summary: buildToolSummary(seg.call, seg.result),
-        hasResult: !!seg.result,
-        ...empty,
-        resultContent: seg.result?.content || '',
-        filePath: target?.path || '',
-        fileDisplay: target?.display || '',
-        summaryPrefix: target?.prefix || '',
-        summarySuffix: target?.suffix || '',
-      }
-    }
-    if (seg.kind === 'agent') {
-      const trace = seg.result ? parseAgentTrace(seg.result.content || '') : null
-      // 异步派生回执:不是结论,必须标"后台未回报"(回归:旧版因 trace.status 为
-      // null 而落到 else,给一张正文只是启动回执的卡片打上"已完成")
-      const asyncPending = !!trace?.asyncPending
-      // 标题:子任务意图 + 子智能体类型/状态后缀
-      const tags: string[] = []
-      if (trace?.subType) tags.push(trace.subType)
-      if (!seg.result) tags.push('执行中…')
-      else if (asyncPending) tags.push(trace?.agentId ? `后台未回报 ${trace.agentId}` : '后台未回报')
-      else if (trace?.status && trace.status !== 'completed') tags.push(trace.status)
-      else tags.push('已完成')
-      return {
-        key: callId,
-        kind: 'agent' as const,
-        callId,
-        summary: `🤖 ${parts.intent}${tags.length ? ' · ' + tags.join(' · ') : ''}`,
-        hasResult: !!seg.result,
-        ...empty,
-        agentAsync: asyncPending,
-        callDetail: parts.detail,
-        agentThink: trace?.think || '',
-        agentBodyHtml: trace ? renderMarkdown(trace.body) : '',
-      }
-    }
-    // toolpair:普通工具(写操作/非只读命令等),调用+结果整体一张折叠卡
-    return {
-      key: callId,
-      kind: 'toolpair' as const,
-      callId,
-      summary: `🔧 ${parts.intent}`,
-      hasResult: !!seg.result,
-      ...empty,
-      callDetail: parts.detail,
-      resultContent: seg.result?.content || '',
-    }
   })
 }
 
@@ -3161,7 +3214,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
             <div class="messages">
               <template
                 v-for="seg in group.segments"
-                :key="seg.kind === 'step' ? `step-${seg.id}` : `${seg.kind}-${seg.item.id}`"
+                :key="segmentKey(seg)"
               >
                 <!-- 平铺段:agent2 追问卡、user 指令等关键消息 -->
                 <!-- 用户补充消息(type=message)右对齐,与顶部 userDirective 视觉一致 -->
@@ -3227,106 +3280,18 @@ const showKnowledgeToolbar = computed<boolean>(() => {
                       </div>
                     </template>
                     <template v-for="iter in seg.iterations" :key="iter.id">
-                    <!-- 迭代内容直接平铺:无摘要行、无边框包装(wrapper 仅作结构容器) -->
+                    <!-- 迭代内容直接平铺:无摘要行、无边框包装(wrapper 仅作结构容器);
+                         思考卡 + 工具渲染行 + 其他项交给 IterationBody 组件,与子任务块共用 -->
                     <div class="iteration-block">
-                      <div class="iteration-body">
-                        <!-- thinking 项(流式或历史) -->
-                        <ConversationMessage
-                          v-for="t in iter.thinkingItems"
-                          :key="t.id"
-                          :item="t"
-                          @toggle-reasoning="toggleReasoning"
-                        />
-                        <!-- 工具调用渲染行:compact 单行摘要 / agent 子智能体卡片 /
-                             toolpair 普通工具卡片 / plain 兜底 -->
-                        <template v-for="row in toolRowsOf(iter)" :key="row.key">
-                          <!-- 紧凑工具:单行摘要,点击轻量展开原始结果 -->
-                          <div v-if="row.kind === 'compact'" class="tool-compact">
-                            <div class="tool-compact-row" @click="toggleRow(row.callId)">
-                              <span class="tool-group-toggle">
-                                {{ row.hasResult ? (isRowExpanded(row.callId) ? '▼' : '▶') : '' }}
-                              </span>
-                              <span class="tool-compact-summary">
-                                <template v-if="row.filePath">
-                                  {{ row.summaryPrefix }}<a
-                                    class="tool-file-link"
-                                    title="在文件树中打开"
-                                    @click.stop="onToolFileClick(row.filePath)"
-                                  >{{ row.fileDisplay }}</a>{{ row.summarySuffix }}
-                                </template>
-                                <template v-else>{{ row.summary }}</template>
-                              </span>
-                            </div>
-                            <div
-                              v-if="row.hasResult && isRowExpanded(row.callId)"
-                              class="tool-compact-result"
-                            >{{ row.resultContent }}</div>
-                          </div>
-                          <!-- 子智能体卡片:标题单行,展开后参数 + 内部思考 + Markdown 报告 -->
-                          <div v-else-if="row.kind === 'agent'" class="tool-card tool-card-agent">
-                            <div class="tool-card-header" @click="toggleAgentBlockRow(row)">
-                              <span class="tool-group-toggle">{{ agentBlockOpen(row) ? '▼' : '▶' }}</span>
-                              <span class="tool-card-title">{{ row.summary }}</span>
-                            </div>
-                            <div v-if="agentBlockOpen(row)" class="tool-card-body">
-                              <div v-if="row.callDetail" class="tool-card-section">
-                                <div class="tool-card-section-label">子任务参数</div>
-                                <div class="tool-card-mono">{{ row.callDetail }}</div>
-                              </div>
-                              <div v-if="row.agentThink" class="tool-card-section">
-                                <div
-                                  class="tool-card-section-label tool-card-think-toggle"
-                                  @click.stop="toggleRow(row.callId + '-think')"
-                                >{{ isRowExpanded(row.callId + '-think') ? '▼' : '▶' }} 内部思考</div>
-                                <div
-                                  v-if="isRowExpanded(row.callId + '-think')"
-                                  class="tool-card-think"
-                                >{{ row.agentThink }}</div>
-                              </div>
-                              <div
-                                v-if="row.hasResult"
-                                class="tool-card-markdown markdown-body"
-                                v-html="row.agentBodyHtml"
-                              />
-                              <div v-else class="tool-card-running">子智能体执行中…</div>
-                            </div>
-                          </div>
-                          <!-- 普通工具卡片:调用+结果整体折叠 -->
-                          <div v-else-if="row.kind === 'toolpair'" class="tool-card">
-                            <div class="tool-card-header" @click="toggleRow(row.callId)">
-                              <span class="tool-group-toggle">{{ isRowExpanded(row.callId) ? '▼' : '▶' }}</span>
-                              <span class="tool-card-title">{{ row.summary }}</span>
-                            </div>
-                            <div v-if="isRowExpanded(row.callId)" class="tool-card-body">
-                              <div v-if="row.callDetail" class="tool-card-section">
-                                <div class="tool-card-section-label">调用参数</div>
-                                <div class="tool-card-mono">{{ row.callDetail }}</div>
-                              </div>
-                              <div v-if="row.hasResult" class="tool-card-section">
-                                <div class="tool-card-section-label">工具结果</div>
-                                <div class="tool-card-mono">{{ row.resultContent }}</div>
-                              </div>
-                              <div v-if="!row.callDetail && !row.hasResult" class="tool-card-running">执行中…</div>
-                            </div>
-                          </div>
-                          <!-- plain 兜底:落单 result 等原样渲染 -->
-                          <template v-else-if="row.kind === 'plain'">
-                            <ConversationMessage
-                              v-for="ti in row.items"
-                              :key="ti.id"
-                              :item="ti"
-                              @toggle-reasoning="toggleReasoning"
-                            />
-                          </template>
-                        </template>
-                        <!-- 其他项(submit 等) -->
-                        <ConversationMessage
-                          v-for="o in iter.otherItems"
-                          :key="o.id"
-                          :item="o"
-                          @toggle-reasoning="toggleReasoning"
-                        />
-                      </div>
+                      <IterationBody
+                        :iter="iter"
+                        :expanded-keys="expandedToolRows"
+                        :collapsed-keys="collapsedToolRows"
+                        @toggle-reasoning="toggleReasoning"
+                        @toggle-key="toggleRow"
+                        @toggle-agent="toggleAgentBlockRow"
+                        @open-file="onToolFileClick"
+                      />
                     </div>
                     <!-- 组内平铺消息(如用户追问):渲染在该迭代之后,与迭代内容保持时间顺序 -->
                     <template v-for="p in plainsAfter(seg, iter.iterationIdx)" :key="`plain-${p.item.id}`">
@@ -3337,6 +3302,40 @@ const showKnowledgeToolbar = computed<boolean>(() => {
                         />
                       </div>
                     </template>
+                    </template>
+                  </div>
+                </div>
+
+                <!-- 子任务块:内置 react 并行派发的每个子任务 = 一个可折叠块;
+                     运行中默认展开(正文 max-height 内滚),fan-in 落库后整块自动折叠 -->
+                <div
+                  v-else-if="seg.kind === 'subtask'"
+                  class="subtask-block"
+                  :class="{ 'subtask-live': seg.live }"
+                >
+                  <div class="subtask-header" @click="toggleSubtask(seg)">
+                    <span class="subtask-toggle">{{ subtaskOpen(seg) ? '▼' : '▶' }}</span>
+                    <span
+                      :class="['step-status-icon', seg.live ? 'step-status-in_progress' : 'step-status-done']"
+                    >{{ seg.live ? '◌' : '✓' }}</span>
+                    <span class="subtask-title">子任务 · {{ seg.label }}</span>
+                    <span v-if="seg.live" class="step-streaming-tag">
+                      <span class="typing-dots"><span></span><span></span><span></span></span>
+                    </span>
+                    <span class="subtask-counts">{{ seg.thinkingCount }} 段思考 · {{ seg.toolCount }} 次工具调用</span>
+                  </div>
+                  <div v-if="subtaskOpen(seg)" class="subtask-body">
+                    <template v-for="iter in seg.iterations" :key="iter.id">
+                      <IterationBody
+                        :iter="iter"
+                        :expanded-keys="expandedToolRows"
+                        :collapsed-keys="collapsedToolRows"
+                        hide-facet-badge
+                        @toggle-reasoning="toggleReasoning"
+                        @toggle-key="toggleRow"
+                        @toggle-agent="toggleAgentBlockRow"
+                        @open-file="onToolFileClick"
+                      />
                     </template>
                   </div>
                 </div>
@@ -5187,13 +5186,63 @@ const showKnowledgeToolbar = computed<boolean>(() => {
   padding-bottom: var(--space-1);
 }
 
-/* ---- 迭代块(agent1 一次 ReAct 循环,结构容器:无摘要行、无边框包装) ----
-   .iteration-block 为透明容器,仅承载 iteration-body 的间距 */
-.iteration-body {
+/* ---- 子任务块(内置 react 并行派发:每个子任务一个可折叠块;
+   迭代体样式已随 IterationBody 组件自带 scoped CSS,父视图仅留块级容器样式) ---- */
+.subtask-block {
+  margin-bottom: var(--space-2);
+  border-left: 2px solid var(--color-primary, #6366f1);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+
+.subtask-live {
+  border-left-color: var(--color-warning, #f59e0b);
+}
+
+.subtask-header {
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: var(--space-2);
-  padding: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s ease;
+}
+
+.subtask-header:hover {
+  background: var(--color-surface-alt);
+}
+
+.subtask-toggle {
+  flex-shrink: 0;
+  width: 14px;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
+.subtask-title {
+  flex: 1;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtask-counts {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+}
+
+.subtask-body {
+  max-height: min(60vh, 560px);
+  overflow-y: auto;
+  padding-left: var(--space-3);
+  padding-bottom: var(--space-1);
+  border-top: 1px solid var(--color-border);
 }
 
 /* ---- 工具卡片(agent 子智能体 / toolpair 普通工具:标题行 + 折叠内容) ---- */
