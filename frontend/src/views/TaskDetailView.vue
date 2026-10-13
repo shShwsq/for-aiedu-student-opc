@@ -3595,7 +3595,7 @@ const showKnowledgeToolbar = computed<boolean>(() => {
               动态验证
               <span
                 :class="['verifier-status', verifierActive ? 'verifier-on' : 'verifier-off']"
-              >{{ verifierActive ? '运行中' : '已关闭' }}</span>
+              >{{ verifierActive ? '已启用' : '未启用' }}</span>
             </summary>
             <div class="verifier-env">
               <span class="label">测试环境</span>

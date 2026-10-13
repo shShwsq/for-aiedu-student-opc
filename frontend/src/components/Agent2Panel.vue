@@ -48,6 +48,7 @@ import {
 } from '@/utils/reviewBucket'
 import { renderMarkdown } from '@/utils/markdown'
 import { isThinkingExpanded } from '@/utils/thinkingExpand'
+import { toolNameOf } from '@/utils/toolSummary'
 import {
   agent2RoundStats,
   buildAgent2Rounds,
@@ -236,6 +237,19 @@ function toolIntent(c: Conversation): string {
   return truncate(firstLine(c.content).replace(TOOL_INTENT_PREFIX, ''), 70)
 }
 
+// 动态验证动作(有副作用:真打测试环境 / 在沙箱跑取证代码),与只读的
+// read_file / check_reference 区分标注。这两个工具名由 verifier_agent 产生
+// (role=agent2,附 verify 标记),本面板只渲染 agent2,故命中即为动态验证。
+const DYNAMIC_VERIFY_LABELS: Record<string, string> = {
+  http_request: '实时请求',
+  run_python_code: '沙箱执行',
+}
+
+/** 动态验证动作的短标签;只读核查返回空串(不显示标记) */
+function dynamicVerifyLabel(c: Conversation): string {
+  return DYNAMIC_VERIFY_LABELS[toolNameOf(c)] || ''
+}
+
 /** 评估摘要:区分"评估完成"与"发出修正指令" */
 function evalDigest(e: Conversation): string {
   const content = (e.content || '').trim()
@@ -358,7 +372,13 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
         <template v-for="e in g.entries" :key="e.key">
           <!-- 工具核查(读码核对 / PoC / 引用复核):紧跟触发它的那段思考 -->
           <details v-if="e.kind === 'tool'" class="panel-item panel-tool">
-            <summary>{{ toolIntent(e.call) }}</summary>
+            <summary>
+              <span
+                v-if="dynamicVerifyLabel(e.call)"
+                class="panel-tool-dyn-tag"
+                title="动态验证:向测试环境发起真实请求 / 在沙箱执行取证代码"
+              >{{ dynamicVerifyLabel(e.call) }}</span>{{ toolIntent(e.call) }}
+            </summary>
             <div v-if="e.result" class="panel-tool-result">{{ truncate(e.result.content, 1500) }}</div>
             <div v-else class="panel-tool-pending">执行中…</div>
           </details>
@@ -582,6 +602,19 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
   padding: var(--space-1) var(--space-2);
   font-size: var(--fs-xs);
   color: var(--color-text-tertiary);
+}
+
+/* 动态验证动作标记(实时请求 / 沙箱执行):有副作用、真打测试环境,与只读核查一眼
+   区分。配色沿用动态验证思考卡的 is-verify(--color-info),同一条验证链路视觉同源。 */
+.panel-tool-dyn-tag {
+  display: inline-block;
+  margin-right: var(--space-1);
+  padding: 0 var(--space-1);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-info);
+  border: 1px solid var(--color-info);
+  border-radius: var(--radius-sm);
 }
 
 .panel-stream-text {
