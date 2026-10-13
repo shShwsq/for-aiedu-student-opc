@@ -234,8 +234,7 @@ function onCliContextChange(value: string | number): void {
 
         <!-- 执行器(当前任务用哪个 agent1 执行;详情展示,不可在运行态切换) -->
         <div class="rs-field rs-executor-field">
-          <span class="rs-label">执行器</span>
-          <p class="rs-effective" :title="executorLabel">{{ executorLabel }}</p>
+          <p class="rs-executor-name" :title="executorLabel">{{ executorLabel }}</p>
         </div>
 
         <!-- agent1 模型 -->
@@ -258,7 +257,7 @@ function onCliContextChange(value: string | number): void {
         <!-- CLI 执行器模型参数(仅 qoder_cli / deepseek_cli 可改;写入 task.params) -->
         <template v-else-if="isCliWithModelConfig">
           <div class="rs-field">
-            <span class="rs-label">AI助手模型(CLI)</span>
+            <span class="rs-label">AI助手模型</span>
             <BaseSelect
               :model-value="cliParams.model"
               :options="cliModelOptions"
@@ -473,6 +472,17 @@ function onCliContextChange(value: string | number): void {
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
   color: var(--color-text-muted);
+}
+
+/* 执行器名:去掉「执行器」小标题后由它自己承担展示,加粗放大一档作视觉锚点 */
+.rs-executor-name {
+  margin: 0;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .rs-hint {
