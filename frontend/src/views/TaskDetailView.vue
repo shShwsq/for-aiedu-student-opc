@@ -950,6 +950,17 @@ function connectSSE(taskId: string): void {
           streamingItems.delete(retired)
         }
       }
+      // P1-6:分面/计划项子循环 fan-in 收尾(带 parallel+facet 的落库行)时,
+      // 退役该分面遗留的失败思考卡(status==='error')。这些是子循环首轮即死
+      // (如 400)的迭代流留下的孤儿错误卡,无落库记录按 stream_conv_id 退役它,
+      // 任务暂停时会永久悬挂;fan-in 行一到即说明该分面已收尾,清掉同面错误卡。
+      if (data.parallel && data.facet) {
+        for (const [key, s] of streamingItems) {
+          if (s.facet === data.facet && s.status === 'error') {
+            streamingItems.delete(key)
+          }
+        }
+      }
       // 追加到对话列表
       // 注意:type=thinking 的落库记录也会走这里 —— 它是"中途离开页面再回来"
       // 时那段思考的唯一实时来源(thinking_delta 增量是瞬时的,总线不缓存,

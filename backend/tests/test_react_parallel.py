@@ -220,6 +220,76 @@ def test_facet_pass_isolates_llm_error(monkeypatch):
 
 
 # ============================================================
+# 消息序列形状(回归 P0:子循环第 2 迭代 400)
+# ============================================================
+
+
+def _assert_tool_msgs_preceded_by_tool_calls(snapshots):
+    """断每条 {role:tool} 消息前最近的 assistant 带 tool_calls 且 id 匹配。
+
+    镜像 OpenAI provider 契约:'tool must be a response to a preceding message
+    with tool_calls'——旧写法把 assistant 追加成纯 content,下一迭代必 400。
+    """
+    for seq in snapshots:
+        for i, m in enumerate(seq):
+            if m.get("role") != "tool":
+                continue
+            prev = next(
+                (seq[j] for j in range(i - 1, -1, -1)
+                 if seq[j].get("role") == "assistant"),
+                None,
+            )
+            assert prev is not None, "tool 消息前无 assistant"
+            assert prev.get("tool_calls"), (
+                "tool 消息前 assistant 缺 tool_calls → 下一迭代必被 provider 拒 400"
+            )
+            assert m["tool_call_id"] in {tc["id"] for tc in prev["tool_calls"]}
+
+
+def test_facet_pass_assistant_carries_tool_calls(monkeypatch):
+    """回归 P0-1:捕获真实发给 chat_stream 的 messages 序列,断带工具调用的
+    子循环进入下一迭代时 assistant 已带 tool_calls(而非纯 content)。"""
+    monkeypatch.setattr(R, "set_current_task", lambda *a, **k: None)
+    monkeypatch.setattr(R, "execute_tool", lambda fn, args: {"ok": 1})
+
+    turns = [
+        [
+            _chunk(content="先看结构", finish=None),
+            _chunk(deltas=[_delta(0, "c1", "list_files", '{"repo_path": "/x"}')], finish="tool_calls"),
+        ],
+        [_chunk(content="结论:无问题", finish="stop")],
+    ]
+
+    class CapturingClient(FakeClient):
+        def __init__(self, turns):
+            super().__init__(turns)
+            self.snapshots = []
+
+        def chat_stream(self, **kwargs):
+            self.snapshots.append([dict(m) for m in kwargs.get("messages", [])])
+            return super().chat_stream(**kwargs)
+
+    client = CapturingClient(turns)
+    facet_tools = R._facet_readonly_tools(R.get_all_tools())
+    allowed = R._facet_allowed_tool_names(facet_tools)
+    fr = R._run_facet_pass(
+        _facet(),
+        [{"role": "system", "content": "s"}, {"role": "user", "content": "t"}],
+        facet_tools, allowed, client, _Task(),
+        round_idx=1, max_iter=5, executor_command_confirm="always_approve",
+        deadline=time.monotonic() + 60,
+    )
+
+    assert fr.error == ""
+    # 至少两发:第 2 发的 messages 已含首轮的 tool 交换(即回归触发点)
+    assert len(client.snapshots) >= 2
+    assert any(
+        m.get("role") == "tool" for seq in client.snapshots for m in seq
+    ), "脚本未产生 tool 消息,断言形同虚设"
+    _assert_tool_msgs_preceded_by_tool_calls(client.snapshots)
+
+
+# ============================================================
 # _fan_in
 # ============================================================
 
@@ -235,7 +305,8 @@ def test_fan_in_order_adjacency_and_facet_tag(monkeypatch):
             self.id = f"conv-{_Conv._n}"
 
     def fake_add(db, task, *, round_idx, role, type, content, reasoning=None,
-                 tool_call_id=None, extra_payload=None, stream_conv_id=None):
+                 tool_call_id=None, extra_payload=None, stream_conv_id=None,
+                 facet=None):
         c = _Conv()
         recorded.append({
             "type": type, "role": role, "tool_call_id": tool_call_id,

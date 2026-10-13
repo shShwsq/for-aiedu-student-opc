@@ -215,12 +215,17 @@ def test_adopt_entries_renumbers_and_maps():
     assert "E9" not in main.ledger and main._seq == 3
 
 
-def test_remap_refs_in_text_only_rewrites_mapped():
-    text = "结论成立(见 E1/E2),PE12 与 XE3 不是引用,未收养的 E9 原样"
+def test_remap_refs_in_text_rewrites_mapped_strips_others():
+    text = "结论成立(见 E1/E2),PE12 与 XE3 不是引用,未收养的 E9 应被剥离"
     out = remap_refs_in_text(text, {"E1": "E4", "E2": "E5"})
     assert "见 E4/E5" in out
-    assert "PE12" in out and "XE3" in out and "E9" in out
+    # 非引用形态(相邻字母/数字)不动
+    assert "PE12" in out and "XE3" in out
+    # P2-2:命中不到映射的引用号被剔并标注无效,不指向别人证据
+    assert "E9" not in out and "（无效引用）" in out
     assert remap_refs_in_text("", {"E1": "E2"}) == ""
+    # mapping 为空时不动文本(不误伤合法引用)
+    assert remap_refs_in_text("见 E1", {}) == "见 E1"
 
 
 def test_adopted_refs_score_source_confirmed():
@@ -427,6 +432,63 @@ def test_fan_in_pending_rows_pair_tool_call_id(monkeypatch):
 
 
 # ============================================================
+# 消息序列形状(回归 P0:子循环第 2 迭代 400)
+# ============================================================
+
+
+def _assert_tool_msgs_preceded_by_tool_calls(snapshots):
+    """断每条 {role:tool} 消息前最近的 assistant 带 tool_calls 且 id 匹配。
+
+    镜像 OpenAI provider 契约:'tool must be a response to a preceding message
+    with tool_calls'——旧写法把 assistant 追加成纯 content,下一迭代必 400。
+    """
+    for seq in snapshots:
+        for i, m in enumerate(seq):
+            if m.get("role") != "tool":
+                continue
+            prev = next(
+                (seq[j] for j in range(i - 1, -1, -1)
+                 if seq[j].get("role") == "assistant"),
+                None,
+            )
+            assert prev is not None, "tool 消息前无 assistant"
+            assert prev.get("tool_calls"), (
+                "tool 消息前 assistant 缺 tool_calls → 下一迭代必被 provider 拒 400"
+            )
+            assert m["tool_call_id"] in {tc["id"] for tc in prev["tool_calls"]}
+
+
+def test_plan_item_pass_assistant_carries_tool_calls(monkeypatch):
+    """回归 P0-2:直连 _run_plan_item_pass,捕获 stream_llm 每次收到的 messages,
+    断首轮调工具后第二迭代的 assistant 已带 tool_calls(而非纯 content)。"""
+    monkeypatch.setattr(react_agent, "_review_provider_gate", lambda client: nullcontext())
+    monkeypatch.setattr(agent2, "_execute_read_tool", _fake_read_tool)
+    snapshots = []
+    script = deque([
+        _sr(tool_calls=[_tc("read_file", {"file_path": "a.py"}, cid="cA")]),
+        _sr(content="结论:核查成立"),
+    ])
+
+    def _worker(client, messages, **kwargs):
+        snapshots.append(list(messages))
+        return script.popleft()
+
+    monkeypatch.setattr(agent2, "stream_llm", _worker)
+    result = agent2._run_plan_item_pass(
+        {"id": "P1", "target": "t", "planned_evidence": "source"},
+        [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
+        MagicMock(), "task-shape", 1, "C:/repo",
+        read_cap=5, max_iter=8, item_timeout=60,
+    )
+
+    assert result.error == ""
+    assert len(snapshots) >= 2  # 第二发的 messages 已含首轮 tool 交换(回归触发点)
+    assert any(m.get("role") == "tool" for seq in snapshots for m in seq), \
+        "脚本未产生 tool 消息,断言形同虚设"
+    _assert_tool_msgs_preceded_by_tool_calls(snapshots)
+
+
+# ============================================================
 # 子循环引擎单元(_run_plan_item_pass):超时宽限收尾
 # ============================================================
 
@@ -445,7 +507,7 @@ def test_plan_item_deadline_converts_to_finalize_summary(monkeypatch):
         {"id": "P1", "target": "t", "planned_evidence": "source"},
         [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
         MagicMock(), "task-x", 1, "C:/repo",
-        read_cap=5, max_iter=8, deadline=time.monotonic() - 1.0,
+        read_cap=5, max_iter=8, item_timeout=60, hard_deadline=time.monotonic() - 1.0,
     )
 
     assert result.timed_out is True
@@ -469,7 +531,7 @@ def test_plan_item_stop_check_marks_aborted(monkeypatch):
         {"id": "P9", "target": "t", "planned_evidence": "source"},
         [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
         MagicMock(), "task-y", 1, "C:/repo",
-        read_cap=5, max_iter=8, deadline=time.monotonic() + 60,
+        read_cap=5, max_iter=8, item_timeout=60,
         stop_check=lambda: True,
     )
     assert result.aborted is True

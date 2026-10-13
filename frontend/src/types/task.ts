@@ -294,9 +294,9 @@ export interface Conversation {
    */
   attachments?: AttachmentInfo[] | null
   /**
-   * 仅内置 react 分面并行的 agent1 思考/工具有:分面名(skill 名)。
-   * 随 conversation 事件的 extra_payload 下发(会话内可见);
-   * 快照刷新(GET /tasks/{id})不含(后端未持久化),退化为无标签。
+   * 仅并行分面/计划项 fan-in 行有:分面名(如"check_ssrf"/"计划项 P1")。
+   * 已持久化进 conversations.facet,快照刷新(GET /tasks/{id})也携带(P1-5);
+   * 历史数据为 null。
    */
   facet?: string | null
   created_at: string

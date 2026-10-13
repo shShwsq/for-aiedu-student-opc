@@ -218,8 +218,9 @@ class _FakeTask:
 
 
 class _FakeDb:
-    def __init__(self):
+    def __init__(self, task=None):
         self.commits = 0
+        self._task = task
 
     def commit(self):
         self.commits += 1
@@ -228,9 +229,10 @@ class _FakeDb:
         pass
 
     def get(self, *args, **kwargs):
-        # 按轮会话替身:返回 None → 循环回退到传入的 task 对象(行为等价旧路径),
-        # 从而 executor.run 对 task.params 的改写可被 _consume_paused_interrupt_flag 读到
-        return None
+        # P2-4:按轮会话不回退到外层游离 task——get 返回绑定的 task 对象,
+        # 使 executor.run 对该 task.params 的中断改写可被同轮 _consume_paused_interrupt_flag 读到。
+        # 未绑定(单元 consume 测试直接传 task)时返回 None。
+        return self._task
 
 
 def test_consume_paused_flag_absent_returns_false_no_commit():
@@ -248,6 +250,37 @@ def test_consume_paused_flag_true_clears_and_commits():
     assert _consume_paused_interrupt_flag(task, db) is True
     assert "_round_paused_interrupt" not in task.params
     assert task.params.get("_plan") == []  # 其它键保留
+    assert db.commits == 1
+
+
+def test_consume_paused_flag_commit_failure_returns_false():
+    """P1-3:commit 抛错 → 返回 False(标志未从 DB 抹去,不假 park)+ rollback 归还会话"""
+    class _BoomDb(_FakeDb):
+        def commit(self):
+            self.commits += 1
+            raise RuntimeError("connection closed")
+
+    task = _FakeTask({"_round_paused_interrupt": 3})
+    db = _BoomDb()
+    assert _consume_paused_interrupt_flag(task, db, 3) is False
+    assert db.commits == 1
+
+
+def test_consume_paused_flag_round_mismatch_is_ignored():
+    """P1-3:标志轮号与当前轮不符(上一轮残留)→ 判未中断且不清除"""
+    task = _FakeTask({"_round_paused_interrupt": 2})
+    db = _FakeDb()
+    assert _consume_paused_interrupt_flag(task, db, 3) is False
+    assert task.params.get("_round_paused_interrupt") == 2  # 不属于本轮,不动
+    assert db.commits == 0
+
+
+def test_consume_paused_flag_round_match_consumes():
+    """P1-3:标志轮号与当前轮一致 → 正常消费返回 True 并清除"""
+    task = _FakeTask({"_plan": [], "_round_paused_interrupt": 3})
+    db = _FakeDb()
+    assert _consume_paused_interrupt_flag(task, db, 3) is True
+    assert "_round_paused_interrupt" not in task.params
     assert db.commits == 1
 
 
@@ -281,6 +314,9 @@ def _stub_loop_env(monkeypatch, *, auto_continue=True, max_rounds=8):
     parks: list = []
     open_at_park: list[int] = []
     session_state = {"open": 0, "max_open": 0}
+    # P2-4 后循环用 round_db.get(Task, id) 取本轮 task(不回退游离对象),
+    # 故按轮会话需绑定一个跨轮持久的 task,executor 的中断改写才可见。
+    shared_task = _FakeTask({})
 
     monkeypatch.setattr(
         orchestrator, "wait_if_paused",
@@ -297,7 +333,7 @@ def _stub_loop_env(monkeypatch, *, auto_continue=True, max_rounds=8):
             session_state["max_open"], session_state["open"],
         )
         try:
-            yield _FakeDb()
+            yield _FakeDb(shared_task)
         finally:
             session_state["open"] -= 1
 
@@ -431,12 +467,15 @@ def test_resolve_continuation_message_uses_queued_user_text(monkeypatch):
         lambda tid, ev, data: published.append((ev, data)),
     )
     db = MagicMock()
+    db.query.return_value.filter.return_value.update.return_value = 1
     db.query.return_value.filter.return_value.all.return_value = []
 
     msg = _resolve_continuation_message(_FakeTask({}), db, round_idx=2)
     assert msg == "改成只审 src/"
-    # 查库定位待入流消息(即便 .all() 为空也不报错)
-    db.query.assert_called_once()
+    # P2-3 摸轮:先 update 把排队消息挪到新轮首(一次写 + commit),
+    # 再 all() 查回补推入对话流 → db.query 共调 2 次。
+    assert db.query.call_count == 2
+    db.query.return_value.filter.return_value.update.assert_called_once()
 
 
 def test_run_had_tool_calls_any_across_range(monkeypatch):

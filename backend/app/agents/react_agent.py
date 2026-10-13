@@ -395,70 +395,13 @@ def run_react_agent(
                 logger.warning(
                     f"[task={task.id}] 消费消息入流事件推送失败(忽略): {_pub_err}"
                 )
-            # 本批消息附带的上传文件:传输进工作区 followup_uploads/(不重定向
-            # repo_path;无工作根的纯对话任务由传输原语按需建根,见
-            # _ensure_upload_work_root),并把路径提示并入注入文本,让模型感知新文件。
-            # 布局约定:按 params.followup_upload_ids **全量累积列表**传输(全局
-            # 下标),与沙箱回收后的重放 / 工作区回退浏览同一布局 —— 本轮新 ids
-            # 先并入 params 再传,保证三处路径一致;单个上传失败由
-            # add_uploads_to_workspace 逐上传容错(旧附件被 GC 不阻断新文件)。
-            # 传输失败 catch+log,不中断本轮(文字消息照常注入),但要同时
-            # 落库一条 system/warning + 如实告知模型,不能让模型读到不存在的文件。
-            attachment_note = ""
-            batch_upload_ids: list[str] = []
-            for m in pending_user_msgs:
-                for uid in (m.get("upload_ids") or []):
-                    if uid and uid not in batch_upload_ids:
-                        batch_upload_ids.append(uid)
-            if batch_upload_ids:
-                from app.services.upload_layout import extract_followup_ids
-                from app.tools import sandbox_tools
-
-                existing = extract_followup_ids(task.params)
-                merged = existing + [u for u in batch_upload_ids if u not in existing]
-                # 持久化累积(非 JSONB 突变):params 是重放与回退浏览的唯一真源,
-                # 先落库再传输(传输失败也不丢重放依据)
-                task.params = {**(task.params or {}), "followup_upload_ids": merged}
-                try:
-                    db.commit()
-                except Exception as e:
-                    logger.warning(
-                        f"[task={task.id}] 追问上传累积落库失败(忽略): {e}"
-                    )
-                    db.rollback()
-                added: list[str] = []
-                fail_reason = ""
-                try:
-                    added = list(
-                        sandbox_tools.add_uploads_to_workspace(
-                            task_id_str, merged, "followup_uploads"
-                        ) or []
-                    )
-                except Exception as e:
-                    fail_reason = str(e)
-                    logger.warning(
-                        f"[task={task.id}] 追问上传文件传输失败(忽略,文字消息照常注入): {e}"
-                    )
-                if added:
-                    ws_root = (
-                        sandbox_tools.get_workspace_info(task_id_str) or {}
-                    ).get("repo_path", "")
-                    attachment_note = format_followup_attachment_note(
-                        added, ws_root
-                    )
-                else:
-                    # 一个也没落地:告知模型实情(防臆测)+ 对话流里留一条可见告警
-                    attachment_note = ATTACHMENT_UNAVAILABLE_NOTE
-                    try:
-                        _add_conversation(
-                            db, task, round_idx=round_idx,
-                            role="system", type="warning",
-                            content=format_followup_upload_warning(fail_reason),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"[task={task.id}] 追问附件告警落库失败(忽略): {e}"
-                        )
+            # 本批消息附带的上传文件:传输入工区 followup_uploads/ 并把路径
+            # 提示并入注入文本(累积 params / 传输容错 / 失败告警均由共享函数
+            # apply_followup_attachments 负责,与续跑消费同构)。
+            attachment_note = apply_followup_attachments(
+                db, task, pending_user_msgs,
+                round_idx=round_idx, task_id_str=task_id_str,
+            )
             injected = format_injected_user_messages(
                 pending_user_msgs, attachment_note=attachment_note
             )
@@ -798,6 +741,75 @@ def _facet_allowed_tool_names(tools: list[dict[str, Any]]) -> set[str]:
     return {(t.get("function") or {}).get("name") for t in tools} - {None}
 
 
+def apply_followup_attachments(
+    db: Session,
+    task: Task,
+    pending_user_msgs: list[dict[str, Any]],
+    *,
+    round_idx: int,
+    task_id_str: str,
+) -> str:
+    """把一批排队用户消息附带的上传文件传输入工区,返回并入注入文本的附件提示。
+
+    drain 路径(react_agent 迭代边界)与续跑消费路径(orchestrator 自动续跑)
+    共用同一处理(P1-2):
+    - 按 params.followup_upload_ids 全量累积列表传输(全局下标),与沙箱回收后
+      重放 / 工作区回退浏览同一布局;本轮新 ids 先并入 params 再传;
+    - 传输失败 catch+log,不中断本轮(文字消息照常注入),同时落一条 system/warning
+      + 如实告知模型(不能让模型读到不存在的文件);单个上传失败逐上传容错。
+    返回注入用的 attachment_note(无附件时为空串)。
+    """
+    batch_upload_ids: list[str] = []
+    for m in pending_user_msgs:
+        for uid in (m.get("upload_ids") or []):
+            if uid and uid not in batch_upload_ids:
+                batch_upload_ids.append(uid)
+    if not batch_upload_ids:
+        return ""
+
+    from app.services.upload_layout import extract_followup_ids
+    from app.tools import sandbox_tools
+
+    existing = extract_followup_ids(task.params)
+    merged = existing + [u for u in batch_upload_ids if u not in existing]
+    # 持久化累积(非 JSONB 突变):params 是重放与回退浏览的唯一真源,
+    # 先落库再传输(传输失败也不丢重放依据)
+    task.params = {**(task.params or {}), "followup_upload_ids": merged}
+    try:
+        db.commit()
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 追问上传累积落库失败(忽略): {e}")
+        db.rollback()
+    added: list[str] = []
+    fail_reason = ""
+    try:
+        added = list(
+            sandbox_tools.add_uploads_to_workspace(
+                task_id_str, merged, "followup_uploads"
+            ) or []
+        )
+    except Exception as e:
+        fail_reason = str(e)
+        logger.warning(
+            f"[task={task.id}] 追问上传文件传输失败(忽略,文字消息照常注入): {e}"
+        )
+    if added:
+        ws_root = (
+            sandbox_tools.get_workspace_info(task_id_str) or {}
+        ).get("repo_path", "")
+        return format_followup_attachment_note(added, ws_root)
+    # 一个也没落地:告知模型实情(防臆测)+ 对话流里留一条可见告警
+    try:
+        _add_conversation(
+            db, task, round_idx=round_idx,
+            role="system", type="warning",
+            content=format_followup_upload_warning(fail_reason),
+        )
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 追问附件告警落库失败(忽略): {e}")
+    return ATTACHMENT_UNAVAILABLE_NOTE
+
+
 def _facet_stream_turn(
     client: LLMClient,
     messages: list[dict[str, Any]],
@@ -943,7 +955,26 @@ def _run_facet_pass(
                 "content": content, "reasoning": reasoning,
                 "stream_conv_id": conv_id,
             })
-            messages.append({"role": "assistant", "content": content})
+            # 镜像串行主循环(见上方 assistant_msg 构造):assistant 必须带 tool_calls,
+            # 否则下一迭代序列里紧接的 {role:tool} 会违反 OpenAI 契约被拒 400
+            # ("tool must be a response to a preceding message with tool_calls")。
+            # 文本 tool_call 兜底路径产生的合成 id 与下方 tool 消息同源(tc["id"]),天然匹配。
+            assistant_msg: dict[str, Any] = {"role": "assistant"}
+            if content:
+                assistant_msg["content"] = content
+            if tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments_str"],
+                        },
+                    }
+                    for tc in tool_calls
+                ]
+            messages.append(assistant_msg)
 
             if not tool_calls:
                 if content:
@@ -1038,6 +1069,7 @@ def _fan_in(
                 reasoning=row.get("reasoning"),
                 tool_call_id=tool_call_id,
                 stream_conv_id=row.get("stream_conv_id"),
+                facet=fr.facet,
                 extra_payload={"facet": fr.facet, "parallel": True},
             )
             if row["type"] == "tool_call":

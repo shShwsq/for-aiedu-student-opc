@@ -600,10 +600,12 @@ def run_agent2(
         max_summary_tokens = max(
             1, int(getattr(_s, "AGENT2_PLAN_ITEM_SUMMARY_MAX_TOKENS", 3000) or 3000)
         )
-        # 统一算一次扇出基准 deadline(墙钟预算),同时受审查总硬时限约束
-        deadline = time.monotonic() + item_timeout
-        if review_max_seconds > 0:
-            deadline = min(deadline, loop_started + review_max_seconds)
+        # 每个 worker 进场时自起算本项预算(P1-1),这里只算统一的硬时限封顶。
+        # (对比 react_agent 分面侧共用 deadline 是刻意的"整轮预算",两处语义分开)
+        hard_deadline = (
+            float("inf") if review_max_seconds <= 0
+            else loop_started + review_max_seconds
+        )
         # worker 基础上下文:只取 system/user(agent2 的 messages 本就是无状态的
         # system + user;此刻本轮 submit_review_plan 的工具交换尚未收口,
         # 悬挂的 assistant tool_calls 消息不能带进子循环)
@@ -626,7 +628,8 @@ def run_agent2(
                     _run_plan_item_pass, it, base_messages, client,
                     task_id, round_idx, repo_path,
                     read_cap=read_cap, max_iter=max_iter,
-                    deadline=deadline, stop_check=stop_check,
+                    item_timeout=item_timeout, hard_deadline=hard_deadline,
+                    stop_check=stop_check,
                 )
                 for it in plan_items
             ]
@@ -670,6 +673,7 @@ def run_agent2(
                         reasoning=row.get("reasoning") or None,
                         tool_call_id=tool_call_id,
                         stream_conv_id=row.get("stream_conv_id"),
+                        facet=f"计划项 {pr.pid}",
                         extra_payload={"facet": f"计划项 {pr.pid}", "parallel": True},
                     )
                     if row["type"] == "tool_call":
@@ -1467,7 +1471,8 @@ def _run_plan_item_pass(
     *,
     read_cap: int,
     max_iter: int,
-    deadline: float,
+    item_timeout: int,
+    hard_deadline: float = float("inf"),
     stop_check: Callable[[], bool] | None = None,
 ) -> _PlanItemResult:
     """跑单个计划项的有界只读 ReAct 子循环(worker 线程执行,全程无共享副作用)。
@@ -1488,6 +1493,10 @@ def _run_plan_item_pass(
     planned = str(plan_item.get("planned_evidence") or "source").strip()
     facet_label = f"计划项 {pid}"
     result = _PlanItemResult(pid=pid)
+    # 进场自起算本项墙钟预算(P1-1):旧写法在扇出时统一算一次 deadline 全体共享,
+    # 合格项数 > max_workers 时后一波 worker 一进场即(接近)预算终点,只出收尾
+    # 空总结。改为每项自己进场计时,统一受 hard_deadline(审查总硬时限)封顶。
+    deadline = min(time.monotonic() + item_timeout, hard_deadline)
 
     worker_evidence = EvidenceRecorder()
     item_tools = list(_READ_ONLY_TOOL_DEFINITIONS)
@@ -1576,7 +1585,25 @@ def _run_plan_item_pass(
                 "type": "thinking", "content": content,
                 "reasoning": res.reasoning, "stream_conv_id": res.conv_id,
             })
-            messages.append({"role": "assistant", "content": content})
+            # 镜像串行主循环:assistant 必须带 tool_calls(与下方 tool 消息用同一
+            # tc_id 解析口径 tc["id"] or call_{index}),否则下一迭代的 {role:tool}
+            # 因缺前置 tool_calls 被 OpenAI 拒 400,计首项调工具即废。
+            assistant_msg: dict[str, Any] = {"role": "assistant"}
+            if content:
+                assistant_msg["content"] = content
+            if tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc["id"] or f"call_{tc['index']}",
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments_str"],
+                        },
+                    }
+                    for tc in tool_calls
+                ]
+            messages.append(assistant_msg)
 
             if not tool_calls:
                 if content:

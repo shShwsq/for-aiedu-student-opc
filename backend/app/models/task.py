@@ -3,7 +3,7 @@
 通用任务模型,支持多场景。场景标识为字符串,可任意注册新场景。
 """
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum as PyEnum
 
 from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, func
@@ -197,9 +197,19 @@ class Conversation(Base):
     # 仅 user 追问消息有:本条消息附带的上传文件展示信息(刷新后气泡仍渲染 chip)。
     # 每项 {"upload_id", "filename", "size", "kind"};其他消息/历史数据为 None
     attachments: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # 仅并行分面/计划项子循环的 fan-in 行有:所属分面名(如"check_ssrf"/"计划项 P1")。
+    # 刷新/回放后前端据此给近似思考卡打"分面 · X"徽标(旧版只走瞬态 extra_payload,
+    # 刷新后丢失)。历史数据为 NULL,前端不显示徽标。
+    facet: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
+        DateTime(timezone=True),
+        # P2-6:PG now() 返回事务开始时间,会话复用长事务下落库时间戳会显著早于
+        # 真实插入(实测偏差 14s),影响排序与审计。改用 Python 侧默认取插入时刻,
+        # server_default 仍留作不经过 ORM 的直写(如原生 SQL)兜底。
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+        nullable=False,
     )
 
     task: Mapped[Task] = relationship(back_populates="conversations")
@@ -263,6 +273,35 @@ def migrate_conversation_add_attachments_column() -> None:
         )
         conn.commit()
     log.info("conversations.attachments 列迁移完成")
+
+
+def migrate_conversation_add_facet_column() -> None:
+    """幂等给 conversations 加 facet 列(并行分面/计划项子循环所属面名)
+
+    背景同 migrate_conversation_tool_call_id:无 Alembic,老库需显式 ALTER。
+    旧版 facet 只随 SSE 瞬态 extra_payload 下发,刷新/回放后徒标丢失;现在落列。
+    全新库(create_all 已建好)或已迁过 → 直接返回。老数据该列为 NULL。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("conversations"):
+            return  # 全新库,create_all 会建好新列
+        cols = {c["name"] for c in insp.get_columns("conversations")}
+        if "facet" in cols:
+            return  # 已迁过
+        conn.execute(
+            text("ALTER TABLE conversations ADD COLUMN facet VARCHAR(64)")
+        )
+        conn.commit()
+    log.info("conversations.facet 列迁移完成")
 
 
 def migrate_task_drop_checklist_column() -> None:

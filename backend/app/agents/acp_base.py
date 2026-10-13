@@ -4082,7 +4082,7 @@ def run_acp_agent(
             "或追问让助手在同一会话继续]"
         )
         try:
-            task.params = {**(task.params or {}), "_round_paused_interrupt": True}
+            task.params = {**(task.params or {}), "_round_paused_interrupt": round_idx}
             db.commit()
         except Exception as e:
             logger.warning(f"[task={task.id}] 写入暂停中断标志失败(忽略): {e}")

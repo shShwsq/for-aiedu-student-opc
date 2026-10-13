@@ -199,9 +199,18 @@ def test_run_task_background_falls_back_and_publishes(monkeypatch):
     import app.routers.tasks as tasks
 
     tid = str(uuid.uuid4())
-    fake_db = MagicMock()
-    fake_db.get.return_value = object()  # 任务存在
-    monkeypatch.setattr(tasks, "SessionLocal", lambda: fake_db)
+    sessions: list = []
+
+    def _make_session():
+        # P2-5:崩溃兵底除了主会话还会走 _error_event_should_push 另开一个
+        # 独立会话读回状态,故 SessionLocal 需每次返回不同会话(生产语义)
+        # 而非共享同一 mock,否则 close 计数失真。
+        m = MagicMock()
+        m.get.return_value = object()  # 任务存在
+        sessions.append(m)
+        return m
+
+    monkeypatch.setattr(tasks, "SessionLocal", _make_session)
     monkeypatch.setattr(
         tasks, "run_pipeline_audit",
         MagicMock(side_effect=OperationalError("s", {}, Exception("dead"))),
@@ -228,7 +237,9 @@ def test_run_task_background_falls_back_and_publishes(monkeypatch):
     assert persisted and persisted[0][0] == tid  # 新会话兜底落 FAILED
     assert any(ev == "error" for ev, _ in published)  # 前端可收终态
     assert cleaned == [tid]  # scope 泄漏已防
-    fake_db.close.assert_called_once()
+    # 主会话(_run_task_in_background 首个 SessionLocal)被 close 恰好一次;
+    # _error_event_should_push 另开的会话 close 自己的不算泄漏。
+    assert sessions and sessions[0].close.call_count == 1
 
 
 def test_run_resume_background_falls_back_and_publishes(monkeypatch):

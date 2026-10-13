@@ -29,6 +29,7 @@ def record_conversation(
     publish_event: bool = True,
     extra_payload: dict[str, Any] | None = None,
     stream_conv_id: str | None = None,
+    facet: str | None = None,
 ) -> Conversation:
     """落库一条对话(带 round_idx),可选推送 conversation 事件给前端 SSE
 
@@ -38,6 +39,8 @@ def record_conversation(
       看上去就像"思考没保存"。实时卡片改由前端按 stream_conv_id/文本对账退役。
     - tool_call_id:仅 type=tool_result 用,对应 tool_call 记录的 id,
       前端据此配对展示(并行调用时 result 按完成顺序落库,不紧跟 call)
+    - facet:仅并行分面/计划项 fan-in 行用,落库所属分面名(持久化列),
+      刷新/回放后前端据此给思考卡打"分面 · X"徽标(不再只靠瞬态 extra_payload)
     - extra_payload:随事件附加的字段(如 verifier 的 verify=True)
     - stream_conv_id:仅 type=thinking 用,落库前那次流式 thinking_delta 的
       conv_id(瞬态字段,不入 DB)。前端按它把"实时流式卡片"退役成只读历史
@@ -56,6 +59,7 @@ def record_conversation(
         content=content,
         reasoning=reasoning,
         tool_call_id=tool_call_id,
+        facet=facet,
     )
     db.add(conv)
     db.commit()
@@ -84,6 +88,7 @@ def publish_conversation(
         "content": conv.content,
         "reasoning": conv.reasoning,
         "tool_call_id": conv.tool_call_id,
+        "facet": conv.facet,
         "created_at": conv.created_at.isoformat() if conv.created_at else None,
         "stream_conv_id": stream_conv_id,
     }

@@ -114,6 +114,42 @@ router = APIRouter(tags=["tasks"])
 # supportsModelConfig 同一口径(codex_cli 模型经 config.toml 自管,不在此列)。
 _CLI_MODEL_PARAM_EXECUTORS = {"qoder_cli", "deepseek_cli"}
 
+# 按执行器白名单校验 CLI 模型参数(P2-1):与前端 data/cliModelOptions.ts
+# 同口径。空串=清除(回退 CLI profile 默认),非空必须命中白名单,否则 API
+# 直调可写入非法模型名,要到下一轮 session 启动才炸。集合同时约束 reasoning_effort。
+_CLI_MODEL_WHITELIST: dict[str, set[str]] = {
+    "qoder_cli": {
+        "Auto", "Qwen3.8-Max", "Qwen3.8-Flash", "Qwen3.7-Max", "Qwen3.7-Plus",
+        "Qwen3.7-Flash", "DeepSeek-V4-Pro", "DeepSeek-V4-Flash", "GLM-5.3",
+        "GLM-5.2", "Kimi-K2.7-Code", "MiniMax-M2.7",
+    },
+    "deepseek_cli": {"deepseek-v4-flash", "deepseek-v4-pro"},
+}
+_CLI_EFFORT_WHITELIST: dict[str, set[str]] = {
+    "qoder_cli": {"low", "medium", "high", "xhigh", "max"},
+    "deepseek_cli": {"off", "low", "high", "max"},
+}
+
+
+def _validate_cli_model_params(
+    executor: str, model: str | None, reasoning_effort: str | None,
+) -> None:
+    """白名单校验非空 model/reasoning_effort;非法值抛 400。空串(清除)不校。"""
+    if model:
+        allowed = _CLI_MODEL_WHITELIST.get(executor, set())
+        if model not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"模型名 {model!r} 不在执行器 {executor} 的允许列表内",
+            )
+    if reasoning_effort:
+        allowed = _CLI_EFFORT_WHITELIST.get(executor, set())
+        if reasoning_effort not in allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"思考强度 {reasoning_effort!r} 不在执行器 {executor} 的允许列表内",
+            )
+
 
 @router.get("/scenarios", response_model=list[ScenarioInfo])
 def list_all_scenarios() -> list[dict[str, Any]]:
@@ -638,6 +674,8 @@ def update_task_runtime_config(
                 status_code=400,
                 detail=f"当前执行器 {executor} 不支持在此修改模型参数",
             )
+        # P2-1:先按白名单校验非空值(非法模型名/思考强度 → 400),再写 params
+        _validate_cli_model_params(executor, req.model, req.reasoning_effort)
         params = dict(task.params or {})
         if req.model is not None:
             if req.model:
@@ -1001,6 +1039,25 @@ def retry_failed_task_endpoint(
     )
 
 
+def _error_event_should_push(task_id: str) -> bool:
+    """崩溃兜底要不要推 error 事件(P2-5)。
+
+    persist_task_failure_fresh 对"刚写 FAILED"与"已是终态(含 COMPLETED)无需写"
+    都返回 True,无法据此区分。这里用全新会话读回当前落库状态:仅当确认任务已
+    正常完成(COMPLETED)时抑制 error(否则已完成任务误弹失败横幅);读不到/其它
+    状态(FAILED/RUNNING/DB 不可用)一律照推,保证真崩溃场景前端不永久等待。
+    """
+    try:
+        _db = SessionLocal()
+        try:
+            t = _db.get(Task, uuid.UUID(str(task_id)))
+            return not (t is not None and t.status == TaskStatus.COMPLETED)
+        finally:
+            _db.close()
+    except Exception:  # noqa: BLE001 - 读状态失败宁可推 error
+        return True
+
+
 def _run_retry_in_background(task_id: str) -> None:
     """后台线程执行失败任务重试(与 _run_resume_in_background 对齐)
 
@@ -1021,14 +1078,16 @@ def _run_retry_in_background(task_id: str) -> None:
         # 改用全新独立会话落 FAILED(内部防覆盖已完成/已失败终态)。
         persist_task_failure_fresh(task_id, str(e), "重试执行失败")
         # 兜底推送终止事件:走内存总线,防止 SSE 订阅者因线程在进入
-        # resume 主 try 块前崩溃收不到 error 而永久挂起
-        try:
-            publish(uuid.UUID(task_id), "error", {
-                "status": "failed",
-                "error_message": str(e)[:1000],
-            })
-        except Exception:  # noqa: BLE001 - 事件推送失败不得影响下方 scope 清理
-            pass
+        # resume 主 try 块前崩溃收不到 error 而永久挂起。P2-5:已确认完成的
+        # 任务不推(否则已完成任务误弹失败横幅)。
+        if _error_event_should_push(task_id):
+            try:
+                publish(uuid.UUID(task_id), "error", {
+                    "status": "failed",
+                    "error_message": str(e)[:1000],
+                })
+            except Exception:  # noqa: BLE001 - 事件推送失败不得影响下方 scope 清理
+                pass
         # 强制清空事件活跃期:retry 链路可能在崩溃前注册了 scope
         # (resume 前置段异常上抛)——泄漏会让该任务之后所有流被误判
         # "并行中"(永不推 done、SSE 永久悬挂)。先推 error 后清理。
@@ -2198,14 +2257,16 @@ def _run_task_in_background(task_id: str) -> None:
         except Exception:  # noqa: BLE001
             pass
         persist_task_failure_fresh(task_id, _err_detail(e), "执行失败")
-        # 兜底推送终止事件:走内存总线(不碰 DB),前端据此显示失败横幅而非永久等待
-        try:
-            publish(uuid.UUID(task_id), "error", {
-                "status": "failed",
-                "error_message": _err_detail(e)[:1000],
-            })
-        except Exception:  # noqa: BLE001 - 事件推送失败不得影响下方 scope 清理
-            pass
+        # 兜底推送终止事件:走内存总线(不碰 DB),前端据此显示失败横幅而非永久
+        # 等待。P2-5:已确认完成的任务不推(否则已完成任务误弹失败横幅)。
+        if _error_event_should_push(task_id):
+            try:
+                publish(uuid.UUID(task_id), "error", {
+                    "status": "failed",
+                    "error_message": _err_detail(e)[:1000],
+                })
+            except Exception:  # noqa: BLE001 - 事件推送失败不得影响下方 scope 清理
+                pass
         # 强制清空事件活跃期:若 run_pipeline_audit 在注册 scope 后、进 finally
         # 前崩溃,scope 会泄漏 → 该任务后续所有流被误判"并行中"(SSE 永久悬挂)。
         force_cleanup_event_scopes(task_id)

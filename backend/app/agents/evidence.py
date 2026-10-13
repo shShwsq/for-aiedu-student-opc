@@ -197,16 +197,21 @@ _EVIDENCE_REF_RE = re.compile(r"(?<![A-Za-z0-9_])E(\d+)(?![A-Za-z0-9_])")
 
 
 def remap_refs_in_text(text: str, mapping: dict[str, str]) -> str:
-    """把文本里的 E# 引用号按映射改写(映射外的引用号原样保留)。
+    """把文本里的 E# 引用号按映射改写(未命中映射的引用号剥离并标注无效)
 
     并行 worker 结论里的 E1/E2… 是局部台账编号,收养后主台账重新编号;
     不改写则 call_ref 对不上主台账(命中校验①直接 mismatch)。
+    未命中映射的 E# 是 worker 臆造或属于其他 worker 的局部编号,若原样保留会
+    指向主台账里别人的证据(张冠李戴),故剔字并标注(P2-2)。
+    mapping 为空时不动文本(worker 未产生局部台账 → 无可改写,不误伤)。
     """
     if not text or not mapping:
         return text or ""
-    return _EVIDENCE_REF_RE.sub(
-        lambda m: mapping.get(m.group(0), m.group(0)), text
-    )
+
+    def _repl(m: "re.Match[str]") -> str:
+        return mapping.get(m.group(0)) or "（无效引用）"
+
+    return _EVIDENCE_REF_RE.sub(_repl, text)
 
 
 def _lookup(ledger: dict[str, dict[str, Any]], call_ref: Any) -> dict[str, Any] | None:

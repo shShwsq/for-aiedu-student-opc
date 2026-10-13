@@ -600,6 +600,14 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
                 f"[task={task.id}] 崩溃时主连接落库失败,改用新会话兜底: {commit_err}"
             )
             persist_task_failure_fresh(task.id, err_detail, "执行失败")
+            # P1-4:commit 失败后 session 处于 pending-rollback,若直接复用它
+            # 补写错误对话必报 PendingRollbackError——恰在断连场景下丢失失败记录。
+            # 先 rollback 清脏态(FAILED 终态已由上面新会话落库,回滚主会话无害),
+            # 再让下面的补写走已归还的连接。
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001 - rollback 失败仅已上抛的 commit 错
+                pass
         # 错误对话落库(补充信息):单独兜底,失败不得影响上面已落的终态/事件
         try:
             _add_conversation(
@@ -683,19 +691,36 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
 run_dual_agent_audit = run_pipeline_audit
 
 
-def _consume_paused_interrupt_flag(task: Task, db: Session) -> bool:
+def _consume_paused_interrupt_flag(
+    task: Task, db: Session, round_idx: int | None = None,
+) -> bool:
     """读取并清除本轮"被暂停中断"标志,返回本轮是否被暂停中断。
 
     标志由 acp_base 在 CLI/ACP 轮被 session/cancel 真中断时写入
-    (`task.params["_round_paused_interrupt"]=True`)。builtin react_agent
+    (`task.params["_round_paused_interrupt"]=本轮轮号`)。builtin react_agent
     不写此标志,故其任务恒返回 False(行为无变化)。
 
     仅当标志为真才改写 task.params 并 commit:只脏 params 列,不触碰
     status/current_stage(暂停端点已在其会话把状态落 PAUSED,回写会覆盖)。
     消费后清除,避免影响下一轮。
+
+    两道防假中断(P1-3):
+    ① 轮号校验:传入 round_idx 时,标志值必须等于本轮(历史值 True 视为兼容,
+      匹配任意轮);不等则是上一轮 commit 失败残留的脏标志,直接判"本轮未中断"
+      且不清除(它属于别轮)——否则会把一个正常完成的轮误判"被中断"→假 park。
+    ② commit 失败返回 False:标志未能从 DB 抹去,若仍返回 True 会假 park 假续跑;
+      返回 False 后残留脏标志靠下一次消费的轮号校验兼底。
     """
     params = task.params or {}
-    if not params.get("_round_paused_interrupt"):
+    flag = params.get("_round_paused_interrupt")
+    if not flag:
+        return False
+    # 轮号校验(round_idx=None 时跳过,兼容旧调用方/历史 True 值)
+    if round_idx is not None and flag is not True and flag != round_idx:
+        logger.warning(
+            f"[task={task.id}] 暂停中断标志轮号 {flag!r} 与当前轮 {round_idx} 不符,"
+            f"判为跨轮残留,不清除也不触发续跑"
+        )
         return False
     new_params = {**params}
     new_params.pop("_round_paused_interrupt", None)
@@ -703,7 +728,14 @@ def _consume_paused_interrupt_flag(task: Task, db: Session) -> bool:
     try:
         db.commit()
     except Exception as e:
-        logger.warning(f"[task={task.id}] 清除暂停中断标志失败(忽略): {e}")
+        # commit 失败标志仍残留 DB:不能返回 True(否则假 park),best-effort rollback
+        # 归还 pending-rollback session。
+        logger.warning(f"[task={task.id}] 清除暂停中断标志失败,本轮不判中断: {e}")
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 - rollback 失败仅已上抛的 commit 错
+            pass
+        return False
     return True
 
 
@@ -713,18 +745,29 @@ def _resolve_continuation_message(task: Task, db: Session, round_idx: int) -> st
     暂停/运行期间用户发的消息由 API 端点落库为 Conversation(role=user)并
     push_user_message 入队(仅推 user_message_pending,未入对话流)。CLI/ACP 的
     prompt 循环内不 drain,故这些排队消息不会像 builtin 那样在迭代边界被消费;
-    自动续跑是唯一的消费时机,在此补推 conversation 事件让它们进入对话流
-    (与 react_agent 的 drain 处理一致),并用其原文作为续跑输入。
+    自动续跑是唯一的消费时机,在此补推 conversation 事件让它们进入对话流。
     无排队消息(用户只点了恢复)→ 用 AUTO_CONTINUE_FOLLOWUP 默认文案。
+
+    与 drain 路径对齐的两处(P1-2 / P2-3):
+    - 摸轮:消费的消息原落在被中断轮 N,内容却将成为第 N+1 轮的输入→按
+      _auto_resume_leftover_messages 同款逻辑摸到新轮首,前端分组才不错位;
+    - 附件:排队消息附带的上传文件同样要传文件进工作区 + 累积 params +
+      失败落告警(调共享函数 apply_followup_attachments),不能静默丢弃。
     """
     pending = drain_user_messages(task.id)
     if not pending:
         return AUTO_CONTINUE_FOLLOWUP
-    # 补推入对话流(待处理条目 → 对话流;失败仅记录,不影响续跑)
+    new_round = round_idx + 1
+    # 摸轮 + 补推入对话流(待处理条目 → 新轮对话流首;失败仅记录,不影响续跑)
     try:
         msg_ids = [
             uuid.UUID(m["message_id"]) for m in pending if m.get("message_id")
         ]
+        if msg_ids:
+            db.query(Conversation).filter(
+                Conversation.id.in_(msg_ids)
+            ).update({"round_idx": new_round}, synchronize_session=False)
+            db.commit()
         drained = (
             db.query(Conversation).filter(Conversation.id.in_(msg_ids)).all()
             if msg_ids else []
@@ -742,10 +785,22 @@ def _resolve_continuation_message(task: Task, db: Session, round_idx: int) -> st
             })
     except Exception as e:
         logger.warning(f"[task={task.id}] 续跑消费消息入流失败(忽略): {e}")
+    # 附件处理(P1-2):与 drain 路径同构(懒导入避开循环依赖)
+    attachment_note = ""
+    try:
+        from app.agents.react_agent import apply_followup_attachments
+        attachment_note = apply_followup_attachments(
+            db, task, pending,
+            round_idx=new_round, task_id_str=str(task.id),
+        )
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 续跑消费附件处理失败(忽略): {e}")
     # 多条合并为一段(按入队顺序),避免上下文碎片化
     merged = "\n\n".join(
         m["content"] for m in pending if m.get("content")
     )
+    if attachment_note:
+        merged = f"{merged}\n\n{attachment_note}" if merged else attachment_note
     return merged or AUTO_CONTINUE_FOLLOWUP
 
 
@@ -839,10 +894,21 @@ def _run_agent1_rounds_with_auto_continue(
     followup = first_followup
     repo_ctx = first_repo_context
     prev_plan = first_previous_plan
+    # 供"任务已不存在提前收尾"时返回(首轮即被删时还没有真实值)
+    results: list[Any] = []
+    summary = ""
+    plan = None
     while True:
         # ---- 轮内:独立短会话执行 + 落 plan + 读中断标志;with 退出即归还连接 ----
         with _round_session() as round_db:
-            round_task = round_db.get(Task, task_id) or task
+            # P2-4:不回退到外层 session 的游离 task 对象(经 round_db 的写会静默
+            # 丢失,且任务已删后续轮空跑);get 为 None 直接收尾返回。
+            round_task = round_db.get(Task, task_id)
+            if round_task is None:
+                logger.warning(
+                    f"[task={task_id}] 续跑第 {round_idx} 轮:任务已不存在,收尾返回"
+                )
+                return results, summary, plan, round_idx
             _t0 = time.perf_counter()
             results, summary, plan = executor.run(
                 round_task, round_db,
@@ -858,7 +924,7 @@ def _run_agent1_rounds_with_auto_continue(
             )
             # plan 状态持久化(resume/续轮跨轮续接)
             _save_plan_to_task(round_task, round_db, plan)
-            interrupted = _consume_paused_interrupt_flag(round_task, round_db)
+            interrupted = _consume_paused_interrupt_flag(round_task, round_db, round_idx)
         emit(
             AGENT1_ROUND_COMPLETED, task_id,
             round_idx=round_idx, executor=executor.name,
@@ -893,7 +959,13 @@ def _run_agent1_rounds_with_auto_continue(
         # 自动续跑:恢复后先确保工作区可用(容器可能已回收),再取续跑文案。
         # 这段同样用独立短会话,决不与上面的 wait_if_paused 交叉持有连接。
         with _round_session() as cont_db:
-            cont_task = cont_db.get(Task, task_id) or task
+            # P2-4:不回退到外层游离 task 对象;任务已删则对上一轮收尾返回。
+            cont_task = cont_db.get(Task, task_id)
+            if cont_task is None:
+                logger.warning(
+                    f"[task={task_id}] 续跑前任务已不存在,对第 {round_idx} 轮收尾"
+                )
+                return results, summary, plan, round_idx
             repo_ctx = _ensure_workspace_for_continuation(
                 cont_task, cont_db, str(task_id), git_tokens,
             )
