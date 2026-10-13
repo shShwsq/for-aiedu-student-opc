@@ -243,6 +243,8 @@ class SubmitAnswerRequest(BaseModel):
 
     question_id: uuid.UUID
     chosen_idx: int = Field(ge=0)
+    # 作答耗时(看题→提交毫秒,前端上报);缺省 None(老客户端降级,不影响判分)
+    latency_ms: int | None = Field(default=None, ge=0)
 
 
 class KnowledgeStateResponse(BaseModel):
@@ -259,6 +261,10 @@ class KnowledgeStateResponse(BaseModel):
     attempts: int
     correct_count: int
     accuracy: float | None = None
+    # FSRS 记忆状态(仅 PRACTICE_SCHEDULER=fsrs 有意义;sm2 路径为 0)
+    # 看板可据此展示「预计可保持天数」=stability
+    stability: float = 0.0
+    difficulty: float = 0.0
 
     model_config = {"from_attributes": True}
 

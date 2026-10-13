@@ -153,13 +153,19 @@ def test_ability_cold_start():
 
 
 def test_ability_weighted_recent():
-    # [1, 5]:权重 1,2 → (1*1 + 5*2)/3 = 11/3
-    assert abs(estimate_ability([1.0, 5.0]) - 11 / 3) < 1e-9
+    # 全答对 [(1,T), (5,T)]:权重 1,2 → (1*1 + 5*2)/3 = 11/3
+    assert abs(estimate_ability([(1.0, True), (5.0, True)]) - 11 / 3) < 1e-9
+
+
+def test_ability_wrong_pulls_down():
+    # 单条答对难度 4 → 4.0;同难度答错 → 目标值 4-1=3.0(失败拉低)
+    assert abs(estimate_ability([(4.0, True)]) - 4.0) < 1e-9
+    assert abs(estimate_ability([(4.0, False)]) - 3.0) < 1e-9
 
 
 def test_ability_window_limits_to_10():
-    seq = [1.0] * 20  # 全 1,结果与窗口无关
+    seq = [(1.0, True)] * 20  # 全 1,结果与窗口无关
     assert estimate_ability(seq) == 1.0
-    # 前 10 条被丢弃:前面塞高难度不影响结果
-    seq2 = [5.0] * 15 + [2.0] * 10
+    # 前 15 条被丢弃:前面塞高难度不影响结果
+    seq2 = [(5.0, True)] * 15 + [(2.0, True)] * 10
     assert estimate_ability(seq2) == 2.0

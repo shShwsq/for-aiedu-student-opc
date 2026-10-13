@@ -362,6 +362,10 @@ class UserKnowledgeState(Base):
     ease_factor: Mapped[float] = mapped_column(Float, nullable=False, default=2.5)
     interval_days: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     repetitions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # FSRS 记忆状态(仅 PRACTICE_SCHEDULER=fsrs 读写;sm2 路径不碰这两列)
+    # stability=记忆稳定性(天),difficulty=题目内在难度(1-10)。首次进 FSRS 时创建。
+    stability: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    difficulty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     # 下次到期复习时间(None = 尚未建立记忆轨迹)
     due_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -434,6 +438,9 @@ class Attempt(Base):
 
     chosen_idx: Mapped[int] = mapped_column(Integer, nullable=False)
     is_correct: Mapped[bool] = mapped_column(nullable=False)
+    # 作答耗时(看题→提交毫秒,前端上报;可空——老客户端/手工导入无此信号)。
+    # 供质量分级(快答=Easy / 犹豫=Hard)与未来 FSRS 参数拟合。
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
     answered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -787,3 +794,57 @@ def migrate_practice_drop_explain_with_questions_column() -> None:
         "practice_settings.generate_explanation_with_questions 旧列已删除"
         "(自动讲解路径废弃)"
     )
+
+
+def migrate_practice_scheduling_columns() -> None:
+    """幂等补遗忘曲线升级新列(耗时埋点 + FSRS 状态),全新库/已迁过 → 直接返回。
+
+    - practice_attempts.latency_ms:作答耗时埋点(可空)
+    - user_knowledge_states.stability / .difficulty:FSRS 记忆状态(默认 0,
+      仅 fsrs 路径写入;sm2 路径不碰)。存量行按 interval_days 回堆
+      stability≈interval×1.5(旧 SM-2 间隔近似为新调度器提供起点),
+      difficulty 留 0(首次进 FSRS 时由调度器重建)。
+    背景:项目用 Base.metadata.create_all(无 Alembic),已存在表不会自动加新列。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if insp.has_table("practice_attempts"):
+            cols = {c["name"] for c in insp.get_columns("practice_attempts")}
+            if "latency_ms" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE practice_attempts ADD COLUMN latency_ms INTEGER"
+                ))
+                log.info("practice_attempts.latency_ms 列迁移完成")
+        if insp.has_table("user_knowledge_states"):
+            cols = {c["name"] for c in insp.get_columns("user_knowledge_states")}
+            added_stability = False
+            if "stability" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE user_knowledge_states ADD COLUMN stability "
+                    "DOUBLE PRECISION NOT NULL DEFAULT 0"
+                ))
+                added_stability = True
+                log.info("user_knowledge_states.stability 列迁移完成")
+            if "difficulty" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE user_knowledge_states ADD COLUMN difficulty "
+                    "DOUBLE PRECISION NOT NULL DEFAULT 0"
+                ))
+                log.info("user_knowledge_states.difficulty 列迁移完成")
+            # 存量行回堆 stability(仅本轮刚加列时一次,幂等):
+            # interval_days>0 的旧 SM-2 行取 interval×1.5 作为稳定性起点
+            if added_stability:
+                conn.execute(text(
+                    "UPDATE user_knowledge_states SET stability = interval_days * 1.5 "
+                    "WHERE interval_days > 0"
+                ))
+                log.info("user_knowledge_states.stability 存量回填完成")
+        conn.commit()

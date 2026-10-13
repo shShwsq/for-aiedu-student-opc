@@ -139,6 +139,11 @@ async def lifespan(app: FastAPI):
     from app.models.practice import migrate_practice_drop_explain_with_questions_column
 
     migrate_practice_drop_explain_with_questions_column()
+    # 遗忘曲线升级:补 practice_attempts.latency_ms(耗时埋点)与
+    # user_knowledge_states.stability/difficulty(FSRS 状态,含 stability 存量回填);幂等
+    from app.models.practice import migrate_practice_scheduling_columns
+
+    migrate_practice_scheduling_columns()
     # 模型槽位收敛:practice_settings / memory_settings 上的模型列拷入 model_slot_defaults
     # (须晚于上面的补列迁移与 create_all;旧列保留不删,只作新表无行时的读取兜底)
     from app.models.model_slot import migrate_model_slot_defaults

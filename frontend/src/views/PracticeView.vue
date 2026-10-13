@@ -310,6 +310,7 @@ async function handleStartPractice(
     sessionResults.value = []
     chosenIdx.value = null
     feedback.value = null
+    questionStartAt.value = Date.now()
     submitting.value = false
     codeTaskOverride.value = null
     mode.value = 'session'
@@ -331,6 +332,8 @@ async function handleStartPractice(
 const chosenIdx = ref<number | null>(null)
 const submitting = ref(false)
 const feedback = ref<SubmitAnswerResponse | null>(null)
+// 当前题开始呈现时刻(看题→提交毫秒作为作答耗时上报,供质量分级/未来拟合)
+const questionStartAt = ref<number>(Date.now())
 
 /**
  * 答错时展开的知识点讲解 HTML
@@ -351,9 +354,11 @@ async function handleSubmit(): Promise<void> {
   if (!q || chosenIdx.value === null || submitting.value || feedback.value) return
   submitting.value = true
   try {
+    const latencyMs = Math.max(0, Date.now() - questionStartAt.value)
     const res = await submitAnswer(sessionId.value, {
       question_id: q.id,
       chosen_idx: chosenIdx.value,
+      latency_ms: latencyMs,
     })
     feedback.value = res
     sessionResults.value.push({ question: q, correct: res.is_correct })
@@ -374,6 +379,7 @@ function handleNext(): void {
   currentIndex.value += 1
   chosenIdx.value = null
   feedback.value = null
+  questionStartAt.value = Date.now()
   // 切题后侧栏重新跟随当前题的来源任务
   codeTaskOverride.value = null
 }

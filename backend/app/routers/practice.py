@@ -6,6 +6,7 @@
 """
 import json
 import logging
+import random
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -74,6 +75,7 @@ from app.schemas.practice import (
 from app.services.practice import jobs as gen_jobs
 from app.services.practice.difficulty import (
     ABILITY_WINDOW,
+    FACET_ABILITY_SCAN,
     adjust_question_difficulty,
     estimate_ability,
 )
@@ -97,8 +99,8 @@ from app.services.practice.selector import (
 )
 from app.services.practice.sm2 import (
     SM2State,
-    apply_sm2,
-    quality_from_correct,
+    advance_schedule,
+    derive_rating,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,16 +119,47 @@ def _get_task_owned(db: Session, task_id: UUID, user_id: UUID) -> Task:
 
 
 def _estimate_user_ability(db: Session, user_id: UUID) -> float:
-    """由最近答对题目的难度估计能力值(升序传入 estimate_ability)"""
+    """由最近作答(答对+答错)的难度估计能力值(升序传入 estimate_ability)"""
     rows = (
-        db.query(Question.difficulty)
+        db.query(Question.difficulty, Attempt.is_correct)
         .join(Attempt, Attempt.question_id == Question.id)
-        .filter(Attempt.user_id == user_id, Attempt.is_correct.is_(True))
+        .filter(Attempt.user_id == user_id)
         .order_by(Attempt.answered_at.desc())
         .limit(ABILITY_WINDOW)
         .all()
     )
-    return estimate_ability([d for (d,) in reversed(rows)])
+    return estimate_ability([(d, bool(c)) for (d, c) in reversed(rows)])
+
+
+def _estimate_facet_abilities(db: Session, user_id: UUID) -> dict[str, float]:
+    """按学习主题分面估计能力值({learning_topic: ability})。
+
+    用户可能在某主题强、另一主题弱:单一全局标量会把难度匹配套偏。
+    取最近若干条作答按 KP 主题分组,各自走 estimate_ability(答对+答错都计入)。
+    无作答记录的主题不出现在结果中(调用方回退全局能力值)。
+    """
+    rows = (
+        db.query(
+            KnowledgePoint.learning_topic,
+            Question.difficulty,
+            Attempt.is_correct,
+            Attempt.answered_at,
+        )
+        .join(Question, Attempt.question_id == Question.id)
+        .join(KnowledgePoint, Question.knowledge_point_id == KnowledgePoint.id)
+        .filter(Attempt.user_id == user_id)
+        .order_by(Attempt.answered_at.desc())
+        .limit(FACET_ABILITY_SCAN)
+        .all()
+    )
+    grouped: dict[str, list[tuple[float, bool]]] = {}
+    for topic, difficulty, is_correct, _answered in rows:
+        # rows 按时间降序;反转为升序后逐主题收集(estimate_ability 期望旧→新)
+        grouped.setdefault(topic, []).append((difficulty, bool(is_correct)))
+    return {
+        topic: estimate_ability(list(reversed(samples))[-ABILITY_WINDOW:])
+        for topic, samples in grouped.items()
+    }
 
 
 # ============================================================
@@ -602,18 +635,25 @@ def start_session(
             UserKnowledgeState.knowledge_point_id.in_(list(kps.keys())),
         ).all()
     }
-    # 每题历史作答次数(判新题)
-    attempt_counts = dict(
-        db.query(Attempt.question_id, sa_func.count(Attempt.id))
+    # 每题历史作答次数(判新题)+ 上次作答时刻(新近度惩罚)
+    seen_rows = (
+        db.query(
+            Attempt.question_id,
+            sa_func.count(Attempt.id),
+            sa_func.max(Attempt.answered_at),
+        )
         .filter(Attempt.user_id == current_user.id)
         .group_by(Attempt.question_id)
         .all()
     )
+    attempt_counts = {qid: cnt for qid, cnt, _last in seen_rows}
+    last_seen = {qid: last for qid, _cnt, last in seen_rows}
 
     now = _now()
     candidates = []
     for q in questions:
         st = states.get(q.knowledge_point_id)
+        kp = kps.get(q.knowledge_point_id)
         candidates.append(CandidateInfo(
             question=q,
             question_id=q.id,
@@ -623,10 +663,14 @@ def start_session(
             kp_due_at=st.due_at if st else None,
             kp_attempts=st.attempts if st else 0,
             kp_correct_count=st.correct_count if st else 0,
+            kp_interval_days=st.interval_days if st else 0.0,
+            facet=kp.learning_topic if kp else None,
+            last_seen_at=last_seen.get(q.id),
         ))
 
     ability = _estimate_user_ability(db, current_user.id)
-    picked = select_questions(candidates, ability, req.count, now)
+    ability_map = _estimate_facet_abilities(db, current_user.id)
+    picked = select_questions(candidates, ability, req.count, now, ability_map=ability_map)
     if not picked:
         raise HTTPException(status_code=400, detail="当前筛选条件下没有可出的题目")
 
@@ -676,13 +720,20 @@ def _start_session_from_pool(
     kps: dict,
     count: int,
 ) -> StartSessionResponse:
-    """白名单组卷:直接按创建顺序取前 count 题,不走选题策略(错题重练用)"""
-    picked = questions[:count]
+    """白名单组卷:错题重练专用。先洗牌再取前 count 题(不走选题策略)。
+
+    洗牌避免固定位序被死记(白名单模式下不混复习/不约束多样性,
+    但顺序仍应每次不同);会话 seed 写入 stats 供复盘。
+    """
+    rng = random.Random()
+    pool = list(questions)
+    rng.shuffle(pool)
+    picked = pool[:count]
     session = PracticeSession(
         user_id=current_user.id,
         question_count=len(picked),
         question_ids=[str(q.id) for q in picked],
-        stats={"mode": "question_ids"},
+        stats={"mode": "question_ids", "shuffle_seed": rng.getstate()[1][0]},
     )
     db.add(session)
     db.commit()
@@ -770,10 +821,11 @@ def submit_answer(
         question_id=question.id,
         chosen_idx=req.chosen_idx,
         is_correct=is_correct,
+        latency_ms=req.latency_ms,
     )
     db.add(attempt)
 
-    # 2. SM-2 更新知识点记忆状态(get_or_create)
+    # 2. 记忆状态更新(get_or_create):质量分级 → advance_schedule(SM-2/FSRS 分派)
     kp = db.query(KnowledgePoint).filter(
         KnowledgePoint.id == question.knowledge_point_id
     ).first()
@@ -789,7 +841,14 @@ def submit_answer(
         db.add(state_row)
         db.flush()
 
-    new_state = apply_sm2(
+    # 由正确性 + 作答耗时派生 FSRS 4 级 rating(难度用本次微调前的值)
+    rating = derive_rating(is_correct, req.latency_ms, question.difficulty)
+    # 距上次复习的真实天数:上次复习时刻 ≈ due_at - interval_days(无轨迹则 0)
+    elapsed_days = 0.0
+    if state_row.due_at is not None and state_row.interval_days > 0:
+        last_review = state_row.due_at - timedelta(days=state_row.interval_days)
+        elapsed_days = max(0.0, (now - last_review).total_seconds() / 86400.0)
+    new_state = advance_schedule(
         SM2State(
             ease_factor=state_row.ease_factor,
             interval_days=state_row.interval_days,
@@ -798,9 +857,12 @@ def submit_answer(
             attempts=state_row.attempts,
             correct_count=state_row.correct_count,
             last_quality=state_row.last_quality,
+            stability=state_row.stability,
+            difficulty=state_row.difficulty,
         ),
-        quality_from_correct(is_correct),
+        rating,
         now,
+        elapsed_days=elapsed_days,
     )
     state_row.ease_factor = new_state.ease_factor
     state_row.interval_days = new_state.interval_days
@@ -809,6 +871,8 @@ def submit_answer(
     state_row.attempts = new_state.attempts
     state_row.correct_count = new_state.correct_count
     state_row.last_quality = new_state.last_quality
+    state_row.stability = new_state.stability
+    state_row.difficulty = new_state.difficulty
 
     # 3. 题目难度微调(能力值用本次作答前的估计)
     question.difficulty = adjust_question_difficulty(
@@ -840,6 +904,8 @@ def submit_answer(
             attempts=new_state.attempts,
             correct_count=new_state.correct_count,
             accuracy=accuracy,
+            stability=new_state.stability,
+            difficulty=new_state.difficulty,
         ),
         answered_count=answered_count,
         total_count=session.question_count,

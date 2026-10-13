@@ -1,15 +1,21 @@
 """题目难度评估与用户能力估计
 
 - 题目难度 1-5:LLM 生成时初评;作答后按「能力-难度-结果」三角微调
-- 用户能力值:冷启动 2.5;之后为最近 10 次答对题目难度的加权均值
+- 用户能力值:冷启动 2.5;之后为最近 10 次作答(答对+答错)题目难度的加权均值
   (越近的作答权重越高,反映当前水平)
+  答对以该题难度为目标值,答错以「难度 - PENALTY」为目标值(失败把能力往下拉,
+  修正旧版只统计答对题导致能力值系统性偏高、越出越难)。
 """
 
 DIFFICULTY_MIN = 1.0
 DIFFICULTY_MAX = 5.0
 COLD_START_ABILITY = 2.5
-# 能力估计的答对样本窗口
+# 能力估计的作答样本窗口(答对+答错都计入)
 ABILITY_WINDOW = 10
+# 分面能力估计扫描的最近作答上限(分组前先从 DB 取的行数,兼顾精度与开销)
+FACET_ABILITY_SCAN = 200
+# 答错题对能力估计的扣减:失败说明该难度当前不可及,目标值下探
+ABILITY_WRONG_PENALTY = 1.0
 
 
 def clamp_difficulty(value: float) -> float:
@@ -34,20 +40,26 @@ def adjust_question_difficulty(
     return d
 
 
-def estimate_ability(correct_difficulties: list[float]) -> float:
-    """由最近答对题目的难度序列估计能力值
+def estimate_ability(samples: list[tuple[float, bool]]) -> float:
+    """由最近作答(答对+答错)的难度序列估计能力值
 
-    入参按作答时间升序(旧→新);只取最后 ABILITY_WINDOW 条。
-    权重线性递增:第 i 条(0 起)权重 i+1,越近越重要。
-    无答对记录 → 冷启动 2.5。
+    入参为 (difficulty, is_correct) 元组,按作答时间升序(旧→新);
+    只取最后 ABILITY_WINDOW 条。权重线性递增:第 i 条(0 起)权重 i+1,
+    越近越重要。答对目标值取难度本身,答错取「难度 - ABILITY_WRONG_PENALTY」
+    (失败把能力往下拉)。结果钳制到 [1,5]。无作答记录 → 冷启动 2.5。
     """
-    recent = correct_difficulties[-ABILITY_WINDOW:]
+    recent = samples[-ABILITY_WINDOW:]
     if not recent:
         return COLD_START_ABILITY
     total_w = 0.0
     total = 0.0
-    for i, d in enumerate(recent):
+    for i, (d, is_correct) in enumerate(recent):
+        target = clamp_difficulty(d) if is_correct else max(
+            DIFFICULTY_MIN, clamp_difficulty(d) - ABILITY_WRONG_PENALTY
+        )
         w = i + 1
-        total += clamp_difficulty(d) * w
+        total += target * w
         total_w += w
-    return total / total_w if total_w else COLD_START_ABILITY
+    if not total_w:
+        return COLD_START_ABILITY
+    return clamp_difficulty(total / total_w)

@@ -244,9 +244,11 @@ export interface StartSessionResponse {
 export interface SubmitAnswerRequest {
   question_id: string
   chosen_idx: number
+  // 作答耗时(看题→提交毫秒);无法计时时传 null
+  latency_ms?: number | null
 }
 
-/** 知识点记忆状态(SM-2) */
+/** 知识点记忆状态(SM-2 / FSRS) */
 export interface KnowledgeState {
   knowledge_key: string
   knowledge_name: string
@@ -257,6 +259,9 @@ export interface KnowledgeState {
   repetitions: number
   due_at: string | null
   attempts: number
+  // FSRS 记忆状态(仅调度器=fsrs 有意义;sm2 路径为 0)
+  stability?: number
+  difficulty?: number
   correct_count: number
   accuracy: number | null
 }

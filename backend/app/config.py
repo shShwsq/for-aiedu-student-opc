@@ -30,6 +30,17 @@ class Settings(BaseSettings):
     # 已建表与题库数据保留,重新开启后可继续使用;用户级偏好 auto_generate_practice 在此开关之下)
     PRACTICE_ENABLED: bool = True
 
+    # ---- 遗忘曲线调度器与组卷策略(详见 services/practice/{sm2,fsrs,selector}.py)----
+    # 调度器分派:sm2=经典 SM-2(默认,行为与升级前一致);fsrs=FSRS-4.5
+    # (公开默认参数,无需训练数据)。灰度:先跑 sm2 验证埋点/衰减链路,
+    # 回归稳定后翻 fsrs。非法值回落 sm2。
+    PRACTICE_SCHEDULER: str = "sm2"
+    # FSRS 目标保留率(0-1):由 stability 反解下次复习间隔,越高排期越密。
+    # 仅 PRACTICE_SCHEDULER=fsrs 时生效。
+    PRACTICE_REQUEST_RETENTION: float = 0.9
+    # 难度匹配高斯带宽 SIGMA(越小越严格贴合能力值)与组卷其余权重/阈值
+    # 仍为 selector.py 内模块常量(集中可改);如需热调可后续上提为设置项。
+
     # JWT(阶段 6 用)
     JWT_SECRET: str = "change_me_in_production"
     JWT_ALGORITHM: str = "HS256"
