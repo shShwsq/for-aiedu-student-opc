@@ -284,8 +284,8 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
     task_id_str = str(task.id)
 
     # 先解析 agent 策略(agent2 启停、验证权限等):
-    # 启动阶段文案必须在推送前由 agent2 启停决定,
-    # 否则单 agent 模式(未启检查助手)会先闪现误导性的启动阶段文案
+    # 后面走哪条执行链(单 agent 一轮 / 带后台审查的流水线)由它决定,
+    # 必须在首次推送阶段文案前拿到,否则下游分支会读到未定的启停值
     # 合并用户级默认(agent_policies 表)+ 任务级覆盖(task.params["_agent_policy"])
     agent_policy = resolve_agent_policy(task, db)
     logger.info(f"[task={task.id}] agent_policy: {agent_policy}")
@@ -300,9 +300,8 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
     )
 
     task.status = TaskStatus.RUNNING
-    task.current_stage = (
-        "任务启动" if ua_enabled else "任务启动(单智能体模式)"
-    )
+    # 阶段文案不分智能体档位:模式是内部实现,用户只关心"在做什么"
+    task.current_stage = "任务启动"
     db.commit()
     _publish_status(task)
     # 领域事件:任务启动(订阅者:审计日志等,见 app/domain_events.py)
@@ -382,7 +381,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
         # react_agent 只跑 1 轮,用 summary 作为唯一结构化结果(无 covered/missing 提取)
         if not ua_enabled:
             logger.info(f"[task={task.id}] agent2 已禁用,单 agent 模式")
-            task.current_stage = "react_agent 执行(单 agent 模式)"
+            task.current_stage = "AI助手执行"
             db.commit()
             _publish_status(task)
 
@@ -421,7 +420,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
             # 标记完成
             task.status = TaskStatus.COMPLETED
             task.current_stage = (
-                f"单 agent 执行完成,共 {len(react_summaries)} 轮,"
+                f"AI助手执行完成,共 {len(react_summaries)} 轮,"
                 f"共 {all_results_count} 个结果"
             )
             task.completed_at = datetime.now(timezone.utc)
