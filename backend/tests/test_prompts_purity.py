@@ -58,51 +58,49 @@ def test_prompts_modules_importable_and_nonempty():
     assert polish.build_polish_messages("你好")[0]["content"].strip()
 
 
-def test_build_facet_instruction_is_pure_and_tool_neutral():
-    """分面指令层纯函数:零 app.* 依赖(由上方 AST 扫描守门),措辞工具中立。"""
+def test_build_subtask_instruction_is_pure_and_tool_neutral():
+    """子任务指令层纯函数:零 app.* 依赖(由上方 AST 扫描守门),措辞工具中立。
+
+    技能正文不再预注入 —— 指令层只含主 agent 写的 instruction(取代旧 body/focus),
+    引导子任务按需用 skill 工具读取。
+    """
     from app.prompts import executor
 
-    text = executor.build_facet_instruction("check_sql_injection", "find sqli")
-    assert "check_sql_injection" in text
-    assert "find sqli" in text
+    text = executor.build_subtask_instruction("鉴权核查", "重点核对鉴权与注入")
+    assert "子任务" in text
+    assert "鉴权核查" in text
+    assert "重点核对鉴权与注入" in text
     # 只读约束明示,且不出现改动工具
     assert "只读工具" in text
     for mutating in ("write_file", "run_command", "clone_repo"):
         assert mutating not in text
+    # 技能正文改为按需自取:指令里引导用 skill 工具按需读取(不写死 body)
+    assert "skill" in text
     # 空入参不抛(健壮性)
-    assert executor.build_facet_instruction("", "").strip()
+    assert executor.build_subtask_instruction("", "").strip()
 
 
-def test_build_facet_instruction_injects_shared_focus():
-    """focus 非空时并入指令层(主 agent 给定的共享审查重点);空则不注入该段。"""
+def test_build_subtask_instruction_clips_long_instruction():
+    """instruction 超长按 SUBTASK_INSTRUCTION_MAX_CHARS 截断,不把子循环上下文撑胖。"""
     from app.prompts import executor
 
-    with_focus = executor.build_facet_instruction(
-        "check_ssrf", "body", "重点核对鉴权与注入"
-    )
-    assert "本次审查重点" in with_focus
-    assert "重点核对鉴权与注入" in with_focus
-    # 空 focus 不出现重点段
-    without_focus = executor.build_facet_instruction("check_ssrf", "body", "")
-    assert "本次审查重点" not in without_focus
-    # 超长 focus 按 FACET_FOCUS_MAX_CHARS 截断,不把子循环上下文撑胖
-    long_focus = "点" * (executor.FACET_FOCUS_MAX_CHARS + 500)
-    clipped = executor.build_facet_instruction("f", "b", long_focus)
-    assert len(clipped) < len(long_focus)
+    long_instruction = "点" * (executor.SUBTASK_INSTRUCTION_MAX_CHARS + 500)
+    clipped = executor.build_subtask_instruction("f", long_instruction)
+    assert len(clipped) < len(long_instruction)
 
 
-def test_dispatch_facets_tool_description_is_disciplined():
-    """派发工具描述模板:含纪律文案与 {facet_names} 占位符,纯函数零依赖。"""
+def test_dispatch_subtasks_tool_description_is_disciplined():
+    """派发工具描述模板:含纪律文案与 {skill_names} 占位符,纯函数零依赖。"""
     from app.prompts import executor
 
-    tmpl = executor.DISPATCH_FACETS_TOOL_DESCRIPTION_TEMPLATE
-    assert "{facet_names}" in tmpl
+    tmpl = executor.DISPATCH_SUBTASKS_TOOL_DESCRIPTION_TEMPLATE
+    assert "{skill_names}" in tmpl
     # 纪律核心措辞(与 system prompt 派发段同一口径)
     assert "按需派发" in tmpl
     assert "不适合" in tmpl
-    # 填充分面名后不残留占位符
-    filled = tmpl.format(facet_names="check_ssrf, review_concurrency")
-    assert "{facet_names}" not in filled
+    # 填充技能名后不残留占位符
+    filled = tmpl.format(skill_names="check_ssrf, review_concurrency")
+    assert "{skill_names}" not in filled
     assert "check_ssrf" in filled
 
 

@@ -68,7 +68,7 @@ REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(AI助手),负责执行实际�
    search_code / run_semgrep / query_cve / list_dependencies / write_file /
    run_python_code / git_log / git_blame / git_diff / run_command / run_lint /
    run_coverage / str_replace_editor / list_skills / skill,以及按需派发的
-   dispatch_review_facets 等)
+   dispatch_review_subtasks 等)
 3. **观察**:查看工具返回的结果
 4. 重复以上步骤,直到完成分析
 
@@ -91,8 +91,9 @@ REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(AI助手),负责执行实际�
 - git_blame:追溯某文件每行的最后修改提交/作者,定位"这行是谁/哪次提交改的"(需完整克隆)
 - git_diff:查看两个 ref 间的结构化 diff(增量审查;默认最近一次提交,大区间先用 stat_only 总览)
 - list_skills / skill:查看并加载专家技能(获取 SKILL.md 指令后按其指引执行)
-- dispatch_review_facets(仅在存在多个可用技能时出现):按需派发并行只读审查
-  分面,调用会等待全部分面完成后返回各面结论(详见下方"分面按需派发")
+- dispatch_review_subtasks(按需派发工具):你为每个子任务自写要求/上下文并选定
+  可见技能子集,派发并行只读审查子任务,调用会等待全部子任务完成后返回各任务
+  结论(详见下方"子任务按需派发")
 
 ## 工作原则
 - **自适应任务类型**:根据用户意图判断任务性质(安全审计/代码审查/质量分析/
@@ -104,18 +105,21 @@ REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(AI助手),负责执行实际�
   避免盲目遍历所有文件。
 - **计划性**:复杂任务先输出 <plan> 步骤清单,逐步推进。
 
-## 分面按需派发(仅当工具列表里有 dispatch_review_facets 时适用)
-并行审查分面 = 每个技能一条独立的只读核查子循环,由你按需派发。
+## 子任务按需派发(仅当工具列表里有 dispatch_review_subtasks 时适用)
+并行审查子任务 = 每条独立的只读核查子循环,由你按需派发:每个子任务自带一段
+instruction(你为该任务写的要求/上下文),可选地给它一个 skills 可见技能子集
+(只能是下方列出的技能名的子集,可为空);技能正文不再预注入,子任务按需用 skill
+工具自行读取。
 **先计划后派发**:先看清任务与仓库结构,列出需要核查的维度和关键路径;
-只把互不依赖的独立核查维度交给分面,关键路径(定性判断、跨面交叉验证、
+只把互不依赖的独立核查维度交给子任务,关键路径(定性判断、跨任务交叉验证、
 产物输出)自己做。
-**何时派**:全量/多维度审计 → 一次派发全部相关分面;多维度定向核查 →
-只派相关分面。一次任务通常只派发 1 次。
+**何时派**:全量/多维度审计 → 一次派发全部相关子任务;多维度定向核查 →
+只派相关子任务。一次任务通常只派发 1 次。
 **何时不派**:单一具体问题(自己用 read_file / search_code 查)、纯对话或
 澄清(直接回答)、结论已在手(不重复派发)。
-**派发后**:基于各面结论集成、补缺、交叉验证,不重跑已完成的分面;
-某面失败或超时时,先判断能否自行补查,再如实汇报哪些维度未覆盖。
-派发调用会等待全部分面完成才返回,返回的就是各面的结论(含失败/超时状态)。
+**派发后**:基于各任务结论集成、补缺、交叉验证,不重跑已完成的任务;
+某任务失败或超时时,先判断能否自行补查,再如实汇报哪些维度未覆盖。
+派发调用会等待全部子任务完成才返回,返回的就是各任务的结论(含失败/超时状态)。
 
 ## 计划格式(可选,复杂任务建议)
 在思考内容中输出 <plan> 标签包裹的计划:
@@ -660,52 +664,52 @@ MAX_ITERATION_PROMPT = (
 )
 
 
-def build_facet_instruction(
-    facet_name: str, facet_body: str, focus: str = "",
-) -> str:
-    """构造单个分面的只读核查指令(作为分面子循环的独立 system 指令层,不落库不展示)。
+def build_subtask_instruction(label: str, instruction: str) -> str:
+    """构造单个子任务的只读核查指令(作为子任务子循环的独立 system 指令层,不落库不展示)。
 
-    背景:按需派发时,每个分面跑一条有界只读 ReAct 子循环。
+    背景:按需派发时,每个子任务跑一条有界只读 ReAct 子循环。
     借鉴 codex 的 subagent_developer_instructions 将子 agent 的角色/约束作为独立
     指令层而非塞进 user 消息 —— 不污染真实用户问题,且便于集中管理/去重。
 
-    focus:主 agent 传来的本次审查整体重点/已知上下文(各分面共享,
-    对标 Codex spawn_agent 的 message 参数)。空则不注入该段。
+    instruction:主 agent 为该子任务自写的要求/上下文(取代旧的共享 focus 通道)。
+    技能正文不再预注入 —— 子任务按需用 skill 工具自行读取(可见技能子集由
+    react_agent 侧经 allowed_skills 设置)。
     本函数零 app.* 依赖(见 tests/test_prompts_purity.py),措辞工具中立。
     """
-    focus_text = (focus or "").strip()[:FACET_FOCUS_MAX_CHARS]
-    focus_section = (
-        f"\n[本次审查重点(主 agent 给定,各分面共享)]\n{focus_text}\n" if focus_text else ""
-    )
     return (
-        f"[审查分面:{(facet_name or '').strip()}]\n"
-        "本轮只针对该分面深入核查,不要覆盖其他维度:\n"
-        f"{(facet_body or '').strip()}\n"
-        f"{focus_section}"
+        f"[子任务:{(label or '').strip()}]\n"
+        "本轮只针对该子任务深入核查,不要覆盖其他维度:\n"
+        f"{(instruction or '').strip()[:SUBTASK_INSTRUCTION_MAX_CHARS]}\n"
+        "技能正文未预置,若该子任务分到了可见技能,需要时先用 skill 工具按需读取"
+        "再按其指引执行;\n"
         "只使用只读工具(list_files/read_file/search_code/find_files/"
         "run_semgrep/run_lint/git_*/query_cve/list_dependencies 等),"
-        "定位到具体文件:行号后给出该分面的完整结论(证据+修复建议)。"
+        "定位到具体文件:行号后给出该子任务的完整结论(证据+修复建议)。"
     )
 
 
-# focus 入指令层前的字符上限:它是主 agent 已积累的任务理解摘要,过长会把
-# 每份分面子循环的上下文都撑胖(工具定义侧同步告知模型该约束)
-FACET_FOCUS_MAX_CHARS = 2000
+# instruction 入指令层前的字符上限:它是主 agent 为该子任务写的要求/上下文摘要,
+# 过长会把每份子任务子循环的上下文都撑胖(工具定义侧同步告知模型该约束)
+SUBTASK_INSTRUCTION_MAX_CHARS = 2000
 
 
-# dispatch_review_facets 工具描述的模板(派发纪律写进工具本体,对标 Codex
-# multi_agents_spec.rs 把纪律放在 spawn_agent 描述里)。{facet_names} 由调用侧
-# 按当前可见技能名填(信息链路已有:list_skills 给 name+description,模型据此选面)。
-# 纪律正文与 system prompt 里的"分面按需派发"段同一口径,两处改动要同步。
-DISPATCH_FACETS_TOOL_DESCRIPTION_TEMPLATE = (
-    "按需派发并行只读审查分面(每个分面 = 一个技能的独立只读核查子循环)。\n"
-    "适合:全量/多维度代码审计(一次派发全部相关分面)、多个独立维度的定向核查。\n"
+# dispatch_review_subtasks 工具描述的模板(派发纪律写进工具本体,对标 Codex
+# multi_agents_spec.rs 把纪律放在 spawn_agent 描述里)。{skill_names} 由调用侧
+# 按当前可见技能名填(信息链路已有:list_skills 给 name+description,模型据此为
+# 每个子任务挑可见技能子集)。纪律正文与 system prompt 里的"子任务按需派发"段
+# 同一口径,两处改动要同步。
+DISPATCH_SUBTASKS_TOOL_DESCRIPTION_TEMPLATE = (
+    "按需派发并行只读审查子任务(每个子任务 = 一条独立只读核查子循环)。\n"
+    "你为每个子任务自写 instruction(要求/上下文),可选地给它一个 skills 可见技能"
+    "子集(只能是下方技能名的子集,可为空);技能正文不预注入,子任务按需用 skill "
+    "工具自行读取。\n"
+    "适合:全量/多维度代码审计(一次派发全部相关子任务)、多个独立维度的定向核查。\n"
     "不适合:单一具体问题(自己用 read_file/search_code 查)、纯对话或澄清"
     "(直接回答)、结论已在手(不重复派发)。\n"
-    "先形成高层计划再派发:只把互不依赖的独立核查维度交给分面,关键路径自己做。\n"
-    "一次任务通常只派发 1 次;调用会等待全部分面完成后返回各面结论"
-    "(含失败/超时状态),拿到后请集成与交叉验证,不要重跑已完成的分面。\n"
-    "可用分面名(取值只能从这里面选):{facet_names}。"
+    "先形成高层计划再派发:只把互不依赖的独立核查维度交给子任务,关键路径自己做。\n"
+    "一次任务通常只派发 1 次;调用会等待全部子任务完成后返回各任务结论"
+    "(含失败/超时状态),拿到后请集成与交叉验证,不要重跑已完成的子任务。\n"
+    "可用技能名(skills 只能从这里面选,可为空):{skill_names}。"
 )
 
 

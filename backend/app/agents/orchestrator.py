@@ -300,7 +300,7 @@ def run_pipeline_audit(task: Task, db: Session) -> None:
     )
 
     task.status = TaskStatus.RUNNING
-    # 阶段文案不分智能体档位:模式是内部实现,用户只关心"在做什么"
+    # 阶段文案不区分是否启用检查助手:执行档位属内部实现,用户只看"在做什么"
     task.current_stage = "任务启动"
     db.commit()
     _publish_status(task)

@@ -66,11 +66,14 @@ def _b_http_request(a: dict[str, Any]) -> str:
     return f"验证请求: {method} {a.get('path', '/')}"
 
 
-def _b_dispatch_review_facets(a: dict[str, Any]) -> str:
-    facets = [str(f).strip() for f in (a.get("facets") or []) if str(f).strip()]
-    if not facets:
-        return "派发审查分面"
-    return f"派发 {len(facets)} 个审查分面:{'/'.join(facets)}"
+def _b_dispatch_review_subtasks(a: dict[str, Any]) -> str:
+    subs = [s for s in (a.get("subagents") or []) if isinstance(s, dict)]
+    if not subs:
+        return "派发并行审查子任务"
+    # label 缺省时按序号回退「子任务 N」(与 react_agent._dispatch_subtasks 同一口径)
+    named = [str(s.get("label") or "").strip() or f"子任务{i + 1}"
+             for i, s in enumerate(subs)]
+    return f"派发 {len(subs)} 个并行审查子任务:{'/'.join(named)}"
 
 
 def _b_dispatch_review_subagents(a: dict[str, Any]) -> str:
@@ -107,8 +110,8 @@ _TOOL_INTENT_BUILDERS: dict[str, IntentBuilder] = {
     "check_reference": _b_check_reference,
     # verifier 动态验证
     "http_request": _b_http_request,
-    # agent1 分面按需派发
-    "dispatch_review_facets": _b_dispatch_review_facets,
+    # agent1 子任务按需派发
+    "dispatch_review_subtasks": _b_dispatch_review_subtasks,
     # agent2 审查子智能体按需派发
     "dispatch_review_subagents": _b_dispatch_review_subagents,
 }

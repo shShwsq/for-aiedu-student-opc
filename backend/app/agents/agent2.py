@@ -1490,7 +1490,7 @@ def _execute_reference_tool(
 
 # 收尾轮(跑满迭代/超时)的墙钟宽限(秒):对已到期的 deadline 再叠一段,
 # 保证收尾这一发 LLM 能真正吐出总结而非被 stop_check 秒停
-# (镜像 react_agent._FACET_FINALIZE_GRACE_SECONDS)。
+# (镜像 react_agent._SUBTASK_FINALIZE_GRACE_SECONDS)。
 _PLAN_ITEM_FINALIZE_GRACE_SECONDS = 90
 
 @dataclass
@@ -1594,7 +1594,7 @@ def _run_plan_item_pass(
 ) -> _PlanItemResult:
     """跑单个计划项的有界只读 ReAct 子循环(worker 线程执行,全程无共享副作用)。
 
-    与 react_agent._run_facet_pass 同机制(LLM→只读工具→再思考直到停),但:
+    与 react_agent._run_subtask_pass 同机制(LLM→只读工具→再思考直到停),但:
     - 不落库不 publish:工具执行走 _execute_read_tool/_execute_reference_tool
       的 db=None 形态(只执行),对话行进 pending_rows 缓冲等 fan-in;
     - 证据入 worker 自己的 EvidenceRecorder(局部 E ref,fan-in 收养);

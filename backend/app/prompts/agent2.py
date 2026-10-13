@@ -404,7 +404,7 @@ _SUBMIT_SUGGESTION_TOOL: dict[str, Any] = {
 
 # 派发纪律正文:既作为工具描述喂给模型,也在 AGENT2_REVIEW_PROMPT 里作为独立
 # 章节出现(单一来源,避免两处手工保持一致)。措辞对标 prompts/executor.py 的
-# 分面按需派发纪律。本模块零 app.* 依赖(见 tests/test_prompts_purity.py)。
+# 子任务按需派发纪律。本模块零 app.* 依赖(见 tests/test_prompts_purity.py)。
 AGENT2_SUBAGENT_DISPATCH_GUIDANCE = (
     "## 审查子智能体按需派发(仅当工具列表里有 dispatch_review_subagents 时适用)\n"
     "审查子智能体 = 每个计划项一条独立的只读核查子循环,自带只读取证工具与独立证据"
@@ -672,7 +672,7 @@ AGENT2_SYSTEM_PROMPT = AGENT2_REVIEW_PROMPT
 # 背景:agent2 按需调 dispatch_review_subagents 派发后,选定的计划项
 # (planned_evidence 非 verify)会被扇出成有界只读 ReAct 子循环并行核实(执行逻辑见
 # app/agents/agent2.py 的 _run_plan_item_pass / _fan_out_plan_items)。形状镜像
-# prompts/executor.py 的分面并行文本资产,但本模块仍守零 app.* 依赖硬约束
+# prompts/executor.py 的子任务并行文本资产,但本模块仍守零 app.* 依赖硬约束
 # (见 tests/test_prompts_purity.py)。
 # ============================================================
 
@@ -685,7 +685,7 @@ _SYSTEM_INJECT_MARKER = "[系统注入|"
 def build_agent2_plan_item_instruction(plan_item: dict) -> str:
     """构造单个计划项的只读核查指令(子循环的独立 system 指令层,不落库不展示)。
 
-    镜像 executor.build_facet_instruction:子 agent 的角色/约束作独立指令层,
+    镜像 executor.build_subtask_instruction:子 agent 的角色/约束作独立指令层,
     不污染真实上下文。参数为 _stamp_plan_items 补过 id 的计划项 dict
     (id/target/origin/priority/planned_evidence)。本函数零 app.* 依赖,纯文本拼装。
     """
@@ -742,7 +742,7 @@ def build_agent2_plan_result_messages(
 ) -> list[dict[str, str]]:
     """把各计划项结论装配成回灌主循环上下文的 system 消息序列。
 
-    与 executor.build_facet_instruction 分面只读回灌同思路:首条行动指引,
+    与 executor.build_subtask_instruction 子任务只读回灌同思路:首条行动指引,
     随后每项一条独立信封(刻意用 system 角色:注入内容不能被当成用户原话)。
 
     参数:

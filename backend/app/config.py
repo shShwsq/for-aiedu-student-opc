@@ -97,37 +97,38 @@ class Settings(BaseSettings):
     # 防两个 job 各自 4 并行把厂商配额扫光
     PRACTICE_PROVIDER_MAX_CONCURRENCY: int = 4
 
-    # ---- 内置 react_agent 分面按需派发(主循环内工具驱动扇出) ----
-    # 执行器通过 dispatch_review_facets 工具**按需**把审查分面扇出成 N 条有界只读
-    # ReAct 子循环 → 主线程串行 fan-in 落库 → 各面结论作为 tool_result 回灌主循环
-    # 继续集成。派发决策由模型自己做(先理解任务再决定派哪些面),而非编排器在
-    # 循环开始前无差别全量扇出 —— 轻量输入("hi?")不再为 7 个分面付 14 发 LLM 调用。
-    # 复用出题侧已验证的 provider 闸门 + ThreadPoolExecutor 形状,worker 不碰共享
-    # session/publish(只跑 LLM + 只读工具 + 内存缓冲),fan-in 在主线程逐条做。
-    # 真优势:子智能体带原生身份(ACP 侧不带身份导致并行 chunk 交织乱码)。
+    # ---- 内置 react_agent 子任务按需派发(主循环内工具驱动扇出) ----
+    # 执行器通过 dispatch_review_subtasks 工具**按需**把审查子任务扇出成 N 条有界只读
+    # ReAct 子循环 → 主线程串行 fan-in 落库 → 各子任务结论作为 tool_result 回灌主循环
+    # 继续集成。派发决策由模型自己做(先理解任务再决定派哪些子任务、各带什么技能子集与
+    # 要求),而非编排器在循环开始前无差别全量扇出 —— 轻量输入("hi?")不再为多个子任务
+    # 付成倍 LLM 调用。复用出题侧已验证的 provider 闸门 + ThreadPoolExecutor 形状,worker
+    # 不碰共享 session/publish(只跑 LLM + 只读工具 + 内存缓冲),fan-in 在主线程逐条做。
+    # 真优势:子任务带原生身份 label(ACP 侧不带身份导致并行 chunk 交织乱码)。
     # 默认开;关闭 = 不注册派发工具(纯串行主循环,而非回退全量扇出)。
     REACT_FACET_DISPATCH_ENABLED: bool = True
-    # 分面扇出线程数上限(实际取 min(本项, 本次派发分面数))
+    # 子任务扇出线程数上限(实际取 min(本项, 本次派发子任务数))
     REACT_PARALLEL_MAX_CONCURRENCY: int = 4
-    # 注册派发工具所需的最低可见技能数(低于此数不出现该工具:单维度任务模型自己
-    # 用只读工具查即可,扇出的 bootstrap + 上下文复制成本高于串行收益)
+    # 【已废弃】旧"注册派发工具所需最低可见技能数"闸门。子任务可纯 instruction、不再
+    # 等同技能,可见技能数不再决定是否注册(现只看 REACT_FACET_DISPATCH_ENABLED,是否派发
+    # 始终由模型决定)。键仅保留兼容既有 env,读取后不再参与注册判定。
     REACT_FACET_DISPATCH_MIN_FACETS: int = 2
-    # 单次派发可调用的分面上限(0/留空 = 不额外限制,取可见技能总数)
+    # 单次派发可调用的子任务数上限(0/留空 = 不额外限制)
     REACT_FACET_DISPATCH_MAX_FACETS: int = 0
     # 单轮(一次 run_react_agent)内派发调用次数上限:对标 Codex "同一未决线程
     # 避免重复派发",防反复扇出烧配额;超限直接报错让模型基于已有结论集成。
     REACT_FACET_DISPATCH_MAX_CALLS: int = 1
-    # 单个分面子循环的最大迭代次数(有界,防止某一分面跑飞拖垮整轮)
+    # 单个子任务子循环的最大迭代次数(有界,防止某一子任务跑飞拖垮整轮)
     REACT_FACET_MAX_ITERATIONS: int = 12
-    # 单个分面子循环的墙钟预算(秒):循环每次迭代边界与收 chunk 时协作式检查,
-    # 超时则转入本分面总结收尾(部分结论)并隔离,不拖垮 fan-in 整轮
+    # 单个子任务子循环的墙钟预算(秒):循环每次迭代边界与收 chunk 时协作式检查,
+    # 超时则转入本子任务总结收尾(部分结论)并隔离,不拖垮 fan-in 整轮
     REACT_FACET_TIMEOUT_SECONDS: int = 240
-    # 单个分面结论回灌 tool_result 前的 token 上限(CJK 感知粗估,见 _clip_to_tokens)。
+    # 单个子任务结论回灌 tool_result 前的 token 上限(CJK 感知粗估,见 _clip_to_tokens)。
     # 借鉴 codex 对子 agent 回灌消息设上限的做法:并行放大的是"份数",
     # 每份必须有界,否则父上下文会被 N 份长结论撑爆。
     REACT_FACET_SUMMARY_MAX_TOKENS: int = 3000
     # 审查链路同厂商(provider+model 归组)全局并发天花板,跨任务共享:
-    # 置于分面子循环的 LLM 调用外层,防并行放大并发把配额打爆(本次真凶是 403)
+    # 置于子任务子循环的 LLM 调用外层,防并行放大把配额打爆(本次真凶是 403)
     REACT_PROVIDER_MAX_CONCURRENCY: int = 4
 
     # ---- 数据统一根 ----
@@ -212,9 +213,9 @@ class Settings(BaseSettings):
     # ---- agent2 审查子智能体按需派发(工具驱动,主循环内扇出) ----
     # agent2 发射 submit_review_plan 后,**自行判断**是否调用 dispatch_review_subagents
     # 工具把选定的计划项扇出成 N 条有界只读 ReAct 子循环并行核实(每个子智能体 =
-    # 一个计划项),而非"计划一发射就无差别自动扇出" —— 与 agent1 分面按需派发同构。
+    # 一个计划项),而非"计划一发射就无差别自动扇出" —— 与 agent1 子任务按需派发同构。
     # 派发决策由模型自己做(先规划再决定派哪些项/是否全派/一个都不派),不派则按原
-    # 串行流程自己逐项取证。形状复用 react_agent 分面并行(worker 只跑 LLM + 只读
+    # 串行流程自己逐项取证。形状复用 react_agent 子任务并行(worker 只跑 LLM + 只读
     # 工具 + 内存缓冲,不碰共享 db session/publish/证据台账;发射、落库、verify 全部
     # fan-in 后留主线程)。子智能体带原生身份(计划项 id),规避 ACP 侧不带身份导致
     # 的并行 chunk 交织乱码。默认开;仍受最低合格项数/厂商闸门(REACT_PROVIDER_MAX_
