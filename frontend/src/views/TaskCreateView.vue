@@ -34,6 +34,13 @@ import {
 } from '@/api/git_provider'
 import { getSkills, type SkillSummary } from '@/api/skill'
 import { getPreferences } from '@/api/memory'
+import {
+  DEEPSEEK_EFFORT_OPTIONS as deepseekEffortOptions,
+  DEEPSEEK_MODEL_OPTIONS as deepseekModelOptions,
+  QODER_CONTEXT_OPTIONS as qoderContextOptions,
+  QODER_EFFORT_OPTIONS as qoderEffortOptions,
+  QODER_MODEL_OPTIONS as qoderModelOptions,
+} from '@/data/cliModelOptions'
 import { extractErrorMessage } from '@/utils/error'
 import type { PromptTemplate, Scenario } from '@/types/task'
 import type { LLMConfigItemOut } from '@/types/model_configs'
@@ -127,43 +134,7 @@ const modelSelectLabel = computed(() =>
 )
 
 // ---- Qoder CLI 模型配置(qoder_cli 执行器显示;deepseek_cli 见下方独立配置) ----
-// 见 https://docs.qoder.cn/cli/model
-
-/** Qoder CLI 模型选项(value 必须与 CLI --model 接受的名称严格大小写匹配,
- * 见 https://docs.qoder.cn/cli/model 及 ACP 错误返回的 Available models 列表) */
-const qoderModelOptions: { value: string; label: string }[] = [
-  { value: '', label: '默认(智能路由 Auto)' },
-  { value: 'Auto', label: '智能路由 (Auto)' },
-  { value: 'Qwen3.8-Max', label: 'Qwen3.8-Max' },
-  { value: 'Qwen3.8-Flash', label: 'Qwen3.8-Flash' },
-  { value: 'Qwen3.7-Max', label: 'Qwen3.7-Max' },
-  { value: 'Qwen3.7-Plus', label: 'Qwen3.7-Plus' },
-  { value: 'Qwen3.7-Flash', label: 'Qwen3.7-Flash' },
-  { value: 'DeepSeek-V4-Pro', label: 'DeepSeek-V4-Pro' },
-  { value: 'DeepSeek-V4-Flash', label: 'DeepSeek-V4-Flash' },
-  { value: 'GLM-5.3', label: 'GLM-5.3' },
-  { value: 'GLM-5.2', label: 'GLM-5.2' },
-  { value: 'Kimi-K2.7-Code', label: 'Kimi-K2.7-Code' },
-  { value: 'MiniMax-M2.7', label: 'MiniMax-M2.7' },
-]
-
-/** 思考强度选项 */
-const qoderEffortOptions: { value: string; label: string }[] = [
-  { value: '', label: '默认' },
-  { value: 'low', label: 'Low(最快)' },
-  { value: 'medium', label: 'Medium(适中)' },
-  { value: 'high', label: 'High(深入)' },
-  { value: 'xhigh', label: 'XHigh(深度分析)' },
-  { value: 'max', label: 'Max(最大推理)' },
-]
-
-/** 上下文窗口选项 */
-const qoderContextOptions: { value: number; label: string }[] = [
-  { value: 0, label: '默认' },
-  { value: 200000, label: '200K' },
-  { value: 400000, label: '400K' },
-  { value: 1000000, label: '1M' },
-]
+// 选项清单集中在 @/data/cliModelOptions(与详情页「运行时设置」共用)
 
 /** Qoder CLI 配置面板是否展开 */
 const qoderConfigOpen = ref(false)
@@ -176,23 +147,7 @@ const qoderContextWindow = ref(0)
 
 // ---- DeepSeek CLI 模型配置(deepseek_cli 执行器显示) ----
 // dsh ACP 模式不接受 --model CLI 参数,模型/思考强度经 session/set_config_option 设置;
-// 模型见 dsh deepseek-official provider 目录:deepseek-v4-flash / deepseek-v4-pro
-
-/** DeepSeek CLI 模型选项 */
-const deepseekModelOptions: { value: string; label: string }[] = [
-  { value: '', label: '默认(DeepSeek-V4-Flash)' },
-  { value: 'deepseek-v4-flash', label: 'DeepSeek-V4-Flash(轻量)' },
-  { value: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro' },
-]
-
-/** DeepSeek 思考强度选项(dsh 广播等级:off / low / high / max) */
-const deepseekEffortOptions: { value: string; label: string }[] = [
-  { value: '', label: '默认(Max)' },
-  { value: 'off', label: 'Off(不思考)' },
-  { value: 'low', label: 'Low(最快)' },
-  { value: 'high', label: 'High(深入)' },
-  { value: 'max', label: 'Max(最大推理)' },
-]
+// 选项清单集中在 @/data/cliModelOptions
 
 /** 选中的 DeepSeek 模型(空字符串=默认) */
 const deepseekModel = ref('')

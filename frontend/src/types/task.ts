@@ -700,6 +700,15 @@ export interface RuntimeConfigUpdateRequest {
   llm_config_id?: string
   /** agent1 模型配置 id(仅 executor=builtin);空字符串=清除(回退 llm_config_id) */
   react_llm_config_id?: string
+  /**
+   * CLI 执行器模型名(仅 qoder_cli / deepseek_cli;写入 task.params.model)
+   * 空字符串=清除(回退 CLI profile 默认);undefined=不修改
+   */
+  model?: string
+  /** CLI 执行器思考强度(写入 task.params.reasoning_effort);空字符串=清除 */
+  reasoning_effort?: string
+  /** 上下文窗口(仅 qoder_cli;写入 task.params.context_window);0=清除 */
+  context_window?: number
 }
 
 /**

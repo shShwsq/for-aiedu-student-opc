@@ -347,12 +347,17 @@ class VerifyConfigUpdateRequest(BaseModel):
 class RuntimeConfigUpdateRequest(BaseModel):
     """更新任务运行时配置请求(PATCH /tasks/{id}/runtime_config)
 
-    任务进行中修改 react_agent / agent2 模型。
+    任务进行中修改 react_agent / agent2 模型,以及 CLI 执行器的模型参数。
     生效时机:running/paused 的当前执行线程仍用启动时加载的配置,
     修改在下一轮执行(completed 后追加消息 / failed 重试)时生效。
 
     所有字段可选,只更新传入的字段;模型字段传空字符串表示清除
-    (llm_config_id 清除后回退 env 默认,react_llm_config_id 清除后回退 llm_config_id)。
+    (llm_config_id 清除后回退 env 默认,react_llm_config_id 清除后回退 llm_config_id;
+    CLI 模型参数清除后从 task.params 移除,回退 CLI profile 默认)。
+
+    CLI 模型参数(model / reasoning_effort / context_window)写入 task.params,
+    仅对支持任务级模型参数的执行器生效(qoder_cli / deepseek_cli),
+    内置执行器与 codex_cli(模型经 config.toml 自管)传入会报 400。
 
     历史:曾有 agent_policy.max_rounds(协作总轮次)子对象,
     已随后台审查重构移除(初始运行单轮,多轮由用户 resume 驱动)。
@@ -360,3 +365,8 @@ class RuntimeConfigUpdateRequest(BaseModel):
 
     llm_config_id: str | None = Field(default=None, max_length=128)
     react_llm_config_id: str | None = Field(default=None, max_length=128)
+    # ---- CLI 执行器模型参数(写入 task.params;空字符串=清除该键) ----
+    model: str | None = Field(default=None, max_length=128)
+    reasoning_effort: str | None = Field(default=None, max_length=32)
+    # 上下文窗口仅 qoder_cli 支持(deepseek_cli 忽略),传 0/负数视为清除
+    context_window: int | None = Field(default=None, ge=0, le=10_000_000)

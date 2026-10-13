@@ -109,6 +109,11 @@ from app.user_messages import push_user_message, remove_user_message
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["tasks"])
 
+# 支持任务级模型参数(model/reasoning_effort/context_window,经 task.params)
+# 的 CLI 执行器集合:与前端 TaskCreateView/TaskRuntimeSettings 的
+# supportsModelConfig 同一口径(codex_cli 模型经 config.toml 自管,不在此列)。
+_CLI_MODEL_PARAM_EXECUTORS = {"qoder_cli", "deepseek_cli"}
+
 
 @router.get("/scenarios", response_model=list[ScenarioInfo])
 def list_all_scenarios() -> list[dict[str, Any]]:
@@ -618,11 +623,46 @@ def update_task_runtime_config(
             _validate_config_id(req.react_llm_config_id, "react_agent 模型配置")
         task.react_llm_config_id = req.react_llm_config_id or None
 
+    # ---- CLI 执行器模型参数(model/reasoning_effort/context_window)写回 task.params ----
+    # 仅 qoder_cli / deepseek_cli 支持任务级模型参数(codex_cli 经 config.toml 自管);
+    # 空字符串 / context_window<=0 视为清除该键(回退 CLI profile 默认)。
+    cli_params_touched = (
+        req.model is not None
+        or req.reasoning_effort is not None
+        or req.context_window is not None
+    )
+    if cli_params_touched:
+        executor = task.executor or "builtin"
+        if executor not in _CLI_MODEL_PARAM_EXECUTORS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"当前执行器 {executor} 不支持在此修改模型参数",
+            )
+        params = dict(task.params or {})
+        if req.model is not None:
+            if req.model:
+                params["model"] = req.model
+            else:
+                params.pop("model", None)
+        if req.reasoning_effort is not None:
+            if req.reasoning_effort:
+                params["reasoning_effort"] = req.reasoning_effort
+            else:
+                params.pop("reasoning_effort", None)
+        if req.context_window is not None:
+            # 上下文窗口仅 qoder_cli 支持;deepseek_cli 忽略(不报错,与创建页一致)
+            if executor == "qoder_cli" and req.context_window > 0:
+                params["context_window"] = req.context_window
+            else:
+                params.pop("context_window", None)
+        task.params = params
+
     db.commit()
     db.refresh(task)
     logger.info(
         f"[task={task.id}] 运行时配置已更新: llm={task.llm_config_id}, "
-        f"react_llm={task.react_llm_config_id}"
+        f"react_llm={task.react_llm_config_id}, "
+        f"cli_model={(task.params or {}).get('model')}"
     )
     return task
 

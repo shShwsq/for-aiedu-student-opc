@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 任务运行时设置:对话使用的模型(检查助手 + 内置 AI助手)
+ * 任务运行时设置:执行器 + 对话使用的模型(检查助手 + 内置 AI助手 / CLI 模型参数)
  *
  * 两种形态由 variant 选(同一个组件,选项/解析口径/保存链路全共用):
  * - bar:消息输入框上方,箭头折叠(默认)
@@ -9,6 +9,8 @@
  * 允许在任务进行中修改:
  * - agent1 模型(仅 executor=builtin;CLI 执行器模型自管)
  * - agent2 评估模型
+ * - CLI 执行器的模型参数(model/reasoning_effort/context_window,
+ *   仅 qoder_cli / deepseek_cli;写入 task.params)
  *
  * 生效时机:running/paused 的当前执行线程仍用启动时加载的配置,
  * 修改在下一轮执行(completed 后追加消息 / failed 重试)时生效;
@@ -21,6 +23,13 @@ import { computed, onMounted, ref } from 'vue'
 
 import BaseSelect from '@/components/BaseSelect.vue'
 import { updateTaskRuntimeConfig } from '@/api/task'
+import {
+  contextOptionsFor,
+  effortOptionsFor,
+  modelOptionsFor,
+  supportsModelConfig,
+} from '@/data/cliModelOptions'
+import { agentTypes, ensureAgentTypesLoaded } from '@/composables/useAgentTypes'
 import { useTaskRuntimeModels } from '@/composables/useTaskRuntimeModels'
 import { extractErrorMessage } from '@/utils/error'
 import {
@@ -66,6 +75,35 @@ const {
 /** 任务是否使用内置执行器(CLI 执行器 react 模型自管,选择器禁用) */
 const isBuiltin = computed(() => (props.task.executor ?? 'builtin') === 'builtin')
 
+/** 当前执行器是否为支持任务级模型参数的 CLI(qoder_cli / deepseek_cli) */
+const isCliWithModelConfig = computed(() => supportsModelConfig(props.task.executor))
+
+/**
+ * 执行器展示名:内置固定「内置」,CLI 取后端注册表 display_name
+ *
+ * display_name 来自 GET /agents/types(模块级缓存,与设置页共用);未加载完时
+ * 先回退到原始 executor 字符串(不空着,免得概览少一行看不出在用哪个执行器)。
+ */
+const executorLabel = computed(() => {
+  const ex = props.task.executor ?? 'builtin'
+  if (ex === 'builtin') return '内置'
+  return agentTypes.value.find((t) => t.agent_type === ex)?.display_name ?? ex
+})
+
+/** 当前任务已保存的 CLI 模型参数(task.params;空串/0 表示用 CLI 默认) */
+const cliParams = computed(() => {
+  const p = props.task.params ?? {}
+  return {
+    model: typeof p.model === 'string' ? p.model : '',
+    reasoningEffort: typeof p.reasoning_effort === 'string' ? p.reasoning_effort : '',
+    contextWindow: typeof p.context_window === 'number' ? p.context_window : 0,
+  }
+})
+
+const cliModelOptions = computed(() => modelOptionsFor(props.task.executor))
+const cliEffortOptions = computed(() => effortOptionsFor(props.task.executor))
+const cliContextOptions = computed(() => contextOptionsFor(props.task.executor))
+
 /** 解析输入:任务上的两个模型 id + 执行器 */
 const modelIds = computed(() => ({
   reviewId: props.task.llm_config_id,
@@ -108,6 +146,8 @@ function selectPlaceholder(id?: string | null): string {
 
 onMounted(() => {
   void ensureLoaded()
+  // 执行器展示名需要后端注册表(模块级缓存,多处共用只发一次)
+  void ensureAgentTypesLoaded().catch(() => undefined)
 })
 
 // ---- 顶部居中 toast(保存反馈;运行中/暂停中额外提示下一轮生效) ----
@@ -132,6 +172,9 @@ function showToast(msg: string, type: 'success' | 'error'): void {
 async function save(req: {
   llm_config_id?: string
   react_llm_config_id?: string
+  model?: string
+  reasoning_effort?: string
+  context_window?: number
 }): Promise<void> {
   if (saving.value) return
   saving.value = true
@@ -156,6 +199,17 @@ function onUserModelChange(value: string | number): void {
 function onReactModelChange(value: string | number): void {
   void save({ react_llm_config_id: String(value) })
 }
+
+// ---- CLI 执行器模型参数改动即保存(写入 task.params) ----
+function onCliModelChange(value: string | number): void {
+  void save({ model: String(value) })
+}
+function onCliEffortChange(value: string | number): void {
+  void save({ reasoning_effort: String(value) })
+}
+function onCliContextChange(value: string | number): void {
+  void save({ context_window: Number(value) })
+}
 </script>
 
 <template>
@@ -178,11 +232,16 @@ function onReactModelChange(value: string | number): void {
           }}
         </p>
 
+        <!-- 执行器(当前任务用哪个 agent1 执行;详情展示,不可在运行态切换) -->
+        <div class="rs-field rs-executor-field">
+          <span class="rs-label">执行器</span>
+          <p class="rs-effective" :title="executorLabel">{{ executorLabel }}</p>
+        </div>
+
         <!-- agent1 模型 -->
-        <div class="rs-field">
+        <div v-if="isBuiltin" class="rs-field">
           <span class="rs-label">AI助手模型</span>
           <BaseSelect
-            v-if="isBuiltin"
             :model-value="task.react_llm_config_id ?? ''"
             :options="reactOptions"
             :placeholder="selectPlaceholder(task.react_llm_config_id)"
@@ -191,10 +250,49 @@ function onReactModelChange(value: string | number): void {
             aria-label="AI助手模型"
             @change="onReactModelChange"
           />
-          <p v-else class="rs-hint">当前使用 CLI 执行器,执行模型由 CLI 自管</p>
           <p v-if="showAgentEffective" class="rs-effective" :title="agentModelText">
             实际使用：{{ agentModelText }}
           </p>
+        </div>
+
+        <!-- CLI 执行器模型参数(仅 qoder_cli / deepseek_cli 可改;写入 task.params) -->
+        <template v-else-if="isCliWithModelConfig">
+          <div class="rs-field">
+            <span class="rs-label">AI助手模型(CLI)</span>
+            <BaseSelect
+              :model-value="cliParams.model"
+              :options="cliModelOptions"
+              size="sm"
+              aria-label="CLI 模型"
+              @change="onCliModelChange"
+            />
+          </div>
+          <div class="rs-field">
+            <span class="rs-label">思考强度</span>
+            <BaseSelect
+              :model-value="cliParams.reasoningEffort"
+              :options="cliEffortOptions"
+              size="sm"
+              aria-label="CLI 思考强度"
+              @change="onCliEffortChange"
+            />
+          </div>
+          <div v-if="cliContextOptions.length > 0" class="rs-field">
+            <span class="rs-label">上下文窗口</span>
+            <BaseSelect
+              :model-value="cliParams.contextWindow"
+              :options="cliContextOptions"
+              size="sm"
+              aria-label="CLI 上下文窗口"
+              @change="onCliContextChange"
+            />
+          </div>
+        </template>
+
+        <!-- 其余 CLI(如 codex_cli)模型经自身配置自管,此处不可改 -->
+        <div v-else class="rs-field">
+          <span class="rs-label">AI助手模型</span>
+          <p class="rs-hint">当前使用 CLI 执行器,执行模型由 CLI 自管</p>
         </div>
 
         <!-- agent2 评估模型 -->
