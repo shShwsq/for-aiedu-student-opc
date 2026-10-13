@@ -12,9 +12,11 @@
 - _facet_dispatch_names:开关关闭 / 可见技能数不足 → 不注册派发工具(返回空列表)
 - _build_facet_dispatch_tool:分面名动态注入 facets 参数说明(模型只能从中选)
 - _dispatch_facets:按需扇出校验(空/未知/超分面上限 → ValueError)、去重保序、
-  focus 透传各分面子循环、fan-in 落库
+  focus 透传各分面子循环、fan-in 落库、交接基座剔除本轮未收口的 assistant tool_calls
 - 主循环 dispatch_review_facets 特判:达标注册工具、派发结果作为 tool_result 回灌、
   超调用额度直接报错不扇出
+- 消息序列契约(provider 400 的两半):"tool 必有归属 call"与"call 必有 tool 应答"
+  双向断言,覆盖子循环第 2 迭代与分面首调用这两个真实踩过的坑
 """
 import json
 import threading
@@ -250,6 +252,43 @@ def _assert_tool_msgs_preceded_by_tool_calls(snapshots):
             assert m["tool_call_id"] in {tc["id"] for tc in prev["tool_calls"]}
 
 
+def _assistant_with_calls(*ids, content=""):
+    """构造带结构化 tool_calls 的 assistant 消息(契约断言的公共素材)。"""
+    msg: dict = {"role": "assistant"}
+    if content:
+        msg["content"] = content
+    msg["tool_calls"] = [
+        {
+            "id": i, "type": "function",
+            "function": {"name": "list_files", "arguments": "{}"},
+        }
+        for i in ids
+    ]
+    return msg
+
+
+def _assert_tool_calls_fully_answered(snapshots):
+    """断每条 assistant.tool_calls 的每个 id 其后都有 role=tool 响应(反向契约)。
+
+    与 _assert_tool_msgs_preceded_by_tool_calls 成对,覆盖 provider 契约的两侧:
+    前者管"响应有归属"(tool 必须回应某个 call),本函数管"调用有响应"(call 不能
+    悬空)。线上分面首调用 400 是被后者拒的——
+    "An assistant message with 'tool_calls' must be followed by tool messages
+     responding to each 'tool_call_id'"。
+    """
+    for seq in snapshots:
+        for i, m in enumerate(seq):
+            if m.get("role") != "assistant" or not m.get("tool_calls"):
+                continue
+            answered = {
+                x.get("tool_call_id") for x in seq[i + 1:] if x.get("role") == "tool"
+            }
+            missing = [tc["id"] for tc in m["tool_calls"] if tc["id"] not in answered]
+            assert not missing, (
+                f"assistant tool_calls 悬空未应答 {missing} → provider 必拒 400"
+            )
+
+
 def test_facet_pass_assistant_carries_tool_calls(monkeypatch):
     """回归 P0-1:捕获真实发给 chat_stream 的 messages 序列,断带工具调用的
     子循环进入下一迭代时 assistant 已带 tool_calls(而非纯 content)。"""
@@ -291,6 +330,46 @@ def test_facet_pass_assistant_carries_tool_calls(monkeypatch):
         m.get("role") == "tool" for seq in client.snapshots for m in seq
     ), "脚本未产生 tool 消息,断言形同虚设"
     _assert_tool_msgs_preceded_by_tool_calls(client.snapshots)
+
+
+def test_dispatch_facets_base_is_closed_sequence(monkeypatch):
+    """回归 P0(线上任务 2b38f1ef):派发此刻本轮 assistant(tool_calls)尚未收口,
+    原样当基座交给分面子循环 → 子循环第一次 LLM 调用即被 provider 拒 400。
+
+    断言三件事:① 交给 worker 的基座里没有悬空 tool_calls;② 已收口的工具交换
+    仍在(子循环要靠它继承主循环已积累的任务理解,不是退化成 system+user);
+    ③ 主循环自己的 messages 未被就地改动(回灌照旧)。
+    """
+    monkeypatch.setattr(settings, "REACT_FACET_DISPATCH_MAX_FACETS", 0)
+    _stub_dispatch_common(monkeypatch, ["a"])
+    seen: dict[str, list] = {}
+
+    def _spy(facet, base, *a, **k):
+        seen.setdefault("base", list(base))
+        return R._FacetResult(facet=facet.name, summary="x")
+
+    monkeypatch.setattr(R, "_run_facet_pass", _spy)
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        # 已收口的一轮工具交换:必须原样保留在基座里
+        _assistant_with_calls("tc-old", content="先看结构"),
+        {"role": "tool", "tool_call_id": "tc-old", "content": "{}"},
+        # 本轮刚入栈、结果尚未回灌的 assistant —— 正是悬空点
+        _assistant_with_calls("tc-dispatch", content="派发分面"),
+    ]
+
+    R._dispatch_facets(
+        _Task(), object(), 1, object(), R.get_all_tools(), msgs,
+        "always_approve", ["a"], "", ["a"],
+    )
+
+    base = seen["base"]
+    _assert_tool_calls_fully_answered([base])
+    assert [m.get("tool_call_id") for m in base if m.get("role") == "tool"] == ["tc-old"]
+    assert any(m.get("role") == "user" for m in base), "基座被过度清洗,丢了用户原话"
+    # 别名安全:主循环的列表形状不受影响(派发返回后还要往这里回灌 tool_result)
+    assert msgs[-1].get("tool_calls") and len(msgs) == 5
 
 
 # ============================================================
@@ -655,12 +734,16 @@ class _RoundTask:
         self.allowed_skills = None
 
 
-def _mk_dispatch_round(monkeypatch, *, results, names=None, max_calls=1, stream=None):
+def _mk_dispatch_round(monkeypatch, *, results, names=None, max_calls=1, stream=None,
+                       bases=None):
     """驱动一整回合:第 1 迭代模型派发 dispatch_review_facets,第 2 迭代 stop 总结。
 
     返回 (task, db, seen);seen 逐次记录主循环 _stream_llm_response 收到的
     (iteration, messages, tool_names)。分面子循环用 stub(只产 _FacetResult),
     fan-in 落库与主循环回灌是真代码 —— 要测的正是那条接入点。
+
+    bases(可选):传一个列表就会按派发顺序记录每个分面收到的基座快照
+    [(facet, base_messages)],用于断"交给子循环的序列必须收口"。
     """
     task = _RoundTask()
     db = MagicMock()
@@ -677,9 +760,13 @@ def _mk_dispatch_round(monkeypatch, *, results, names=None, max_calls=1, stream=
         lambda t: [SimpleNamespace(name=fr.facet, body="b") for fr in results],
     )
     by_name = {fr.facet: fr for fr in results}
-    monkeypatch.setattr(
-        R, "_run_facet_pass", lambda facet, *a, **k: by_name[facet.name]
-    )
+
+    def _stub_pass(facet, *a, **k):
+        if bases is not None:
+            bases.append((facet.name, [dict(m) for m in (a[0] or [])]))
+        return by_name[facet.name]
+
+    monkeypatch.setattr(R, "_run_facet_pass", _stub_pass)
     monkeypatch.setattr(
         R, "_add_conversation", lambda *a, **k: SimpleNamespace(id="c-x")
     )
@@ -768,6 +855,29 @@ def test_dispatch_result_returned_as_tool_result(monkeypatch):
         f["facet"] == "f1" and "f1结论" in f["summary"] for f in payload["facets"]
     )
     assert summary == "集成完毕:综合各面结论"  # 主循环自然总结
+
+
+def test_main_loop_facet_base_is_closed_sequence(monkeypatch):
+    """端到端(最贴近线上 400):主循环里模型调 dispatch_review_facets 时,
+    交给每个分面的基座必须是收口的消息序列。
+
+    与 test_dispatch_facets_base_is_closed_sequence 的分工:那条直接调
+    _dispatch_facets 并手工构造基座;这条跑整回合,验证"主循环此刻的 messages
+    形状"与交接清洗真的接上了(悬空 assistant 由本轮 assistant 入栈产生)。
+    """
+    results = [R._FacetResult(facet=f"f{i}", summary="x") for i in (1, 2)]
+    bases: list[tuple[str, list]] = []
+    task, db, _seen = _mk_dispatch_round(
+        monkeypatch, results=results, bases=bases,
+    )
+
+    _run_round(task, db)
+
+    assert [name for name, _ in bases] == ["f1", "f2"], "两个分面都应拿到基座"
+    for name, base in bases:
+        # 悬空 tool_calls 直接在助手函数里抛 AssertionError(带缺应答的 id)
+        _assert_tool_calls_fully_answered([base])
+        assert any(m.get("role") == "user" for m in base), "基座应带上主循环上下文"
 
 
 def test_dispatch_over_call_cap_errors_without_fanout(monkeypatch):

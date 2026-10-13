@@ -89,6 +89,116 @@ def strip_tool_call_blocks(content: str) -> str:
 
 
 # ============================================================
+# 发送前消息契约归一化(assistant tool_calls ↔ tool 响应配对)
+# ============================================================
+
+# 合成 tool 响应的固定正文。措辞确定(对齐 Codex ensure_call_outputs_present
+# 的 "aborted"):既不伪装成真实工具结果,也不含随时间变化的内容,
+# 免得每次修复都把后续 prompt cache 打没。
+SYNTHETIC_TOOL_OUTPUT = "该工具调用未返回结果(已中止)"
+
+
+def _assistant_tool_call_ids(message: dict[str, Any]) -> list[str]:
+    """取 assistant 消息里结构化 tool_calls 的 id(跳过缺 id / 非 dict 的畸形项)。"""
+    ids: list[str] = []
+    for tc in message.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        call_id = tc.get("id")
+        if call_id:
+            ids.append(str(call_id))
+    return ids
+
+
+def normalize_call_output_pairing(
+    messages: list[dict[str, Any]],
+    *,
+    task_id: Any = None,
+    round_idx: int | None = None,
+    role: str | None = None,
+) -> list[dict[str, Any]]:
+    """发送前归一化 OpenAI 消息契约,保证发给 provider 的序列一定合法。
+
+    provider 对 chat 消息序列有两条硬契约,违反任一条都直接拒 400:
+    ① assistant 的每个 tool_calls id 都必须有对应的 role="tool" 响应
+       ("An assistant message with 'tool_calls' must be followed by tool
+        messages responding to each 'tool_call_id'");
+    ② 每条 role="tool" 都必须能回溯到声明它的 assistant。
+    子智能体交接(基座取在"本轮 assistant 已入栈、工具结果尚未回灌"的窗口)、
+    历史截断/派生把一对 call/output 拆开的路径都能造出违约序列。
+
+    做法对齐 Codex 的 context_manager(发送口统一归一化,见
+    references/codex-main/.../context_manager/history.rs 的 for_prompt →
+    normalize_history 与 normalize.rs 的 ensure_call_outputs_present /
+    remove_orphan_outputs):修复优先"补"而非"删"——缺响应就在其 assistant 之后
+    插一条合成响应(保住调用记录),只有无归属的孤儿响应才删。
+
+    性质:不改入参、幂等;合法序列原样返回同一个列表对象(各调用方本就已收口,
+    这一发只是两次 O(n) 扫描)。只作用于本次发送:Conversation 落库与前端时间线
+    看到的仍是真实序列。
+
+    触发任一修复即记 WARNING(带 task / round / role 与涉及的 id):兜底必须
+    可观测,否则就是在静默掩盖上游构造消息的 bug —— 线上出现该 WARNING 就按
+    日志里的 id 去定位还在产悬空序列的路径。
+    """
+    declared: set[str] = set()
+    answered: set[str] = set()
+    for m in messages:
+        if m.get("role") == "assistant":
+            declared.update(_assistant_tool_call_ids(m))
+        elif m.get("role") == "tool" and m.get("tool_call_id"):
+            answered.add(str(m["tool_call_id"]))
+
+    # ①缺响应的 call:(assistant 下标, 该 assistant 缺应答的 id 列表)
+    missing_calls: list[tuple[int, list[str]]] = []
+    # ②无归属的孤儿响应:(下标, tool_call_id)
+    orphans: list[tuple[int, Any]] = []
+    for i, m in enumerate(messages):
+        mrole = m.get("role")
+        if mrole == "assistant":
+            miss = [cid for cid in _assistant_tool_call_ids(m) if cid not in answered]
+            if miss:
+                missing_calls.append((i, miss))
+        elif mrole == "tool":
+            call_id = m.get("tool_call_id")
+            if not call_id or str(call_id) not in declared:
+                orphans.append((i, call_id))
+
+    if not missing_calls and not orphans:
+        return messages  # 合法序列零改动
+
+    who = f"[task={task_id}] {role} 第 {round_idx} 轮"
+    if missing_calls:
+        missing_ids = [cid for _, miss in missing_calls for cid in miss]
+        logger.warning(
+            f"{who} 消息契约修复:assistant tool_calls 缺响应,"
+            f"补 {len(missing_ids)} 条合成 tool 消息 {missing_ids}"
+        )
+    if orphans:
+        logger.warning(
+            f"{who} 消息契约修复:删除无对应 tool_calls 的孤儿 tool 消息 "
+            f"{[call_id for _, call_id in orphans]}"
+        )
+
+    synthetics = {i: miss for i, miss in missing_calls}
+    orphan_indexes = {i for i, _ in orphans}
+    out: list[dict[str, Any]] = []
+    for i, m in enumerate(messages):
+        if i in orphan_indexes:
+            continue
+        out.append(m)
+        # 合成响应紧跟其 assistant(Codex 的 idx+1 插法):OpenAI 要求 tool 消息
+        # 紧随带 tool_calls 的 assistant,插到别处仍会被拒
+        for call_id in synthetics.get(i, ()):
+            out.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": SYNTHETIC_TOOL_OUTPUT,
+            })
+    return out
+
+
+# ============================================================
 # 跨 chunk 工具调用累积
 # ============================================================
 
@@ -176,7 +286,9 @@ def stream_llm(
 
     参数:
         client: LLMClient(已按用户配置构造)
-        messages: OpenAI 风格消息序列(system / user / assistant / tool)
+        messages: OpenAI 风格消息序列(system / user / assistant / tool);
+            发给 provider 前先过 normalize_call_output_pairing(契约兜底,
+            合法序列不改)
         task_id / round_idx / role:事件标注(前端按 role + round 分流)
         tools: 工具定义(None 表示不启用 function calling)
         max_tokens: 单次输出上限(调用方策略不同:react_agent / verifier
@@ -200,6 +312,14 @@ def stream_llm(
     perf:打点 llm_ttft(首 token 延迟)与 llm_stream_total(整次流耗时),
     附 role 字段区分智能体;perf_log 内部吞异常,不影响主流程。
     """
+    # 发送口不变量兜底:所有智能体/子循环都走这一条通道,在这里归一化一次
+    # 就没人需要再各写一份过滤(见 normalize_call_output_pairing)。合法序列
+    # 原样返回;被修复时会换新列表并记 WARNING —— 入参 messages 不受影响,
+    # 故调用方(主循环/分面/agent2)的上下文与落库形状都不变。
+    messages = normalize_call_output_pairing(
+        messages, task_id=task_id, round_idx=round_idx, role=role
+    )
+
     conv_id = str(uuid.uuid4())
     acc = ToolCallAccumulator()
     reasoning_full = ""

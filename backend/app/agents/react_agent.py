@@ -1199,6 +1199,59 @@ def _facet_result_items(results: list["_FacetResult"]) -> list[tuple[str, str, s
     return items
 
 
+def _drop_inflight_assistant_tool_calls(
+    messages: list[dict[str, Any]], *, task_id: Any = None,
+) -> list[dict[str, Any]]:
+    """剔除"本轮尚未收口"的 assistant tool_calls,给子智能体一份语义干净的基座。
+
+    主循环的顺序是"assistant(带 tool_calls)先入栈 → 逐个执行工具 → 回灌 tool
+    结果",所以在 dispatch_review_facets 执行的此刻,messages 的最后一条就是刚入栈
+    的 assistant,它的 tool 结果要等派发返回后才追加。把这份基座原样交给分面子循环,
+    子循环第一次 LLM 调用就会被 provider 拒 400("An assistant message with
+    'tool_calls' must be followed by tool messages responding to each
+    'tool_call_id'")—— 线上任务 2b38f1ef 即此因,两个分面都在首调用就产出 error 结论。
+
+    与发送口的 runtime.normalize_call_output_pairing(正确性兜底:给缺响应的 call 补
+    合成响应)分工不同,这里按**语义**整条剔除:那条派发是父智能体的动作,而
+    dispatch_review_facets 不在分面只读白名单里,保留它(哪怕配合成响应)会让分面误
+    以为"我调用了派发工具",既归属误导又诱导它在思考里讨论派发。
+    agent2 侧同类机制走"只取 system/user"的粗滤(见 _fan_out_plan_items);分面要保留
+    模型已积累的任务理解,故不能照搬,只能精确剔掉未收口的这一条。
+
+    已收口的历史(各次工具调用/结果/思考)全部保留。返回新列表、不改入参:主循环
+    随后照常把派发的 tool_result 回灌自己的 messages。
+    """
+    answered = {
+        str(m["tool_call_id"]) for m in messages
+        if m.get("role") == "tool" and m.get("tool_call_id")
+    }
+    dropped_ids: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            call_ids = [
+                str(tc["id"]) for tc in m["tool_calls"]
+                if isinstance(tc, dict) and tc.get("id")
+            ]
+            if call_ids and not all(cid in answered for cid in call_ids):
+                # 未收口:整条剔除(部分已应答的多调用也一并剔,避免留下半截配对)
+                dropped_ids.update(call_ids)
+                continue
+        kept.append(dict(m))
+    if dropped_ids:
+        # 被剔 assistant 的已应答 tool 行随之成了无归属孤儿(provider 契约占位符),
+        # 一并清掉;其余消息里同名 id 不存在(tool_call_id 全局唯一)
+        kept = [
+            m for m in kept
+            if not (m.get("role") == "tool" and str(m.get("tool_call_id")) in dropped_ids)
+        ]
+        logger.info(
+            f"[task={task_id}] react_agent 子循环基座剔除未收口的 "
+            f"assistant tool_calls:{sorted(dropped_ids)}"
+        )
+    return kept
+
+
 def _dispatch_facets(
     task: Task,
     db: Session,
@@ -1214,7 +1267,9 @@ def _dispatch_facets(
     """工具驱动的扇出/扇入(同步派发—等待—回灌)。
 
     与旧前置全量扇出的差异:分面列表来自工具参数(而非 _resolve_facets 全集);
-    messages 基底 = 主循环当前 messages(模型已积累的任务理解随派发传递);
+    messages 基底 = 主循环当前 messages(模型已积累的任务理解随派发传递),
+    再经 _drop_inflight_assistant_tool_calls 剔掉本轮未收口的那条 assistant
+    (此刻派发自己的 tool_result 尚未回灌,原样传递会让分面首调用被拒 400);
     focus 并入分面 system 指令层。扇出主体(_run_facet_pass 的 deadline/厂商闸门/
     只读白名单/收尾宽限、wait_if_paused 检查点、fan-in 落库)全部原样保留。
 
@@ -1264,6 +1319,9 @@ def _dispatch_facets(
     wait_if_paused(task.id, db)
 
     results: list[_FacetResult] = []
+    # 子循环基座:L1 语义层清洗(见 _drop_inflight_assistant_tool_calls),
+    # 发送口另有 runtime.normalize_call_output_pairing 作正确性兜底
+    base_messages = _drop_inflight_assistant_tool_calls(messages, task_id=task.id)
     with ThreadPoolExecutor(
         max_workers=max_workers,
         thread_name_prefix=f"react-facet-{str(task.id)[:8]}",
@@ -1271,7 +1329,7 @@ def _dispatch_facets(
         # 按分面顺序提交并收集,保证 fan-in 落库/展示顺序确定(与完成顺序无关)
         futures = [
             pool.submit(
-                _run_facet_pass, f, messages, facet_tools, allowed_names,
+                _run_facet_pass, f, base_messages, facet_tools, allowed_names,
                 client, task, round_idx, max_iter, executor_command_confirm,
                 deadline, focus,
             )

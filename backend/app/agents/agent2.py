@@ -615,7 +615,10 @@ def run_agent2(
         )
         # worker 基础上下文:只取 system/user(agent2 的 messages 本就是无状态的
         # system + user;此刻本轮 submit_review_plan 的工具交换尚未收口,
-        # 悬挂的 assistant tool_calls 消息不能带进子循环)
+        # 悬挂的 assistant tool_calls 消息不能带进子循环)。
+        # 这层粗滤够用;万一以后要带上 assistant/tool 历史,发送口的
+        # runtime.normalize_call_output_pairing 会兜住契约(缺响应补合成 + WARNING),
+        # 不必在这里再写一份过滤
         base_messages = [
             dict(m) for m in messages if m.get("role") in ("system", "user")
         ]

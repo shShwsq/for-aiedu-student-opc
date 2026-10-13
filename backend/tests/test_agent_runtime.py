@@ -14,12 +14,16 @@ tool_call 兜底没有覆盖 agent2 / verifier——这类模型把工具调用�
 5. agent2 审查循环的文本 tool_call 兜底(端到端:文本块 → 工具执行
    → 二次调用 → JSON 正常解析,而非 parse_failed)
 6. verifier 循环的文本 tool_call 兜底(文本块 → PoC 实际执行,
-   而非把工具调用文本当总结返回)
+   而非把工具调用文本当验证总结返回)
+7. 发送口 call/output 契约归一化 normalize_call_output_pairing(补缺、清孤儿、
+   幂等、不改入参、修复可观测)—— 子智能体交接或历史派生把一对 call/output 拆开时
+   的兜底,违反契约 provider 直接拒 400
 
 特殊标记字符不直接写在测试源码里,从 runtime 正则模式反推构造,
 保证与实现逐字节一致。
 """
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -489,3 +493,148 @@ def test_record_conversation_publish_event_off(monkeypatch):
     )
     db.add.assert_called_once()
     assert events == []
+
+
+# ============================================================
+# 8) 发送前 call/output 契约归一化(不变量测试组)
+#
+# 线上分面首调用 400 的兜底层:assistant 的 tool_calls 若缺 role=tool 响应,
+# provider 直接拒("must be followed by tool messages responding to each
+# 'tool_call_id'")。正反两向 + 幂等 + 不改入参 + 可观测,一条都不缺。
+# ============================================================
+
+
+def _assistant_call(*ids, content=""):
+    """构造带结构化 tool_calls 的 assistant 消息(契约素材)。"""
+    msg: dict = {"role": "assistant"}
+    if content:
+        msg["content"] = content
+    msg["tool_calls"] = [
+        {
+            "id": i, "type": "function",
+            "function": {"name": "list_files", "arguments": "{}"},
+        }
+        for i in ids
+    ]
+    return msg
+
+
+def _tool_out(call_id, content="结果"):
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+
+def _normalize(msgs):
+    return rt_stream.normalize_call_output_pairing(
+        msgs, task_id="t-1", round_idx=1, role="agent1"
+    )
+
+
+def test_normalize_adds_missing_output_for_call():
+    """悬空 call → 其后补出合成 tool 消息;原 call 保留(修复优先补而非删)。"""
+    msgs = [{"role": "system", "content": "s"}, _assistant_call("tc-d", content="派发分面")]
+    out = _normalize(msgs)
+
+    assert out[1] is msgs[1], "assistant 被丢了,应原样保留"
+    assert out[2] == {
+        "role": "tool", "tool_call_id": "tc-d",
+        "content": rt_stream.SYNTHETIC_TOOL_OUTPUT,
+    }
+    # 合成响应必须紧跟其 assistant(OpenAI 要求 tool 块紧随 tool_calls)
+    assert out.index(out[2]) == out.index(msgs[1]) + 1
+
+
+def test_normalize_adds_only_for_unanswered_ids():
+    """一条 assistant 两个 call、只应答了一个 → 只为缺的那个补。"""
+    msgs = [_assistant_call("tc-a", "tc-b"), _tool_out("tc-a")]
+    out = _normalize(msgs)
+
+    assert [m.get("tool_call_id") for m in out if m.get("role") == "tool"] == [
+        "tc-b", "tc-a",
+    ]
+    assert len(out) == 3
+
+
+def test_normalize_removes_orphan_tool():
+    """无对应 assistant 声明的 tool 消息 → 删除。"""
+    msgs = [
+        {"role": "system", "content": "s"},
+        _tool_out("tc-ghost"),
+        {"role": "user", "content": "q"},
+    ]
+    out = _normalize(msgs)
+
+    assert out[1:] == [{"role": "user", "content": "q"}]
+    assert all(m.get("role") != "tool" for m in out)
+
+
+def test_normalize_mixed_inserts_and_removals():
+    """同一序列里"补缺 + 清孤儿"并存(对齐 Codex normalize_history 两条不变量)。"""
+    msgs = [_tool_out("tc-ghost"), _assistant_call("tc-d")]
+    out = _normalize(msgs)
+
+    assert [m.get("role") for m in out] == ["assistant", "tool"]
+    assert out[0] is msgs[1]
+    assert out[1]["tool_call_id"] == "tc-d"
+
+
+def test_normalize_noop_on_valid_sequence():
+    """已收口序列 → 同一个列表对象原样返回(合法调用方零改动、零拷贝)。"""
+    msgs = [
+        {"role": "system", "content": "s"},
+        _assistant_call("tc-1", content="先看结构"),
+        _tool_out("tc-1"),
+        _assistant_call("tc-2"),
+        _tool_out("tc-2"),
+        {"role": "assistant", "content": "收尾"},
+    ]
+    assert _normalize(msgs) is msgs
+
+
+def test_normalize_does_not_mutate_input():
+    """入参列表不被就地修改(调用方的 messages 与落库形状不受影响)。"""
+    msgs = [{"role": "system", "content": "s"}, _assistant_call("tc-d")]
+    before = [dict(m) for m in msgs]
+
+    _normalize(msgs)
+
+    assert msgs == before
+    assert len(msgs) == 2
+
+
+def test_normalize_is_idempotent():
+    """归一化再过一次不再改动(修复不自我放大)。"""
+    once = _normalize([_tool_out("tc-ghost"), _assistant_call("tc-d")])
+    assert _normalize(once) is once
+
+
+def test_normalize_warns_when_it_repairs(caplog):
+    """兜底必须可观测:发生修复就记 WARNING,并带上涉及的 id。"""
+    with caplog.at_level(logging.WARNING, logger="app.agents.runtime.llm_stream"):
+        _normalize([_assistant_call("tc-d"), _tool_out("tc-ghost")])
+
+    assert "消息契约修复" in caplog.text
+    assert "tc-d" in caplog.text and "tc-ghost" in caplog.text
+    assert "t-1" in caplog.text and "agent1" in caplog.text
+
+
+def test_normalize_silent_on_valid_sequence(caplog):
+    """合法序列不触发修复也不留 WARNING(线上按该计数判断是否还有其它悬空路径)。"""
+    with caplog.at_level(logging.WARNING, logger="app.agents.runtime.llm_stream"):
+        _normalize([_assistant_call("tc-1"), _tool_out("tc-1")])
+
+    assert "消息契约修复" not in caplog.text
+
+
+def test_stream_llm_sends_normalized_messages(captured_events):
+    """发送口回归:悬空 assistant 进 stream_llm,实际发给 client 的序列已被补齐。"""
+    client = _fake_client([_FakeChunk(finish_reason="stop")])
+    msgs = [{"role": "system", "content": "s"}, _assistant_call("tc-d")]
+
+    stream_llm(client, msgs, task_id="t-1", round_idx=1, role="agent1")
+
+    sent = client.chat_stream.call_args.kwargs["messages"]
+    assert [m.get("role") for m in sent] == ["system", "assistant", "tool"]
+    assert sent[-1]["tool_call_id"] == "tc-d"
+    # 入参未被改:主循环随后还要往自己的 messages 回灌真实 tool_result
+    assert len(msgs) == 2
+
