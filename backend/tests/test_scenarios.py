@@ -44,12 +44,12 @@ def test_unknown_scenario_raises():
 
 
 def test_code_review_recommended_skills_merged():
-    """代码审核:合并安全审计后共 6 个 skill。"""
+    """代码审核:合并安全审计后共 4 个 skill。"""
     s = get_scenario("code_review")
     assert s.name == "代码审核"
     assert set(s.recommended_skills) == {
-        "check_sql_injection", "check_hardcoded_secrets", "check_ssrf",
-        "review_error_handling", "review_concurrency", "review_test_quality",
+        "check_hardcoded_secrets", "check_ssrf",
+        "review_error_handling", "review_concurrency",
     }
 
 

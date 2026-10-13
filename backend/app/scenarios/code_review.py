@@ -62,12 +62,10 @@ class CodeReviewTemplate:
     def recommended_skills(self) -> list[str]:
         # 对应 skills/code_review/ 目录下实际存在的 skill name(来自 SKILL.md frontmatter)
         return [
-            "check_sql_injection",
             "check_hardcoded_secrets",
             "check_ssrf",
             "review_error_handling",
             "review_concurrency",
-            "review_test_quality",
         ]
 
 

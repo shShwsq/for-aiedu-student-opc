@@ -616,7 +616,7 @@ _ALL_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "properties": {
                     "skill_name": {
                         "type": "string",
-                        "description": "skill 名称,如 check_sql_injection",
+                        "description": "skill 名称,如 check_ssrf",
                     },
                 },
                 "required": ["skill_name"],
