@@ -289,14 +289,22 @@ def test_full_chain(ctx):
     assert len(body["questions"]) == 3
     assert all("answer_idx" not in q for q in body["questions"])
 
-    # 逐题作答:第 1 题答对,其余答错
+    # 逐题作答:第 1 题答对,其余答错(带作答耗时,验证 latency 埋点链路)
     for i, q in enumerate(body["questions"]):
         r = ctx.client.post(f"/practice/sessions/{session_id}/answers", json={
             "question_id": q["id"], "chosen_idx": 0 if i == 0 else 1,
+            "latency_ms": 800 + i * 100,
         })
         assert r.status_code == 200
         assert r.json()["is_correct"] == (i == 0)
         assert r.json()["answered_count"] == i + 1
+        # 记忆状态回写:sm2 默认调度器下 interval_days/due_at 已建立,
+        # 新 schema 字段 stability/difficulty 存在(默认 0)
+        if i == 0:
+            st = r.json()["state"]
+            assert st["interval_days"] >= 1.0
+            assert st["due_at"] is not None
+            assert "stability" in st and "difficulty" in st
 
     # 重复作答 409
     r = ctx.client.post(f"/practice/sessions/{session_id}/answers", json={
