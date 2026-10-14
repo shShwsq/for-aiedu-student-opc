@@ -2,8 +2,10 @@
 
 覆盖:
 - build_first_round_question golden 快照(护 create_task 落库幂等去重:
-  create_task 与 CLI 首轮共用此拼装,字节漂移会造成落库/展示不同步)
-- 上传场景三处文案直白化锚点(wrapper / header / 首轮行):
+  create_task 与 CLI 首轮共用此拼装,字节漂移会造成落库/展示不同步;
+  上传任务不再附"用户上传的文件已放入任务工作区"行,该信息改由 upload
+  变体 repo_context 段承载)
+- 上传场景文案直白化锚点(wrapper / header):
   不用"交付物"内部术语、不加"无需 clone"否定指令、直接陈述文件位置
 - followup 核心指引文本 react/cli 两侧共享
 - plan reminder 双 variant 的前缀锚点(react 循环内按前缀查找替换)
@@ -38,15 +40,17 @@ def test_golden_basic_repo():
 
 
 def test_golden_upload():
-    """上传任务:直白行"用户上传的文件已放入任务工作区"(不带"无需 clone")。"""
+    """上传任务:落库/展示提问保持纯净,不带"用户上传的文件已放入任务工作区"行。"""
     q = build_first_round_question("审查这份合同", {"upload_ids": ["u1", "u2"]})
-    assert q == "审查这份合同\n用户上传的文件已放入任务工作区"
+    assert q == "审查这份合同"
+    assert "用户上传的文件已放入任务工作区" not in q
 
 
 def test_golden_legacy_single_upload_id():
-    """legacy 单数 upload_id 同样识别为上传任务。"""
+    """legacy 单数 upload_id 同样不附上传行(落库提问与无参时一致)。"""
     q = build_first_round_question("审查合同", {"upload_id": "u1"})
-    assert "用户上传的文件已放入任务工作区" in q
+    assert q == "审查合同"
+    assert "用户上传的文件已放入任务工作区" not in q
 
 
 def test_golden_no_params():

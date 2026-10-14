@@ -133,11 +133,15 @@ def test_base_prompt_first_round_matches_create_task_record():
     assert base == build_first_round_question(task.user_input, task.params)
 
 
-def test_base_prompt_upload_task_includes_upload_line():
-    """上传任务:CLI 首轮带上"用户上传的文件已放入任务工作区"行(与落库一致)。"""
+def test_base_prompt_upload_task_has_no_upload_line():
+    """上传任务:CLI 首轮 base(落库/展示)不带"用户上传的文件已放入任务工作区"行,
+    该就绪信息改由 upload 变体 repo_context 段(只进发送内容)承载。"""
+    from app.prompts.executor import build_first_round_question
+
     task = _mk_task(params={"upload_id": "u1"})
     base = _build_base_prompt(task, 1, None, "[repo context]", "/ws/uploaded_files", None)
-    assert "用户上传的文件已放入任务工作区" in base
+    assert "用户上传的文件已放入任务工作区" not in base
+    assert base == build_first_round_question(task.user_input, task.params)
 
 
 def test_base_prompt_repo_path_fallback_kept():

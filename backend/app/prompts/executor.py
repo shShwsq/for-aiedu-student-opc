@@ -21,15 +21,16 @@ from typing import Any
 def _has_creation_upload(params: dict | None) -> bool:
     """创建时是否带上传文件(兼容 legacy 单数 upload_id 与多文件 upload_ids)
 
-    react_agent 用它判定"上传任务"语境(首轮提问提示 + repo_context 措辞),
-    与 orchestrator._creation_upload_ids 语义一致;此处内联避免跨模块循环导入。
+    react_agent / acp_base 用它判定"上传任务"语境(选择 repo_context 的
+    upload 包裹变体),与 orchestrator._creation_upload_ids 语义一致;
+    此处内联避免跨模块循环导入。
     """
     p = params or {}
     return bool(p.get("upload_id") or p.get("upload_ids"))
 
 
 def build_first_round_question(user_input: str, params: dict | None) -> str:
-    """构造首轮"用户提问"对话的落库内容(user_input + 仓库/分支/上传来源提示)
+    """构造首轮"用户提问"对话的落库内容(user_input + 仓库/分支元信息)
 
     任务创建时(create_task)即以此内容落库 role=user / type=question 对话,
     保证前端首屏 getTask 快照立即显示用户提问,无需等待后台线程完成预 clone、
@@ -40,6 +41,10 @@ def build_first_round_question(user_input: str, params: dict | None) -> str:
 
     注意:不含"预 clone 上下文段"与"跨轮历史记忆块",两者属系统编排信息,
     只进发送给 LLM 的内容,不落库展示。
+
+    上传任务也不再附"用户上传的文件已放入任务工作区"行:该信息同属系统编排
+    信息(工作区已就绪),统一由上传变体的 repo_context 段承载(只进发送内容),
+    避免泄漏进前端用户提问气泡。
     """
     params = params or {}
     content = user_input
@@ -47,8 +52,6 @@ def build_first_round_question(user_input: str, params: dict | None) -> str:
         content += f"\n仓库地址: {params['repo_url']}"
     if params.get("branch"):
         content += f"\n分支: {params['branch']}"
-    if _has_creation_upload(params):
-        content += "\n用户上传的文件已放入任务工作区"
     return content
 
 

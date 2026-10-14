@@ -3055,8 +3055,8 @@ def _build_base_prompt(
     """
     if followup_query is None:
         # 委托共享拼装(与 create_task 落库 / 内置 react_agent 首轮完全一致,
-        # 修复此前 CLI 首轮与落库展示不同步的双轨不一致;上传任务会带上
-        # "用户上传的文件已放入任务工作区"行)
+        # 修复此前 CLI 首轮与落库展示不同步的双轨不一致;上传任务的就绪
+        # 信息由 upload 变体 repo_context 段承载,不写进落库提问正文)
         msg = build_first_round_question(task.user_input, task.params)
 
         # 预 clone 上下文见 _build_repo_context_section(只进发送内容);

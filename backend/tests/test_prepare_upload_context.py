@@ -5,7 +5,7 @@
 - 单个上传:走 transfer_upload_to_workspace(文件铺根,保持既有布局),header 含文件名
 - 多个上传:走 transfer_uploads_to_workspace_root(各占子目录),header 含数量与文件名
 - legacy upload_id 与 upload_ids 共存时合并去重
-- 根目录为空 → 不注入 repo_context(同 clone 分支,避免误导 agent)
+- 根目录为空 → 不列根目录结构,但仍返回上传 header 兜底(让 agent 知道是上传工作区)
 - 无上传 id → RuntimeError(不降级)
 """
 from unittest.mock import MagicMock
@@ -153,8 +153,8 @@ def test_multi_upload_merges_legacy_dedup(monkeypatch):
     assert multi_calls[0][1] == [u1, u2]  # u1 去重,保序
 
 
-def test_empty_root_returns_no_context(monkeypatch):
-    """根目录为空 → repo_context 为空(不注入,避免误导 agent),仍返回 repo_path"""
+def test_empty_root_returns_header_fallback(monkeypatch):
+    """根目录为空 → 不列根目录结构,但仍返回上传 header 兜底(含路径),让 agent 知道是上传工作区"""
     _patch_transfer(monkeypatch, entries=[])
     uid = save_upload(b"x", "a.txt", "u1")["upload_id"]
     task = _mk_task({"upload_id": uid})
@@ -162,7 +162,9 @@ def test_empty_root_returns_no_context(monkeypatch):
     repo_path, ctx_text = _prepare_upload_context(task, MagicMock(), "t1")
 
     assert repo_path == "/ws/uploaded_files"
-    assert ctx_text == ""
+    assert "用户上传的文件" in ctx_text
+    assert "已放入 /ws/uploaded_files" in ctx_text
+    assert "根目录结构" not in ctx_text  # 空目录不列结构,避免"共 0 项"误导
 
 
 def test_no_upload_ids_raises(monkeypatch):

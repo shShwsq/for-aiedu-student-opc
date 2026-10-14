@@ -299,8 +299,9 @@ def run_react_agent(
 {task.user_input}
 仓库地址: {repo_url}
 分支: {branch}
-用户上传的文件已放入任务工作区        ← 仅上传任务(直白陈述,不提 clone)
 ```
+
+> 上传任务不再附“用户上传的文件已放入任务工作区”行：该信息同属系统编排信息（工作区已就绪），统一由下方 upload 变体 repo_context 段承载，避免泄漏进前端用户提问气泡。
 
 预 clone 上下文段（只进发送内容不落库）按任务类型选变体：
 ```
@@ -309,6 +310,8 @@ def run_react_agent(
 {repo_context}
 请直接基于上述仓库路径开始执行任务(用 read_file / search_code / list_files 等工具)...
 ```
+
+> 上传任务的 `repo_context` 由 header（文件名 + 位置）+ 根目录结构组成；根目录为空（`list_files` 降级或上传内容本身为空）时只给 header、不列“共 0 项”结构，保证 agent 仍知道这是上传工作区及其路径——此前该信号靠首轮提问里的“用户上传的文件已放入任务工作区”行，现已移出落库/展示（属系统编排信息）。
 
 **追问轮（`followup_query` 非空，resume/重试时为用户消息或重试指令原文）**：
 
@@ -778,7 +781,7 @@ CLI 侧每轮构造单条 user 文本，由 `_compose_send_text` 按**稳定注�
 
 各段文案实现收敛于 [app/prompts/executor.py](../backend/app/prompts/executor.py)（与内置 react_agent 侧同源集中管理，消除"注释里约定两边保持一致"的双轨手抄）；`_build_prompt_message` 为四段拼接的聚合视图（供测试锚定），生产路径走 `_resolve_injection_plan` + `_compose_send_text`，两者共用同一装配函数。
 
-**第 1 轮**（底座复用 `build_first_round_question`——与 create_task 落库、内置 react_agent 首轮完全一致；上传任务会带"用户上传的文件已放入任务工作区"行；未预 clone 但有路径时附"仓库路径"兜底行）：
+**第 1 轮**（底座复用 `build_first_round_question`——与 create_task 落库、内置 react_agent 首轮完全一致；上传任务的就绪信息由 upload 变体 repo_context 段承载；未预 clone 但有路径时附“仓库路径”兜底行）：
 ```
 {task.user_input}
 仓库地址: {repo_url}

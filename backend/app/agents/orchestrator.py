@@ -2180,13 +2180,16 @@ def _prepare_upload_context(
     except Exception as tree_err:
         logger.warning(f"[task={task.id}] 捕获仓库树快照失败(忽略): {tree_err}")
 
-    # 空目录不注入 repo_context(同 clone 分支,避免误导 agent)
+    # 根目录无条目(list_files 降级或上传内容本身为空):不列根目录结构
+    # (避免"共 0 项"误导),但仍给出上传 header —— 让 agent 知道这是上传
+    # 工作区及其路径。此前该信号靠首轮提问里的"用户上传的文件已放入任务
+    # 工作区"行,该行已移出落库/展示(属系统编排信息),改由本段承载。
     if not files_result.get("entries"):
         logger.info(
-            f"[task={task.id}] 上传内容根目录为空,不注入 repo_context"
-            f"(降级为仅 repo_path={repo_path})"
+            f"[task={task.id}] 上传内容根目录为空,不列根目录结构"
+            f"(降级为仅 header + repo_path={repo_path})"
         )
-        return repo_path, ""
+        return repo_path, build_upload_header(metas, repo_path)
 
     header = build_upload_header(metas, repo_path)
     repo_context = format_repo_context_body("", repo_path, files_result, header=header)
