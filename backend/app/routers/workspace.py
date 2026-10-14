@@ -70,6 +70,18 @@ from app.tools import sandbox_tools
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["workspace"])
 
+# Linux 系统 /etc/mime.types 中常见 Office 文档类型不全 (Windows 自带,
+# 导致开发环境不会重现)。显式注册保证 MIME 在所有平台一致。
+mimetypes.add_type(
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"
+)
+mimetypes.add_type(
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"
+)
+mimetypes.add_type(
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"
+)
+
 # 上传回退树缓存:task_id -> (写入时间戳, payload),短 TTL 缓解 S3 多页 list 压力
 # (与 sandbox_tools._tree_cache 同模式;上传内容不可变,GC 后 30s 内可能读到陈旧树,可接受)
 _UPLOADS_TREE_CACHE_TTL = 30.0

@@ -61,6 +61,7 @@ def test_disallow_gate_flag_and_type(monkeypatch):
 
 def test_disallow_forces_autoccontinue_off(monkeypatch):
     # 常规白名单本应允许 qoder_cli 续轮回收
+    monkeypatch.setattr(settings, "ACP_DISALLOW_SUBAGENTS", False)
     monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_AUTOCONTINUE", True)
     monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_TYPES", "qoder_cli")
     assert A._async_agent_autoccontinue_enabled("qoder_cli") is True

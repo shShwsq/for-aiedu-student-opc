@@ -102,10 +102,11 @@ def _clean_tables(test_engine):
     yield
 
 
-# fake 生成器:每条 Result 出 1 题,并发出 finding/token 流式事件
+# fake 生成器:每条 Result 出 1 题，并发出 finding/token 流式事件
 def _fake_generate(db, task, user_id, max_findings=10, client=None,
                    progress_callback=None, event_callback=None,
-                   force_regenerate=False):
+                   force_regenerate=False, conversation_fallback=False,
+                   should_stop=None):
     findings = db.query(Result).filter(Result.task_id == task.id).all()[:max_findings]
     created = []
     for i, r in enumerate(findings):

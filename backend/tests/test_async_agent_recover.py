@@ -158,6 +158,7 @@ class _GateClient:
 
 @pytest.fixture()
 def _gate_on(monkeypatch):
+    monkeypatch.setattr(settings, "ACP_DISALLOW_SUBAGENTS", False)
     monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_AUTOCONTINUE", True)
     monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_TYPES", "qoder_cli")
     monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_DELIVERED_MIN_CHARS", 100)
@@ -223,6 +224,7 @@ def test_should_recover_treats_launch_count_stub_collector(_gate_on):
 # ============================================================
 
 def test_autoccontinue_gate_flag_and_type(monkeypatch):
+    monkeypatch.setattr(settings, "ACP_DISALLOW_SUBAGENTS", False)
     monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_AUTOCONTINUE", True)
     monkeypatch.setattr(settings, "ACP_ASYNC_AGENT_TYPES", "qoder_cli,codex_cli")
     assert A._async_agent_autoccontinue_enabled("qoder_cli") is True
