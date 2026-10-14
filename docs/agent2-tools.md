@@ -28,7 +28,9 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 
 额度定义于 `app/agents/agent2.py`:`MAX_READ_TOOL_CALLS=300`、`MIN_VERIFY_CALLS=3`(上限 `settings.AGENT2_MAX_VERIFY_CALLS=8`)、`MAX_REFERENCE_CALLS=3`。四个只读工具**共享** 300 次额度(`read_tool_count` 计数);`verify` 额度由 `_verify_budget()` 按审查计划里 `planned_evidence="verify"` 的条目数现算(`min(cap, planned + 1)`,下限 3)。
 
-> 额度不是拍出来的:只读取证从 12→100→300(12 太少——实测 8 条计划项摊 12 次人均 1.5 次直接把结论压成 suspected;100 在多计划项时仍偏薄,现放宽到 300 按"事实上不限制"给,真正约束改由墙钟时限与上下文裁剪护栏兜);验证额度沿用同一道算术。配套护栏:`MAX_LIVE_TOOL_RESULTS=40`(旧回传压成一行摘要)、`settings.AGENT2_REVIEW_MAX_SECONDS`(挂钟硬时限)、`settings.VERIFY_AUTH_TIMEOUT_SECONDS`(逐动作授权等待上限)。
+> 额度不是拍出来的:只读取证从 12→100→300(12 太少——实测 8 条计划项摊 12 次人均 1.5 次直接把结论压成 suspected;100 在多计划项时仍偏薄,故放宽到 300 让正常深查不被额度误杀);验证额度沿用同一道算术。配套护栏:`MAX_LIVE_TOOL_RESULTS=40`(旧回传压成一行摘要)、`settings.AGENT2_REVIEW_MAX_SECONDS`(挂钟硬时限)、`settings.VERIFY_AUTH_TIMEOUT_SECONDS`(逐动作授权等待上限)。
+>
+> **300 是"较宽"而非"无限"**:大型仓库里 300 次仍可能不够(尤其多计划项全扇出时,单项 60 × N 项会先于总池 300 触顶)。提示词(`app/prompts/agent2.py`)只客观告知模型"只读工具上限 300 次"、**不断言额度充足**,并给不够时的取舍策略:优先核到取到证,若覆盖不过来则**按优先级取舍(先保高危/上线阻塞项),其余转 `submit_suggestion` 交回 agent1**,不把清单无限拉长。
 
 工具组装见 `run_agent2()` 内 `tools` 拼接段:按启用条件把工具定义拼进 `tools` 传给 LLM;不满足条件的工具不进本轮调用面。
 

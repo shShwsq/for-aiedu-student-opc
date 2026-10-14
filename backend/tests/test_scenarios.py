@@ -4,7 +4,8 @@
 - 注册表恰好含 general / code_review / document_review 三场景
 - code_security_audit 经别名解析到 code_review(resolve_scenario_id / get_scenario)
 - list_scenarios 输出结构供前端消费
-- 代码审核推荐合并后 6 个 skill;文书审核/通用无推荐 skill
+- 代码审核推荐 4 个 skill;文书审核推荐 review_requirements;通用无推荐 skill
+- 各场景 recommended_skills 与磁盘内置 skill 名对账(防推荐名漂移后静默降级)
 """
 import pytest
 
@@ -97,3 +98,26 @@ def test_list_scenarios_shape():
             "prompt_templates",
         }
         assert isinstance(item["prompt_templates"], list)
+
+
+def test_recommended_skills_anchor_to_disk():
+    """对账:各场景 recommended_skills 必须命中内置 skills 根目录里真实存在的 skill 名。
+
+    推荐名一旦与磁盘 SKILL.md 的 frontmatter name 漂移,前端 applyRecommendedSkills
+    会勾选出空集并提交 allowed_skills=[],后端按"全部可用"静默降级,链路无任何
+    报错——只能靠本测试锚定。
+    """
+    from app.skills.loader import DEFAULT_SKILLS_ROOT, discover_skills
+
+    registry = discover_skills(DEFAULT_SKILLS_ROOT)
+    on_disk = {
+        skill.name
+        for bucket in registry.skills.values()
+        for skill in bucket.values()
+    }
+    assert on_disk, "内置 skills 根目录为空,对账失去意义"
+    for decl in list_scenarios():
+        rec = set(decl["recommended_skills"])
+        assert rec <= on_disk, (
+            f"场景 {decl['id']} 推荐了磁盘上不存在的 skill: {sorted(rec - on_disk)}"
+        )
