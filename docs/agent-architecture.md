@@ -232,7 +232,7 @@ agent1 结论引用外部依据(URL / CVE / 安全公告 / 官方文档)时,agen
 
 ### 2.9 审查子智能体按需派发(工具驱动扇出;读阶段并发 / 写阶段主线程串行)
 
-`submit_review_plan` 发射后,**由 agent2 自行判断**是否调用 `dispatch_review_subagents` 工具把选定的计划项扇出为 N 条**有界只读 ReAct 子循环**并行核实(形态复用 §3.7 分面按需派行的机制:同一 `_review_provider_gate` 厂商闸门 + ThreadPoolExecutor + fan-in),派发决策融合在规划后的思考里,而非"计划一发射就无差别自动扇出"。不派发则按原串行流程自己逐项取证。知识点提炼与出题不在并行范围内(知识点仍在 fan-in 后的主循环发射;出题已有并发机制)。
+`submit_review_plan` 发射后,**由 agent2 自行判断**是否调用 `dispatch_review_subagents` 工具把选定的计划项扇出为 N 条**有界只读 ReAct 子循环**并行核实(形态复用 §3.7 子任务按需派发的机制:同一 `_review_provider_gate` 厂商闸门 + ThreadPoolExecutor + fan-in),派发决策融合在规划后的思考里,而非"计划一发射就无差别自动扇出"。不派发则按原串行流程自己逐项取证。知识点提炼与出题不在并行范围内(知识点仍在 fan-in 后的主循环发射;出题已有并发机制)。
 
 - **工具注册**(`dispatch_review_subagents`):注册条件只能静态化(计划项 id 运行时才产生)——`AGENT2_SUBAGENT_DISPATCH_ENABLED`(默认开) + 有 `repo_path` → 注入工具;否则不注册 = 纯串行自核(而非回退自动扇出)。项数/合法性校验移到**调用时**
 - **合法性翻译**(`_dispatchable_plan_items`,纯函数):把请求的 `plan_item_ids` 翻译成(可派发项, 逐条拒收理由)。开关关 / 无工作区 → 全部拒收;未编号/未知 id、`planned_evidence=verify` 项逐条拒收(verifier 的 `run_python_code` 与新轮 agent1 共享任务沙箱,§1 世代门控同一口径,不可并发;`superseded_check` 只在主循环生效);引用复核关闭时 reference 项降级为纯只读仍参与派发;请求 id 去重保序。**项数下限**(`AGENT2_PARALLEL_MIN_ITEMS`,默认 3):过滤后合格项 < 此数 → 主循环特判分支**整批拒绝**(子循环 bootstrap + 上下文复制成本高于串行收益),回执提示"自行逐项核查"
@@ -381,32 +381,32 @@ def run_react_agent(
 "run_command":     ["执行", "运行", "跑", "测试", "构建", "build", "test", "run", "shell"],
 ```
 
-### 3.7 分面按需派发(工具驱动扇出)
+### 3.7 子任务按需派发(工具驱动扇出)
 
-ReAct 主循环可按 skill 分面扇出为多个只读子循环并发核查。**派发时机由模型自己定**(对齐 Codex 主 agent `spawn_agent` 按需派发),而非编排器在循环前无差别全量扇出——轻量输入("hi?")不再为 7 个分面付 14 发 LLM 调用。达标时主循环注册 `dispatch_review_facets` 工具,模型先理解任务、自行决定派发哪些分面(或全部、或不派),派发结果作为 `tool_result` 回灌主循环继续集成。结构分三层:
+ReAct 主循环可按需把审查子任务扇出为多个只读子循环并发核查。**派发时机由模型自己定**(对齐 Codex 主 agent `spawn_agent` 按需派发),而非编排器在循环前无差别全量扇出——轻量输入("hi?")不再为多个子任务付成倍 LLM 调用。开关开时主循环注册 `dispatch_review_subtasks` 工具,模型先理解任务、自行决定派发哪些子任务(或全部、或不派),派发结果作为 `tool_result` 回灌主循环继续集成。结构分三层:
 
 | 层 | 执行体 | 工具集 | 落库 |
 |----|--------|--------|------|
-| ① 分面扇出 | `_dispatch_facets` 内 `ThreadPoolExecutor`,每面一条有界只读子循环(`_run_facet_pass`) | `_facet_readonly_tools` 剔除 `_FACET_MUTATING_TOOLS`(clone_repo / write_file / run_python_code / run_command / str_replace_editor),执行层再按 `allowed_names` 硬拒一道;`dispatch_review_facets` 本身不在只读白名单里,分面无法再派发(结构性保证派生深度=1) | 只进内存缓冲 `pending_rows`,worker 不碰共享 db session / publish / current_plan |
-| ② fan-in | 主线程串行(`_fan_in`) | 无 | 逐条落库带 `extra_payload={"facet":…, "parallel":True}` + 透传 `stream_conv_id`(前端分面分桶与实时卡退役依赖它),并拼出小标题式的汇总串 |
-| ③ 回灌集成 | fan-in 后各面结论组装成 `tool_result` 回灌 `messages`,主循环自然继续(无独立合成回合) | 主循环全量 `get_all_tools()`(含 run_command / write_file) | 普通主循环行,无 facet 标签 |
+| ① 子任务扇出 | `_dispatch_subtasks` 内 `ThreadPoolExecutor`,每项一条有界只读子循环(`_run_subtask_pass`) | `_subtask_readonly_tools` 剔除 `_SUBTASK_FORBIDDEN_TOOLS`(= 改动类工具 `_SUBTASK_MUTATING_TOOLS`:clone_repo / write_file / run_python_code / run_command / str_replace_editor,并上只在主循环有 handler 的 `dispatch_review_subtasks`),执行层再按 `allowed_names` 硬拒一道;`dispatch_review_subtasks` 本身不在只读白名单里,子任务无法再派发(结构性保证派生深度=1) | 只进内存缓冲 `pending_rows`,worker 不碰共享 db session / publish / current_plan |
+| ② fan-in | 主线程串行(`_fan_in`) | 无 | 逐条落库带 `extra_payload={"facet":…, "parallel":True}` + 透传 `stream_conv_id`(前端子任务分桶与实时卡退役依赖它,列名沿用 `facet`),并拼出小标题式的汇总串 |
+| ③ 回灌集成 | fan-in 后各子任务结论组装成 `tool_result` 回灌 `messages`,主循环自然继续(无独立合成回合) | 主循环全量 `get_all_tools()`(含 run_command / write_file) | 普通主循环行,无 facet 标签 |
 
-注册门控(`_facet_dispatch_names`):`REACT_FACET_DISPATCH_ENABLED` 关 / 可见技能数 < `REACT_FACET_DISPATCH_MIN_FACETS`(下界固定 2) → 返回空列表 = 不注册工具(纯串行主循环)。不再区分追问轮——`dispatch_review_facets` 在追问轮同样可用(是否派发交给模型)。
+注册门控:仅看 `REACT_FACET_DISPATCH_ENABLED`(默认开)——关则不注册工具 = 纯串行主循环。子任务可纯 instruction、不再等同一个技能,故旧"注册派发工具所需最低可见技能数"闸门 `REACT_FACET_DISPATCH_MIN_FACETS` 已废弃(键保留仅兼容既有 env,不再参与注册判定)。不再区分追问轮——`dispatch_review_subtasks` 在追问轮同样可用(是否派发交给模型)。
 
 **派发纪律与参数**(对齐 Codex 把纪律写进 `spawn_agent` 描述,见 `multi_agents_spec.rs`):
 
-- 工具描述模板 `DISPATCH_FACETS_TOOL_DESCRIPTION_TEMPLATE`(prompts/executor.py,纯函数)含"适合/不适合/先计划后派发/一次任务通常只派 1 次/派发后集成不重跑"文案;`{facet_names}` 占位符由调用侧按当前可见技能名动态填(`_build_facet_dispatch_tool`),模型只能从这些名字里选,写错直接报错。
-- 参数 `facets`(必填,分面名数组)+ `focus`(可选,主 agent 给定的共享审查重点/已知上下文,各分面共享,对标 `spawn_agent` 的 `message`)。`focus` 经 `build_facet_instruction` 并入分面 system 指令层,入参前按 `FACET_FOCUS_MAX_CHARS`(默认 2000)截断。
-- `_dispatch_facets` 校验:空列表 / 未知分面 / 超 `REACT_FACET_DISPATCH_MAX_FACETS`(默认 0=不限)→ 抛 `ValueError`,由主循环特判当工具失败回灌;请求分面去重保序后按可见分面对象保留原始 skill 对象(需 `body` 进指令层)。
-- **交接基座的消息契约(两层,缺一不可)**:主循环是"assistant(带 tool_calls)先入栈 → 执行工具 → 回灌 tool 结果",派发此刻本轮尚未收口,把 `messages` 原样当基座交给分面会让子循环**首次 LLM 调用就被 provider 拒 400**(`An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'`)。
-  - L1 语义层(`react_agent._drop_inflight_assistant_tool_calls`,交接前):整条剔除未收口的 assistant(其已应答的 tool 行随之成孤儿一并清掉),已收口的工具交换/思考全部保留——分面要继承主循环已积累的任务理解,不能像 agent2 那样只取 system/user。选"剔除"而非"保留+合成":派发是父智能体的动作,`dispatch_review_facets` 不在分面只读白名单里,留着会让分面误以为"我调用了派发"。
+- 工具描述模板 `DISPATCH_SUBTASKS_TOOL_DESCRIPTION_TEMPLATE`(prompts/executor.py,纯函数)含"适合/不适合/先计划后派发/一次任务通常只派 1 次/派发后集成不重跑"文案;`{skill_names}` 占位符由调用侧按当前可见技能名动态填(`_build_subtask_dispatch_tool`),模型只能从这些名字里选,写错直接报错。
+- 参数 `subagents`(必填,子任务数组):每项 `{instruction(必填,主 agent 为该子任务自写的要求/上下文), skills(可选,可见技能名子集,可为空), label(可选,缺省按序号「子任务 N」)}`。`subagents` 取代旧的「facets 名数组 + 共享 focus 通道」——技能正文不再预注入,子任务按需用 skill 工具自行读取。`instruction` 经 `build_subtask_instruction` 并入子任务 system 指令层,入参前按 `SUBTASK_INSTRUCTION_MAX_CHARS`(默认 2000)截断。
+- `_dispatch_subtasks` 校验:空列表 / 缺 instruction / 未知技能 / 超 `REACT_FACET_DISPATCH_MAX_FACETS`(默认 0=不限)→ 抛 `ValueError`,由主循环特判当工具失败回灌;skills 去重保序并校验 ⊆ 可见技能集,label 缺省按序号回退「子任务 N」。
+- **交接基座的消息契约(两层,缺一不可)**:主循环是"assistant(带 tool_calls)先入栈 → 执行工具 → 回灌 tool 结果",派发此刻本轮尚未收口,把 `messages` 原样当基座交给子任务会让子循环**首次 LLM 调用就被 provider 拒 400**(`An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'`)。
+  - L1 语义层(`react_agent._drop_inflight_assistant_tool_calls`,交接前):整条剔除未收口的 assistant(其已应答的 tool 行随之成孤儿一并清掉),已收口的工具交换/思考全部保留——子任务要继承主循环已积累的任务理解,不能像 agent2 那样只取 system/user。选"剔除"而非"保留+合成":派发是父智能体的动作,`dispatch_review_subtasks` 不在子任务只读白名单里,留着会让子任务误以为"我调用了派发"。
   - L2 正确性层(`runtime/llm_stream.normalize_call_output_pairing`,发送口):任一调用方发给 provider 前统一归一化,缺响应→在其 assistant 之后补合成响应(`SYNTHETIC_TOOL_OUTPUT`),无归属→删孤儿;合法序列原样返回同一列表(不改入参、幂等、落库/前端时间线不受影响),**触发即记 WARNING**(带 task/round/role 与 id)——兜底必须可观测,否则是在静默掩盖上游构造 bug。对齐 Codex `context_manager` 的 `for_prompt` → `normalize_history`(见 `references/codex-main/codex-rs/core/src/context_manager/`),比"每个交接点各写一份过滤"更耐未来新增路径。
-- 单轮派发调用次数上限 `REACT_FACET_DISPATCH_MAX_CALLS`(默认 1):超限直接报错"请基于已有分面结论集成,不要重复派发",对标 Codex"同一未决线程避免重复派发"。
-- 单面结论回灌 `tool_result` 前按 `REACT_FACET_SUMMARY_MAX_TOKENS`(默认 3000,`_clip_to_tokens` CJK 感知粗估)截断,`status`(ok / error / timed_out)与错误措辞保留在回灌 payload 里,供模型如实汇报哪些维度未覆盖。
+- 单轮派发调用次数上限 `REACT_FACET_DISPATCH_MAX_CALLS`(默认 1):超限直接报错"请基于已有子任务结论集成,不要重复派发",对标 Codex"同一未决线程避免重复派发"。
+- 单份子任务结论回灌 `tool_result` 前按 `REACT_FACET_SUMMARY_MAX_TOKENS`(默认 3000,`_clip_to_tokens` CJK 感知粗估)截断,`status`(ok / error / timed_out)与错误措辞保留在回灌 payload 里,供模型如实汇报哪些维度未覆盖。
 
-**为何回灌后主循环拿得到写工具是安全的**:派发是同步"扇出—等待—回灌",fan-in 之后此刻只有一个主线程在跑,不存在并发写共享工作区的问题,因此不改分面侧只读黑名单即可拿到写能力;危险命令仍由 `_classify_command` + `command_confirm_mode` 按原有口径把关。
+**为何回灌后主循环拿得到写工具是安全的**:派发是同步"扇出—等待—回灌",fan-in 之后此刻只有一个主线程在跑,不存在并发写共享工作区的问题,因此不改子任务侧只读黑名单即可拿到写能力;危险命令仍由 `_classify_command` + `command_confirm_mode` 按原有口径把关。
 
-已知代价与限制(接受的设计取舍):分面子循环的 thinking/tool 行按 facet 标签落库(实时流式),但工具调用细节不进主循环 `messages`(只回灌结论),避免 N 面长上下文撑爆父线程;`focus` 是主 agent 已积累任务理解的摘要,过长会把每份分面子循环的上下文都撑胖,故入指令层前截断。
+已知代价与限制(接受的设计取舍):子任务子循环的 thinking/tool 行按 facet 标签落库(实时流式),但工具调用细节不进主循环 `messages`(只回灌结论),避免 N 份长上下文撑爆父线程;子任务的 `instruction` 是主 agent 为该任务写的要求/上下文摘要,过长会把每份子任务子循环的上下文都撑胖,故入指令层前截断。
 
 ### 3.8 返回值
 
