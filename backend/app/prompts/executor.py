@@ -666,6 +666,14 @@ MAX_ITERATION_PROMPT = (
     "包括已确认的漏洞、已检查的范围、未完成的检查项。"
 )
 
+# 单次输出被 max_tokens 截断且正文为空时的收尾提示:思考型模型可能把输出
+# 预算全烧在推理上,连正文/工具调用都没产出。注入本提示令其基于已有思考
+# 直接作答,避免本轮以空结果收尾(否则 orchestrator 会把任务误标为完成)。
+TRUNCATION_CONTINUE_PROMPT = (
+    "系统提示:你上一轮的输出因达到单次生成token上限被截断,尚未产出任何结论。"
+    "请勿基于你已经完成的分析继续执行。"
+)
+
 
 def build_subtask_instruction(label: str, instruction: str) -> str:
     """构造单个子任务的只读核查指令(作为子任务子循环的独立 system 指令层,不落库不展示)。

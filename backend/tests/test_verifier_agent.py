@@ -131,6 +131,53 @@ def test_max_iterations_still_publishes_end(monkeypatch):
     assert outcome["outcome"] == OUTCOME_UNKNOWN  # 一直没申报 → 不抬档
 
 
+def test_truncation_without_output_retries_then_finishes(monkeypatch):
+    """finish=length 且正文为空:不当作"验证完成",注入收尾提示重试后正常收尾"""
+    ends: list[int] = []
+    monkeypatch.setattr(verifier_agent, "_publish_verify_end", lambda tid, ri: ends.append(ri))
+
+    seen: list[list[dict]] = []
+
+    def fake(client, messages, *, task_id, round_idx, iteration):
+        seen.append([dict(m) for m in messages])
+        if len(seen) == 1:
+            return ("被截断的长思考……", "", [], "length")
+        return ("", "PoC 不成立,普通参数也能拿到数据", [], "stop")
+
+    monkeypatch.setattr(verifier_agent, "_stream_verifier_llm", fake)
+
+    outcome: dict = {}
+    text = verifier_agent.run_verifier_agent(
+        _mk_task(), MagicMock(), "验证 SQL 注入", client=MagicMock(),
+        round_idx=1, outcome_out=outcome,
+    )
+
+    # 零产出后必须重试(共 2 次流式调用),而不是第一次就静默收尾
+    assert len(seen) == 2
+    assert seen[1][-1]["role"] == "user"
+    assert seen[1][-1]["content"] == verifier_agent.TRUNCATION_CONTINUE_PROMPT
+    assert "普通参数" in text
+    assert ends == [1]
+
+
+def test_truncation_retry_is_bounded(monkeypatch):
+    """始终零产出:重试有界,之后降级收尾而非无限循环"""
+    monkeypatch.setattr(verifier_agent, "_publish_verify_end", lambda tid, ri: None)
+    calls = {"n": 0}
+
+    def fake(client, messages, *, task_id, round_idx, iteration):
+        calls["n"] += 1
+        return ("一直截断", "", [], "length")
+
+    monkeypatch.setattr(verifier_agent, "_stream_verifier_llm", fake)
+    outcome: dict = {}
+    verifier_agent.run_verifier_agent(
+        _mk_task(), MagicMock(), "验证", client=MagicMock(),
+        round_idx=1, outcome_out=outcome,
+    )
+    assert calls["n"] == 1 + verifier_agent._MAX_TRUNCATION_RETRIES
+
+
 def test_submit_verification_not_called_fails_closed(monkeypatch):
     # 模型没申报 → unknown:宁可不抬档,也不让"跑过"冒充"验出来"
     monkeypatch.setattr(

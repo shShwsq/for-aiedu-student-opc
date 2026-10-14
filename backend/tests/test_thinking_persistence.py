@@ -340,3 +340,148 @@ def test_verifier_thinking_published(monkeypatch):
     assert recorded["role"] == "agent2"
     assert recorded.get("publish_event") is not False
     assert recorded["content"].startswith("[验证结果]")
+
+
+# ============================================================
+# 6) react_agent:输出被 max_tokens 截断且零产出 → 收尾重试(不静默结束)
+# ============================================================
+
+
+class _TruncTask:
+    def __init__(self):
+        self.id = "task-trunc"
+        self.scenario = "general"
+        self.user_id = None
+        self.params = {}
+        self.user_input = "审核这份商业计划书"
+        self.allowed_skills = None
+
+
+def _drive_truncation_round(monkeypatch, responses):
+    """驱动一整轮 run_react_agent,`_stream_llm_response` 按 responses 依次返回。
+
+    responses 元素形如 (reasoning, content, tool_calls, finish_reason),
+    内部补上 conv_id 凑成包装层返回的 5 元组契约。
+    返回 (seen, summary):seen 逐次记录每次流式调用收到的 messages 快照。
+    """
+    import app.agents.react_agent as R
+
+    task = _TruncTask()
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = []
+
+    monkeypatch.setattr(R, "set_current_task", lambda *a, **k: None)
+    monkeypatch.setattr(R, "wait_if_paused", lambda *a, **k: None)
+    monkeypatch.setattr(R, "perf_log", lambda *a, **k: None)
+    monkeypatch.setattr(R, "publish", lambda *a, **k: None)
+    monkeypatch.setattr(R, "drain_user_messages", lambda *a, **k: [])
+    monkeypatch.setattr(R, "has_pending_messages", lambda *a, **k: False)
+    monkeypatch.setattr(R, "_add_conversation", lambda *a, **k: SimpleNamespace(id="c"))
+    monkeypatch.setattr(R, "_visible_skill_names", lambda t: [])
+    monkeypatch.setattr(R, "get_all_tools", lambda: [])
+
+    queue = list(responses)
+    seen: list[list[dict]] = []
+
+    def _fake_stream(client, t, db_, round_idx, iteration, messages, tools):
+        seen.append([dict(m) for m in messages])
+        return queue.pop(0) + (f"conv-{iteration}",)
+
+    monkeypatch.setattr(R, "_stream_llm_response", _fake_stream)
+
+    _results, summary, _plan = R.run_react_agent(
+        task, db, round_idx=1, followup_query=None,
+        client=MagicMock(), repo_context=None, previous_plan=None,
+    )
+    return seen, summary
+
+
+def test_react_agent_truncation_without_output_retries(monkeypatch):
+    """finish=length 且正文为空:不静默结束,注入收尾提示重试直到有产出"""
+    import app.agents.react_agent as R
+
+    seen, summary = _drive_truncation_round(monkeypatch, [
+        ("被截断的长思考……", "", [], "length"),
+        ("", "结论:单元经济自洽性存疑", [], "stop"),
+    ])
+
+    # 第一次零产出后必须重试(共 2 次流式调用),而不是一次就 break
+    assert len(seen) == 2
+    assert summary == "结论:单元经济自洽性存疑"
+    # 第二次调用前注入了收尾提示(最后一条 user 消息)
+    assert seen[1][-1]["role"] == "user"
+    assert seen[1][-1]["content"] == R.TRUNCATION_CONTINUE_PROMPT
+    # 零产出的那次不落空 assistant 消息(否则 provider 400 / 污染上下文)
+    assert not any(
+        m.get("role") == "assistant" and not m.get("content") and not m.get("tool_calls")
+        for m in seen[1]
+    )
+
+
+def test_react_agent_truncation_retry_is_bounded(monkeypatch):
+    """始终零产出时,重试有界(MAX_TRUNCATION_RETRIES),之后降级结束"""
+    import app.agents.react_agent as R
+
+    n = 1 + R.MAX_TRUNCATION_RETRIES
+    seen, summary = _drive_truncation_round(
+        monkeypatch, [("被截断", "", [], "length")] * n
+    )
+    # 重试有界:恰好 n 次(1 次原始 + MAX_TRUNCATION_RETRIES 次重试),不无限循环
+    assert len(seen) == n
+    # 重试耗尽后走既有降级兜底(run_react_agent 的空 summary 占位)
+    assert summary == "执行完成"
+
+
+def test_stream_llm_response_passes_model_output_limit(monkeypatch):
+    """react_agent 不再吃 stream_llm 的 4096 默认值:下发模型解析后的输出上限"""
+    import app.agents.react_agent as R
+
+    captured = {}
+
+    def _fake_stream_llm(client, messages, **kw):
+        captured.update(kw)
+        return StreamResult(
+            conv_id="c", reasoning="", content="", tool_calls=[], finish_reason="stop",
+        )
+
+    monkeypatch.setattr(R, "stream_llm", _fake_stream_llm)
+    client = MagicMock()
+    client.max_output_tokens = 8192
+
+    R._stream_llm_response(
+        client, MagicMock(id="t-1"), MagicMock(),
+        round_idx=1, iteration=1, messages=[], tools=None,
+    )
+
+    assert captured["max_tokens"] == 8192
+
+
+def test_subtask_stream_turn_passes_model_output_limit(monkeypatch):
+    """子任务(分面)子循环同样下发模型输出上限,不再落到 4096 默认值"""
+    import time as _time
+    from contextlib import nullcontext
+
+    import app.agents.react_agent as R
+
+    captured = {}
+
+    def _fake_stream_llm(client, messages, **kw):
+        captured.update(kw)
+        return StreamResult(
+            conv_id="c", reasoning="", content="", tool_calls=[], finish_reason="stop",
+        )
+
+    monkeypatch.setattr(R, "stream_llm", _fake_stream_llm)
+    monkeypatch.setattr(R, "_review_provider_gate", lambda client: nullcontext())
+
+    client = MagicMock()
+    client.max_output_tokens = 8192
+
+    R._subtask_stream_turn(
+        client, [], None,
+        task=MagicMock(id="t-1"), round_idx=1, label="f1", iteration=1,
+        deadline=_time.monotonic() + 60,
+    )
+
+    assert captured["max_tokens"] == 8192

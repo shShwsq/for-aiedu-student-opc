@@ -291,8 +291,10 @@ def stream_llm(
             合法序列不改)
         task_id / round_idx / role:事件标注(前端按 role + round 分流)
         tools: 工具定义(None 表示不启用 function calling)
-        max_tokens: 单次输出上限(调用方策略不同:react_agent / verifier
-            4096;agent2 评估 16384——大 JSON results 需要余量)
+        max_tokens: 单次输出上限(调用方策略不同:react_agent 传模型解析后的
+            输出上限 client.max_output_tokens;verifier 4096;agent2 评估
+            16384——大 JSON results 需要余量)。缺省 4096 仅为兜底,思考型
+            模型易把预算烧在推理上,新调用点应显式传入
         publish_content: 是否把 content 增量推给前端。
             react_agent / verifier 展示正文 → True;
             agent2 的 content 是最终评估 JSON(侧栏只展示思考链)→ False

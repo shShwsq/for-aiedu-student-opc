@@ -55,6 +55,8 @@ class FakeClient:
     provider_id = "fake"
     model = "m1"
     base_url_override = ""
+    # 与 LLMClient 契约一致:调用方会读它作为单次输出上限
+    max_output_tokens = 8192
 
     def __init__(self, turns):
         self._turns = list(turns)

@@ -58,6 +58,7 @@ from app.agents.verification_outcome import (
 from app.event_bus import publish
 from app.llm.client import LLMClient
 from app.models.task import Task
+from app.prompts.executor import TRUNCATION_CONTINUE_PROMPT
 from app.prompts.verifier import VERIFIER_SYSTEM_PROMPT, build_auth_section
 from app.tools.verifier_tools import (
     VERIFIER_EMIT_TOOL_DEFINITIONS,
@@ -69,6 +70,9 @@ logger = logging.getLogger(__name__)
 
 # verifier_agent ReAct 循环最大迭代次数
 MAX_VERIFIER_ITERATIONS = 10
+
+# 输出被 max_tokens 截断且正文为空(思考吃光预算、零产出)时的收尾重试上限
+_MAX_TRUNCATION_RETRIES = 2
 
 # 结论申报工具名(无副作用:不授权、不进沙箱)
 _SUBMIT_VERIFICATION_TOOL_NAME = "submit_verification"
@@ -179,6 +183,9 @@ def run_verifier_agent(
         )},
     ]
 
+    # 因"输出被截断且零产出"触发的收尾重试已用次数(见下方无工具调用分支)
+    truncation_retries = 0
+
     for iteration in range(1, MAX_VERIFIER_ITERATIONS + 1):
         # 审查已终止/被新一轮取代:不再花 LLM 往返,也不等新授权
         if abort_check is not None and abort_check():
@@ -208,12 +215,40 @@ def run_verifier_agent(
                 tool_calls_full = text_tool_calls
                 content_full = strip_tool_call_blocks(content_full)
 
-        # 无工具调用 → 验证完成,content 是总结
+        # 无工具调用:模型主动 stop → 验证完成,content 是总结
+        # 但 finish=length 且正文为空时,是思考吃光输出预算、本轮零产出——
+        # 不能当"验证完成"静默收尾(会把截断伪装成完成)。注入收尾提示重试
+        # (有界),耗尽再降级收尾
         if not tool_calls_full:
-            logger.info(
-                f"[task={task_id}] verifier_agent 在第 {iteration} 轮完成验证,"
-                f"content={len(content_full)}字符"
-            )
+            if finish_reason == "length" and not content_full:
+                if truncation_retries < _MAX_TRUNCATION_RETRIES:
+                    truncation_retries += 1
+                    logger.warning(
+                        f"[task={task_id}] verifier_agent 第 {iteration} 轮输出被 "
+                        f"max_tokens 截断且零产出(reasoning={len(reasoning_full)}字符),"
+                        f"注入收尾提示重试({truncation_retries}/{_MAX_TRUNCATION_RETRIES})"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": TRUNCATION_CONTINUE_PROMPT,
+                    })
+                    continue
+                logger.warning(
+                    f"[task={task_id}] verifier_agent 第 {iteration} 轮输出被 "
+                    f"max_tokens 截断且零产出,收尾重试已达上限"
+                    f"({_MAX_TRUNCATION_RETRIES}),降级收尾"
+                )
+            elif finish_reason == "length":
+                logger.warning(
+                    f"[task={task_id}] verifier_agent 第 {iteration} 轮输出被 "
+                    f"max_tokens 截断(finish=length),以现有正文降级收尾。"
+                    f"content={len(content_full)}字符"
+                )
+            else:
+                logger.info(
+                    f"[task={task_id}] verifier_agent 在第 {iteration} 轮完成验证,"
+                    f"content={len(content_full)}字符"
+                )
             return _finish(
                 content_full or "(验证完成,无总结输出)",
                 reasoning=reasoning_full,
@@ -391,10 +426,12 @@ def _stream_verifier_llm(
 
     返回 (reasoning_full, content_full, tool_calls_full, finish_reason)
     """
+    # max_tokens 取模型解析后的输出上限:思考型模型把预算烧在推理上时,
+    # 写死 4096 会导致零产出被截断(chat_stream 仍会向下钳制)
     result = stream_llm(
         client, messages,
         task_id=task_id, round_idx=round_idx, role="agent2",
-        tools=_VERIFIER_TOOLS, max_tokens=4096,
+        tools=_VERIFIER_TOOLS, max_tokens=client.max_output_tokens,
         iteration=iteration,
         extra={"verify": True},
         phase_start=False,

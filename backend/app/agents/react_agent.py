@@ -64,6 +64,7 @@ from app.prompts.executor import (
     MAX_ITERATION_PROMPT,
     REACT_AGENT_SYSTEM_PROMPT,
     SYSTEM_INJECT_MARKER,
+    TRUNCATION_CONTINUE_PROMPT,
     _has_creation_upload,
     build_first_round_question,
     build_history_compress_segments,
@@ -81,6 +82,9 @@ logger = logging.getLogger(__name__)
 
 # 最大迭代轮次,防止死循环
 MAX_ITERATIONS = 30
+# 单次输出被 max_tokens 截断且正文为空时,注入收尾提示重试的最大次数
+# (思考型模型把输出预算烧在推理上会零产出;有界重试避免死循环)
+MAX_TRUNCATION_RETRIES = 2
 # 连续相同工具调用的容忍次数,超过就打破循环
 MAX_SAME_CALLS = 3
 # 修复 12:循环检测滑动窗口参数
@@ -339,6 +343,8 @@ def run_react_agent(
     #      按需调用 dispatch_review_subtasks 工具(见下方工具执行分支的特判)。
     #      派发结果作为 tool_result 回灌 messages,集成由模型在后续迭代自然完成。 ----
     loop_limit = MAX_ITERATIONS
+    # 本轮因"截断且零产出"触发的收尾重试已用次数(见下方结束判断分支)
+    truncation_retries = 0
     # 本轮已用派发次数(对标 Codex "避免对同一未决线程重复派发",额度见配置)
     subtask_dispatch_calls = 0
     subtask_dispatch_max_calls = max(
@@ -425,7 +431,11 @@ def run_react_agent(
                 }
                 for tc in tool_calls_full
             ]
-        messages.append(assistant_msg)
+        # 仅当确实有正文或工具调用时才落这条 assistant 消息:二者皆空
+        # (输出被 max_tokens 截断、零产出)时,空 assistant 会让 provider 报
+        # 400,且下方截断重试需要干净上下文继续补发收尾提示
+        if content_full or tool_calls_full:
+            messages.append(assistant_msg)
 
         # 落库思考(content + reasoning),供刷新页面后查看
         # 同时推 conversation 事件:流式卡片按 conv_id 退役为只读历史卡片,
@@ -479,8 +489,11 @@ def run_react_agent(
                     assistant_msg["content"] = cleaned
 
         # 结束判断:模型主动 stop 且无工具调用 → 真正结束
-        # finish_reason=length 是被 max_tokens 截断,模型没说完,不算主动结束
-        # (降级处理:用现有 content 作 summary,记录 warning)
+        # finish_reason=length 是被 max_tokens 截断,模型没说完,不算主动结束:
+        #   - 有正文:用现有 content 作 summary 收尾(降级,记录 warning)
+        #   - 正文为空:输出预算全被思考吃掉、本轮零产出。直接收尾会让
+        #     orchestrator 把任务误标为完成(静默丢结果),故注入收尾提示
+        #     重试(有界);重试耗尽再降级结束
         if not tool_calls_full:
             # 遗留消息守卫:最终答案生成期间(本迭代 drain 之后)到达的用户
             # 消息 → 不结束,继续循环让下一迭代顶部 drain+注入 —— 模型在
@@ -491,7 +504,27 @@ def run_react_agent(
                     f"继续本轮处理(迭代 {iteration} → {iteration + 1})"
                 )
                 continue
-            if finish_reason == "length":
+            if finish_reason == "length" and not content_full:
+                if truncation_retries < MAX_TRUNCATION_RETRIES:
+                    truncation_retries += 1
+                    logger.warning(
+                        f"[task={task.id}] react_agent 第 {round_idx} 轮/迭代 {iteration} "
+                        f"输出被 max_tokens 截断且零产出"
+                        f"(reasoning={len(reasoning_full)}字符),注入收尾提示重试"
+                        f"({truncation_retries}/{MAX_TRUNCATION_RETRIES})"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": TRUNCATION_CONTINUE_PROMPT,
+                    })
+                    continue
+                logger.warning(
+                    f"[task={task.id}] react_agent 第 {round_idx} 轮/迭代 {iteration} "
+                    f"输出被 max_tokens 截断且零产出,收尾重试已达上限"
+                    f"({MAX_TRUNCATION_RETRIES}),降级结束。"
+                    f"reasoning={len(reasoning_full)}字符"
+                )
+            elif finish_reason == "length":
                 logger.warning(
                     f"[task={task.id}] react_agent 第 {round_idx} 轮/迭代 {iteration} "
                     f"输出被 max_tokens 截断(finish=length),降级结束。"
@@ -907,10 +940,13 @@ def _subtask_stream_turn(
     返回 (reasoning, content, tool_calls, finish_reason, conv_id)。
     """
     with _review_provider_gate(client):
+        # max_tokens 同主循环:取模型解析后的输出上限,避免思考把 4K 预算
+        # 烧光导致子任务零产出被截断(chat_stream 仍会向下钳制)
         res = stream_llm(
             client, messages,
             task_id=task.id, round_idx=round_idx, role="agent1",
             tools=tools, iteration=iteration,
+            max_tokens=client.max_output_tokens,
             extra={"facet": label, "parallel": True},
             stop_check=lambda: time.monotonic() > deadline,
         )
@@ -1436,10 +1472,15 @@ def _stream_llm_response(
         - conv_id: 这次 LLM 调用的流式卡片标识,落库 thinking 时作为
             stream_conv_id 一起推给前端,供实时卡片与历史记录对账退役
     """
+    # 输出上限取模型解析后的能力值(用户设置 > catalog > 系统默认),
+    # 而非 stream_llm 的 4096 默认值:思考型模型(reasoning 也占用输出预算)
+    # 在长分析任务里很容易把 4K 预算全烧在思考上,导致零产出被截断。
+    # chat_stream 仍会向下钳制到模型真实上限,故此处传入解析值安全。
     result = stream_llm(
         client, messages,
         task_id=task.id, round_idx=round_idx, role="agent1",
         tools=tools, iteration=iteration,
+        max_tokens=client.max_output_tokens,
     )
     return (
         result.reasoning,
