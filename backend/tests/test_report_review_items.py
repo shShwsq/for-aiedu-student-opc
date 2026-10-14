@@ -40,10 +40,12 @@ def test_markdown_sections_and_buckets():
     assert "### 已核实成立 (1)" in text
     assert "### 已核实不成立 (1)" in text
     assert "### 待核实 (1)" in text
-    # 置信(带证据) + 无证据(未取证,旧文案"未分级"读不出原因)
-    assert "源码取证" in text
-    assert "78%" not in text  # 百分比已去掉,只留档位标签
-    assert "无证据(未取证)" in text
+    # 置信档位不再逐档渲染为标签(只保留动态验证/证据未核验两个标记)
+    assert "源码取证" not in text
+    assert "仅断言·待核实" not in text
+    assert "置信度:" not in text
+    assert "78%" not in text  # 百分比早已去掉
+    assert "🔬 动态验证" not in text  # 本组无 tier=verified 项
     assert "原始证据(src/users.py:42)" in text
     # 字段新语义与中文标签
     assert "待核实对象:users.py 存在注入" in text
@@ -61,6 +63,35 @@ def test_markdown_empty_no_section():
     lines: list[str] = []
     _append_review_items_md(lines, [])
     assert lines == []
+
+
+def test_poc_and_mismatch_are_flags():
+    """只有跑过 PoC(tier=verified)才标“动态验证”;核验未过标“证据未核验”;
+    其余档位标签不再出现在报告里(旧实现会把 label 如“仅断言·待核实”直接铺上)。"""
+    lines: list[str] = []
+    _append_review_items_md(lines, [
+        _item(title="PoC 跑崩", confidence={"tier": "verified", "label": "已动态验证"}),
+        _item(title="核验未过", evidence_mismatch=True,
+              confidence={"tier": "assertion_only", "label": "仅断言·待核实"}),
+    ])
+    text = "\n".join(lines)
+    assert "🔬 动态验证" in text
+    assert "⚠ 证据未核验" in text
+    # 旧档位标签不单独成行(已动态验证/仅断言·待核实 都已被换成粗标记或不输出)
+    assert "已动态验证" not in text
+    assert "仅断言·待核实" not in text
+
+
+def test_not_established_verified_still_flagged():
+    """不成立类用 PoC 反证复现不了 → tier=verified 也要标“动态验证”"""
+    lines: list[str] = []
+    _append_review_items_md(lines, [
+        _item(title="误报已反证", verdict="false_positive", severity=None,
+              confidence={"tier": "verified", "label": "已动态验证"}, evidence=None),
+    ])
+    text = "\n".join(lines)
+    assert "### 已核实不成立 (1)" in text
+    assert "🔬 动态验证" in text
 
 
 def test_html_escapes_and_new_fields():

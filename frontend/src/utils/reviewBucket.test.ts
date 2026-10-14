@@ -1,8 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import {
   bucketizeReviewItems,
-  confidenceClass,
-  confidenceLabel,
   isLegacyReviewSummary,
   originLabel,
   pendingVerifyBadge,
@@ -10,7 +8,7 @@ import {
   planTally,
   PLAN_STATE_LABELS,
   REVIEW_BUCKET_ORDER,
-  summaryConfidenceTally,
+  reviewItemBadge,
   summaryCounts,
   summaryVerdictText,
   unverifiedReasonLabel,
@@ -87,19 +85,32 @@ describe('originLabel', () => {
   })
 })
 
-describe('confidenceLabel / confidenceClass', () => {
-  it('档位映射与后端 TIER_LABELS 对齐', () => {
-    expect(confidenceLabel('verified')).toBe('已动态验证')
-    expect(confidenceLabel('source_confirmed')).toBe('源码取证')
-    expect(confidenceLabel('reference_corroborated')).toBe('外部佐证')
-    expect(confidenceLabel('assertion_only')).toBe('仅断言·待核实')
+describe('reviewItemBadge', () => {
+  it('待核实档走原因徽章(非置信档)', () => {
+    const b = reviewItemBadge(item({ bucket: 'pending_verify', status: 'missing' }))
+    expect(b).toEqual({ label: '未核实', cls: 'conf-assertion', title: '这一项还没开始核查' })
   })
 
-  it('无 tier → 无证据(旧文案"未分级"读不出原因)', () => {
-    expect(confidenceLabel(undefined)).toBe('无证据')
-    expect(confidenceLabel(null)).toBe('无证据')
-    expect(confidenceClass('assertion_only')).toBe('assertion')
-    expect(confidenceClass(undefined)).toBe('assertion')
+  it('成立档无 tier → 不显徽章(置信档位已从展示层去掉)', () => {
+    expect(reviewItemBadge(item({ bucket: 'established', confidence: null }))).toBeNull()
+    expect(reviewItemBadge(item({
+      bucket: 'established', confidence: { tier: 'source_confirmed', label: '源码取证' },
+    }))).toBeNull()
+  })
+
+  it('成立档 tier=verified → 标 🔬 动态验证', () => {
+    const b = reviewItemBadge(item({
+      bucket: 'established', confidence: { tier: 'verified', label: '已动态验证' },
+    }))
+    expect(b!.label).toBe('🔬 动态验证')
+    expect(b!.cls).toBe('conf-verified')
+  })
+
+  it('不成立档 tier=verified → 也标 🔬 动态验证(PoC 反证)', () => {
+    const b = reviewItemBadge(item({
+      bucket: 'not_established', confidence: { tier: 'verified', label: '已动态验证' },
+    }))
+    expect(b!.label).toBe('🔬 动态验证')
   })
 })
 
@@ -109,10 +120,7 @@ describe('pendingVerifyBadge', () => {
     expect(pendingVerifyBadge(item({ bucket: 'not_established' }))).toBeNull()
   })
 
-  it('待核实档按成因给标签:mismatch > missing > partial > 未取证', () => {
-    expect(pendingVerifyBadge(item({
-      bucket: 'pending_verify', evidence_mismatch: true,
-    }))!.label).toBe('证据未核验')
+  it('待核实档按成因给标签:missing > partial > 未取证', () => {
     expect(pendingVerifyBadge(item({
       bucket: 'pending_verify', status: 'missing',
     }))!.label).toBe('未核实')
@@ -122,6 +130,20 @@ describe('pendingVerifyBadge', () => {
     expect(pendingVerifyBadge(item({
       bucket: 'pending_verify', status: 'covered',
     }))!.label).toBe('未取证')
+  })
+
+  it('mismatch 不再在此出标签:交由独立「⚠ 证据未核验」徽章承载,避免字面重复', () => {
+    // 旧实现下 mismatch 优先返回"证据未核验",与卡片独立徽章重复;
+    // 现按 status 正常归因(mismatch 不抢占),回归点得证。
+    const covered = pendingVerifyBadge(item({
+      bucket: 'pending_verify', status: 'covered', evidence_mismatch: true,
+    }))!
+    expect(covered.label).toBe('未取证')
+    expect(covered.label).not.toBe('证据未核验')
+    // status 优先级不被 mismatch 覆盖:missing + mismatch 仍归"未核实"
+    expect(pendingVerifyBadge(item({
+      bucket: 'pending_verify', status: 'missing', evidence_mismatch: true,
+    }))!.label).toBe('未核实')
   })
 })
 
@@ -244,13 +266,6 @@ describe('旧快照兼容(假缺口已被启动迁移删掉)', () => {
     })
     expect(summaryCounts(fresh, survivors)).toEqual(fresh.counts)
     expect(summaryCounts(null, survivors)).toBeNull()
-  })
-
-  it('置信分布同样重算(旧数字把被删的假缺口计进了"未取证")', () => {
-    expect(summaryConfidenceTally(summary({}), survivors)).toEqual({
-      verified: 0, source_confirmed: 1, reference_corroborated: 0,
-      assertion_only: 0, no_evidence: 2,
-    })
   })
 
   it('判定行:旧快照换成口径说明,不拿虚增数字骗用户', () => {

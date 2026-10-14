@@ -85,9 +85,9 @@ describe('审查项「可追问内容」接线', () => {
     // 卡片列表不再把英文枚举直铺给用户
     expect(SRC).toContain('originLabel(it.origin)')
     expect(SRC).not.toContain("<span class=\"origin-tag\" :title=\"it.origin\">{{ it.origin }}</span>")
-    // 待核实档不拿"未分级 · —"冒充置信度
+    // 置信档位已从展示层去掉:reviewBadge 委派给 reviewItemBadge(待核实原因 / 仅 PoC 标记)
     expect(SRC).toContain('function reviewBadge')
-    expect(sliceFrom('function reviewBadge', 500)).toContain('pendingVerifyBadge(it)')
+    expect(sliceFrom('function reviewBadge', 300)).toContain('reviewItemBadge(it)')
   })
 
   it('计划卡不再显示"回填缺口",改叫未核实', () => {

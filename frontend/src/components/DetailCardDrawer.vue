@@ -18,10 +18,8 @@ import { computed, onMounted, onUnmounted, watch } from 'vue'
 import type { ReviewItem, TaskResult } from '@/types/task'
 import { renderMarkdown } from '@/utils/markdown'
 import {
-  confidenceClass,
-  confidenceLabel,
   originLabel,
-  pendingVerifyBadge,
+  reviewItemBadge,
 } from '@/utils/reviewBucket'
 
 const props = defineProps<{
@@ -64,10 +62,10 @@ watch(
 /** 判断当前展示的是否为审查项 (通过 type discriminator) */
 const isReview = computed(() => props.type === 'review')
 
-/** 待核实档的徽章(无证据时不拿"无证据·—"冒充置信度) */
-const pendingBadge = computed(() => {
+/** 审查项右上徽章(去档位:待核实说原因 / 成立仅 PoC 标记 / 否则 null) */
+const reviewBadge = computed(() => {
   const it = props.item as ReviewItem | null
-  return isReview.value && it ? pendingVerifyBadge(it) : null
+  return isReview.value && it ? reviewItemBadge(it) : null
 })
 
 /** 可追问内容(一句可直接发回 AI助手 的问句) */
@@ -111,18 +109,18 @@ const sourceReviewItem = computed<ReviewItem | null>(() => {
         <!-- 头部:标题 + 关闭按钮 -->
         <header class="detail-drawer-header">
           <h3 class="detail-drawer-title">{{ item.title }}</h3>
-          <!-- 审查项:待核实档显式标出未核实原因,其余显示置信度 -->
+          <!-- 审查项:待核实档标出未核实原因,成立/不成立档仅 PoC 标"🔬 动态验证",否则不显 -->
           <span
-            v-if="isReview && pendingBadge"
-            class="conf-badge conf-assertion"
-            :title="pendingBadge.title"
-          >{{ pendingBadge.label }}</span>
+            v-if="isReview && reviewBadge"
+            :class="['conf-badge', reviewBadge.cls]"
+            :title="reviewBadge.title"
+          >{{ reviewBadge.label }}</span>
+          <!-- 证据核验失败:独立告警徽章(mismatch 的唯一出口,与列表卡一致) -->
           <span
-            v-else-if="isReview"
-            :class="['conf-badge', `conf-${confidenceClass((item as ReviewItem).confidence?.tier)}`]"
-          >
-            {{ confidenceLabel((item as ReviewItem).confidence?.tier) }}
-          </span>
+            v-if="isReview && (item as ReviewItem).evidence_mismatch"
+            class="conf-warn"
+            title="有引用但后端核验未通过"
+          >⚠ 证据未核验</span>
           <!-- 知识点:学习点徽标 -->
           <span
             v-if="!isReview && (item as TaskResult).metadata_?.learning_note"
@@ -410,6 +408,7 @@ const sourceReviewItem = computed<ReviewItem | null>(() => {
 .conf-source { background: rgba(37, 99, 235, 0.12); color: var(--color-info, #2563eb); }
 .conf-reference { background: rgba(124, 58, 237, 0.12); color: #7c3aed; }
 .conf-assertion { background: rgba(120, 120, 120, 0.14); color: var(--color-text-secondary); }
+.conf-warn { font-size: var(--fs-xs); color: var(--color-warning, #d97706); }
 
 /* ---- Result / Knowledge item detail ---- */
 .learning-badge {

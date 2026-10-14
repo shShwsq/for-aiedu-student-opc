@@ -74,11 +74,9 @@ import { findRetiredCardConvId } from '@/utils/thinkingReconcile'
 import { createDeltaBuffer } from '@/utils/thinkingDeltaBuffer'
 import {
   bucketizeReviewItems,
-  confidenceClass,
-  confidenceLabel,
   originLabel,
-  pendingVerifyBadge,
   REVIEW_BUCKET_ORDER,
+  reviewItemBadge,
 } from '@/utils/reviewBucket'
 import type {
   AttachmentInfo,
@@ -2644,18 +2642,12 @@ const reviewSummary = computed<ReviewSummary | null>(() => {
 const reviewPlanLive = ref<ReviewPlanUpdateEventData | null>(null)
 
 /**
- * 审查项卡片右上标签:待核实档说"为什么还没核实",其余说置信档位。
- *
- * 旧版无证据也铺一个"未分级 · —",满屏都是它,读不出是"未取证"还是"核验失败"。
- * 分档标题与顺序集中在 utils/reviewBucket(与后端同一名单),不在视图里再拼一份。
+ * 审查项卡片右上标签:置信档位已从展示层去掉,只保留——待核实档说"为什么还没核实"，
+ * 成立/不成立档仅跑过 PoC 时标"🔬 动态验证"，否则不显徽章(null)。
+ * 口径集中在 utils/reviewBucket.reviewItemBadge。
  */
-function reviewBadge(it: ReviewItem): { label: string; cls: string; title?: string } {
-  const pending = pendingVerifyBadge(it)
-  if (pending) return { label: pending.label, cls: 'conf-assertion', title: pending.title }
-  return {
-    label: confidenceLabel(it.confidence?.tier),
-    cls: `conf-${confidenceClass(it.confidence?.tier)}`,
-  }
+function reviewBadge(it: ReviewItem): { label: string; cls: string; title?: string } | null {
+  return reviewItemBadge(it)
 }
 
 /** 审查项证据里的源码/原文文件:复用工作区文件跳转 */
@@ -3821,8 +3813,12 @@ const showKnowledgeToolbar = computed<boolean>(() => {
                   <div class="review-header">
                     <span class="card-chevron">›</span>
                     <h4>{{ it.title }}</h4>
-                    <span :class="['conf-badge', reviewBadge(it).cls]" :title="reviewBadge(it).title">
-                      {{ reviewBadge(it).label }}
+                    <span
+                      v-if="reviewBadge(it)"
+                      :class="['conf-badge', reviewBadge(it)!.cls]"
+                      :title="reviewBadge(it)!.title"
+                    >
+                      {{ reviewBadge(it)!.label }}
                     </span>
                     <span v-if="it.evidence_mismatch" class="conf-warn" title="有引用但后端核验未通过">⚠ 证据未核验</span>
                   </div>

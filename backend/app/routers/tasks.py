@@ -1637,12 +1637,16 @@ _REVIEW_BUCKET_ORDER = [(k, BUCKET_LABELS[k]) for k in BUCKET_ORDER]
 _SEVERITY_LABELS = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
 
 
-def _review_confidence_str(it) -> str:
-    conf = it.confidence or {}
-    if not conf:
-        # 无证据 = 未取到证(待核实档的常态),旧文案"未分级"读不出原因
-        return "无证据(未取证)"
-    return conf.get("label") or "无证据"
+def _review_item_flags(it) -> list[str]:
+    """审查项展示标记:置信档位已不逐档输出,只在跑过 PoC 时标“动态验证”
+    (成立/不成立都适用——不成立类用 PoC 反证复现不了同样有价值);证据未核验另标。
+    """
+    flags: list[str] = []
+    if (it.confidence or {}).get("tier") == "verified":
+        flags.append("🔬 动态验证")
+    if it.evidence_mismatch:
+        flags.append("⚠ 证据未核验")
+    return flags
 
 
 def _review_item_meta_str(it) -> str:
@@ -1657,7 +1661,7 @@ def _review_item_meta_str(it) -> str:
 
 
 def _append_review_items_md(lines: list[str], items: list) -> None:
-    """追加"审查结果"节:按三分档 + 待核实对象/审查结论/证据链/置信(后端派生)"""
+    """追加"审查结果"节:按三分档 + 待核实对象/审查结论/证据链(动态验证、证据未核验作标记)"""
     if not items:
         return
     buckets: dict[str, list] = {}
@@ -1678,8 +1682,9 @@ def _append_review_items_md(lines: list[str], items: list) -> None:
                 f"- 待核实对象:{it.review_target or '—'}"
             )
             lines.append(f"- {_review_item_meta_str(it)}")
-            warn = " · ⚠ 证据未核验" if it.evidence_mismatch else ""
-            lines.append(f"- 置信度:{_review_confidence_str(it)}{warn}")
+            flags = _review_item_flags(it)
+            if flags:
+                lines.append(f"- {' · '.join(flags)}")
             if it.conclusion:
                 lines.append(f"- 审查结论:{it.conclusion}")
             ev = it.evidence or {}
@@ -1848,7 +1853,7 @@ def _append_result_html(
 
 
 def _append_review_items_html(parts: list[str], items: list) -> None:
-    """追加"审查结果"节(HTML):按三分档 + 待核实对象/审查结论/证据链/置信"""
+    """追加"审查结果"节(HTML):按三分档 + 待核实对象/审查结论/证据链(动态验证、证据未核验作标记)"""
     if not items:
         return
     buckets: dict[str, list] = {}
@@ -1863,13 +1868,18 @@ def _append_review_items_html(parts: list[str], items: list) -> None:
         for it in rs:
             conf = it.confidence or {}
             parts.append('<div class="result">')
-            warn = " <span style='color:#d97706'>⚠ 证据未核验</span>" if it.evidence_mismatch else ""
+            html_flags: list[str] = []
+            if conf.get("tier") == "verified":
+                html_flags.append("🔬 动态验证")
+            if it.evidence_mismatch:
+                html_flags.append("<span style='color:#d97706'>⚠ 证据未核验</span>")
             parts.append(f"<h4>{html.escape(it.title or '(无标题)')}</h4>")
             parts.append(
                 f"<div>待核实对象:{html.escape(it.review_target or '—')}</div>"
             )
             parts.append(f"<div>{html.escape(_review_item_meta_str(it))}</div>")
-            parts.append(f"<div>置信度:{html.escape(_review_confidence_str(it))}{warn}</div>")
+            if html_flags:
+                parts.append(f"<div>{' · '.join(html_flags)}</div>")
             if it.conclusion:
                 parts.append(
                     f"<div>审查结论:{html.escape(it.conclusion)}</div>"
@@ -2350,6 +2360,9 @@ def _normalize_request(req: TaskCreateRequest) -> tuple[str, dict | None]:
     - 通用方式:直接用 scenario + user_input + params
     - 兼容旧 API:传了 repo_url 但没传 user_input,自动生成
     - 验证器配置(test_env_url/verifier_enabled/verifier_auth_mode)存入 params._verifier
+
+    user_input 判空用 strip 后真值(与 /messages 端点一致):纯空白 user_input 视同未填,
+    否则会落一条近乎空的首轮 question,agent1 如实回复"用户发的是空消息"。
     """
     params = None
     user_input = None
@@ -2363,9 +2376,10 @@ def _normalize_request(req: TaskCreateRequest) -> tuple[str, dict | None]:
             detail="交付物来源只能二选一:Git 仓库或上传文件",
         )
 
-    if req.user_input:
-        # 通用方式:直接用
-        user_input = req.user_input
+    # strip 后判空:空串/纯空白都走 repo_url 兜底或最终 422,杜绝空白 user_input 落库
+    user_input = (req.user_input or "").strip()
+    if user_input:
+        # 通用方式:直接用(存 strip 后的值,去除首尾噪声空白)
         params = req.params
         # 若同时传了 repo_url 等,合并到 params
         if req.repo_url:

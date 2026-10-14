@@ -379,10 +379,15 @@ RoundGroup { roundIdx, segments, planSteps }
 `utils/reviewBucket.bucketizeReviewItems` 三分(已核实成立 / 已核实不成立 /
 待核实 —— 分档主语是"检查助手对这条待核实对象的核实结果",不是"你的项目里有几类
 条目";旧口径 发现风险 / 已核查·剔除误报 / 缺口·待改进 让用户分不清在说谁),
-每档下紧凑卡片(标题 + 置信档位/分数 + 来源/严重度),点击开
-`DetailCardDrawer` 看正文与证据;置信度由后端核验证据引用后派生,模型不自报。
-**待核实档不显示置信档位**(它本就没证据):`utils/reviewBucket.pendingVerifyBadge`
-按成因给标签(未取证 / 部分核实 / 未核实 / 证据未核验),旧文案"未分级 · —"不再铺满。
+每档下紧凑卡片(标题 + 状态徽章 + 来源/严重度),点击开
+`DetailCardDrawer` 看正文与证据。**置信档位已从展示层整体去掉**(理由:混合证据硬分单一
+档失真,且"仅断言·待核实"与分档的"待核实"撞词让用户一头雾水);后端 `evidence.py`
+仍派生 tier 作为数据,只是不再渲染为标签。徽章口径集中在 `utils/reviewBucket.reviewItemBadge`:
+待核实档说明"为什么还没核实"(未取证 / 部分核实 / 未核实);成立与不成立档仅当跑过
+PoC(`tier=verified`)时标一个粗标记「🔬 动态验证」——不成立类用 PoC 反证复现不了也
+同样标;其余一律不显徽章(返回 null)。证据核验失败(`evidence_mismatch`)不在此出标签——
+统一由卡片右上独立的「⚠ 证据未核验」徽章(`TaskDetailView.vue` 与抽屉,`v-if="it.evidence_mismatch"`)
+承载。侧栏审查结论面板也不再展示置信分布行(只余三分档计数 + 总体判定)。
 来源也不直铺英文枚举:`ORIGIN_LABELS` 把 `agent1_claim` 等显示成「AI助手 的结论」
 「你的要求」「领域经验」(后端报告导出共用同一份口径 `app/models/audit.ORIGIN_LABELS`)。
 **段内不再有「审查结果 (N)」同名 h2**(段名与计数已上移标题行,见 §5.2),
@@ -747,11 +752,11 @@ agent2 发射审查计划后,合格计划项会扇出为多个只读子循环并
 | 组件本地 `StreamingLike` 未声明 facet | 补可选 `facet?: string`(与 TaskDetailView 的 `StreamingItem` 同一张卡片实体,字段对齐) |
 
 类型零新增:`types/task.ts` 的 `ThinkingDeltaEventData`/`ConversationEventData`/`Conversation`
-已有可选 facet 字段(内置 react 分面并行先落的接线),agent2 侧直接复用。
+已有可选 facet 字段(内置 react 子任务并行先落的接线),agent2 侧直接复用。
 静态守卫:`components/agent2PanelFacetWiring.test.ts`(镜像
 `views/taskDetailViewFacetWiring.test.ts` 的扫描风格),钉住 StreamingLike 声明、
 条件渲染与上游 conv_id 分桶三处形状。
 
 保留不变:思考卡展开生命周期、tool_call/tool_result 配对、按轮折叠组时序穿插;
-主对话流的"分面 · X"标签(内置 react 分面并行)与样式不动,agent2 侧用
+主对话流的"子任务 · X"标签(内置 react 子任务并行)与样式不动,agent2 侧用
 "核查 · X"是因为受众在审查侧栏语境。

@@ -40,7 +40,6 @@ import {
   planItemStatus,
   planTally,
   PLAN_STATE_LABELS,
-  summaryConfidenceTally,
   summaryCounts,
   summaryVerdictText,
   unverifiedReasonLabel,
@@ -169,9 +168,6 @@ const reviewPlanTally = computed(() =>
  */
 const summaryCountsView = computed(() =>
   summaryCounts(props.reviewSummary, props.reviewItems),
-)
-const summaryConfidenceView = computed(() =>
-  summaryConfidenceTally(props.reviewSummary, props.reviewItems),
 )
 const summaryVerdict = computed(() => summaryVerdictText(props.reviewSummary))
 
@@ -359,20 +355,13 @@ function onStreamToggle(s: StreamingLike, ev: Event): void {
       >{{ stoppingReview ? '终止中...' : '终止检查' }}</button>
     </h2>
 
-    <!-- 审查结论面板(task.params._review 聚合:三分档计数 + 置信分布 + 总体判定) -->
+    <!-- 审查结论面板(task.params._review 聚合:三分档计数 + 总体判定;置信分布已从展示层去掉) -->
     <div v-if="reviewSummary && summaryCountsView" class="panel-review-summary">
       <div class="prs-counts">
         <span class="prs-established">成立 {{ summaryCountsView.established }}</span>
         <span class="prs-not-established">不成立 {{ summaryCountsView.not_established }}</span>
         <span class="prs-pending">待核实 {{ summaryCountsView.pending_verify }}</span>
         <span class="prs-total">共 {{ summaryCountsView.total }} 项</span>
-      </div>
-      <div v-if="summaryConfidenceView" class="prs-conf">
-        <span class="conf-badge conf-verified">已验证 {{ summaryConfidenceView.verified }}</span>
-        <span class="conf-badge conf-source">源码 {{ summaryConfidenceView.source_confirmed }}</span>
-        <span class="conf-badge conf-reference">佐证 {{ summaryConfidenceView.reference_corroborated }}</span>
-        <span class="conf-badge conf-assertion">断言 {{ summaryConfidenceView.assertion_only }}</span>
-        <span class="conf-badge conf-assertion">未取证 {{ summaryConfidenceView.no_evidence ?? 0 }}</span>
       </div>
       <p v-if="summaryVerdict" class="prs-verdict">{{ summaryVerdict }}</p>
     </div>

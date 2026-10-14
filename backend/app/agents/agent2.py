@@ -2324,14 +2324,15 @@ def _finalize_emitted(
             f"审查达时限 {review_max_seconds}s" if timed_out else "未排到取证"
         )
         unverified_clause = f",{len(unverified)} 项因{why}未核实"
+    # 置信档位不再逐档罗列展示(混合证据硬分单一档失真);只保留“动态验证”
+    #   这一个强信号——只有真跑过 PoC 才提,没跑过就不在总结里堆。
+    poc_clause = f"(其中动态验证 {conf_tally['verified']} 项)" if conf_tally["verified"] else ""
     verdict_summary = (
         f"核实 {counts['total']} 项:"
         f"{BUCKET_LABELS[BUCKET_ESTABLISHED]} {counts[BUCKET_ESTABLISHED]}、"
         f"{BUCKET_LABELS[BUCKET_NOT_ESTABLISHED]} {counts[BUCKET_NOT_ESTABLISHED]}、"
         f"{BUCKET_LABELS[BUCKET_PENDING_VERIFY]} {counts[BUCKET_PENDING_VERIFY]}"
-        f"(源码取证 {conf_tally['source_confirmed']}、动态验证 {conf_tally['verified']}、"
-        f"外部佐证 {conf_tally['reference_corroborated']}、"
-        f"仅断言 {conf_tally['assertion_only']}、未取证 {conf_tally['no_evidence']});"
+        f"{poc_clause};"
         f"计划 {planned} 项已核实 {executed}{unverified_clause}"
     )
 

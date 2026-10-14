@@ -9,7 +9,6 @@
  * ——旧口径(发现风险 / 已核查·剔除误报 / 缺口·待改进)让用户分不清在说谁。
  */
 import type {
-  ConfidenceTier,
   ReviewBucket,
   ReviewItem,
   ReviewOrigin,
@@ -56,31 +55,15 @@ export function bucketizeReviewItems(items: ReviewItem[] | undefined | null): Re
   return buckets
 }
 
-/** 置信档位 → 展示短标签(与后端 evidence.py TIER_LABELS 对齐) */
-const TIER_LABELS: Record<ConfidenceTier, string> = {
-  verified: '已动态验证',
-  source_confirmed: '源码取证',
-  reference_corroborated: '外部佐证',
-  assertion_only: '仅断言·待核实',
-}
-
-/** 无 evidence → confidence 为空 → "无证据(未取证)"(旧文案"未分级"读不出原因) */
-export function confidenceLabel(tier: ConfidenceTier | undefined | null): string {
-  if (!tier) return '无证据'
-  return TIER_LABELS[tier] ?? '无证据'
-}
-
-/** 置信档位 → CSS class 后缀(conf-<class>);未知/缺省 → assertion */
-export function confidenceClass(tier: ConfidenceTier | undefined | null): string {
-  if (tier === 'verified') return 'verified'
-  if (tier === 'source_confirmed') return 'source'
-  if (tier === 'reference_corroborated') return 'reference'
-  return 'assertion'
-}
+/** 置信档位不再作为展示徽章输出(后端 tier 仍作为数据保留):展示口径集中在 `reviewItemBadge`。 */
 
 /**
  * 审查项的状态徽章:待核实档不显示置信档位(它没有证据,分数无意义),
  * 改显示"为什么还没核实"。
+ *
+ * 注意:evidence_mismatch 不在这里出标签——它由卡片上独立的「⚠ 证据未核验」
+ * 徽章统一承载(见 TaskDetailView.vue),避免待核实档下同一条既显示"证据未核验"
+ * 又显示"⚠ 证据未核验"的字面重复。
  *
  * 返回 null = 按常规置信徽章显示。
  */
@@ -88,9 +71,6 @@ export function pendingVerifyBadge(
   item: ReviewItem,
 ): { label: string; title: string } | null {
   if (item.bucket !== 'pending_verify') return null
-  if (item.evidence_mismatch) {
-    return { label: '证据未核验', title: '引用了取证记录,但后端核验未通过' }
-  }
   if (item.status === 'missing') {
     return { label: '未核实', title: '这一项还没开始核查' }
   }
@@ -98,6 +78,28 @@ export function pendingVerifyBadge(
     return { label: '部分核实', title: '只核实了一部分,结论仍待补证' }
   }
   return { label: '未取证', title: '存疑但本轮未取到独立证据,不作成立结论' }
+}
+
+/**
+ * 审查项卡片/抽屉右上的状态徽章。
+ *
+ * 置信档位已从展示层去掉(混合证据硬分单一档失真,且"仅断言·待核实"与分档
+ * 的"待核实"撞词),只保留两件事:
+ *  - 待核实档:说明"为什么还没核实"(未取证/未核实/部分核实),走 pendingVerifyBadge;
+ *  - 成立/不成立档:仅当跑过 PoC 动态验证(tier=verified)时给一个粗标记"🔬 动态验证"
+ *    ——不成立类用 PoC 反证复现不了也值得标;其余一律不显徽章,证据细节在抽屉逐条展示。
+ *
+ * 返回 null = 不渲染徽章。evidence_mismatch 由独立的「⚠ 证据未核验」徽章承载,不在此。
+ */
+export function reviewItemBadge(
+  item: ReviewItem,
+): { label: string; cls: string; title: string } | null {
+  const pending = pendingVerifyBadge(item)
+  if (pending) return { label: pending.label, cls: 'conf-assertion', title: pending.title }
+  if (item.confidence?.tier === 'verified') {
+    return { label: '🔬 动态验证', cls: 'conf-verified', title: '已跑 PoC 动态验证' }
+  }
+  return null
 }
 
 /** 计划条目的对账展示态 */
@@ -170,24 +172,6 @@ export function summaryCounts(
     not_established: b.not_established.length,
     pending_verify: b.pending_verify.length,
   }
-}
-
-/** 置信分布:同上,旧快照按现存审查项重算(旧数字把被删的假缺口计进了"未取证") */
-export function summaryConfidenceTally(
-  summary: ReviewSummary | null | undefined,
-  items: ReviewItem[] | undefined | null,
-): ReviewSummary['confidence_tally'] | null {
-  if (!summary) return null
-  if (!isLegacyReviewSummary(summary)) return summary.confidence_tally
-  const tally = {
-    verified: 0, source_confirmed: 0, reference_corroborated: 0,
-    assertion_only: 0, no_evidence: 0,
-  } as ReviewSummary['confidence_tally']
-  for (const it of items ?? []) {
-    const tier = it.confidence?.tier
-    tally[tier && tier in tally ? tier : 'no_evidence'] += 1
-  }
-  return tally
 }
 
 /** 总体判定文本:旧快照的那句带着虚增数字,宁可不显示也不能报错给用户 */
