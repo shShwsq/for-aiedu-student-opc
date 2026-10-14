@@ -15,7 +15,7 @@ description: 审查并发与线程安全问题,覆盖竞态条件、共享可变
 
 ### 1. 定位共享可变状态
 
-调用 `search_code`(建议 context_lines=3-5):
+调用 `search_code`(建议 context_lines=3-5;示例省略必填参数 `repo_path`,实际调用须带上任务工作区根路径——仓库任务为 `clone_repo` 返回值,上传任务由系统注入工作区、见任务上下文):
 
 ```
 search_code(pattern="^_?[a-z_]+\\s*[:=]\\s*(\\{|\\[|dict\\(|list\\(|set\\()", file_glob="*.py")  # 模块级可变容器

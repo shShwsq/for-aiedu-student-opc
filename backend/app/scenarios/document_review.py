@@ -3,7 +3,7 @@
 覆盖合同/协议类文书的审查:权责对等、付款与违约、知识产权归属、霸王条款。
 docx/pdf 不做正文解析:既不在线预览也不能被智能体阅读(read_file 会拦成占位文案),
 只能在文件面板下载原件,因此 description 引导用户优先上传 txt/md。
-无推荐 skill(前端语义为全部可用)。
+推荐 skill:review_requirements(需求文档审查),创建任务时默认勾选并限定为它。
 """
 from app.scenarios.base import register_scenario
 
@@ -65,7 +65,9 @@ class DocumentReviewTemplate:
 
     @property
     def recommended_skills(self) -> list[str]:
-        return []  # 无推荐 → 前端全选(等同于不限制)
+        # 对应 skills/document_review/ 目录下实际存在的 skill name(来自 SKILL.md frontmatter)
+        # 非空 → 前端默认勾选这些 skill,任务 allowed_skills 限定为该集合
+        return ["review_requirements"]
 
 
 register_scenario(DocumentReviewTemplate())

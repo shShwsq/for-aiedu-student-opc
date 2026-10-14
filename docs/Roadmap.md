@@ -52,6 +52,7 @@
 
 - **记忆管理**:三类长期记忆统一管理(用户偏好 User Profile / 全局记忆 UserMemory / 项目记忆 Project)。agent2 在 system prompt 注入精简版,agent1(内置 react_agent 或 CLI agent)在沙箱写入完整项目记忆供 `read_file` 查阅。前端记忆管理页支持查看 / 编辑 / 删除。
 - **用户技能上传**:用户可上传自定义 skill(SKILL.md 文件),隔离存储(per-user 目录),仅本人任务可用。系统内置 skill 全局共享。任务创建时可选允许调用的 skill 集合(`allowed_skills`)。
+- **内置技能清单(当前)**:`code_review` 场景 4 个(check_ssrf / check_hardcoded_secrets / review_error_handling / review_concurrency)+ `document_review` 场景 review_requirements(需求文档审查;文书场景唯一推荐技能,任务 `allowed_skills` 默认限定为它)。技能输出统一为"位置 / 类别 / 严重度 / 证据 / 建议"五字段,严重度枚举与平台对齐(high/medium/low/info)。
 
 #### 练习题与自适应练习
 
@@ -76,7 +77,7 @@
 
 - **质量工具**:`run_lint`(Python ruff / JS eslint)/ `run_coverage`(pytest-cov / vitest),local/sandbox 双模式(缺工具返回指引 / 自动安装)。
 - **依赖清单工具**:`list_dependencies` 扫描清单文件返回结构化依赖,串联 `query_cve` 批量查已知漏洞。
-- **code_review 场景 skill**:review_concurrency(并发安全)/ review_error_handling(错误处理)/ review_test_quality(测试质量)。
+- **code_review 场景 skill**:check_ssrf(SSRF)/ check_hardcoded_secrets(硬编码密钥)/ review_error_handling(错误处理)/ review_concurrency(并发安全)。
 
 #### 安全与隔离
 

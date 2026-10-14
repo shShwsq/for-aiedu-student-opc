@@ -13,7 +13,7 @@ description: 检查代码中硬编码的密钥、密码、token、私钥等敏�
 
 ### 1. 搜密钥关键字
 
-调用 `search_code` 搜以下模式(大小写不敏感,分开搜):
+调用 `search_code` 搜以下模式(大小写不敏感,分开搜;示例省略必填参数 `repo_path`,实际调用须带上任务工作区根路径——仓库任务为 `clone_repo` 返回值,上传任务由系统注入工作区、见任务上下文):
 
 **通用关键字:**
 ```
@@ -67,24 +67,26 @@ DATABASE_URL = "postgres://user:Passw0rd!@db.example.com/mydb"
 
 ### 3. 检查 .env / 配置文件被提交
 
-调用 `list_files` 查根目录,看是否有 `.env`、`.env.local`、`config.json`、`config.yml`、`secrets.yml` 等文件:
+调用 `list_files`(带 `repo_path`)查根目录,看是否有 `.env`、`.env.local`、`config.json`、`config.yml`、`secrets.yml` 等文件:
 - 若有,`read_file` 检查是否含真实凭证(非占位符)
 - 真实凭证被提交到仓库:严重漏洞
 
-### 4. 提交结果
+### 4. 输出结果
 
-调用 `submit_results` 提交。每个硬编码密钥:
+每个硬编码密钥问题在最终总结里按下列字段给出:
 
-- `title`: `[critical] CWE-798 硬编码密钥 <file>:<line>`(AWS key 等高危用 critical)
-- `content`: 类型(AWS Key / API Token / 数据库密码 / 私钥) + 真实值的前 4 位打码(如 `sk-1***...`) + 修复建议(改用环境变量 / 密钥管理服务)
-- `metadata`: `{"cwe": "CWE-798", "severity": "critical|high", "file_path": "...", "line_range": "...", "remediation": "迁移到环境变量或密钥管理服务,并立即吊销已泄露的凭证"}`
+- **位置**:文件:行号
+- **类别**:CWE-798 硬编码密钥 + 具体类型(AWS Access Key / API Token / 数据库密码 / 私钥)
+- **严重度**:high / info(判定见下表;平台严重度枚举只有 high/medium/low/info,无更高档)
+- **证据**:真实值前 4 位打码(如 `sk-1***...`)+ 所在代码片段
+- **建议**:改用环境变量 / 密钥管理服务,并立即吊销已泄露的凭证
 
 ## 严重度判定
 
 | 类型 | severity |
 |------|----------|
-| AWS / 云服务 access key | critical |
-| 数据库密码(明文连接串) | critical |
+| AWS / 云服务 access key | high(最高危,优先报) |
+| 数据库密码(明文连接串) | high(最高危,优先报) |
 | OpenAI / Stripe 等付费 API key | high |
 | GitHub PAT / Slack token | high |
 | 通用 password / secret | high |
@@ -99,6 +101,6 @@ DATABASE_URL = "postgres://user:Passw0rd!@db.example.com/mydb"
 
 ## 避免漏报
 
-- 一定要搜 `-----BEGIN ... PRIVATE KEY-----`,私钥泄露是 critical
+- 一定要搜 `-----BEGIN ... PRIVATE KEY-----`,私钥泄露按最高档 high 报
 - 数据库连接串 `postgres://user:pass@host` 经常被忽略,要专门搜
 - 多语言统一处理,不要只搜 Python 风格

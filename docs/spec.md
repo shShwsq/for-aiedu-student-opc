@@ -57,12 +57,12 @@
 
 **场景二:代码审核**(`code_review`)
 - 预设提示词:审查代码交付物敢不敢上线,关注安全漏洞(注入/硬编码凭证/认证授权/SSRF/配置泄露)、隐性成本(失控 API 调用/死循环烧钱)、可维护性(可读性/边界条件/异常处理/并发)、上线可行性
-- 推荐 skill:check_sql_injection / check_hardcoded_secrets / check_ssrf / review_error_handling / review_concurrency / review_test_quality
+- 推荐 skill:check_hardcoded_secrets / check_ssrf / review_error_handling / review_concurrency
 - 说明:原「代码安全审计」(`code_security_audit`)已并入本场景,旧 id 经 `SCENARIO_ALIASES` 别名兼容(老任务/旧链接仍可达)
 
 **场景三:文书审核**(`document_review`)
 - 预设提示词:审核合同/协议文书敢不敢签,关注权责对等、付款与违约、知识产权归属、常见霸王条款,逐条定位到具体条款
-- 推荐 skill:无(前端语义为全部可用)
+- 推荐 skill:review_requirements(需求文档审查;创建任务时默认勾选,任务 `allowed_skills` 限定为该集合)
 - 说明:docx/pdf 不做正文解析——既不在线预览,智能体的 `read_file` 也会把它拦成占位文案(见 §9.6 二进制拦截),仅能在文件面板下载原件;description 已引导用户上传文本格式
 
 ### 2.3 场景扩展预留
@@ -503,20 +503,22 @@ Result(任务结果项,通用)
 - **技能定义格式:SKILL.md**(Markdown frontmatter + body,非 YAML 步骤编排):
   ```markdown
   ---
-  name: check_sql_injection
-  description: 检查 SQL 注入漏洞,覆盖拼接、ORM raw 查询、动态表名等模式。
+  name: check_ssrf
+  description: 检查 SSRF(服务端请求伪造)漏洞,覆盖 requests/urllib/httpx/aiohttp 接收用户 URL 的场景。
   ---
 
-  # SQL 注入审计
+  # SSRF 审计
 
   ## 执行步骤
-  ### 1. 定位数据库交互点
+  ### 1. 定位外部请求点
   调用 `search_code` 搜以下高危模式……
-  ### 2. 判断是否用户可控
+  ### 2. 判断 URL 是否用户可控
   对每个搜索命中点,调用 `read_file` 看上下文……
-  ### 3. 验证(可选,沙箱可用时)
-  ### 4. 提交结果
-  调用 `submit_results` 提交……
+  ### 3. 检查防护是否存在
+  ……
+  ### 4. 输出结果
+  每个问题在最终总结里给出:位置 / 类别 / 严重度 / 证据 / 建议
+  (severity 取值须与平台枚举对齐:high / medium / low / info,无 critical 档)
   ```
 - **设计说明**:skill 不是硬编码步骤编排,而是给 LLM 的自然语言指令。LLM 读取 body 后自行决定调用哪些工具、按什么顺序执行,灵活性远高于固定 YAML 步骤
 - **目录结构**:
@@ -528,11 +530,11 @@ Result(任务结果项,通用)
   - 用户上传:`POST /skills/upload`(zip,含 `SKILL.md`)+ `POST /skills/{scenario_id}/{skill_name}`(在线编辑自己的 SKILL.md 全文,先验后写 + 热保存;frontmatter `name` 与 URL 不一致即重命名)+ `DELETE /skills/{scenario_id}/{skill_name}`(只能删自己的)
 - **react_agent 调用**:通过 `list_skills` 工具查看可用 skill(内置 + 当前用户上传的),通过 `skill` 工具加载指定 skill 的 body 到上下文,LLM 按其指引执行
 - **CLI 执行器调用**(Qoder/DeepSeek/Codex,经 ACP):外部 CLI 无进程内 SkillRegistry 与 skill 工具,故与记忆文件同构——任务启动时 `orchestrator._write_skill_files_for_task` 把"当前用户可见 ∩ `allowed_skills`"的 skill 物化进容器固定目录(sandbox 模式 `/home/user/.agent_skills/<skill>/`,local 模式 `<local_dir>/.agent_skills/<skill>/`,含 SKILL.md 全文 + 文本类附加资源,二进制跳过;先清后写避免残留),再在 prompt 末尾(并入记忆注入桶参与去重)追加"可用技能"清单与路径指针,引导 CLI 用自身文件读取工具按需查阅 SKILL.md 并执行。`build_cli_skills_section` 保持零 `app.*` 依赖,可见集解析与路径计算在调用侧(`loader.resolve_visible_skills` / `memory_injection.resolve_agent_skills_dir_path`)
-- **首版技能清单**(场景降级后按 scenario 组织,用户创建任务时可选 `allowed_skills` 过滤;均挂在 `code_review` 场景下):
-  - `code_review/check_sql_injection`(注入类)
+- **内置技能清单**(场景降级后按 scenario 组织,用户创建任务时可选 `allowed_skills` 过滤):
   - `code_review/check_hardcoded_secrets`(硬编码密钥)
   - `code_review/check_ssrf`(SSRF)
-  - `code_review/review_error_handling`(错误处理)/ `code_review/review_concurrency`(并发安全)/ `code_review/review_test_quality`(测试质量)
+  - `code_review/review_error_handling`(错误处理)/ `code_review/review_concurrency`(并发安全)
+  - `document_review/review_requirements`(需求文档审查)
 - **用户上传 skill 限制**(`backend/app/config.py`):
   - zip 最大:`SKILL_MAX_ZIP_SIZE_MB=50`
   - 解压后最大:`SKILL_MAX_EXTRACT_SIZE_MB=200`

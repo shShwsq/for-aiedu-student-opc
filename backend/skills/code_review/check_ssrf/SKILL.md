@@ -14,7 +14,7 @@ description: 检查 SSRF(服务端请求伪造)漏洞,覆盖 requests/urllib/htt
 
 ### 1. 定位外部请求点
 
-调用 `search_code` 搜以下模式:
+调用 `search_code` 搜以下模式(示例省略必填参数 `repo_path`,实际调用须带上任务工作区根路径——仓库任务为 `clone_repo` 返回值,上传任务由系统注入工作区、见任务上下文):
 
 **Python:**
 ```
@@ -45,9 +45,7 @@ search_code(pattern="curl_setopt.*CURLOPT_URL|file_get_contents\\s*\\(", file_gl
 
 ### 2. 判断 URL 是否用户可控
 
-对每个命中点,调用 `read_file` 看上下文(±20 行):
-
-追 URL 来源,常见用户输入入口:
+对每个命中点,调用 `read_file` 读取命中行附近的内容(用 `offset` / `max_lines` 定位),追 URL 来源,常见用户输入入口:
 - `request.args` / `request.form` / `request.json` / `request.query`(Flask/FastAPI)
 - `req.body` / `req.query` / `req.params`(Express)
 - `@PathVariable` / `@RequestParam`(Spring)
@@ -79,19 +77,21 @@ search_code(pattern="file://|gopher://|dict://|ftp://", case_sensitive=false)
 - AWS / GCP: `http://169.254.169.254/`
 - 阿里云: `http://100.100.100.200/`
 
-### 5. 提交结果
+### 5. 输出结果
 
-调用 `submit_results` 提交。每个 SSRF:
+每个 SSRF 问题在最终总结里按下列字段给出:
 
-- `title`: `[high] CWE-918 SSRF <file>:<line>`
-- `content`: 用户可控入口 + 缺失的防护 + 危害(可访问内网 / 元数据接口 / 端口扫描)+ 修复建议
-- `metadata`: `{"cwe": "CWE-918", "severity": "high", "file_path": "...", "line_range": "...", "remediation": "scheme 白名单 + 域名白名单 + 解析后 IP 校验 + 禁用重定向或重定向后再次校验"}`
+- **位置**:文件:行号
+- **类别**:CWE-918 SSRF + 可控入口类型(webhook / 抓取 / 代理 / 文件远程加载)
+- **严重度**:high / medium(判定见下表;平台严重度枚举只有 high/medium/low/info,无更高档)
+- **证据**:用户可控入口 + 缺失的防护 + 危害(可访问内网 / 元数据接口 / 端口扫描)
+- **建议**:scheme 白名单 + 域名白名单 + 解析后 IP 校验 + 禁用重定向或重定向后再次校验
 
 ## 严重度判定
 
 | 情形 | severity |
 |------|----------|
-| 无任何防护,可访问云元数据接口 | critical |
+| 无任何防护,可访问云元数据接口 | high(最高危,优先报) |
 | 无任何防护,可访问内网 | high |
 | 只校验 scheme 前缀,可被绕过 | high |
 | 有域名白名单但解析前校验(DNS rebinding) | medium |

@@ -14,7 +14,7 @@ description: 审查异常处理与错误边界,覆盖异常吞没、资源泄漏
 
 ### 1. 定位异常吞没点
 
-调用 `search_code` 搜以下模式(每次搜一个,建议 context_lines=3-5 看上下文):
+调用 `search_code` 搜以下模式(每次搜一个,建议 context_lines=3-5 看上下文;示例省略必填参数 `repo_path`,实际调用须带上任务工作区根路径——仓库任务为 `clone_repo` 返回值,上传任务由系统注入工作区、见任务上下文):
 
 **Python(空 except / 吞异常 / 裸 pass):**
 ```

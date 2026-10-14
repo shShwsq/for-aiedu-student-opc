@@ -53,11 +53,11 @@ def test_code_review_recommended_skills_merged():
     }
 
 
-def test_document_review_no_recommended_skills():
-    """文书审核:无推荐 skill(前端语义为全部可用),但有预设提示词。"""
+def test_document_review_recommended_skills():
+    """文书审核:推荐 review_requirements(需求文档审查),并有预设提示词。"""
     s = get_scenario("document_review")
     assert s.name == "文书审核"
-    assert s.recommended_skills == []
+    assert s.recommended_skills == ["review_requirements"]
     assert s.preset_prompt
 
 
