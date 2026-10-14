@@ -1019,6 +1019,8 @@ def _run_subtask_pass(
 
         recent_calls: list[str] = []
         summary = ""
+        # 零产出截断有界重试计数(镜像主循环/verifier,每子任务独立)
+        truncation_retries = 0
 
         def _finalize_turn(prompt_text: str, notice: str | None, it: int) -> None:
             """收尾轮(loop-break / max-iter / timeout 共用)。
@@ -1074,6 +1076,29 @@ def _run_subtask_pass(
                 "content": content, "reasoning": reasoning,
                 "stream_conv_id": conv_id,
             })
+            # 零产出截断重试(镜像主循环 L508-527 / verifier):finish=length 且正文空、
+            # 无工具调用 = 本轮输出预算全被思考吃掉。直接 break 会让子任务静默产出空
+            # 结论(fan-in 仅得占位)。注入收尾提示有界重试;此处不 append 空 assistant
+            # (避免脏上下文),改而 append 一条 user 提示后 continue 开下一迭代。
+            if not tool_calls and _finish == "length" and not content.strip():
+                if truncation_retries < MAX_TRUNCATION_RETRIES:
+                    truncation_retries += 1
+                    logger.warning(
+                        f"[task={task.id}] react_agent 子任务 {label} 第 {_it} 迭代"
+                        f"输出被 max_tokens 截断且零产出"
+                        f"(reasoning={len(reasoning)}字符),注入收尾提示重试"
+                        f"({truncation_retries}/{MAX_TRUNCATION_RETRIES})"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": TRUNCATION_CONTINUE_PROMPT,
+                    })
+                    continue
+                logger.warning(
+                    f"[task={task.id}] react_agent 子任务 {label} 输出被 max_tokens"
+                    f"截断且零产出,收尾重试已达上限({MAX_TRUNCATION_RETRIES}),"
+                    f"按空结论收尾"
+                )
             # 镜像串行主循环(见上方 assistant_msg 构造):assistant 必须带 tool_calls,
             # 否则下一迭代序列里紧接的 {role:tool} 会违反 OpenAI 契约被拒 400
             # ("tool must be a response to a preceding message with tool_calls")。

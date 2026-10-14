@@ -792,3 +792,68 @@ def test_plan_item_stop_check_marks_aborted(monkeypatch):
     )
     assert result.aborted is True
     assert result.pending_rows == []
+
+
+# ============================================================
+# 零产出截断重试 + fan-in 空结论占位(回归静默丢结果)
+# ============================================================
+
+
+def test_plan_item_zero_output_truncation_retries(monkeypatch):
+    """回归:worker 首轮 finish=length 且正文空时,应注入收尾提示
+    有界重试,重试轮拿到正文后 summary 非空。旧实现直接 break:只发 1 次调用
+    且 summary=""。判别点:调用次数==2 且 summary 非空。"""
+    monkeypatch.setattr(react_agent, "_review_provider_gate", lambda client: nullcontext())
+    monkeypatch.setattr(agent2, "_execute_read_tool", _fake_read_tool)
+    script = deque([
+        StreamResult(conv_id="c1", reasoning="思考" * 200, content="",
+                     tool_calls=[], finish_reason="length", stopped=False),
+        _sr(content="重试后拿到的结论"),
+    ])
+    seen_msgs = []
+
+    def _worker(client, messages, **kwargs):
+        seen_msgs.append(list(messages))
+        return script.popleft()
+
+    monkeypatch.setattr(agent2, "stream_llm", _worker)
+    result = agent2._run_plan_item_pass(
+        {"id": "P1", "target": "t", "planned_evidence": "source"},
+        [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
+        MagicMock(), "task-trunc", 1, "C:/repo",
+        read_cap=5, max_iter=8, item_timeout=60,
+        hard_deadline=time.monotonic() + 60,
+    )
+
+    assert len(seen_msgs) == 2                       # 旧实现只 1 次
+    assert result.summary == "重试后拿到的结论"  # 旧实现为 ""
+    # 重试轮上下文末尾是注入的收尾提示 user,且未落入空 assistant(脏上下文)
+    assert seen_msgs[1][-1]["role"] == "user"
+    assert "截断" in seen_msgs[1][-1]["content"]
+    assert not any(
+        m["role"] == "assistant" and not m.get("content") and not m.get("tool_calls")
+        for m in seen_msgs[1]
+    )
+
+
+def test_fan_in_empty_summary_gets_placeholder(monkeypatch):
+    """回归:worker 产出空结论(ok 状态)时,fan-in 回灌信封补占位文案,
+    主循环不会收到 (P,"ok","") 的静默空结论。与 react_agent 子任务
+    fan-in 的 '(本子任务无明确结论)' 兑底对齐。"""
+    _patch_common(monkeypatch)
+    worker = _mk_worker_stream({
+        f"P{i}": [_sr(content="")]  # finish=stop、正文空 → summary=""(不走重试分支)
+        for i in (1, 2, 3)
+    })
+    main = _mk_main_stream([
+        ("", [_plan_tc(_plan_items(3))], "先规划"),
+        ("", [_dispatch_tc(["P1", "P2", "P3"])], "派发"),
+    ])
+    _run(monkeypatch, main, worker)
+
+    fan_in_msgs = main.snapshots[-1]
+    envelopes = [m for m in fan_in_msgs if m.get("role") == "system"
+                 and "[系统注入|计划项结论|P" in str(m.get("content"))]
+    assert len(envelopes) == 3
+    for env in envelopes:
+        assert "(本计划项无明确结论)" in env["content"]

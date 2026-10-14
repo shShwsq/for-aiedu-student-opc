@@ -1119,3 +1119,41 @@ def test_clip_to_tokens_passthrough_and_truncate():
     out = R._clip_to_tokens(text, 3000)
     assert out.startswith("洞") and "结论过长已截断" in out
     assert R._estimate_tokens(out.split("\n…(")[0]) <= 3000
+
+
+def test_subtask_pass_zero_output_truncation_retries(monkeypatch):
+    """回归:子任务首轮 finish=length 且零产出时,应注入收尾提示有界
+    重试,重试轮拿到正文后 summary 非空。旧实现直接 break:只发 1 次调用
+    且 summary=""。另验证未将空 assistant 落入上下文(脏上下文/400 隐患)。"""
+    monkeypatch.setattr(R, "set_current_task", lambda *a, **k: None)
+    seen = []
+    turns = [
+        ("思考" * 200, "", [], "length", "cid-1"),  # 零产出截断
+        ("", "重试后结论", [], "stop", "cid-2"),        # 重试拿到正文
+    ]
+    box = {"i": 0 }
+
+    def fake_turn(client, messages, tools, **kw):
+        seen.append(list(messages))
+        r = turns[box["i"]]
+        box["i"] += 1
+        return r
+
+    monkeypatch.setattr(R, "_subtask_stream_turn", fake_turn)
+    readonly = R._subtask_readonly_tools(R.get_all_tools())
+    fr = R._run_subtask_pass(
+        _spec(label="截断重试"),
+        [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
+        readonly, object(), _Task(), round_idx=1, max_iter=5,
+        executor_command_confirm="always_approve",
+        deadline=time.monotonic() + 60,
+    )
+
+    assert len(seen) == 2                    # 旧实现只 1 次
+    assert fr.summary == "重试后结论"          # 旧实现为 ""
+    assert seen[1][-1]["role"] == "user"      # 重试轮末尾是注入的收尾提示
+    assert "截断" in seen[1][-1]["content"]
+    assert not any(
+        m["role"] == "assistant" and not m.get("content") and not m.get("tool_calls")
+        for m in seen[1]
+    )

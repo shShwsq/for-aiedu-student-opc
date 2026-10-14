@@ -110,6 +110,7 @@ from app.prompts.agent2 import (
     build_agent2_plan_item_instruction,
     build_agent2_plan_result_messages,
 )
+from app.prompts.executor import TRUNCATION_CONTINUE_PROMPT
 from app.prompts.practice import EXPLANATION_FORMAT_CONTRACT
 
 logger = logging.getLogger(__name__)
@@ -681,6 +682,11 @@ def run_agent2(
                 status, text = "timed_out", remap_refs_in_text(pr.summary, mapping)
             else:
                 status, text = "ok", remap_refs_in_text(pr.summary, mapping)
+            # 空结论守卫:worker 零产出截断/收尾失败时 summary 为空,原样回灌会让主循环
+            # 收到 (pid,"ok","") 把该计划项误读为"已完成且无内容"(静默丢结果)。补占位
+            # 文案,与 react_agent 子任务 fan-in 的 '(本子任务无明确结论)' 对齐,让缺结论显式可见。
+            if not text.strip():
+                text = "(本计划项无明确结论)"
             text = _clip_to_tokens(text, max_summary_tokens)
             env_items.append((pr.pid, status, text))
             # 取证计数并入主循环总池(全局上限与 fan-in 后的补查共享额度口径)
@@ -1669,7 +1675,7 @@ def _run_plan_item_pass(
       避开循环依赖)限并发;deadline/stop_check 逐迭代边界 + 逐 chunk 协作式
       检查;单 worker 异常 catch 后置 error,不拖垮整轮。
     """
-    from app.agents.react_agent import _review_provider_gate
+    from app.agents.react_agent import _review_provider_gate, MAX_TRUNCATION_RETRIES
 
     pid = str(plan_item.get("id") or "(未编号)").strip()
     planned = str(plan_item.get("planned_evidence") or "source").strip()
@@ -1710,6 +1716,8 @@ def _run_plan_item_pass(
             "content": build_agent2_plan_item_instruction(plan_item),
         })
         summary = ""
+        # 零产出截断有界重试计数(镜像主循环/verifier/子任务循环,每计划项独立)
+        truncation_retries = 0
 
         def _finalize_turn(notice: str | None) -> None:
             """预算耗尽后的收尾轮:注入收尾提示,再跑一发取总结。
@@ -1767,6 +1775,27 @@ def _run_plan_item_pass(
                 "type": "thinking", "content": content,
                 "reasoning": res.reasoning, "stream_conv_id": res.conv_id,
             })
+            # 零产出截断重试(镜像主循环/verifier/react 子任务循环):finish=length 且
+            # 正文空、无工具调用 = 本轮输出预算全被思考吃掉。直接 break 会让本计划项
+            # 静默产出空结论(fan-in 仅得占位)。注入收尾提示有界重试;不 append 空
+            # assistant(避免脏上下文),改而 append 一条 user 提示后 continue 开下一迭代。
+            if not tool_calls and res.finish_reason == "length" and not content.strip():
+                if truncation_retries < MAX_TRUNCATION_RETRIES:
+                    truncation_retries += 1
+                    logger.warning(
+                        f"[task={task_id}] 计划项 {pid} 第 {_it} 迭代输出被 max_tokens"
+                        f"截断且零产出(reasoning={len(res.reasoning)}字符),注入收尾提示"
+                        f"重试({truncation_retries}/{MAX_TRUNCATION_RETRIES})"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": TRUNCATION_CONTINUE_PROMPT,
+                    })
+                    continue
+                logger.warning(
+                    f"[task={task_id}] 计划项 {pid} 输出被 max_tokens 截断且零产出,"
+                    f"收尾重试已达上限({MAX_TRUNCATION_RETRIES}),按空结论收尾"
+                )
             # 镜像串行主循环:assistant 必须带 tool_calls(与下方 tool 消息用同一
             # tc_id 解析口径 tc["id"] or call_{index}),否则下一迭代的 {role:tool}
             # 因缺前置 tool_calls 被 OpenAI 拒 400,计首项调工具即废。
