@@ -158,6 +158,16 @@ def _fake_read_tool(fn, args, repo_path, task_id):
     )
 
 
+def _long_read_json() -> str:
+    """sandbox_tools.read_file 的真实返回形状,正文远超回灌预算(500 行)"""
+    lines = [f"{i:>4}: def f_{i}(x):  # {'y' * 40}" for i in range(1, 501)]
+    return json.dumps({
+        "path": "big.py", "content": "\n".join(lines),
+        "start_line": 1, "end_line": 500, "total_lines": 500,
+        "truncated": False, "binary": False, "size": 0,
+    }, ensure_ascii=False)
+
+
 def _mk_task():
     task = MagicMock()
     task.id = uuid.uuid4()
@@ -693,6 +703,45 @@ def test_plan_item_pass_assistant_carries_tool_calls(monkeypatch):
     assert any(m.get("role") == "tool" for seq in snapshots for m in seq), \
         "脚本未产生 tool 消息,断言形同虚设"
     _assert_tool_msgs_preceded_by_tool_calls(snapshots)
+
+
+def test_plan_item_long_read_is_line_bounded_for_worker(monkeypatch):
+    """并行 worker 的回灌口径与主循环一致:超长 read 按**整行**裁剪并修正范围。
+
+    回归点:worker 路径此前直接用 _truncate_for_llm 硬砍 3000 字符,导致 worker 模型
+    看不懂区间尾部、且回传 end_line 失真。改为共用 _bound_for_llm 后,模型看到的是
+    一段完整、自陈真实范围的代码(可据 offset=end_line+1 续读)。
+    """
+    import re
+
+    monkeypatch.setattr(react_agent, "_review_provider_gate", lambda client: nullcontext())
+    monkeypatch.setattr(agent2, "_execute_read_tool", lambda *a, **k: _long_read_json())
+    snapshots = []
+    script = deque([
+        _sr(tool_calls=[_tc("read_file", {"file_path": "big.py"}, cid="cB")]),
+        _sr(content="结论"),
+    ])
+
+    def _worker(client, messages, **kwargs):
+        snapshots.append(list(messages))
+        return script.popleft()
+
+    monkeypatch.setattr(agent2, "stream_llm", _worker)
+    agent2._run_plan_item_pass(
+        {"id": "P1", "target": "t", "planned_evidence": "source"},
+        [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
+        MagicMock(), "task-shape", 1, "C:/repo",
+        read_cap=5, max_iter=8, item_timeout=60,
+    )
+
+    tool_msgs = [m["content"] for seq in snapshots for m in seq if m.get("role") == "tool"]
+    assert tool_msgs, "脚本未产生 tool 消息"
+    fed = tool_msgs[-1]
+    assert "工具结果过长已截断" not in fed  # 不再是硬砍
+    obj = json.loads(fed)
+    assert obj["_evidence_ref"] == "E1"  # 注入的引用号在最前,未被裁掉
+    assert obj["end_line"] < 500 and obj["truncated"] is True  # 范围自陈
+    assert all(re.match(r"^\s*\d+:", ln) for ln in obj["content"].splitlines())
 
 
 # ============================================================

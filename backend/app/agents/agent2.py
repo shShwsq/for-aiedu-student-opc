@@ -1026,7 +1026,7 @@ def run_agent2(
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"] or f"call_{tc['index']}",
-                    "content": _bound_read_result_for_llm(tool_result_str),
+                    "content": _bound_for_llm(tool_result_str),
                 })
                 continue
 
@@ -1066,7 +1066,7 @@ def run_agent2(
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"] or f"call_{tc['index']}",
-                    "content": _truncate_for_llm(tool_result_str),
+                    "content": _bound_for_llm(tool_result_str),
                 })
                 continue
 
@@ -1407,7 +1407,7 @@ def _execute_read_tool(
             logger.warning(f"[task={task_id}] 落库 agent2 工具结果失败(忽略): {e}")
 
     # 完整正文原样返回:证据台账须存全量(quote 校验对齐完整正文),
-    # 回灌 LLM 的截断在调用方用 _truncate_for_llm 做(见 _MAX_TOOL_RESULT_CHARS)
+    # 回灌 LLM 的有界化在调用方用 _bound_for_llm 做(见 _MAX_TOOL_RESULT_CHARS)
     return result_str
 
 
@@ -1429,16 +1429,17 @@ def _truncate_for_llm(text: str) -> str:
     return text
 
 
-def _bound_read_result_for_llm(result_str: str) -> str:
-    """read_file 回灌内容:按字符预算裁到**完整行**,并修正 end_line/truncated。
+def _bound_for_llm(result_str: str) -> str:
+    """回灌 LLM 前的统一有界化入口(主循环与并行 worker 共用)。
 
-    只读工具回传的 read_file 结果带 start_line/end_line/total_lines/truncated
-    (见 sandbox_tools.read_file)。若正文超预算直接 _truncate_for_llm 会**中途砍断**:
-    模型于是看不懂所请求区间尾部的代码,而回传里的 end_line 仍标称"读到了最后一行"
-    ——既误导模型引用,也让它在被截断处之外无从判断。这里改成按行裁剪并同步
-    end_line/truncated:模型永远看到"一段完整、且自陈真实范围"的代码;要看后面
-    用 offset=end_line+1 续读(见 prompt 的翻页规则)。
-    非 read_file 形状的结果(无 start_line,如 list_files/search_code)退回通用截断。
+    - **read_file 形状**(带 start_line 元数据):按字符预算裁到**完整行**,并同步修正
+      end_line/truncated。只读工具回传本就带 start_line/end_line/total_lines/truncated
+      (见 sandbox_tools.read_file);若直接 _truncate_for_llm 会**中途砍断**——模型看不懂
+      所请求区间尾部的代码,而回传里的 end_line 仍标称"读到了最后一行",既误导引用、
+      又让它在截断点之外无从判断。改成按行裁剪后,模型永远看到"一段完整、且自陈真实范围"
+      的代码;要看后面用 offset=end_line+1 续读(见 prompt 的翻页规则)。
+    - **其余形状**(无 start_line,如 list_files/search_code/check_reference):退回通用截断。
+
     台账仍存完整正文(record_read 已存),本函数只改"模型看到的那份"。
     """
     try:
@@ -1534,7 +1535,7 @@ def _execute_reference_tool(
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 引用复核结果失败(忽略): {e}")
 
-    # 完整正文原样返回:证据台账须存全量,回灌截断交由调用方 _truncate_for_llm
+    # 完整正文原样返回:证据台账须存全量,回灌有界化交由调用方 _bound_for_llm
     return result_str
 
 
@@ -1833,8 +1834,8 @@ def _run_plan_item_pass(
                         out,
                         args_brief=f"{fn}:{json.dumps(fn_args, ensure_ascii=False)[:120]}",
                     )
-                result.pending_rows.append({"type": "tool_result", "content": _truncate_for_llm(out)})
-                messages.append({"role": "tool", "tool_call_id": tc_id, "content": _truncate_for_llm(out)})
+                result.pending_rows.append({"type": "tool_result", "content": _bound_for_llm(out)})
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": _bound_for_llm(out)})
         else:
             # 跑满迭代:请模型就本计划项输出总结
             _finalize_turn(None)
