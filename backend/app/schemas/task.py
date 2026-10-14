@@ -154,8 +154,8 @@ class ConversationResponse(BaseModel):
     # 仅 user 追问消息有:附带上传文件展示信息(刷新后气泡仍渲染 chip)。
     # 每项 {upload_id, filename, size, kind};其他消息/历史数据为 None
     attachments: list[dict[str, Any]] | None = None
-    # 仅并行分面/计划项 fan-in 行有:所属分面名(如"check_ssrf"/"计划项 P1"),
-    # 刷新/回放后前端据此给思考卡打"分面 · X"徽标。历史数据为 None
+    # 仅并行子任务/计划项 fan-in 行有:所属子任务名(如"check_ssrf"/"计划项 P1"),
+    # 刷新/回放后前端据此给思考卡打"子任务 · X"徽标。历史数据为 None
     facet: str | None = None
     created_at: datetime
 

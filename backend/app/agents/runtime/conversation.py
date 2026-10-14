@@ -39,8 +39,8 @@ def record_conversation(
       看上去就像"思考没保存"。实时卡片改由前端按 stream_conv_id/文本对账退役。
     - tool_call_id:仅 type=tool_result 用,对应 tool_call 记录的 id,
       前端据此配对展示(并行调用时 result 按完成顺序落库,不紧跟 call)
-    - facet:仅并行分面/计划项 fan-in 行用,落库所属分面名(持久化列),
-      刷新/回放后前端据此给思考卡打"分面 · X"徽标(不再只靠瞬态 extra_payload)
+    - facet:仅并行子任务/计划项 fan-in 行用,落库所属子任务名(持久化列),
+      刷新/回放后前端据此给思考卡打"子任务 · X"徽标(不再只靠瞬态 extra_payload)
     - extra_payload:随事件附加的字段(如 verifier 的 verify=True)
     - stream_conv_id:仅 type=thinking 用,落库前那次流式 thinking_delta 的
       conv_id(瞬态字段,不入 DB)。前端按它把"实时流式卡片"退役成只读历史

@@ -19,7 +19,7 @@ import { renderMarkdown } from './markdown'
 export interface ToolRowItem extends ToolItem {
   /** 是否流式思考项(流式项的身份标在 streaming.facet 上) */
   is_streaming?: boolean
-  /** 分面名(内置 react 子任务并行;落库行在顶层) */
+  /** 子任务名(内置 react 子任务并行;落库行在顶层) */
   facet?: string
   /** 流式卡(仅实时流式项有) */
   streaming?: { facet?: string }
@@ -65,7 +65,7 @@ export interface AgentBlockRowLike {
   agentAsync: boolean
 }
 
-/** 取项的分面名(子任务 label):流式项读流式卡上的 facet,落库行读顶层 facet */
+/** 取项的子任务名(子任务 label):流式项读流式卡上的 facet,落库行读顶层 facet */
 export function itemFacetOf(item: ToolRowItem): string | undefined {
   return item.is_streaming ? item.streaming?.facet : item.facet
 }

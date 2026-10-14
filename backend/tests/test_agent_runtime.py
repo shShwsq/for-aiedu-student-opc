@@ -498,7 +498,7 @@ def test_record_conversation_publish_event_off(monkeypatch):
 # ============================================================
 # 8) 发送前 call/output 契约归一化(不变量测试组)
 #
-# 线上分面首调用 400 的兜底层:assistant 的 tool_calls 若缺 role=tool 响应,
+# 线上子任务首调用 400 的兜底层:assistant 的 tool_calls 若缺 role=tool 响应,
 # provider 直接拒("must be followed by tool messages responding to each
 # 'tool_call_id'")。正反两向 + 幂等 + 不改入参 + 可观测,一条都不缺。
 # ============================================================
@@ -531,7 +531,7 @@ def _normalize(msgs):
 
 def test_normalize_adds_missing_output_for_call():
     """悬空 call → 其后补出合成 tool 消息;原 call 保留(修复优先补而非删)。"""
-    msgs = [{"role": "system", "content": "s"}, _assistant_call("tc-d", content="派发分面")]
+    msgs = [{"role": "system", "content": "s"}, _assistant_call("tc-d", content="派发子任务")]
     out = _normalize(msgs)
 
     assert out[1] is msgs[1], "assistant 被丢了,应原样保留"

@@ -26,7 +26,7 @@ interface StreamingItem {
   reasoning_grace?: boolean
   reasoning_pin?: boolean | null
   role?: 'agent1' | 'agent2'
-  /** 仅内置 react 分面并行有:分面名(思考卡据此标注) */
+  /** 仅内置 react 子任务并行有:子任务名(思考卡据此标注) */
   facet?: string
 }
 

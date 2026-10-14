@@ -28,7 +28,7 @@ export interface DeltaSink {
 export interface DeltaBuffer {
   /**
    * 累积一条增量。同一 conv_id 内 reasoning / content 各按到达顺序拼接,
-   * 两类文本互不串位;不同 conv_id(并行分面/子智能体)天然各自独立。
+   * 两类文本互不串位;不同 conv_id(并行子任务/子智能体)天然各自独立。
    */
   push(convId: string, phase: 'reasoning' | 'content', text: string): void
   /** 同步把缓冲写入 sink(幂等:空缓冲直接返回,不触发 afterFlush) */

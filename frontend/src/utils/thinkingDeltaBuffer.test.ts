@@ -82,7 +82,7 @@ describe('createDeltaBuffer:合帧', () => {
     ])
   })
 
-  it('不同 conv_id(并行分面/子智能体)互不串扰', () => {
+  it('不同 conv_id(并行子任务/子智能体)互不串扰', () => {
     const clock = createClock()
     const { sink, calls } = createRecorder()
     const buf = createDeltaBuffer(sink, clock.schedule)

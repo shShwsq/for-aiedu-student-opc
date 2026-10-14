@@ -625,7 +625,7 @@ def run_agent2(
             1, int(getattr(_s, "AGENT2_PLAN_ITEM_SUMMARY_MAX_TOKENS", 3000) or 3000)
         )
         # 每个 worker 进场时自起算本项预算(P1-1),这里只算统一的硬时限封顶。
-        # (对比 react_agent 分面侧共用 deadline 是刻意的"整轮预算",两处语义分开)
+        # (对比 react_agent 子任务侧共用 deadline 是刻意的"整轮预算",两处语义分开)
         hard_deadline = (
             float("inf") if review_max_seconds <= 0
             else loop_started + review_max_seconds
@@ -1495,7 +1495,7 @@ def _execute_reference_tool(
 # 审查子智能体按需派发(工具驱动扇出;读阶段并发 / 写阶段主线程串行)
 #
 # agent2 发射 submit_review_plan 后自行决定是否调 dispatch_review_subagents 把选定的
-# 计划项扇出成 N 条有界只读 ReAct 子循环并行核实。形状复用 react_agent 分面并行:
+# 计划项扇出成 N 条有界只读 ReAct 子循环并行核实。形状复用 react_agent 子任务并行:
 # worker 只跑 LLM + 只读工具 + 内存缓冲,绝不碰共享 db session / publish / 证据台账 /
 # emit_state;收养证据、落库、发射全部在 fan-in 后由主线程逐条做。verify 项由模型请求
 # 时逐项拒收,仍走主循环串行路径(PoC 会写沙箱状态、与新轮 agent1 争抢端口/进程,不可
@@ -1616,7 +1616,7 @@ def _run_plan_item_pass(
       的 db=None 形态(只执行),对话行进 pending_rows 缓冲等 fan-in;
     - 证据入 worker 自己的 EvidenceRecorder(局部 E ref,fan-in 收养);
     - 不注入发射工具:模型若仍请求 submit_*/verify 会被拒并如实回告(镜像
-      分面只读白名单硬约束);
+      子任务只读白名单硬约束);
     - thinking 实时流式带计划项身份,厂商闸门(_review_provider_gate,懒导入
       避开循环依赖)限并发;deadline/stop_check 逐迭代边界 + 逐 chunk 协作式
       检查;单 worker 异常 catch 后置 error,不拖垮整轮。
@@ -1667,7 +1667,7 @@ def _run_plan_item_pass(
             """预算耗尽后的收尾轮:注入收尾提示,再跑一发取总结。
 
             用独立宽限 deadline(time.monotonic()+90)保证即便主预算已到期
-            这一发也能真正吐出总结而非被 stop_check 秒停(镜像分面收尾轮)。
+            这一发也能真正吐出总结而非被 stop_check 秒停(镜像子任务收尾轮)。
             """
             nonlocal summary
             if notice:

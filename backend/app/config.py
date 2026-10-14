@@ -506,7 +506,7 @@ class Settings(BaseSettings):
     ACP_ASYNC_AGENT_REPORTS_MAX_FILES: int = 8
 
     # 预防性禁止 CLI 派生子智能体:命中白名单的 executor 在首轮 prompt 就要求
-    # "不要 fan-out,在主循环里串行完成各分面审查"。开启时同时抑制"后台子任务
+    # "不要 fan-out,在主循环里串行完成各子任务审查"。开启时同时抑制"后台子任务
     # 结论落盘"注入段并关闭续轮回收(见 acp_base._disallow_subagents_enabled /
     # _async_agent_autoccontinue_enabled)——三者互斥于"教子任务落盘"的旧链路。
     # 背景:ACP 事件不带子智能体身份,并行 chunk 交织成乱码,续轮回收又有截断误判

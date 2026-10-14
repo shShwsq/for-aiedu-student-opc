@@ -206,8 +206,8 @@ class Conversation(Base):
     # 仅 user 追问消息有:本条消息附带的上传文件展示信息(刷新后气泡仍渲染 chip)。
     # 每项 {"upload_id", "filename", "size", "kind"};其他消息/历史数据为 None
     attachments: Mapped[list | None] = mapped_column(JSONB, nullable=True)
-    # 仅并行分面/计划项子循环的 fan-in 行有:所属分面名(如"check_ssrf"/"计划项 P1")。
-    # 刷新/回放后前端据此给近似思考卡打"分面 · X"徽标(旧版只走瞬态 extra_payload,
+    # 仅并行子任务/计划项子循环的 fan-in 行有:所属子任务名(如"check_ssrf"/"计划项 P1")。
+    # 刷新/回放后前端据此给近似思考卡打"子任务 · X"徽标(旧版只走瞬态 extra_payload,
     # 刷新后丢失)。历史数据为 NULL,前端不显示徽标。
     facet: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
@@ -285,7 +285,7 @@ def migrate_conversation_add_attachments_column() -> None:
 
 
 def migrate_conversation_add_facet_column() -> None:
-    """幂等给 conversations 加 facet 列(并行分面/计划项子循环所属面名)
+    """幂等给 conversations 加 facet 列(并行子任务/计划项子循环所属子任务名)
 
     背景同 migrate_conversation_tool_call_id:无 Alembic,老库需显式 ALTER。
     旧版 facet 只随 SSE 瞬态 extra_payload 下发,刷新/回放后徒标丢失;现在落列。

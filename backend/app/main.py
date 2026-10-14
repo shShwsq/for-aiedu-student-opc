@@ -194,7 +194,7 @@ async def lifespan(app: FastAPI):
     migrate_conversation_tool_call_id()
     # 追问多文件上传:加 conversations.attachments 列(附件展示信息,刷新后气泡仍渲染 chip)
     migrate_conversation_add_attachments_column()
-    # 并行分面/计划项徒标持久化:加 conversations.facet 列(刷新/回放后仍显"分面 · X")
+    # 并行子任务/计划项徒标持久化:加 conversations.facet 列(刷新/回放后仍显"子任务 · X")
     migrate_conversation_add_facet_column()
     # 任务知识点 ↔ 看板知识点链接:给 results 加 knowledge_point_id 列(幂等;
     # 须晚于 knowledge_points 建表,新表由 create_all 已建)

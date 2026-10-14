@@ -138,7 +138,7 @@ describe('toolRowsOf:plain(落单 result 兜底)', () => {
   })
 })
 
-describe('itemFacetOf:分面名读取(流式卡 vs 落库行)', () => {
+describe('itemFacetOf:子任务名读取(流式卡 vs 落库行)', () => {
   it('流式项读 streaming.facet', () => {
     const item: ToolRowItem = {
       id: 's1', type: 'thinking', is_streaming: true,

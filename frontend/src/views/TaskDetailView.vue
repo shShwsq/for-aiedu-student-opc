@@ -500,7 +500,7 @@ interface StreamingItem {
   insertSeq: number
   /** 是否为动态验证的思考流(verifier_agent 产生,显示"正在验证"而非"正在思考") */
   verify?: boolean
-  /** 仅内置 react 分面并行有:分面名(多路思考卡据此标注区分) */
+  /** 仅内置 react 子任务并行有:子任务名(多路思考卡据此标注区分) */
   facet?: string
 }
 
@@ -957,10 +957,10 @@ function connectSSE(taskId: string): void {
           streamingItems.delete(retired)
         }
       }
-      // P1-6:分面/计划项子循环 fan-in 收尾(带 parallel+facet 的落库行)时,
-      // 退役该分面遗留的失败思考卡(status==='error')。这些是子循环首轮即死
+      // P1-6:子任务/计划项子循环 fan-in 收尾(带 parallel+facet 的落库行)时,
+      // 退役该子任务遗留的失败思考卡(status==='error')。这些是子循环首轮即死
       // (如 400)的迭代流留下的孤儿错误卡,无落库记录按 stream_conv_id 退役它,
-      // 任务暂停时会永久悬挂;fan-in 行一到即说明该分面已收尾,清掉同面错误卡。
+      // 任务暂停时会永久悬挂;fan-in 行一到即说明该子任务已收尾,清掉该子任务内的错误卡。
       if (data.parallel && data.facet) {
         for (const [key, s] of streamingItems) {
           if (s.facet === data.facet && s.status === 'error') {

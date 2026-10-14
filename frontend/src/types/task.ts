@@ -294,7 +294,7 @@ export interface Conversation {
    */
   attachments?: AttachmentInfo[] | null
   /**
-   * 仅并行分面/计划项 fan-in 行有:分面名(如"check_ssrf"/"计划项 P1")。
+   * 仅并行子任务/计划项 fan-in 行有:子任务名(如"check_ssrf"/"计划项 P1")。
    * 已持久化进 conversations.facet,快照刷新(GET /tasks/{id})也携带(P1-5);
    * 历史数据为 null。
    */
@@ -418,9 +418,9 @@ export interface ConversationEventData {
    * 老任务/老后端为 undefined,文本对账仍可用。
    */
   stream_conv_id?: string | null
-  /** 仅内置 react 分面并行有:分面名(随 extra_payload 下发) */
+  /** 仅内置 react 子任务并行有:子任务名(随 extra_payload 下发) */
   facet?: string | null
-  /** 仅分面并行落库的项有:标记来自并行扇出 */
+  /** 仅子任务并行落库的项有:标记来自并行扇出 */
   parallel?: boolean
   created_at: string | null
 }
@@ -496,8 +496,8 @@ export interface ThinkingDeltaEventData {
    */
   verify?: boolean
   /**
-   * 仅内置 react 分面并行的思考流有:分面名(skill 名)。
-   * 前端据此在思考卡标题区标注“分面 · X”,多路并行时区分各路。
+   * 仅内置 react 子任务并行的思考流有:子任务名(skill 名)。
+   * 前端据此在思考卡标题区标注“子任务 · X”,多路并行时区分各路。
    */
   facet?: string
 }

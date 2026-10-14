@@ -315,7 +315,7 @@ def stream_llm(
     # 发送口不变量兜底:所有智能体/子循环都走这一条通道,在这里归一化一次
     # 就没人需要再各写一份过滤(见 normalize_call_output_pairing)。合法序列
     # 原样返回;被修复时会换新列表并记 WARNING —— 入参 messages 不受影响,
-    # 故调用方(主循环/分面/agent2)的上下文与落库形状都不变。
+    # 故调用方(主循环/子任务/agent2)的上下文与落库形状都不变。
     messages = normalize_call_output_pairing(
         messages, task_id=task_id, round_idx=round_idx, role=role
     )

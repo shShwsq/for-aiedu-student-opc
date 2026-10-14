@@ -293,7 +293,7 @@ def test_plan_item_instruction_shape():
 
 def test_plan_result_messages_envelope_shape():
     """fan-in 信封:首条行动指引(整批一份)+ 每项一条 system 信封;
-    三种状态措辞镜射分面版;空入参空列表。"""
+    三种状态措辞镜射子任务版;空入参空列表。"""
     msgs = build_agent2_plan_result_messages([
         ("P1", "ok", "成立,见 E1"),
         ("P2", "error", "provider 500"),
