@@ -2,7 +2,7 @@
 
 覆盖:
 - 打分:到期紧迫度 / 薄弱点 / 难度匹配 / 新题
-- 约束:同知识点 ≤60%、复习题占比 ≥50%、冷启动低难度新题
+- 约束:同知识点 ≤60%、复习题占比 ≥50%、冷启动低难度新题(无低难度题时退化兜底)
 """
 import random
 from datetime import datetime, timedelta
@@ -112,6 +112,18 @@ def test_cold_start_only_easy_new():
     ]
     picked = select_questions(candidates, ability=2.5, count=5, now=NOW)
     assert [c.question_id for c in picked] == ["q1", "q2"]
+
+
+def test_cold_start_falls_back_to_easiest_when_no_easy_question():
+    # 冷启动且题库无 difficulty ≤ 2 的题(真实生成题默认 3、prompt 示例即 3):
+    # 不应返回空(那会让「开始练习」报"没有可出的题目"),而应按难度升序取最易的 count 道
+    candidates = [
+        make_candidate("q1", difficulty=3.0, attempts=0, kp_attempts=0),
+        make_candidate("q2", difficulty=5.0, attempts=0, kp_attempts=0),
+        make_candidate("q3", difficulty=4.0, attempts=0, kp_attempts=0),
+    ]
+    picked = select_questions(candidates, ability=2.5, count=2, now=NOW)
+    assert [c.question_id for c in picked] == ["q1", "q3"]
 
 
 def test_same_kp_capped_at_60_percent():

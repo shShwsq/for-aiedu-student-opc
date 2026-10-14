@@ -11,7 +11,8 @@
 约束:
 - 同一知识点最多占 60%
 - 存在到期复习题时,复习题占比不低于 50%(不够则全选)
-- 冷启动(无任何记忆状态):只取 difficulty ≤ 2 的新题
+- 冷启动(无任何记忆状态):优先取 difficulty ≤ 2 的题;若一道都没有
+  (真实生成题难度普遍 ≥3),退化为按难度升序取最易的若干题,避免无题可出
 
 实现为纯函数(输入 CandidateInfo 列表),与 ORM 解耦便于单测。
 """
@@ -167,6 +168,10 @@ def select_questions(
     has_memory = any(c.kp_due_at is not None for c in candidates)
     if not has_memory:
         pool = [c for c in candidates if c.difficulty <= COLD_START_MAX_DIFFICULTY]
+        if not pool:
+            # 兜底:真实生成题难度普遍 ≥3(生成默认 3),严格按 ≤2 过滤会无题可出。
+            # 退化为全部候选按难度升序,取最易的 count 道,保证冷启动用户能开局。
+            pool = list(candidates)
         pool.sort(key=lambda c: c.difficulty)
         return pool[:count]
 
