@@ -233,7 +233,7 @@ function formatTime(iso: string | null | undefined): string {
 /** 各字段帮助说明(点击问号按钮展示) */
 const FIELD_HELP: Record<string, string> = {
   agent2_enabled:
-    '开启后,检查助手参与协作(每轮执行后的质检评估、验证)。关闭后退化为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做质检评估、不验证。适合简单任务或用户完全信任 AI助手的场景。',
+    '开启后,AI助手 产出结果后由检查助手在后台独立复核(核查与验证)。关闭后退化为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做复核、不验证。适合简单任务或用户完全信任 AI助手的场景。',
   extract_knowledge_points:
     '开启后,检查助手除核查外还会从全程产出提炼「重点与知识点」(供侧栏展示、驱动出题与知识点看板)。关闭时只做核查/验证/引用复核,不产出知识点;自动出题可降级为直接基于对话出题。',
   allow_verify:

@@ -2,13 +2,13 @@
 
 > 说明对象:`backend/app/agents/agent2.py` 在后台审查中可调用的工具,及其定义、启用条件、参数、返回与语义。
 > 工具**文本定义**集中于 [app/prompts/agent2.py](../backend/app/prompts/agent2.py);**执行逻辑**在 [app/agents/agent2.py](../backend/app/agents/agent2.py);**底层实现**在 `backend/app/tools/` 与 `backend/app/agents/verifier_agent.py`。
-> 阅读前置:`docs/agent-architecture.md`(执行 + 后台质检架构)、`docs/spec.md` §3(核心流程)。
+> 阅读前置:`docs/agent-architecture.md`(先产出 + 后台独立复核架构)、`docs/spec.md` §3(核心流程)。
 
 ---
 
 ## 0. 一句话定位
 
-agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的发现是否有真实依据,而不是亲自重做审查。因此它的工具集是**取证型**的——读源码、动态验证、复核外部引用——**不含任何改代码 / 提交 / 部署能力**(这正是"检查助手被剥夺改代码权限,只有取证职责"的落地)。
+agent2 是**幕后复核者**,职责是"核查优先":核实 agent1(AI助手)的发现是否有真实依据,而不是亲自重做审查。因此它的工具集是**取证型**的——读源码、动态验证、复核外部引用——**不含任何改代码 / 提交 / 部署能力**(这正是"检查助手被剥夺改代码权限,只有取证职责"的落地)。
 
 工具分**取证**与**发射**两族:
 

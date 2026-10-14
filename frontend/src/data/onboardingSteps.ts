@@ -81,7 +81,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     placement: 'bottom',
     title: '欢迎使用 SecondLook',
     content:
-      '这是一个「AI助手 执行 + 检查助手 后台质检」系统:AI助手 负责调用工具执行任务,跑完即完成;检查助手 随后在后台核查产出,并把无法自查的缺口整理成建议追问方向。下面用 30 秒带你认识主要入口。',
+      '这是一个「AI助手 先产出、检查助手 后台独立复核」系统:AI助手 负责调用工具执行任务,跑完即完成;检查助手 随后在后台独立复核产出,并把无法自查的缺口整理成建议追问方向。下面用 30 秒带你认识主要入口。',
   },
   {
     id: 'home-cta',
@@ -164,7 +164,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     placement: 'right',
     title: '高级设置',
     content:
-      '点开可配置检查助手(启停 / 评估模型 / 允许自行验证)与执行命令确认模式。检查助手默认在后台质检 AI助手 的产出;关闭后进入单 agent 模式,AI助手 跑 1 轮直接产出结果。',
+      '点开可配置检查助手(启停 / 评估模型 / 允许自行验证)与执行命令确认模式。检查助手默认在后台独立复核 AI助手 的产出;关闭后进入单 agent 模式,AI助手 跑 1 轮直接产出结果。',
   },
   {
     id: 'create-input',

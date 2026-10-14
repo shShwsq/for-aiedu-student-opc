@@ -1,19 +1,19 @@
 # SecondLook
 
-> An agent task platform pairing an executing AI assistant with a background quality inspector (code / document / general tasks)
+> An agent task platform where the AI assistant produces the result and an inspector independently reviews it in the background (code / document / general tasks)
 
 **English** · [简体中文](./README.zh-CN.md)
 
-SecondLook runs every task as a two-stage pipeline (the former dual-agent collaboration loop was removed — the two stages are serial and multi-round is user-driven):
+SecondLook runs every task as a produce-then-review flow: the AI assistant produces the result first, then the inspector independently reviews it in the background (the former dual-agent collaboration loop was removed — the two stages are serial and multi-round is user-driven):
 
 - **Agent 1 — Executor (shown as "AI Assistant" in the UI)**: performs the actual task (code analysis / document review / general work). Either the built-in LLM-driven `react_agent` or an external CLI executor (Qoder CLI / DeepSeek Harness CLI / Codex CLI).
-- **Agent 2 — Inspector (shown as "Inspector" in the UI)**: a rigorous quality reviewer, verify-first and review-only (it never modifies code). It ① runs a single complete background review once Agent 1 finishes (verifying findings against real source code, defining its own review dimensions from the task description), ② runs PoC verifications when a test environment is configured (verification actions: `http_request` / `run_python_code`, with `per_action` / `direct` authorization modes), ③ spot-checks external references cited by Agent 1 (CVE / advisories / official docs — existence, source authority, SSRF-hardened fetching), ④ tags the most learning-worthy findings (`practice_worthy`) so practice generation prioritizes them, and ⑤ turns genuine gaps it cannot resolve itself into "suggested deep-dive directions" (suggestions) the user can trigger with one click.
+- **Agent 2 — Inspector (shown as "Inspector" in the UI)**: a rigorous, independent reviewer — verify-first and review-only (it never modifies code). It ① independently reviews Agent 1's result in the background once Agent 1 finishes (verifying findings against real source code, defining its own review dimensions from the task description), ② runs PoC verifications when a test environment is configured (verification actions: `http_request` / `run_python_code`, with `per_action` / `direct` authorization modes), ③ spot-checks external references cited by Agent 1 (CVE / advisories / official docs — existence, source authority, SSRF-hardened fetching), ④ tags the most learning-worthy findings (`practice_worthy`) so practice generation prioritizes them, and ⑤ turns genuine gaps it cannot resolve itself into "suggested deep-dive directions" (suggestions) the user can trigger with one click.
 
-Agent 1 starts executing directly on the user's task description; the task is marked complete as soon as Agent 1 finishes. Agent 2 then runs a single complete review in the background (reading code, running PoCs, checking references), producing "key points & knowledge" plus "suggested deep-dive directions" — it verifies on its own and never asks follow-up questions, turning genuine gaps into suggestions the user can trigger with one click ("deep dive"). The Settings page (a single shell with two-level navigation — account / model settings / CLI settings / agent policy / memory settings / practice settings) configures the inspector toggle, verification permissions, and more; disabling Agent 2 falls back to single-agent mode (no background review). Multiple rounds are user-driven (follow-up messages / clicking a suggestion).
+Agent 1 starts executing directly on the user's task description; the task is marked complete as soon as Agent 1 finishes. Agent 2 then independently reviews it in the background (reading code, running PoCs, checking references), producing "key points & knowledge" plus "suggested deep-dive directions" — it verifies on its own and never asks follow-up questions, turning genuine gaps into suggestions the user can trigger with one click ("deep dive"). The Settings page (a single shell with two-level navigation — account / model settings / CLI settings / agent policy / memory settings / practice settings) configures the inspector toggle, verification permissions, and more; disabling Agent 2 falls back to single-agent mode (no background review). Multiple rounds are user-driven (follow-up messages / clicking a suggestion).
 
 ## Key Features
 
-- **Execution + background review**: Agent 1 executor (`react_agent` or an external CLI, shown as "AI Assistant") completes the task on finish, then Agent 2 inspector (verify-first background review, reference checking and learning-point tagging, shown as "Inspector") produces key knowledge points and suggested deep-dive directions; multiple rounds are user-driven (follow-up messages / clicking a suggestion), and disabling Agent 2 degrades to single-agent mode (the former dual-agent collaboration loop was removed)
+- **Produce, then review**: Agent 1 executor (`react_agent` or an external CLI, shown as "AI Assistant") produces the result first (the task is marked complete at that point), then Agent 2 inspector (an independent background review — verify-first, reference checking and learning-point tagging, shown as "Inspector") produces key knowledge points and suggested deep-dive directions; multiple rounds are user-driven (follow-up messages / clicking a suggestion), and disabling Agent 2 degrades to single-agent mode (the former dual-agent collaboration loop was removed)
 - **Executor abstraction layer**: Pluggable executors — built-in react_agent / Qoder CLI / DeepSeek Harness CLI (dsh) / Codex CLI — unified via the ACP protocol
 - **Deliverable uploads**: The task creation page offers three deliverable source tabs — Git repository / upload ZIP / upload single file. `upload_id` and `repo_url` are mutually exclusive; the task description is required in upload mode; ZIPs are protected against zip-slip with size limits. Uploading is optional — plain-text tasks work without one
 - **Scenario templating**: General, code review, and document review as quick templates (preset prompts + recommended skills); the inspector defines its own review dimensions per task
@@ -49,7 +49,7 @@ SecondLook/
 │   │   ├── services/         # Practice engine (SM-2 / selector / generator) + memory / workspace diff
 │   │   ├── skills/           # Skill loader + skill registry
 │   │   ├── tools/            # ReAct tools (clone_repo / search_code / run_lint / ...)
-│   │   ├── agent_policy.py    # Collaboration policy (defaults + user/task-level merge)
+│   │   ├── agent_policy.py    # Agent policy (defaults + user/task-level merge)
 │   │   ├── config.py         # Environment variable config (pydantic-settings)
 │   │   ├── git_provider.py   # Git platform abstraction layer (GitHub / Gitee)
 │   │   └── main.py           # FastAPI entry point
@@ -415,7 +415,7 @@ docker compose up -d
 - [Specification](docs/spec.md) — Full product spec and architecture design (in Chinese)
 - [Roadmap](docs/Roadmap.md) — Phased plan and progress (in Chinese)
 - [Sandbox Deployment Guide](docs/opensandbox-deploy.md) — OpenSandbox Server deployment and image build (in Chinese)
-- [Agent Architecture](docs/agent-architecture.md) — agent1 (executor) / agent2 (inspector) / CLI agent internals, context passing, collaboration policy (in Chinese)
+- [Agent Architecture](docs/agent-architecture.md) — agent1 (executor) / agent2 (inspector) / CLI agent internals, context passing, agent policy (in Chinese)
 - [Task Detail View Structure](docs/task-detail-view-structure.md) — TaskDetailView layout and rendering pipeline (in Chinese)
 
 ## Development Notes

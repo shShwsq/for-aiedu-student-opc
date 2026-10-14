@@ -1,16 +1,16 @@
-# 智能体架构(执行 + 后台质检)与上下文传递逻辑
+# 智能体架构(先产出 + 后台独立复核)与上下文传递逻辑
 
-本文档整理 `backend/app/agents/` 目录下 agent2（质检智能体,前端显示「检查助手」）、agent1（前端显示「AI助手」,内置实现为 `react_agent`）、外部 CLI agent（Qoder / DeepSeek Harness / Codex）的代码逻辑、执行与质检流程与上下文传递机制，并覆盖智能体策略（`agent_policy.py`）、交付物上传链路（uploads → orchestrator）与工作区变更捕获（`workspace_diff.py`）。
+本文档整理 `backend/app/agents/` 目录下 agent2（复核智能体,前端显示「检查助手」）、agent1（前端显示「AI助手」,内置实现为 `react_agent`）、外部 CLI agent（Qoder / DeepSeek Harness / Codex）的代码逻辑、产出与复核流程与上下文传递机制，并覆盖智能体策略（`agent_policy.py`）、交付物上传链路（uploads → orchestrator）与工作区变更捕获（`workspace_diff.py`）。
 
-> 命名约定:agent1 = AI助手(内置实现 react_agent.py,或外部 CLI 执行器);agent2 = 质检智能体(「检查助手」)。Conversation 落库与 SSE 事件的 `role` 取值即为 `agent1` / `agent2`。下文代码细节中 `react_agent` 指内置实现模块。
+> 命名约定:agent1 = AI助手(内置实现 react_agent.py,或外部 CLI 执行器);agent2 = 复核智能体(「检查助手」)。Conversation 落库与 SSE 事件的 `role` 取值即为 `agent1` / `agent2`。下文代码细节中 `react_agent` 指内置实现模块。
 
-> 阅读前置：`docs/spec.md`（产品定义）、`backend/app/agents/orchestrator.py`（执行 + 后台质检编排）。
+> 阅读前置：`docs/spec.md`（产品定义）、`backend/app/agents/orchestrator.py`（先产出 + 后台独立复核编排）。
 
 ---
 
 ## 1. 架构总览
 
-系统采用 **agent1(执行)+ agent2(后台质检)串行流水线** 模型，由 `orchestrator.run_pipeline_audit` 编排（历史名 `run_dual_agent_audit`，已更名、暂留兼容别名；原「双智能体协作循环」已移除，agent2 单次后台审查不向 agent1 发问，多轮由用户 resume 驱动；关闭 agent2 即单 agent 模式）：
+系统采用 **agent1 先产出 + agent2 后台独立复核的串行流水线** 模型，由 `orchestrator.run_pipeline_audit` 编排（历史名 `run_dual_agent_audit`，已更名、暂留兼容别名；原「双智能体协作循环」已移除，agent2 单次后台审查不向 agent1 发问，多轮由用户 resume 驱动；关闭 agent2 即单 agent 模式）：
 
 ```
 用户意图
@@ -55,16 +55,16 @@
 
 | 角色 | 职责 | 是否调工具 | 模型来源 |
 |------|------|-----------|---------|
-| **agent2(检查助手)** | **幕后质检 + 学习点提炼**:核查 agent1 的产出(读真实源码核实/PoC/引用复核),审查完成时提炼重点与知识点(results,3-8 条精选,含 learning_note),确属缺失且无法自查的方向给建议追问(suggestions,用户点击后触发 resume);核查过程与知识点经核查与结果侧栏呈现,不进主对话流 | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=100`,允许长时间后台跑;超出窗口的旧回传由 `_trim_agent2_tool_history` 压成一行摘要,证据台账不裁);可选经 verifier_agent 生成 PoC 验证(单轮额度按审查计划联动:`MIN_VERIFY_CALLS=3` 至 `settings.AGENT2_MAX_VERIFY_CALLS=8`,另受 `VERIFY_AUTH_TIMEOUT_SECONDS` 逐动作授权等待上限约束);引用复核 `check_reference`(后端安全抓取,单轮上限 `MAX_REFERENCE_CALLS=3`,`allow_reference_check` 默认开);整轮另有挂钟硬时限 `settings.AGENT2_REVIEW_MAX_SECONDS` | `task.llm_config_id` |
+| **agent2(检查助手)** | **幕后独立复核 + 学习点提炼**:核查 agent1 的产出(读真实源码核实/PoC/引用复核),复核完成时提炼重点与知识点(results,3-8 条精选,含 learning_note),确属缺失且无法自查的方向给建议追问(suggestions,用户点击后触发 resume);核查过程与知识点经核查与结果侧栏呈现,不进主对话流 | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=100`,允许长时间后台跑;超出窗口的旧回传由 `_trim_agent2_tool_history` 压成一行摘要,证据台账不裁);可选经 verifier_agent 生成 PoC 验证(单轮额度按审查计划联动:`MIN_VERIFY_CALLS=3` 至 `settings.AGENT2_MAX_VERIFY_CALLS=8`,另受 `VERIFY_AUTH_TIMEOUT_SECONDS` 逐动作授权等待上限约束);引用复核 `check_reference`(后端安全抓取,单轮上限 `MAX_REFERENCE_CALLS=3`,`allow_reference_check` 默认开);整轮另有挂钟硬时限 `settings.AGENT2_REVIEW_MAX_SECONDS` | `task.llm_config_id` |
 | **内置 react_agent(agent1)** | ReAct 循环执行代码分析(clone / search / read / semgrep 等) | 是,调用沙箱工具 | `task.react_llm_config_id`(空时回退 `llm_config_id`) |
 | **ExternalCLIAgent(agent1)** | 沙箱内启动外部 CLI,通过 ACP 协议通信 | 是,由 CLI 自主调工具 | CLI 自管(凭证经环境变量注入) |
 | **verifier_agent**(实验性) | 在沙箱里跑 PoC / HTTP 请求动态验证 agent1 的发现 | 是,独立工具集(`http_request` + `run_python_code` + `submit_verification` 结论申报) | `task.llm_config_id`(复用 agent2 的 LLMClient) |
 
-### 1.2 协作流程(后台审查版)
+### 1.2 产出与复核流程(后台复核版)
 
 - **agent1 单轮执行**:初始运行只有 1 轮 agent1(无 agent2 初始评估,agent1 直接按用户意图执行)→ 返回 `summary`
 - **agent1 结束即任务完成**:summary 落库为临时 Result,`task.status=COMPLETED`、`review_status=running`,推 `agent1_done`(事件总线保持打开)。用户感知的"任务完成"以 agent1 结束为准
-- **agent2 后台审查**:在同一后台线程内单次完整核查(只读工具核对 / verify / check_reference),整理重点与知识点(`results + grouping`)替换**本轮**临时 Result(知识点按轮追加:仅删本轮 `round_idx`,历史轮次保留),发现缺口输出"建议追问方向"(`suggestions`,0-3 条);审查完成 `review_status=done` → 推 `review_done`,再经 `_end_event_scope`(事件活跃期)收尾:自己是最后活跃流 → 推 `done` → `finish_task`;仍有并行流在跑 → 总线保持打开。agent2 只审不改
+- **agent2 后台复核**:在同一后台线程内单次独立核查(只读工具核对 / verify / check_reference),整理重点与知识点(`results + grouping`)替换**本轮**临时 Result(知识点按轮追加:仅删本轮 `round_idx`,历史轮次保留),发现缺口输出"建议追问方向"(`suggestions`,0-3 条);审查完成 `review_status=done` → 推 `review_done`,再经 `_end_event_scope`(事件活跃期)收尾:自己是最后活跃流 → 推 `done` → `finish_task`;仍有并行流在跑 → 总线保持打开。agent2 只审不改
 
   > 临时 Result 标题(`INTERIM_RESULT_TITLE`="执行结果(检查助手整理中)")只有三条出口:被知识点替换(删行重建)、终止改写为"执行结果(检查已终止)"、关闭提炼时定稿为"执行结果(未提炼知识点)"(走 `_finalize_interim_result_title`,按本轮 + 仍挂临时标题筛选)。三条都走不到时侧栏 badge 已是「检查完成」而结果卡还写着「整理中」;失败路径有意保留原标题(见下)
 - **纯对话轮跳过审查**:本轮 agent1 无任何工具调用(`_round_has_tool_calls` 查 Conversation 无 `role=agent1, type=tool_call` 记录;builtin 与 CLI 执行器均按此落库)→ 判定为纯对话轮,`_finish_conversation_round` 直接收尾(推 `agent1_done`,done/finish 经 `_end_event_scope` 统一判定),跳过审查/结果替换/练习题/记忆归纳,保留既有结果与审查状态
@@ -92,13 +92,13 @@
 
 ---
 
-## 2. agent2(检查助手/质检智能体)详解
+## 2. agent2(检查助手/复核智能体)详解
 
 **文件**：[backend/app/agents/agent2.py](../backend/app/agents/agent2.py)
 
 ### 2.1 核心特征
 
-- **幕后质检定位**:agent1 是面向用户的台前回答者(其每轮 summary 即主界面用户看到的回答);agent2 的核查过程(核查与结果侧栏「核查过程」段,即 Agent2Panel)、审查结果(「审查结果」段)与知识点(「重点与知识点」段)分呈在同一侧栏,建议追问方向落在「概览」段,主对话流只显示用户与 agent1 的对话。"敢不敢上线"不再是硬性产出,仅当用户意图涉及上线/采用决策时在 reasoning 附判断
+- **幕后复核定位**:agent1 是面向用户的台前回答者(其每轮 summary 即主界面用户看到的回答);agent2 的核查过程(核查与结果侧栏「核查过程」段,即 Agent2Panel)、审查结果(「审查结果」段)与知识点(「重点与知识点」段)分呈在同一侧栏,建议追问方向落在「概览」段,主对话流只显示用户与 agent1 的对话。"敢不敢上线"不再是硬性产出,仅当用户意图涉及上线/采用决策时在 reasoning 附判断
 - **职责顺序(核查优先、建议追问兜底)**:①核实发现(只读工具读真实源码核对,单轮上限 `MAX_READ_TOOL_CALLS=100`)→ ②动态 PoC 验证(经 verifier_agent,单轮额度按计划项联动 3–8,需测试环境)→ ③引用复核(`check_reference`,单轮上限 `MAX_REFERENCE_CALLS=3`)→ ④提炼重点与知识点 → ⑤(兜底)建议追问方向;凡能自查的绝不建议
 - **两类产物、即时发射(证据驱动可信审查)**:核查过程不再"末尾一次性大 JSON",而是用四个发射工具即时结构化落库——`submit_review_plan`(审查计划,后端给每条补稳定 id P1/P2… 并在回执里返回)、`submit_review_item`(**审查项**,落 `ReviewItem` 表,**按核实结果三分档**:已核实成立 confirmed / 已核实不成立 none·false_positive / 待核实 suspected·pending·missing·partial;旧口径把没取到证的 suspected 也算"发现风险",已纠正)、`submit_knowledge_point`(**知识点**,落 `Result` 表,含 `learning_note`/`practice_worthy`/`source_review_item_id` 回指派生审查项)、`submit_suggestion`(建议追问)。**审查项回答"代码有没有问题、多可信",知识点回答"该记住什么"**,分型但同源。审查项字段:`review_target`(待核实对象)/`conclusion`(审查结论)/`follow_up`(可追问内容)/`plan_item_id`(对账用);提示词带**用户可读性硬约束**(正文禁写 `E9`/`call_ref`/`fail-closed`/`领域基线` 等内部标识,取证引用只进 `evidence`)。审查项带证据者由后端 `app/agents/evidence.py` 核验证据引用(`evidence.*.call_ref` 指向本轮 `_evidence_ref` 台账)后**派生置信度**(verified/source_confirmed/reference_corroborated/assertion_only),**模型不自报 confidence**。不支持结构发射的模型回退旧"末尾大 JSON"路径(covered/missing/reasoning/suggestions/results/grouping),整轮无解析才判失败
 - **题目与知识点生成**:任务完成后由 orchestrator 调用 practice 服务(实现位于 `app/services/practice/`)生成练习题与知识点,选题优先覆盖 practice_worthy 标记的知识点
@@ -196,7 +196,7 @@ def run_agent2(
 - 文本 tool_call 兜底(runtime 共享)：GLM/Qwen 思考模式把工具调用写在正文(Hermes 风格)时,经 runtime 的文本解析提取工具调用并回灌执行——此前 agent2 缺失该兜底,这类模型下审查必然 `parse_failed`
 
 > 历史说明:任务开始时的「初始评估 + 澄清提问(ask_user)+ 覆盖度清单确认」机制已整体移除,
-> agent1 第 1 轮直接按用户意图执行,agent2 从第 1 轮执行完成后开始质检。
+> agent1 第 1 轮直接按用户意图执行,agent2 从第 1 轮执行完成后开始复核。
 
 ### 2.7 落库（`_record_agent2_review`）
 
@@ -1126,13 +1126,13 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | [prompts/verifier.py](../backend/app/prompts/verifier.py) | verifier 文本资产：VERIFIER_SYSTEM_PROMPT + 登录身份动态注入段 |
 | [prompts/memory_curator.py](../backend/app/prompts/memory_curator.py) | 记忆归纳/精简模板 + 记忆类别枚举 |
 | [prompts/practice.py](../backend/app/prompts/practice.py) | 练习出题文本资产：4 主题 head / 工具说明段 / 通用规则 / build_system_prompt / 主题分类器 / 出题模板 |
-| [orchestrator.py](../backend/app/agents/orchestrator.py) | 执行 + 后台质检编排（agent1 单轮 + 后台审查 + resume） |
+| [orchestrator.py](../backend/app/agents/orchestrator.py) | 先产出 + 后台独立复核编排（agent1 单轮 + 后台复核 + resume） |
 | [runtime/llm_stream.py](../backend/app/agents/runtime/llm_stream.py) | 共享运行时：统一流式 LLM 调用 + 跨 chunk 工具累积 + 文本 tool_call 兜底解析（§8.6） |
 | [runtime/conversation.py](../backend/app/agents/runtime/conversation.py) | 共享运行时：统一对话落库 + SSE 推送（tool_call_id 配对 + extra_payload） |
 | [runtime/tool_intent.py](../backend/app/agents/runtime/tool_intent.py) | 共享运行时：工具意图生成单一注册表（prefix 支持） |
 | [runtime/constants.py](../backend/app/agents/runtime/constants.py) | 共享运行时：跨智能体截断常量单一事实源 |
 | [runtime/plan.py](../backend/app/agents/runtime/plan.py) | 共享运行时：plan 计划清单解析单一事实源（react_agent 与 acp_base 共用） |
-| [agent2.py](../backend/app/agents/agent2.py) | agent2 实现（质检评估 / 审查维度自定 / 跨轮自记忆） |
+| [agent2.py](../backend/app/agents/agent2.py) | agent2 实现（复核评估 / 审查维度自定 / 跨轮自记忆） |
 | [react_agent.py](../backend/app/agents/react_agent.py) | 内置 react_agent（流式 LLM / 工具调用 / plan 状态机 / 三级压缩跨轮记忆 / 循环检测） |
 | [verifier_agent.py](../backend/app/agents/verifier_agent.py) | 验证智能体（独立 ReAct 循环 + http_request / run_python_code 工具 + per_action 授权） |
 | [executor_agent.py](../backend/app/agents/executor_agent.py) | 执行器抽象层（BuiltinReactAgent + ExternalCLIAgent + 工厂） |

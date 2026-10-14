@@ -1,19 +1,19 @@
 # SecondLook
 
-> 「AI助手 执行 + 检查助手 后台质检」的智能体任务平台(代码 / 文书 / 通用任务)
+> 「AI助手 先产出、检查助手 后台独立复核」的智能体任务平台(代码 / 文书 / 通用任务)
 
 [English](./README.md) · **简体中文**
 
-SecondLook 的每个任务由两个环节串行衔接完成:
+SecondLook 的每个任务都是「先产出、后独立复核」的两段:AI助手 先把结果做出来,检查助手 随后在后台复核。
 
 - **Agent 1 —— AI助手(执行端)**:负责实际执行任务(代码分析 / 文书审核 / 通用任务),可为内置 LLM 驱动的 `react_agent`,或外部 CLI 执行器(Qoder CLI / DeepSeek Harness CLI / Codex CLI)。
-- **Agent 2 —— 质检智能体(前端显示「检查助手」)**:扮演严谨的质量审查官,**核查优先、只审不改**,职责:①AI助手 执行完成后在后台单次完整审查 Agent 1 的结果(读真实源码核实发现、剔除误报、按任务意图自行确定审查维度);②配了测试环境时对"疑似但不确定"的发现生成 PoC 动态验证(验证动作:`http_request` / `run_python_code`,支持 `per_action` / `direct` 两种授权模式);③抽查复核 Agent 1 引用的外部依据链接(CVE / 安全公告 / 官方文档,核对存在性与来源权威性,后端 SSRF 防护抓取);④整理结果时标记最有学习价值的点(`practice_worthy`),出题优先覆盖这些学习点;⑤当维度确属缺失且无法自查时,输出「建议追问方向」(suggestions)供用户一键追问。
+- **Agent 2 —— 复核智能体(前端显示「检查助手」)**:扮演严谨、独立的复核者,**核查优先、只审不改**,职责:①AI助手 执行完成后在后台独立复核 Agent 1 的结果(读真实源码核实发现、剔除误报、按任务意图自行确定审查维度);②配了测试环境时对"疑似但不确定"的发现生成 PoC 动态验证(验证动作:`http_request` / `run_python_code`,支持 `per_action` / `direct` 两种授权模式);③抽查复核 Agent 1 引用的外部依据链接(CVE / 安全公告 / 官方文档,核对存在性与来源权威性,后端 SSRF 防护抓取);④整理结果时标记最有学习价值的点(`practice_worthy`),出题优先覆盖这些学习点;⑤当维度确属缺失且无法自查时,输出「建议追问方向」(suggestions)供用户一键追问。
 
-AI助手 直接按用户的任务描述开始执行,执行完即标记任务完成;检查助手 随后在后台做单次完整审查(读码核实 / PoC 验证 / 引用复核),整理出「重点与知识点」并给出「建议追问方向」——能自己核查的绝不向用户提问,发现的缺口转为建议供用户一键「追问」。设置页(单一外壳 + 两级导航:账户设置 / 模型设置 / CLI 设置 / 智能体策略 / 记忆设置 / 练习设置)可配置检查助手启停、验证权限等;关闭 Agent 2 后退化为单 agent 模式(不做后台审查)。多轮由用户驱动(追加消息 / 点建议追问)。
+AI助手 直接按用户的任务描述开始执行,执行完即标记任务完成;检查助手 随后在后台做单次独立复核(读码核实 / PoC 验证 / 引用复核),整理出「重点与知识点」并给出「建议追问方向」——能自己核查的绝不向用户提问,发现的缺口转为建议供用户一键「追问」。设置页(单一外壳 + 两级导航:账户设置 / 模型设置 / CLI 设置 / 智能体策略 / 记忆设置 / 练习设置)可配置检查助手启停、验证权限等;关闭 Agent 2 后退化为单 agent 模式(不做后台审查)。多轮由用户驱动(追加消息 / 点建议追问)。
 
 ## 核心特性
 
-- **执行 + 后台质检**:Agent 1 AI助手(`react_agent` 或外部 CLI)执行完即完成任务,Agent 2 质检智能体(核查优先的后台审查 + 引用复核 + 学习点标记,前端显示「检查助手」)随后在后台单次审查,产出重点知识点与建议追问方向;多轮由用户驱动(追加消息 / 点建议追问),关闭 Agent 2 退化为单 agent 模式(原「双智能体协作循环」已移除)
+- **先产出、后复核**:Agent 1 AI助手(`react_agent` 或外部 CLI)先产出结果(任务即标记完成),Agent 2 检查助手(前端显示「检查助手」)随后在后台单次独立复核(核查优先 + 引用复核 + 学习点标记),产出重点知识点与建议追问方向;多轮由用户驱动(追加消息 / 点建议追问),关闭 Agent 2 退化为单 agent 模式(原「双智能体协作循环」已移除)
 - **执行器抽象层**:内置 react_agent / Qoder CLI / DeepSeek Harness CLI(dsh)/ Codex CLI 等可插拔执行器,通过 ACP 协议统一通信
 - **交付物上传**:任务创建页交付物来源三 Tab —— Git 仓库 / 上传 ZIP / 上传单文件;`upload_id` 与 `repo_url` 后端互斥,上传模式下任务说明必填,ZIP 有 zip-slip 防护与大小限制;上传为可选,不传时为纯文本任务
 - **场景模板化**:通用 / 代码审核 / 文书审核三场景作为快捷模板(预设提示词 + 推荐 skill),审查维度由检查助手按任务意图自行确定
@@ -39,7 +39,7 @@ AI助手 直接按用户的任务描述开始执行,执行完即标记任务完�
 SecondLook/
 ├── backend/                  # FastAPI 后端
 │   ├── app/
-│   │   ├── agents/           # 智能体(agent1 react_agent / agent2 质检 / orchestrator / verifier / CLI wrapper)
+│   │   ├── agents/           # 智能体(agent1 react_agent / agent2 复核 / orchestrator / verifier / CLI wrapper)
 │   │   ├── llm/              # LLM 客户端封装
 │   │   ├── models/           # SQLAlchemy 数据模型(含 practice / agent_policy / task_artifact)
 │   │   ├── routers/          # API 路由(auth / tasks / git_provider / uploads / practice / ...)
@@ -415,7 +415,7 @@ docker compose up -d
 - [规格说明](docs/spec.md) —— 完整产品规格与架构设计
 - [开发路线图](docs/Roadmap.md) —— 阶段规划与进度
 - [沙箱部署指南](docs/opensandbox-deploy.md) —— OpenSandbox Server 部署与镜像构建
-- [智能体架构](docs/agent-architecture.md) —— agent1(执行)/ agent2(质检)/ CLI 智能体内幕、上下文传递与智能体策略
+- [智能体架构](docs/agent-architecture.md) —— agent1(执行)/ agent2(复核)/ CLI 智能体内幕、上下文传递与智能体策略
 - [任务详情页结构](docs/task-detail-view-structure.md) —— TaskDetailView 布局与渲染管线
 
 ## 开发说明

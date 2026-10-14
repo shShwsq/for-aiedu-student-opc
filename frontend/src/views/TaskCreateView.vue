@@ -1331,7 +1331,7 @@ onUnmounted(() => {
 
                       <label
                         class="policy-toggle-row policy-toggle-primary"
-                        :title="policyAgent2Enabled ? '检查助手后台质检 / 验证' : '单 agent 模式:AI助手 跑 1 轮直接产出结果'"
+                        :title="policyAgent2Enabled ? '检查助手后台独立复核 / 验证' : '单 agent 模式:AI助手 跑 1 轮直接产出结果'"
                       >
                         <input v-model="policyAgent2Enabled" class="switch" type="checkbox" />
                         <span>{{ policyAgent2Enabled ? '已启用' : '已停用' }}</span>
