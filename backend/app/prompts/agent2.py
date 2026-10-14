@@ -311,7 +311,14 @@ _SUBMIT_REVIEW_ITEM_TOOL: dict[str, Any] = {
                             "properties": {
                                 "file_path": {"type": "string"},
                                 "line": {"type": "string", "description": "行号,统一字符串"},
-                                "quote": {"type": "string", "description": "读到的真实代码/原文片段"},
+                                "quote": {
+                                    "type": "string",
+                                    "description": (
+                                        "从 call_ref 那条取证结果里抄回的逐字连续片段"
+                                        "(不许加省略号/注释/压缩成一行/把不相邻的行拼起来);"
+                                        "后端拿它跟该条证据正文做子串比对,不逐字吻合会判「证据未核验」"
+                                    ),
+                                },
                                 "call_ref": {"type": "string", "description": "取证的 _evidence_ref(如 E1)"},
                             },
                         },
@@ -536,6 +543,10 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
      每段的 `call_ref` **就近引用**取证工具回传里的 `_evidence_ref`(如 E1);**缺段=不适用**
      (文书无 source 代码、纯静态无 poc、无引用则无 analysis_basis),缺不代表取证据失败
      —— 但缺证据的条目会被归入"待核实",这是预期行为。
+     写 `quote` 必须是从**同一条 `call_ref` 取证结果**里逐字抄回的连续片段:`call_ref` 指哪条、
+     `quote` 就得是哪条正文里的原文。不要总结成一句话、不要加省略号或注释、不要把不相邻的
+     行拼在一起、不要引用了 E5 却抄 E9 的正文 —— 后端按"quote 是否为所引证据正文的子串"核验,
+     不逐字吻合的条目会打上「证据未核验」标记并降档。
      待核实类(missing/partial/suspected)可不带 evidence,但须在 `conclusion` 里说清
      为何未取证(若因 agent1 未覆盖,应转 `submit_suggestion` 而非发此项),否则视为凭空。
    - **不要自报 `confidence`**:置信度由后端核验你的 `call_ref`/`quote` 后派生(证据链的属性,不是口供)。
@@ -567,6 +578,11 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
 后端据此核验"这条结论是否真的取过证"。工具只作发射/取证,不替你判定结论 true/false——
 真正的可信来自你**实际跑过的取证**(verify 跑出定论、grep 命中真实代码),绝不把自填的
 `verified=true` 当证据。
+
+**大文件分页读,别指望一次读完**:read_file 的回传带 `start_line`/`end_line`/`total_lines`/
+`truncated`。一次只取一段;若 `truncated=true` 说明该文件还有后续未读,用 `offset=end_line+1`
+继续读下一段。**引用某段代码前,先读到包含它的那一段**——`quote` 必须出自你真正读到的那次
+取证结果;没读到的行不要凭印象去引,先分页读到手再引。
 
 **兼容**:若你所用的模型不支持结构化工具发射,仍可在结束时输出一个总结 JSON
 (covered/missing/reasoning/suggestions/results),系统会解析并分流落库(此时无结构化计划);

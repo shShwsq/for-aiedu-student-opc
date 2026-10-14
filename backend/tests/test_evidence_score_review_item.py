@@ -2,7 +2,9 @@
 
 覆盖 score_review_item 的核心判读:
 - call_ref 命中 + quote 吻合 → source_confirmed
-- call_ref 不在台账 → evidence_mismatch + 压到 assertion_only
+- call_ref 不在台账 / 没给 → "缺可核验引用":只降档为仅断言,不判 mismatch
+- 逐字 quote 对不上所引台账 → evidence_mismatch + 压到 assertion_only
+- 带省略号的转述型 quote 对不上 → 只降档,不判 mismatch(那是"总结"不是"谎报引用")
 - verify 跑成且**定论**(confirmed / not_confirmed)+ verified=True → verified
 - verify 跑成但未定论(不可达/未授权/未申报)→ 不抬档也不判 mismatch
 - has_repo=False 缺 source → 不判 mismatch
@@ -46,13 +48,15 @@ def test_source_confirmed_when_quote_matches():
     assert out["evidence_mismatch"] is False
 
 
-def test_mismatch_when_call_ref_not_in_ledger():
+def test_call_ref_not_in_ledger_is_missing_ref_not_mismatch():
+    # 引用了台账里不存在的证据号(跨轮/跨 worker 旧编号或臆造):属"缺可核验引用",
+    # 只降档为仅断言,不判"谎报引用"
     ledger = {}
     ev = {"source": {"file_path": "x.py", "quote": "abc", "call_ref": "E9"}}
     out = score_review_item(ev, "confirmed", ledger, has_repo=True, verify_available=False)
     assert out["tier"] == TIER_ASSERTION
-    assert out["evidence_mismatch"] is True
-    assert out["note"]
+    assert out["evidence_mismatch"] is False
+    assert out["evidence_validated"] is False
 
 
 def test_quote_mismatch_presses_to_assertion():
@@ -62,6 +66,17 @@ def test_quote_mismatch_presses_to_assertion():
     out = score_review_item(ev, "confirmed", ledger, has_repo=True, verify_available=False)
     assert out["tier"] == TIER_ASSERTION
     assert out["evidence_mismatch"] is True
+
+
+def test_paraphrased_quote_downgrades_without_mismatch():
+    # 带省略号的"总结式" quote 对不上所引正文 → 只降档,不判 mismatch
+    ledger = {"E1": {"kind": "read", "body": _read_body(content="    42\tcursor.execute(sql)\n")}}
+    ev = {"source": {"file_path": "src/api/users.py",
+                     "quote": "cursor.execute(sql) ... 第 512 行 settings = Settings()",
+                     "call_ref": "E1"}}
+    out = score_review_item(ev, "confirmed", ledger, has_repo=True, verify_available=False)
+    assert out["tier"] == TIER_ASSERTION
+    assert out["evidence_mismatch"] is False
 
 
 def test_verified_tier_needs_success_verify_ledger():

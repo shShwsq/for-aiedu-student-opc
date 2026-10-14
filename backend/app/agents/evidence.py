@@ -93,6 +93,16 @@ def quote_matches(quote: Any, body: Any) -> bool:
     return needle in normalize_for_quote_match(body)
 
 
+# quote 里的"转述/摘要"标记:省略号(中英文)、"省略/略去/等等"。
+# 命中即视为非逐字原文片段 —— 这类不判"谎报引用",只降档为仅断言。
+_PARAPHRASE_RE = re.compile(r"\.\.\.|…|……|省略|略去|等等")
+
+
+def looks_paraphrased(quote: Any) -> bool:
+    """quote 是否含转述/摘要痕迹(省略号等),而非逐字原文片段"""
+    return bool(_PARAPHRASE_RE.search(str(quote or "")))
+
+
 # ============================================================
 # 台账记录器(Part A):分配 _evidence_ref + 存证 + 回灌注入
 # ============================================================
@@ -116,15 +126,16 @@ class EvidenceRecorder:
         return f"E{self._seq}"
 
     def _inject_json_ref(self, result_str: str, eref: str) -> str:
-        """把 _evidence_ref 注入 JSON 字符串结果;非合法 JSON(如已截断)则尾部追加标记"""
+        """把 _evidence_ref 注入 JSON 字符串结果;非合法 JSON 则行首加标记(截断不伤 ref)"""
         try:
             obj = json.loads(result_str)
         except Exception:
             obj = None
         if isinstance(obj, dict):
-            obj["_evidence_ref"] = eref
-            return json.dumps(obj, ensure_ascii=False, default=str)
-        return f"{result_str}\n[evidence_ref={eref}]"
+            # ref 放最前:回灌内容随后会被 _truncate_for_llm 截断,放尾部会被切掉,
+            # 模型看不到引用号 → 结论文里给不出合法 call_ref(反被误判"缺引用")。
+            return json.dumps({"_evidence_ref": eref, **obj}, ensure_ascii=False, default=str)
+        return f"[evidence_ref={eref}]\n{result_str}"
 
     def record_read(self, result_str: str, *, call_id: str | None = None,
                     args_brief: str = "") -> str:
@@ -241,11 +252,14 @@ def score_review_item(
         {tier, label, evidence_validated, evidence_mismatch,
          verification_outcome, note}
     校验规则:
-      ① 非空 call_ref 必须命中台账,否则 evidence_mismatch;
-      ② source.call_ref 指向 read/search 时对 quote 做归一化宽松子串匹配,不吻合 → mismatch;
+      ① call_ref 未命中台账(跨轮/跨 worker 旧编号或臆造)或压根没给 → 属"缺可核验
+        引用":不判 mismatch,仅不抬档(压到 assertion_only)。绝不把模型自报当证据。
+      ② source.call_ref 命中 read/search 台账时对 quote 做归一化宽松子串匹配:
+        不吻合且 quote 是逐字片段 → mismatch;quote 带省略号等转述痕迹 → 只降档,
+        不判 mismatch(那是"总结"而非"谎报引用")。
       ③ verified=True 仅当指向"跑成且定论"(outcome 为 confirmed|not_confirmed)的
         verify 台账;跑成了但未定论(不可达/未授权/未申报)不抬档也不判 mismatch,
-        指向跑失败的台账才判 mismatch(无 verify 环境时不采信也不判 mismatch);
+        指向跑失败或非 verify 的台账才判 mismatch(无 verify 环境时不采信也不判 mismatch)。
       ④ ref_ok = ref_status=ok 且 authority∈{authoritative,credible} 且 call_ref 指向 reference 台账。
     取最高一档成立;mismatch 压到 assertion_only,
     但"false_positive 且 source_ok"例外保底 source_confirmed(误报剔除也要证据)。
@@ -263,29 +277,24 @@ def score_review_item(
     verification_outcome: str | None = None
 
     # ① source(仅在有工作区时可核验;无 repo 缺 source 不判 mismatch)
+    #    call_ref 查无此人 = 缺可核验引用,只降档不判 mismatch(见规则①)
     if has_repo and (source.get("file_path") or source.get("quote")):
-        cref = source.get("call_ref")
-        entry = _lookup(ledger, cref)
-        if cref and entry is None:
-            mismatch = True
-        elif entry is not None and entry.get("kind") == "read":
+        entry = _lookup(ledger, source.get("call_ref"))
+        if entry is not None and entry.get("kind") == "read":
             quote = source.get("quote")
-            if quote:
-                if quote_matches(quote, entry.get("body")):
-                    source_ok = True
-                else:
-                    mismatch = True
-            else:
+            if not quote:
                 # 指向真实取证调用但无 quote:file_path 定位即算源码取证(宽松)
                 source_ok = True
+            elif quote_matches(quote, entry.get("body")):
+                source_ok = True
+            elif not looks_paraphrased(quote):
+                # 逐字 quote 却对不上所引台账 → 真·引错证据
+                mismatch = True
 
-    # ② analysis_basis → ref_ok
+    # ② analysis_basis → ref_ok(call_ref 查无此人同样只降档不判 mismatch)
     if analysis.get("ref_url"):
-        cref = analysis.get("call_ref")
-        entry = _lookup(ledger, cref)
-        if cref and entry is None:
-            mismatch = True
-        elif (
+        entry = _lookup(ledger, analysis.get("call_ref"))
+        if (
             entry is not None
             and entry.get("kind") == "reference"
             and analysis.get("ref_status") == "ok"
@@ -296,13 +305,11 @@ def score_review_item(
     # ③ verification → verified_ok(仅当指向"跑出定论"的台账)
     #   跑成了但结论未定论(环境不可达/未授权/没申报)不判 mismatch——
     #   那是"试过但没验出来",不是"谎报引用";但不能拿它换「已动态验证」档。
+    #   call_ref 没给/查无此人 = 缺可核验引用,同样只降档不判 mismatch。
     if verification.get("verified") is True:
-        cref = verification.get("call_ref")
-        entry = _lookup(ledger, cref)
+        entry = _lookup(ledger, verification.get("call_ref"))
         if not verify_available:
             verified_ok = False  # 无 verify 环境:优雅降级,不判 mismatch
-        elif cref and entry is None:
-            mismatch = True
         elif entry is not None and entry.get("kind") == "verify":
             outcome = entry.get("outcome") or OUTCOME_UNKNOWN
             verification_outcome = outcome
@@ -312,7 +319,7 @@ def score_review_item(
                 mismatch = True  # 声称 verified 却指向一条跑失败的验证
             else:
                 verify_inconclusive = True
-        else:
+        elif entry is not None:
             mismatch = True  # 声称 verified 却指向非 verify 台账
 
     # 选档:mismatch 压到 assertion_only(false_positive + source_ok 例外保底)

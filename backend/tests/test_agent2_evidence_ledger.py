@@ -104,3 +104,105 @@ def test_run_agent2_verify_injects_text_marker(monkeypatch):
     assert verify_entries and verify_entries[0]["verify_ok"] is True
     # 回灌文本末尾带 [evidence_ref=E#]
     assert any("[evidence_ref=E" in c for c in seen_tool_contents)
+
+
+def test_long_non_range_result_ledger_keeps_full_body_while_llm_sees_truncated(monkeypatch):
+    """回归:超长取证结果只截断回灌给 LLM 的内容,台账须存完整正文。
+
+    覆盖**非 read_file 形状**(无 start_line 元数据,如 list_files/search_code 的
+    超大结果)退回通用截断的兜底:回灌内容被 _truncate_for_llm 砍掉,台账仍存全文
+    ——否则引用了截断点之后原文的 quote 会永远核验失败(被误判「证据未核验」)。
+    带行范围元数据的 read_file 走按行裁剪,见
+    test_long_read_llm_copy_is_line_bounded_and_honest。
+    """
+    long_content = "L1 " + ("x" * 5000)
+    monkeypatch.setattr(
+        agent2, "_execute_read_tool",
+        lambda *a, **k: json.dumps({"path": "big.py", "content": long_content}),
+    )
+    state = {"n": 0}
+    seen_tool_contents: list[str] = []
+
+    def _fake_stream(client, messages, *, task_id, round_idx, tools=None):
+        state["n"] += 1
+        if state["n"] >= 2:
+            for m in messages:
+                if m.get("role") == "tool":
+                    seen_tool_contents.append(str(m.get("content")))
+            return (_final_json(), [], "")
+        return ("", _read_tool_call(), "想读大文件")
+
+    monkeypatch.setattr(agent2, "_stream_agent2_llm", _fake_stream)
+
+    result = run_agent2(
+        "审查这个仓库", [{"round": 1, "summary": "s"}],
+        task_id="task-ledger", db=None, round_idx=1,
+        client=MagicMock(), task=_mk_task(), repo_path="/repo",
+    )
+
+    # 台账正文完整(未被截断)
+    body = result["_evidence_ledger"]["E1"]["body"]
+    assert len(body) > 3000
+    assert "工具结果过长已截断" not in body
+    # 回灌 LLM 的内容被截断
+    assert any("工具结果过长已截断" in c for c in seen_tool_contents)
+
+
+def _real_shape_read_json() -> str:
+    """sandbox_tools.read_file 的真实返回形状(带 start_line/end_line/total_lines)"""
+    lines = [f"{i:>4}: def f_{i}(x):  # {'y' * 40}" for i in range(1, 501)]
+    return json.dumps({
+        "path": "big.py", "content": "\n".join(lines),
+        "start_line": 1, "end_line": 500, "total_lines": 500,
+        "truncated": False, "binary": False, "size": 0,
+    }, ensure_ascii=False)
+
+
+def test_long_read_llm_copy_is_line_bounded_and_honest(monkeypatch):
+    """回归:read_file 超预算时,回灌给 LLM 的那份要裁到**完整行**并自陈真实范围。
+
+    read_file 结果带 start_line/end_line/total_lines/truncated;直接 _truncate_for_llm
+    会中途砍断,模型既看不懂区间尾部、又被标称的 end_line 误导。这里断言:
+    - 模型看到的内容裁到整行(不留半个 line);
+    - end_line/truncated 已修正为"真正看到的范围"(模型可据 offset=end_line+1 续读);
+    - 台账仍存完整正文,元数据未被改动。
+    """
+    import re
+
+    monkeypatch.setattr(agent2, "_execute_read_tool", lambda *a, **k: _real_shape_read_json())
+    state = {"n": 0}
+    seen_tool_contents: list[str] = []
+
+    def _fake_stream(client, messages, *, task_id, round_idx, tools=None):
+        state["n"] += 1
+        if state["n"] >= 2:
+            for m in messages:
+                if m.get("role") == "tool":
+                    seen_tool_contents.append(str(m.get("content")))
+            return (_final_json(), [], "")
+        return ("", _read_tool_call(), "想读大文件")
+
+    monkeypatch.setattr(agent2, "_stream_agent2_llm", _fake_stream)
+
+    result = run_agent2(
+        "审查这个仓库", [{"round": 1, "summary": "s"}],
+        task_id="task-ledger", db=None, round_idx=1,
+        client=MagicMock(), task=_mk_task(), repo_path="/repo",
+    )
+
+    # 台账:完整正文(500 行),元数据原样
+    body_obj = json.loads(result["_evidence_ledger"]["E1"]["body"])
+    assert body_obj["end_line"] == 500 and body_obj["truncated"] is False
+    assert body_obj["content"].count("\n") == 499
+
+    # 回灌 LLM 的那份:引用号在最前、裁到整行、范围自陈
+    fed = seen_tool_contents[-1]
+    assert "工具结果过长已截断" not in fed
+    fed_obj = json.loads(fed)
+    assert fed_obj["_evidence_ref"] == "E1"
+    assert fed_obj["end_line"] < 500
+    assert fed_obj["truncated"] is True
+    kept_lines = fed_obj["content"].splitlines()
+    # 每个保留行都是完整的一行(带行号前缀),没有被切半个
+    assert kept_lines and all(re.match(r"^\s*\d+:", ln) for ln in kept_lines)
+    assert len(fed) <= agent2._MAX_TOOL_RESULT_CHARS

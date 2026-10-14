@@ -302,7 +302,7 @@ def test_remap_refs_in_text_rewrites_mapped_strips_others():
 
 
 def test_adopted_refs_score_source_confirmed():
-    """收养后的新 ref + 原文 quote → 源码取证档;旧局部 ref 查无此人 → mismatch"""
+    """收养后的新 ref + 原文 quote → 源码取证档;旧局部 ref 查无此人 → 只降档不判 mismatch"""
     main = EvidenceRecorder()
     worker = EvidenceRecorder()
     body = '{"file_path": "a.py", "content": "L1 secret()"}'
@@ -313,10 +313,12 @@ def test_adopted_refs_score_source_confirmed():
     score = score_review_item(ev, "established", main.ledger, has_repo=True, verify_available=False)
     assert score["tier"] == "source_confirmed"
     assert score["evidence_validated"] is True
-    # 直接拿 worker 局部旧 ref 指主台账:命中校验① mismatch 压到仅断言
+    # 直接拿 worker 局部旧 ref 指主台账:主台账查无此人 → 缺可核验引用,降档为仅断言
+    # (不判"谎报引用"——旧编号是机制性错配,不是模型凭空捏造)
     ev_stale = {"source": {"file_path": "a.py", "quote": "secret()", "call_ref": "E7"}}
     stale = score_review_item(ev_stale, "established", main.ledger, has_repo=True, verify_available=False)
-    assert stale["evidence_mismatch"] is True
+    assert stale["tier"] == "assertion_only"
+    assert stale["evidence_mismatch"] is False
 
 
 # ============================================================
