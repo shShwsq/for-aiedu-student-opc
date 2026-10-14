@@ -333,6 +333,10 @@ const sourceReviewItem = computed<ReviewItem | null>(() => {
   background: var(--color-bg-subtle, #f9fafb);
   border-left: 3px solid var(--color-border);
   border-radius: var(--radius-sm);
+  /* 不显式设 color:继承 .drawer-section / body 的 --color-text,
+     两主题与 --color-bg-subtle 都是高对比(~13:1)。暗色白底白字
+     已由 --color-bg-subtle token 本身修复;勿改用 --color-text-secondary
+     降权(证据引用是核心内容,且浅色会掉到 ~4.3:1,低于 AA 4.5:1) */
   font-size: var(--fs-xs);
   font-family: var(--font-mono);
   white-space: pre-wrap;

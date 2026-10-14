@@ -68,6 +68,12 @@
 
   /* ---- 色彩:中性 ---- */
   --color-bg: #f8fafc;
+  /* 次级底色:chip / 引用块 / 摘要面板等"浮在主 bg 之上"的容器,
+     比 --color-bg 略深一点点。此前 token 从未定义,各组件 fallback
+     还不统一(#f3f4f6 / #f9fafb / rgba(0,0,0,0.02)),暗色下前两者
+     落到近白底 + 继承的近白文字 = 白底白字。定义后统一走 token,
+     浅色外观基本不变(仅 .rv-quote #f9fafb→#f3f4f6、摘要块半透明→不透明,均极轻微) */
+  --color-bg-subtle: #f3f4f6;
   --color-surface: #ffffff;
   --color-surface-alt: #f1f5f9;
   --color-border: #e2e8f0;
@@ -210,6 +216,10 @@
 
   /* ---- 色彩:中性 ---- */
   --color-bg: #0f172a;
+  /* 暗色下的次级底色:比主 bg(#0f172a)略亮,与 light 主题"略深"对称。
+     注意:此值 == --color-surface,仅适用于"浮在 --color-bg 上"的场景
+     (当前消费方均如此);若放进 surface 卡片内,暗色会与其融色无区分 */
+  --color-bg-subtle: #1e293b;
   --color-surface: #1e293b;
   --color-surface-alt: #334155;
   --color-border: #334155;
