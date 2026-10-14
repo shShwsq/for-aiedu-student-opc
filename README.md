@@ -159,6 +159,23 @@ Open `http://localhost:5173`, register an account (or log in via GitHub / Gitee 
 | `APP_BASE_URL` | App base URL (used in email verification/reset links) | `http://localhost:5173` |
 | `PRACTICE_ENABLED` | Master switch for the practice feature (`false` = `/practice/*` routes not registered, no auto-generation on task completion; existing data is kept) | `true` |
 
+#### Email (SMTP)
+
+Transactional emails (registration verification, password reset). Leaving `SMTP_HOST` empty falls back to **dev mode**: email content is only printed to the backend log, not actually sent. Set `SMTP_HOST` to deliver real mail via the standard-library `smtplib` (no extra dependency).
+
+| Variable | Description | Default |
+|---|---|---|
+| `SMTP_HOST` | SMTP server host. Empty = dev mode (log only, no delivery) | empty |
+| `SMTP_PORT` | SMTP server port | `587` |
+| `SMTP_SECURITY` | Encryption: `starttls` (587) / `ssl` (465, implicit TLS) / `none` (plaintext, local relay only). Invalid values fall back to `starttls` | `starttls` |
+| `SMTP_USERNAME` | Login username. Empty = no auth (local relay only) | empty |
+| `SMTP_PASSWORD` | Login password / authorization code | empty |
+| `SMTP_FROM_EMAIL` | Sender address (empty falls back to `SMTP_USERNAME`, then to `noreply@SMTP_HOST`) | empty |
+| `SMTP_FROM_NAME` | Sender display name | `SecondLook` |
+| `SMTP_TIMEOUT_SECONDS` | Connect/send timeout (seconds); fails fast so an unreachable SMTP does not block registration | `10` |
+
+> Delivery failures are logged but not raised: registration/resend commit before sending, so an SMTP outage won't turn a successful signup into a 500. Users can re-request the verification email via `/auth/resend-verification`.
+
 #### Auth & Encryption
 
 | Variable | Description | Default |

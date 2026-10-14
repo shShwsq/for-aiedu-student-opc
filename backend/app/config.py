@@ -31,6 +31,26 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = ""
     # 邮件链接的基础 URL(开发期指向前端 dev server 或后端)
     APP_BASE_URL: str = "http://localhost:5173"
+
+    # ---- 邮件发送(SMTP)----
+    # 注册验证 / 重置密码等事务性邮件的真实发信通道。SMTP_HOST 留空 = 回落到
+    # 开发模式(send_email 仅把邮件内容打印到日志,不真正发信),既有本地开发与
+    # 测试无需 SMTP 即可跑通;填了 host 才走 smtplib 实际投递。
+    # 用标准库 smtplib 实现,无需额外依赖。
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    # 加密方式:starttls(587 常用,先明文连接再升级 TLS)/ ssl(465 隐式 TLS)/
+    # none(明文,仅本地 relay 或内网可信 MTA)。非法值按 starttls 处理
+    SMTP_SECURITY: str = "starttls"
+    # 登录凭证:留空 username 则不认证(仅用于免认证的本地 relay)
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    # 发件人地址:留空逐级回落 SMTP_USERNAME → noreply@<SMTP_HOST>(避免免认证
+    # relay 下生成畸形 From);FROM_NAME 为收件人看到的显示名
+    SMTP_FROM_EMAIL: str = ""
+    SMTP_FROM_NAME: str = "SecondLook"
+    # 连接 / 发送超时(秒):SMTP 不可达时快速失败,避免阻塞注册等同步请求
+    SMTP_TIMEOUT_SECONDS: int = 10
     # 出题 & 练习功能总开关(false 时 /practice/* 路由不注册、任务完成不自动出题;
     # 已建表与题库数据保留,重新开启后可继续使用;用户级偏好 auto_generate_practice 在此开关之下)
     PRACTICE_ENABLED: bool = True

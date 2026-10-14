@@ -159,6 +159,23 @@ npm run dev
 | `APP_BASE_URL` | 应用基础 URL(用于邮件验证/重置链接) | `http://localhost:5173` |
 | `PRACTICE_ENABLED` | 出题 & 练习功能总开关(`false` = `/practice/*` 路由不注册、任务完成不自动出题;已建表与题库数据保留) | `true` |
 
+#### 邮件 (SMTP)
+
+注册验证 / 重置密码等事务性邮件。`SMTP_HOST` 留空 = **开发模式**:邮件内容仅打印到后端日志,不真正发信;填了 host 才用标准库 `smtplib` 实际投递(无额外依赖)。
+
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `SMTP_HOST` | SMTP 服务器地址。留空 = 开发模式(仅日志,不发信) | 空 |
+| `SMTP_PORT` | SMTP 端口 | `587` |
+| `SMTP_SECURITY` | 加密方式:`starttls`(587)/ `ssl`(465 隐式 TLS)/ `none`(明文,仅本地 relay)。非法值回落 `starttls` | `starttls` |
+| `SMTP_USERNAME` | 登录用户名。留空 = 不认证(仅本地 relay) | 空 |
+| `SMTP_PASSWORD` | 登录密码 / 授权码 | 空 |
+| `SMTP_FROM_EMAIL` | 发件人地址(留空逐级回落 `SMTP_USERNAME` → `noreply@SMTP_HOST`) | 空 |
+| `SMTP_FROM_NAME` | 发件人显示名 | `SecondLook` |
+| `SMTP_TIMEOUT_SECONDS` | 连接/发送超时(秒);快速失败,SMTP 不可达时不阻塞注册 | `10` |
+
+> 发信失败只记日志不抛异常:注册/重发在发信前已 commit,SMTP 故障不会把已成功的注册变成 500;用户可通过 `/auth/resend-verification` 重新获取验证邮件。
+
 #### 认证与加密
 
 | 变量 | 说明 | 默认值 |
