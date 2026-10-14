@@ -433,6 +433,35 @@ def test_react_agent_truncation_retry_is_bounded(monkeypatch):
     assert summary == "执行完成"
 
 
+def test_react_agent_truncation_whitespace_only_retries(monkeypatch):
+    """正文仅空白也算零产出:真值判空会把" "当成有正文直接结束(旧行为),
+    这里必须同样触发重试,且空白 assistant 不落上下文"""
+    import app.agents.react_agent as R
+
+    seen, summary = _drive_truncation_round(monkeypatch, [
+        ("被截断的长思考……", "  \n ", [], "length"),
+        ("", "结论:现金流测算口径不一致", [], "stop"),
+    ])
+
+    # 若把空白正文当真值,第一次就会 break(len(seen)==1、summary 为空白)
+    assert len(seen) == 2
+    assert seen[1][-1]["content"] == R.TRUNCATION_CONTINUE_PROMPT
+    # 空白正文那次不落 assistant 消息(截断重试需要干净上下文)
+    assert not any(m.get("role") == "assistant" for m in seen[1])
+    assert summary == "结论:现金流测算口径不一致"
+
+
+def test_react_agent_truncation_whitespace_exhausted_uses_placeholder(monkeypatch):
+    """重试耗尽后空白正文不得冒充 summary:走"执行完成"占位而非空白"""
+    import app.agents.react_agent as R
+
+    n = 1 + R.MAX_TRUNCATION_RETRIES
+    _seen, summary = _drive_truncation_round(
+        monkeypatch, [("被截断", " \n", [], "length")] * n
+    )
+    assert summary == "执行完成"
+
+
 def test_stream_llm_response_passes_model_output_limit(monkeypatch):
     """react_agent 不再吃 stream_llm 的 4096 默认值:下发模型解析后的输出上限"""
     import app.agents.react_agent as R

@@ -178,6 +178,50 @@ def test_truncation_retry_is_bounded(monkeypatch):
     assert calls["n"] == 1 + verifier_agent._MAX_TRUNCATION_RETRIES
 
 
+def test_truncation_whitespace_only_retries(monkeypatch):
+    """正文仅空白也算零产出:真值判空会把" "当成有正文直接收尾(旧行为),
+    这里必须同样触发重试而非降级收尾"""
+    ends: list[int] = []
+    monkeypatch.setattr(verifier_agent, "_publish_verify_end", lambda tid, ri: ends.append(ri))
+
+    seen: list[list[dict]] = []
+
+    def fake(client, messages, *, task_id, round_idx, iteration):
+        seen.append([dict(m) for m in messages])
+        if len(seen) == 1:
+            return ("被截断", "  \n ", [], "length")
+        return ("", "PoC 不成立,普通参数也能拿到数据", [], "stop")
+
+    monkeypatch.setattr(verifier_agent, "_stream_verifier_llm", fake)
+
+    outcome: dict = {}
+    text = verifier_agent.run_verifier_agent(
+        _mk_task(), MagicMock(), "验证 SQL 注入", client=MagicMock(),
+        round_idx=1, outcome_out=outcome,
+    )
+    # 若把空白正文当真值,第一次就 _finish 返回空白(len(seen)==1)
+    assert len(seen) == 2
+    assert seen[1][-1]["content"] == verifier_agent.TRUNCATION_CONTINUE_PROMPT
+    assert "普通参数" in text
+    assert ends == [1]
+
+
+def test_truncation_whitespace_exhausted_uses_placeholder(monkeypatch):
+    """重试耗尽后空白正文不得冒充总结:走"无总结输出"占位而非返回空白"""
+    monkeypatch.setattr(verifier_agent, "_publish_verify_end", lambda tid, ri: None)
+
+    def fake(client, messages, *, task_id, round_idx, iteration):
+        return ("一直截断", " \n", [], "length")
+
+    monkeypatch.setattr(verifier_agent, "_stream_verifier_llm", fake)
+    outcome: dict = {}
+    text = verifier_agent.run_verifier_agent(
+        _mk_task(), MagicMock(), "验证", client=MagicMock(),
+        round_idx=1, outcome_out=outcome,
+    )
+    assert "无总结输出" in text
+
+
 def test_submit_verification_not_called_fails_closed(monkeypatch):
     # 模型没申报 → unknown:宁可不抬档,也不让"跑过"冒充"验出来"
     monkeypatch.setattr(

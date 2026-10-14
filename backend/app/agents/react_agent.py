@@ -431,17 +431,18 @@ def run_react_agent(
                 }
                 for tc in tool_calls_full
             ]
-        # 仅当确实有正文或工具调用时才落这条 assistant 消息:二者皆空
-        # (输出被 max_tokens 截断、零产出)时,空 assistant 会让 provider 报
-        # 400,且下方截断重试需要干净上下文继续补发收尾提示
-        if content_full or tool_calls_full:
+        # 仅当确实有非空白正文或工具调用时才落这条 assistant 消息:二者皆空
+        # 或正文仅空白(输出被 max_tokens 截断、零产出)时,空 assistant 会让
+        # provider 报 400,且下方截断重试需要干净上下文继续补发收尾提示
+        if content_full.strip() or tool_calls_full:
             messages.append(assistant_msg)
 
         # 落库思考(content + reasoning),供刷新页面后查看
         # 同时推 conversation 事件:流式卡片按 conv_id 退役为只读历史卡片,
         # 中途离开详情页再回来的订阅者(没收到这次的 thinking_delta 增量)
         # 也只有在这条事件到达时才能看到这段思考,否则要等下一次整页快照。
-        if content_full or reasoning_full:
+        # 正文仅空白且无 reasoning 时不落(零产出不算思考)
+        if content_full.strip() or reasoning_full:
             _add_conversation(
                 db, task, round_idx=round_idx,
                 role="agent1", type="thinking",
@@ -491,7 +492,7 @@ def run_react_agent(
         # 结束判断:模型主动 stop 且无工具调用 → 真正结束
         # finish_reason=length 是被 max_tokens 截断,模型没说完,不算主动结束:
         #   - 有正文:用现有 content 作 summary 收尾(降级,记录 warning)
-        #   - 正文为空:输出预算全被思考吃掉、本轮零产出。直接收尾会让
+        #   - 正文为空/仅空白:输出预算全被思考吃掉、本轮零产出。直接收尾会让
         #     orchestrator 把任务误标为完成(静默丢结果),故注入收尾提示
         #     重试(有界);重试耗尽再降级结束
         if not tool_calls_full:
@@ -504,7 +505,7 @@ def run_react_agent(
                     f"继续本轮处理(迭代 {iteration} → {iteration + 1})"
                 )
                 continue
-            if finish_reason == "length" and not content_full:
+            if finish_reason == "length" and not content_full.strip():
                 if truncation_retries < MAX_TRUNCATION_RETRIES:
                     truncation_retries += 1
                     logger.warning(
@@ -535,7 +536,7 @@ def run_react_agent(
                     f"[task={task.id}] react_agent 结束"
                     f"(finish={finish_reason},无工具调用)"
                 )
-            if content_full:
+            if content_full.strip():
                 summary = content_full
             break
 
@@ -742,8 +743,8 @@ def run_react_agent(
             reasoning_full, content_full, tool_calls_full, finish_reason, _conv_id = _stream_llm_response(
                 client, task, db, round_idx, loop_limit, messages, tools
             )
-            # content 作为 summary(自然语言总结)
-            if content_full:
+            # content 作为 summary(自然语言总结);仅空白不落 summary
+            if content_full.strip():
                 summary = content_full
         except Exception as e:
             logger.error(f"[task={task.id}] 最终总结失败: {e}")

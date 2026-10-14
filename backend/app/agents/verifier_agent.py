@@ -216,11 +216,11 @@ def run_verifier_agent(
                 content_full = strip_tool_call_blocks(content_full)
 
         # 无工具调用:模型主动 stop → 验证完成,content 是总结
-        # 但 finish=length 且正文为空时,是思考吃光输出预算、本轮零产出——
+        # 但 finish=length 且正文为空/仅空白时,是思考吃光输出预算、本轮零产出——
         # 不能当"验证完成"静默收尾(会把截断伪装成完成)。注入收尾提示重试
         # (有界),耗尽再降级收尾
         if not tool_calls_full:
-            if finish_reason == "length" and not content_full:
+            if finish_reason == "length" and not content_full.strip():
                 if truncation_retries < _MAX_TRUNCATION_RETRIES:
                     truncation_retries += 1
                     logger.warning(
@@ -250,7 +250,8 @@ def run_verifier_agent(
                     f"content={len(content_full)}字符"
                 )
             return _finish(
-                content_full or "(验证完成,无总结输出)",
+                # 仅空白正文不能冒充总结,走占位文案(避免把空白当验证结果)
+                content_full.strip() or "(验证完成,无总结输出)",
                 reasoning=reasoning_full,
             )
 
