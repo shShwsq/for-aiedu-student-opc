@@ -237,7 +237,7 @@ agent1 结论引用外部依据(URL / CVE / 安全公告 / 官方文档)时,agen
 - **工具注册**(`dispatch_review_subagents`):注册条件只能静态化(计划项 id 运行时才产生)——`AGENT2_SUBAGENT_DISPATCH_ENABLED`(默认开) + 有 `repo_path` → 注入工具;否则不注册 = 纯串行自核(而非回退自动扇出)。项数/合法性校验移到**调用时**
 - **合法性翻译**(`_dispatchable_plan_items`,纯函数):把请求的 `plan_item_ids` 翻译成(可派发项, 逐条拒收理由)。开关关 / 无工作区 → 全部拒收;未编号/未知 id、`planned_evidence=verify` 项逐条拒收(verifier 的 `run_python_code` 与新轮 agent1 共享任务沙箱,§1 世代门控同一口径,不可并发;`superseded_check` 只在主循环生效);引用复核关闭时 reference 项降级为纯只读仍参与派发;请求 id 去重保序。**项数下限**(`AGENT2_PARALLEL_MIN_ITEMS`,默认 3):过滤后合格项 < 此数 → 主循环特判分支**整批拒绝**(子循环 bootstrap + 上下文复制成本高于串行收益),回执提示"自行逐项核查"
 - **派发额度**(`AGENT2_SUBAGENT_DISPATCH_MAX_CALLS`,默认 1):单轮派发调用次数上限,对标 Codex"同一未决线程避免重复派发",超限直接回执 `ok=false`;`emit_state["dispatch_calls"]` 计数取代旧 `parallel_done` 标志(重发计划修订不重置额度)
-- **子循环**(`_run_plan_item_pass`):拷贝 system/user 上下文 + 追加本项专属 system 指令层(`build_agent2_plan_item_instruction`);只挂只读工具白名单(模型仍请求 verify/submit_* 被拒并如实回告;`dispatch_review_subagents` 不在白名单里,子智能体无法再派发,结构性保证派生深度=1);有界(`AGENT2_PLAN_ITEM_MAX_ITERATIONS=8`/墙钟 `AGENT2_PLAN_ITEM_TIMEOUT_SECONDS=240`/取证额度 `AGENT2_PLAN_ITEM_MAX_READ_CALLS=25`,fan-in 后累计计入主循环取证总池);超时转宽限收尾轮(部分结论保留);单 worker 异常不拖垮整轮(信封标该项核查失败)。worker 直连 `runtime.stream_llm` 带原生身份 `extra={"facet": "计划项 Pn", "parallel": True}`,thinking_delta 按 conv_id 分桶不串扰
+- **子循环**(`_run_plan_item_pass`):拷贝 system/user 上下文 + 追加本项专属 system 指令层(`build_agent2_plan_item_instruction`);只挂只读工具白名单(模型仍请求 verify/submit_* 被拒并如实回告;`dispatch_review_subagents` 不在白名单里,子智能体无法再派发,结构性保证派生深度=1);有界(`AGENT2_PLAN_ITEM_MAX_ITERATIONS=20`/墙钟 `AGENT2_PLAN_ITEM_TIMEOUT_SECONDS=600`/取证额度 `AGENT2_PLAN_ITEM_MAX_READ_CALLS=60`,fan-in 后累计计入主循环取证总池);超时转宽限收尾轮(部分结论保留);单 worker 异常不拖垮整轮(信封标该项核查失败)。worker 直连 `runtime.stream_llm` 带原生身份 `extra={"facet": "计划项 Pn", "parallel": True}`,thinking_delta 按 conv_id 分桶不串扰
 - **线程边界铁律**:worker 绝不碰共享 db session / publish / 主证据台账 / emit_state;取证结果入 worker 自己的 `EvidenceRecorder`,对话行进 `pending_rows` 内存缓冲
 - **fan-in(主线程,在 `dispatch_review_subagents` 处理器内完成)**:① 证据收养——`EvidenceRecorder.adopt_entries` 把各子台账按序搬入主台账重新编号,`remap_refs_in_text` 改写结论里的 E ref(`score_review_item` 命中校验口径兼容);② 结论回灌——`build_agent2_plan_result_messages` 装配 system 信封(首条行动指引 + 每项一条,结论按 `AGENT2_PLAN_ITEM_SUMMARY_MAX_TOKENS=3000` 有界裁剪),排在工具回执之后注入(assistant/tool 相邻约束);回执带 `dispatched`(派发成功项)+ `rejected`(逐条拒收项),提示模型不要重跑已完成核查;③ 落库——派发本身落一条 `tool_call` 对话行(时间线可见"派发 N 个审查子智能体",与不落行的发射类工具相别),各 worker `pending_rows` 逐条 `record_conversation`(tool_call/tool_result 邻接配对 `tool_call_id`,thinking 带 `stream_conv_id` 供实时卡退役,`extra_payload` 带 facet/parallel)推 conversation 事件("落库必 publish")。扇出期间命中用户终止 → 部分结果整批丢弃(不落库不回灌),按既有 stopped 分支收尾
 
@@ -1064,7 +1064,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 
 ### 8.1 职责分离
 
-- **agent2 不直接执行审查**：只做核查与提炼；可用只读核查工具（`read_file` / `list_files` / `find_files` / `search_code`，单轮上限 `MAX_READ_TOOL_CALLS=100`）核对 agent1 的发现，可选经 verifier_agent 生成 PoC 验证（单轮额度按审查计划联动 3–8），但不执行写操作，避免与 agent1 职责重叠
+- **agent2 不直接执行审查**：只做核查与提炼；可用只读核查工具（`read_file` / `list_files` / `find_files` / `search_code`，单轮上限 `MAX_READ_TOOL_CALLS=300`）核对 agent1 的发现，可选经 verifier_agent 生成 PoC 验证（单轮额度按审查计划联动 3–8），但不执行写操作，避免与 agent1 职责重叠
 - **react_agent 不管理 task 状态**：只跑一轮返回结果，由 orchestrator 控制 task 状态
 - **结构化结果由 agent2 整理**：react_agent 只输出自然语言 summary，`results + grouping` 由 agent2 审查完成时输出
 - **执行器抽象**：orchestrator 通过 `get_executor(task)` 拿 provider，无需关心底层是内置 LLM 循环还是外部 CLI 协议
@@ -1082,7 +1082,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 - **agent1（内置 react_agent）循环检测**：连续相同调用 + 滑动窗口低多样性检测，强制转入总结
 - **无协作总轮次死循环**：初始运行 agent1 只跑 1 轮，agent2 后台审查单次完成；多轮由用户 resume 驱动，每次 resume = agent1 一轮 + 一次审查，不存在自动多轮循环（原 `max_rounds` / `MAX_RESUME_ROUNDS` 已移除）
 - **MAX_ITERATIONS=30**：单轮 ReAct 迭代上限
-- **MAX_READ_TOOL_CALLS=100**：agent2 单次审查只读核查工具调用上限（四个只读工具共享；旧值 12 会让 8 条计划项摊不到一次深查）
+- **MAX_READ_TOOL_CALLS=300**：agent2 单次审查只读核查工具调用上限（四个只读工具共享；旧值 12→100→300，多计划项时 100 仍偏薄，放宽到 300 让正常深查不被额度误杀；300 为“较宽”而非“无限”，大仓库里仍可能不够，提示词只客观告知上限、不断言充足，覆盖不过来时按优先级取舍、其余转 submit_suggestion）
 - **MIN_VERIFY_CALLS=3 / settings.AGENT2_MAX_VERIFY_CALLS=8**：agent2 单次审查动态验证额度下限/上限，实际额度由 `_verify_budget()` 按计划里 `planned_evidence=verify` 的条目数联动
 - **MAX_REFERENCE_CALLS=3**：agent2 单次评估引用复核调用上限(每次抓取最长 15s,收敛上限控串行阻塞)
 - **verifier MAX_ITERATIONS=10**：验证 ReAct 迭代上限

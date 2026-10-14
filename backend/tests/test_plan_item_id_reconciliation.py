@@ -5,7 +5,7 @@
 凭空伪造 8 条 missing 审查项(聚合显示"核实 0 / 回填缺口 8")。现改为
 plan_item_id 精确命中 + 重合度兜底,且未核实项不再落库。
 
-顺带锚定取证额度 100 次的配套护栏:超出窗口的工具回传压成一行摘要,
+顺带锚定取证额度 300 次的配套护栏:超出窗口的工具回传压成一行摘要,
 但**不动证据台账**(call_ref 核验行为与不裁剪时一致)。
 """
 from app.agents.agent2 import (
@@ -112,7 +112,7 @@ def test_reconcile_empty_plan_matches_nothing():
 
 def test_budget_exhausted_only_when_a_cap_is_hit():
     assert _budget_exhausted({"tool_counts": {"read": 3, "verify": 0, "reference": 0}}) is False
-    assert _budget_exhausted({"tool_counts": {"read": 100}}) is True
+    assert _budget_exhausted({"tool_counts": {"read": 300}}) is True
     assert _budget_exhausted({"tool_counts": {"verify": 3}}) is True
     assert _budget_exhausted({}) is False
 

@@ -26,9 +26,9 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 | 动态验证 | `verify` | 对疑似漏洞生成 PoC 到测试环境实触发 | verifier_enabled + test_env_url + allow_verify | 按计划联动(3–8) |
 | 引用复核 | `check_reference` | 核对 agent1 引用的外部 URL 真实性与权威性 | allow_reference_check(默认 True) | 3 |
 
-额度定义于 `app/agents/agent2.py`:`MAX_READ_TOOL_CALLS=100`、`MIN_VERIFY_CALLS=3`(上限 `settings.AGENT2_MAX_VERIFY_CALLS=8`)、`MAX_REFERENCE_CALLS=3`。四个只读工具**共享** 100 次额度(`read_tool_count` 计数);`verify` 额度由 `_verify_budget()` 按审查计划里 `planned_evidence="verify"` 的条目数现算(`min(cap, planned + 1)`,下限 3)。
+额度定义于 `app/agents/agent2.py`:`MAX_READ_TOOL_CALLS=300`、`MIN_VERIFY_CALLS=3`(上限 `settings.AGENT2_MAX_VERIFY_CALLS=8`)、`MAX_REFERENCE_CALLS=3`。四个只读工具**共享** 300 次额度(`read_tool_count` 计数);`verify` 额度由 `_verify_budget()` 按审查计划里 `planned_evidence="verify"` 的条目数现算(`min(cap, planned + 1)`,下限 3)。
 
-> 额度不是拍出来的:只读取证从 12 提到 100 是因为实测 8 条计划项摊 12 次(人均 1.5 次)直接把 3 条结论压成了无证据的 suspected;验证额度沿用同一道算术。配套护栏:`MAX_LIVE_TOOL_RESULTS=40`(旧回传压成一行摘要)、`settings.AGENT2_REVIEW_MAX_SECONDS`(挂钟硬时限)、`settings.VERIFY_AUTH_TIMEOUT_SECONDS`(逐动作授权等待上限)。
+> 额度不是拍出来的:只读取证从 12→100→300(12 太少——实测 8 条计划项摊 12 次人均 1.5 次直接把结论压成 suspected;100 在多计划项时仍偏薄,现放宽到 300 按"事实上不限制"给,真正约束改由墙钟时限与上下文裁剪护栏兜);验证额度沿用同一道算术。配套护栏:`MAX_LIVE_TOOL_RESULTS=40`(旧回传压成一行摘要)、`settings.AGENT2_REVIEW_MAX_SECONDS`(挂钟硬时限)、`settings.VERIFY_AUTH_TIMEOUT_SECONDS`(逐动作授权等待上限)。
 
 工具组装见 `run_agent2()` 内 `tools` 拼接段:按启用条件把工具定义拼进 `tools` 传给 LLM;不满足条件的工具不进本轮调用面。
 
@@ -169,7 +169,7 @@ agent2 是**幕后质检者**,职责是"核查优先":核实 agent1(AI助手)的
 - 模型**不产出置信度数字**;`verdict` 才是它的定性判断,置信度由后端 `app/agents/evidence.py` 从"证据完整度 + 校验结果"派生(verified / source_confirmed / reference_corroborated / assertion_only);待核实类无证据则不写置信(前端不再拿"未分级 · —"冒充档位,改显"未取证/部分核实/证据未核验")。
 - **即时落库 + 实时事件**:每次 `submit_review_plan` 覆盖计划并推 `review_plan_update`(侧栏计划卡逐条打勾);每条 `submit_review_item` 落 `ReviewItem` 并推 `review_item_add`;每条 `submit_knowledge_point` 落 `Result` 并推 `knowledge_point_add`(侧栏两区各自逐条增长,不再等 `review_done` 一次性出现);本轮首条各自按"同轮重跑幂等"清理本轮旧数据。
 - 循环退出时后端先做**规划对账**:先按 `plan_item_id` 精确命中,无 id 时按 target 重合度(中文单字 + 英文/路径词 的 overlap coefficient ≥ 0.5)兜底。**未核实的计划项不再被伪造成 `status=missing` 审查项**(旧实现对两条各自成句的长中文做"互为子串"判定,实测 8/8 全失配 → 凭空多出一堆假缺口,并把聚合里的"核实"数字算成 0),只记进 `_review.plan.unverified`(带 reason:取证额度用尽 / 未排到取证),在计划卡显示「未核实」;对"确认偏误"的兜底依旧成立(漏掉的条目被如实报出,不藏起来)。随后聚合写 `task.params._review`(三分档计数 + 置信分布含"未取证" + `plan` 对账计数 planned/executed/unverified + 总体判定);`grouping` 由后端按 `ReviewItem.severity` 派生(无 severity → 平铺)。
-- **长审查的护栏**:取证额度 100 次后,单轮可能跑半小时以上——① 超出 `MAX_LIVE_TOOL_RESULTS=40` 窗口的工具回传正文压成一行摘要(台账不裁,`call_ref` 核验行为不变);② 挂钟硬时限 `settings.AGENT2_REVIEW_MAX_SECONDS`(默认 3600,0=关)在循环边界收掉,已发射条目照常聚合(标 `timed_out`,不被当成"检查终止");③ 用户侧「终止检查」仍是协作式取消,行为不变。
+- **长审查的护栏**:取证额度 300 次后,单轮可能跑很久——① 超出 `MAX_LIVE_TOOL_RESULTS=40` 窗口的工具回传正文压成一行摘要(台账不裁,`call_ref` 核验行为不变);② 挂钟硬时限 `settings.AGENT2_REVIEW_MAX_SECONDS`(默认 7200,0=关)在循环边界收掉,已发射条目照常聚合(标 `timed_out`,不被当成"检查终止");③ 用户侧「终止检查」仍是协作式取消,行为不变。
 - **兜底**:不支持结构化工具发射的模型,沿用 `extract_text_tool_calls` 文本兜底解析四个 `submit_*`;整轮一个都没解析出来时回退旧"末尾大 JSON"解析(仍分流落 `ReviewItem`/`Result` + 逐条派生置信;旧路径无结构化计划,前端不显示计划卡)。
 
 > 与 §1–§3 取证工具的配合关系:§1–§3 产生**证据**,§4 把证据**绑定到审查结论并即时输出**——这正是"证据驱动的可信审查"对"谁来审查审查者"的回答:每条审查结论挂可复核的证据指针,置信度由证据派生而非模型自评。

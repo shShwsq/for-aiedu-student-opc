@@ -136,7 +136,10 @@ UA_EVAL_MAX_TOKENS = 16384
 # 3 条结论退化成"受只读工具调用上限限制,未能独立二次读取"的 suspected。
 # 用户接受检查助手长时间后台跑,额度按"每条计划项能深查"给;配套的上下文
 # 护栏(_trim_agent2_tool_history)与硬时限(AGENT2_REVIEW_MAX_SECONDS)防跑飞。
-MAX_READ_TOOL_CALLS = 100
+# 100 → 300:计划项多时 100 仍是薄池(8 项人均 12.5 次,单项子循环 fan-in
+# 后累计又先吃掉一大截),深查稍多就触顶退化成 suspected;按"事实上不限制"
+# 给,真正约束改由墙钟时限(7200s)+ 上下文裁剪护栏兜;call_ref/quote 核验不受裁剪影响
+MAX_READ_TOOL_CALLS = 300
 
 # 单次评估中调用 verifier_agent 的额度下限(=旧固定值 3,保留兼容导入)
 # 不再是一个死数:旧值 3 与只读额度 100 严重不配——8 条计划项里哪怕一半声明
@@ -175,7 +178,7 @@ MAX_REVIEW_ITEMS = 20
 MAX_KNOWLEDGE_POINTS = 12
 MAX_SUGGESTIONS = 5
 
-# 保留在 LLM 上下文里的最近工具回传条数:100 次取证 × 单条 3000 字会打爆 prompt,
+# 保留在 LLM 上下文里的最近工具回传条数:300 次取证 × 单条 3000 字会打爆 prompt,
 # 更早的回传只留一行摘要(引用号 + 参数索引),证据台账本体不裁——
 # 后端核验 call_ref/quote 的行为与不裁剪时一致(见 _trim_agent2_tool_history)
 MAX_LIVE_TOOL_RESULTS = 40
@@ -582,7 +585,7 @@ def run_agent2(
 
     stopped = False  # 退出原因:user(用户终止)/ timeout(硬时限)/ None
     stop_reason: str | None = None
-    # 取证额度开到 100 后,单轮审查可能跑到半小时以上;daemon 线程本身无超时,
+    # 取证额度开到 300 后,单轮审查可能跑到特别久;daemon 线程本身无超时,
     # 用挂钟时限在循环边界收掉(见 settings.AGENT2_REVIEW_MAX_SECONDS)
     from app.config import settings as _settings
 
@@ -615,9 +618,9 @@ def run_agent2(
             len(plan_items),
             max(1, int(getattr(_s, "AGENT2_PARALLEL_MAX_CONCURRENCY", 4) or 4)),
         )
-        max_iter = max(1, int(getattr(_s, "AGENT2_PLAN_ITEM_MAX_ITERATIONS", 8) or 8))
-        item_timeout = max(1, int(getattr(_s, "AGENT2_PLAN_ITEM_TIMEOUT_SECONDS", 240) or 240))
-        read_cap = max(1, int(getattr(_s, "AGENT2_PLAN_ITEM_MAX_READ_CALLS", 25) or 25))
+        max_iter = max(1, int(getattr(_s, "AGENT2_PLAN_ITEM_MAX_ITERATIONS", 20) or 20))
+        item_timeout = max(1, int(getattr(_s, "AGENT2_PLAN_ITEM_TIMEOUT_SECONDS", 600) or 600))
+        read_cap = max(1, int(getattr(_s, "AGENT2_PLAN_ITEM_MAX_READ_CALLS", 60) or 60))
         max_summary_tokens = max(
             1, int(getattr(_s, "AGENT2_PLAN_ITEM_SUMMARY_MAX_TOKENS", 3000) or 3000)
         )
@@ -1175,7 +1178,7 @@ def run_agent2(
         if stopped:
             break
 
-        # 上下文护栏:100 次取证不可能把回传正文全留在上下文里(见函数 docstring)
+        # 上下文护栏:300 次取证不可能把回传正文全留在上下文里(见函数 docstring)
         _trim_agent2_tool_history(messages, evidence.ledger)
 
         # 循环回去:LLM 看到工具结果后,要么再调工具,要么输出 JSON 评估
@@ -1956,7 +1959,7 @@ def _trim_agent2_tool_history(
 ) -> None:
     """把超出窗口的早期工具回传正文压成一行摘要(原地改 messages)。
 
-    为何必需:取证额度 100 次 × 单条硬截 3000 字最多能堆近 30 万字,直接把 prompt
+    为何必需:取证额度 300 次 × 单条硬截 3000 字最多能堆近 90 万字,直接把 prompt
     打爆(模型报上下文超限 → 整轮审查降级)。只压最近 MAX_LIVE_TOOL_RESULTS 条之外的正文:
     - 不动 assistant/tool 的配对结构(兼容接口要求 tool 消息成对存在),只换 content;
     - **不动证据台账本体**(ledger 是 call_ref 核验的数据源),已压过的条目靠前缀识别不重压;

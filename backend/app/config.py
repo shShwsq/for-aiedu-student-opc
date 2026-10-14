@@ -224,11 +224,13 @@ class Settings(BaseSettings):
     UPLOADS_DIR: str = "./data/uploads"
 
     # ---- agent2 后台审查防跑飞(取证额度放开后的最后防线)----
-    # 单次后台审查的最长挂钟时间(秒):只读取证额度 100 次可以让审查跑特别久,
+    # 单次后台审查的最长挂钟时间(秒):只读取证额度 300 次可以让审查跑特别久,
     # 而它在 daemon 线程里无超时——真跑飞了只能用户手动「终止检查」。超时在工具循环
     # 边界按"已发射条目收尾"(保留已落库审查项,标 review_status=stopped)。
     # 设为 0 关闭硬时限(只靠用户终止与额度上限)
-    AGENT2_REVIEW_MAX_SECONDS: int = 3600
+    # 3600 → 7200:墙钟是"最后防挂死"的安全网,不是正常工作边界;深度审查慢但在
+    # 稳步推进时不该被时钟误杀(误杀表现为"总是有些未核查"),故放宽到 2 小时
+    AGENT2_REVIEW_MAX_SECONDS: int = 7200
 
     # ---- agent2 审查子智能体按需派发(工具驱动,主循环内扇出) ----
     # agent2 发射 submit_review_plan 后,**自行判断**是否调用 dispatch_review_subagents
@@ -251,13 +253,18 @@ class Settings(BaseSettings):
     # 事实,模型无法估算,故设硬下限;下界固定 2),回执提示"自行逐项核查"
     AGENT2_PARALLEL_MIN_ITEMS: int = 3
     # 单个计划项子循环的最大迭代次数(有界,防止某一项跑飞拖垮整轮 fan-in)
-    AGENT2_PLAN_ITEM_MAX_ITERATIONS: int = 8
+    # 8 → 20:深查一项常需多轮读→推理→再读,8 轮对复杂文件偏紧易被截成部分结论;
+    # 仍为有界值,配合单项墙钟(600s)与整轮硬时限(7200s)兜住真跑飞
+    AGENT2_PLAN_ITEM_MAX_ITERATIONS: int = 20
     # 单个计划项子循环的墙钟预算(秒):循环边界与收 chunk 时协作式检查,
     # 超时则转入本项总结收尾(部分结论)并隔离,不拖垮 fan-in 整轮
-    AGENT2_PLAN_ITEM_TIMEOUT_SECONDS: int = 240
+    # 240 → 600:单项 4 分钟对大型仓库深查偏紧,是"计划项未核查"的主因;放宽到
+    # 10 分钟,配合整轮 7200s 安全网,让正常深查不被误杀(仍受迭代/取证额度约束)
+    AGENT2_PLAN_ITEM_TIMEOUT_SECONDS: int = 600
     # 单个计划项子循环的取证额度(读类与引用类各自计数):fan-in 后累计
-    # 计入主循环总池(MAX_READ_TOOL_CALLS=100 / MAX_REFERENCE_CALLS=3)
-    AGENT2_PLAN_ITEM_MAX_READ_CALLS: int = 25
+    # 计入主循环总池(MAX_READ_TOOL_CALLS=300 / MAX_REFERENCE_CALLS=3)
+    # 25 → 60:配合总池 100→300,让每条计划项有足够深查额度,不再因摊薄触顶
+    AGENT2_PLAN_ITEM_MAX_READ_CALLS: int = 60
     # 单项结论注入信封前的 token 上限(CJK 感知粗估,镜像
     # REACT_FACET_SUMMARY_MAX_TOKENS:并行放大的是"份数",每份必须有界)
     AGENT2_PLAN_ITEM_SUMMARY_MAX_TOKENS: int = 3000

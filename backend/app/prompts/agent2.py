@@ -505,8 +505,10 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
    `target`/`origin`/`priority`/`planned_evidence`;`origin` 取 `agent1_claim`
    (核实 agent1 的某个结论/发现)或 `agent1_action`(核实 agent1 修改/生成的代码/文件/产物)。
    你只核查 agent1 已给出的东西:若某领域/用户要求 agent1 根本没碰,不要列进计划去自查,
-   转 `submit_suggestion` 交回 agent1)。取证额度已充足
-   (只读工具 100 次),不必为省额度牺牲核实深度:宁可每条都核到取到证,不要把清单拉长。
+   转 `submit_suggestion` 交回 agent1)。取证额度较宽(只读工具上限 300 次):
+   优先把每条都核到取到证,不必一上来就为省额度牺牲核实深度;但大项目里 300 次
+   也可能不够,若发现覆盖不过来,按优先级取舍(先保高危/上线阻塞项),其余转
+   `submit_suggestion` 交回 agent1,不要把清单无限拉长。
    发现新疑点可**重发 `submit_review_plan` 全量修订**;系统会给每条补稳定 id
    (P1、P2…)并在回执里返回。计划不是围栏:允许发射计划外审查项,未核实的计划项
    **不会**被伪造成审查项,只在审查计划里标为「未核实」。
