@@ -276,15 +276,25 @@ def score_review_item(
     verify_inconclusive = False
     verification_outcome: str | None = None
 
-    # ① source(仅在有工作区时可核验;无 repo 缺 source 不判 mismatch)
-    #    call_ref 查无此人 = 缺可核验引用,只降档不判 mismatch(见规则①)
-    if has_repo and (source.get("file_path") or source.get("quote")):
+    # ① source 核验:工作区任务任意 read 台账都能核 quote;无 repo 任务只放行
+    #    "报告取证条目"(read_agent1_report)。它不依赖工作区,是 agent2 核实
+    #    "是否覆盖 / 报告只列了 X 条"这类负向断言的唯一取证据;若仍按 has_repo
+    #    整段跳过,则 prompt「读全文再下结论」的激励在无 repo 场景成空头——取不取证
+    #    恒为 assertion_only。call_ref 查无此人 = 缺可核验引用,只降档不判 mismatch(规则①)。
+    if source.get("file_path") or source.get("quote"):
         entry = _lookup(ledger, source.get("call_ref"))
-        if entry is not None and entry.get("kind") == "read":
+        is_report_entry = (
+            entry is not None
+            and entry.get("kind") == "read"
+            and str(entry.get("args_brief") or "").startswith("read_agent1_report")
+        )
+        # 报告取证条目即便无 repo 也放行;其余 read 台账仍需 has_repo(无 repo 时它们本不可用)
+        if (has_repo or is_report_entry) and entry is not None and entry.get("kind") == "read":
             quote = source.get("quote")
             if not quote:
-                # 指向真实取证调用但无 quote:file_path 定位即算源码取证(宽松)
-                source_ok = True
+                # file_path 定位即算源码取证(宽松);报告页无 file_path 语义,
+                # 必须逐字 quote 命中才算取证,否则视为未取证(不抬档,也不判 mismatch)。
+                source_ok = not is_report_entry
             elif quote_matches(quote, entry.get("body")):
                 source_ok = True
             elif not looks_paraphrased(quote):

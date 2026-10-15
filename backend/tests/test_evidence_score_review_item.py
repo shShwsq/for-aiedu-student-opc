@@ -148,6 +148,61 @@ def test_no_repo_source_not_mismatch():
     assert out["evidence_mismatch"] is False
 
 
+def _report_body(content="本次安全审查覆盖了 JWT 失效与越权两个维度。结论:高危 2 项。"):
+    # read_agent1_report 结果被序列化为 JSON 字符串存进台账(content 为报告页正文)
+    return json.dumps(
+        {"round_idx": 1, "offset": 0, "content": content, "has_more": False},
+        ensure_ascii=False,
+    )
+
+
+def test_no_repo_report_evidence_upgrades_to_source():
+    # 发现 1 回归:无 repo 任务里,模型按指针 read_agent1_report 读全文、逐字 quote
+    # 命中报告页 → 应抬到 source_confirmed,不能让取证恒为 assertion_only(激励空头)。
+    ledger = {
+        "E1": {"kind": "read", "body": _report_body(),
+               "args_brief": 'read_agent1_report:{"round_idx": 1}'},
+    }
+    ev = {"source": {"quote": "高危 2 项", "call_ref": "E1"}}
+    out = score_review_item(ev, "confirmed", ledger, has_repo=False, verify_available=False)
+    assert out["tier"] == TIER_SOURCE
+    assert out["evidence_validated"] is True
+    assert out["evidence_mismatch"] is False
+
+
+def test_no_repo_report_quote_mismatch_is_flagged():
+    # 无 repo 但引用的是报告取证条目:逐字 quote 对不上报告原文 → 真·引错,判 mismatch
+    ledger = {
+        "E1": {"kind": "read", "body": _report_body(content="只列了 1 条建议。"),
+               "args_brief": 'read_agent1_report:{"round_idx": 1}'},
+    }
+    ev = {"source": {"quote": "高危 5 项已全覆盖", "call_ref": "E1"}}
+    out = score_review_item(ev, "confirmed", ledger, has_repo=False, verify_available=False)
+    assert out["tier"] == TIER_ASSERTION
+    assert out["evidence_mismatch"] is True
+
+
+def test_no_repo_report_entry_without_quote_not_credited():
+    # 报告页无 file_path 语义:只给 call_ref 不给 quote → 视为未取证,不抬档也不判 mismatch
+    ledger = {
+        "E1": {"kind": "read", "body": _report_body(),
+               "args_brief": 'read_agent1_report:{"round_idx": 1}'},
+    }
+    ev = {"source": {"file_path": "report", "call_ref": "E1"}}
+    out = score_review_item(ev, "confirmed", ledger, has_repo=False, verify_available=False)
+    assert out["tier"] == TIER_ASSERTION
+    assert out["evidence_mismatch"] is False
+
+
+def test_no_repo_plain_read_entry_still_not_credited():
+    # 非报告取证(普通 read 台账,无 repo 时本不可用):维持原行为,不抬档不判 mismatch
+    ledger = {"E1": {"kind": "read", "body": _read_body(), "args_brief": 'read_file:{"path":"x.py"}'}}
+    ev = {"source": {"file_path": "src/api/users.py", "quote": "cursor.execute(sql)", "call_ref": "E1"}}
+    out = score_review_item(ev, "confirmed", ledger, has_repo=False, verify_available=False)
+    assert out["tier"] == TIER_ASSERTION
+    assert out["evidence_mismatch"] is False
+
+
 def test_reference_corroborated():
     ledger = {"E5": {"kind": "reference", "body": json.dumps({"reachable": True})}}
     ev = {"analysis_basis": {"ref_url": "https://nvd.nist.gov/CWE-89",
