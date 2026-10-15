@@ -188,6 +188,46 @@ _REFERENCE_TOOL_DEFINITION: dict[str, Any] = {
 }
 
 
+# read_agent1_report 工具定义(读取 AI助手某轮完整报告全文)。
+# 与 _READ_ONLY_TOOL_DEFINITIONS 分开:后者受 repo_path 门控注入(无工作区
+# 不可用),本工具须无条件可用——agent2 对「是否覆盖 / 是否出现在报告中」
+# 下负向断言前必须能读到全文,不能因任务没配仓库就被剥夺取证能力。
+# 数据源是 Conversation 表(role=agent1, type=thinking)里已无截断落库的
+# summary 全文,不依赖被审仓库、不新增持久化。
+_READ_AGENT1_REPORT_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_agent1_report",
+        "description": (
+            "读取 AI助手(agent1)某轮的完整报告全文(不受工作区限制,任何任务都可用)。"
+            "回灌给你的总结可能已标注「已截断」并给出 round_idx 与 conversation_id;"
+            "任何「未覆盖某维度 / 该结论未出现在报告中 / 报告只列了 X 条」的负向断言,"
+            "必须先用本工具读到全文(或在工作区 grep 命中)核实后才能给出。"
+            "分页返回:带 offset/limit,回传含 total_chars/returned/has_more/next_offset,"
+            "has_more=true 时用 next_offset 续读。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "round_idx": {
+                    "type": "integer",
+                    "description": "轮次编号(从 1 开始),取回灌标注里给出的那个轮号",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "起始字符偏移,默认 0;续读时填上一页回传的 next_offset",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "本页最多返回字符数,留空则用系统默认分页大小(数千字);返回值里的 has_more/next_offset 指示是否需续读下一轮",
+                },
+            },
+            "required": ["round_idx"],
+        },
+    },
+}
+
+
 # ============================================================
 # 发射工具(结构化落库 + 流式,始终注入,不进 sandbox;不作 true/false 裁判)
 # ============================================================
@@ -599,6 +639,11 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
 
 ## 核查原则
 - 基于 agent1 的总结 + 你自己读到的源码证据做判断,不要臆测未提及的维度已覆盖。
+- **负向断言必须取证**:内联的 agent1 总结可能已标注「已截断」(长报告只给了开头摘录)。
+  任何「agent1 未覆盖某维度 / 该结论未出现在报告中 / 报告只列了 X 条 / 某项未出现」的判断,
+  必须先用 `read_agent1_report` 读到全文(或在工作区 grep 命中)核实后才能给出,并把该次取证的
+  `_evidence_ref` 填进对应审查项的 `evidence.*.call_ref`。未取全文即下此类断言的条目,
+  会被后端核验降档为低置信。分不清「agent1 没做」和「自己没看到」时,先读全文再下结论。
 - 对关键发现(高危漏洞、上线阻塞项)优先用只读工具核实真实性;
   明显合理的低风险结论可以采信,不要为读而读。
 - missing 列表为空说明各维度核查通过;但还需结果质量足够
@@ -610,6 +655,11 @@ injection / readability / contract_terms),并把它们显式化为审查计划(�
 如果提供了只读工具(read_file / list_files / find_files / search_code),
 核查时可用它们核对工作区文件(源码或文书原文):声称的漏洞代码是否属实、行号与上下文是否对得上、
 关键入口是否真的没有防护。工具参数里的路径都是工作区内相对路径。
+
+`read_agent1_report` 不依赖工作区,任何任务都可用:回灌总结里的「已截断」标注会给出
+`round_idx` 与 `conversation_id`,按 `round_idx` 调用即可分页读全文(回传带
+`total_chars`/`returned`/`has_more`/`next_offset`,`has_more=true` 时用 `next_offset` 续读)。
+它是你核实「agent1 是否覆盖了某维度」的唯一可靠依据——摘录不是全文,不要据摘录反推覆盖度。
 
 ## 动态验证(可选,有 verify 工具时)
 如果任务配置了测试环境,你可以调用 `verify` 工具动态验证 agent1 发现的安全问题:

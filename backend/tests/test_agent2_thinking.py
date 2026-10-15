@@ -174,43 +174,79 @@ def _capture_user_msg(monkeypatch):
 
 
 def test_summary_injection_truncated_per_round(monkeypatch):
-    """单条 summary 超 MAX_HISTORY_MSG_CHARS → 截断后注入。"""
-    from app.agents.agent2 import MAX_HISTORY_MSG_CHARS
+    """单条 summary 超 AGENT1_REPORT_EXCERPT_CHARS → 摘录 + 截断标注 + 指针。
+
+    旧行为是头部截断到 MAX_HISTORY_MSG_CHARS 后当全文注入(造成长报告假阴性);
+    现改为只取摘录作概览,超出则强制追加「已截断 + read_agent1_report 指针」标注。
+    """
+    from app.agents.agent2 import AGENT1_REPORT_EXCERPT_CHARS
 
     captured = _capture_user_msg(monkeypatch)
 
-    long_summary = "长" * (MAX_HISTORY_MSG_CHARS + 500)
+    long_summary = "长" * (AGENT1_REPORT_EXCERPT_CHARS + 500)
     run_agent2(
-        "审查这个仓库", [{"round": 1, "summary": long_summary}],
+        "审查这个仓库",
+        [{"round": 1, "summary": long_summary, "conversation_id": "conv-abc"}],
         task_id="task-1", db=None, round_idx=1, client=MagicMock(), task=None,
     )
 
     user_msg = captured[0]
-    assert "长" * 100 in user_msg                      # 内容保留(截断非丢弃)
-    assert "长" * (MAX_HISTORY_MSG_CHARS + 1) not in user_msg  # 但不超上限
+    # 摘录保留(截断非丢弃),但不超摘录上限
+    assert "长" * 100 in user_msg
+    assert "长" * (AGENT1_REPORT_EXCERPT_CHARS + 1) not in user_msg
+    # 截断标注 + 指针:明确告知已截断、给出轮号/对话ID、指向读全文工具
+    assert "已截断" in user_msg
+    assert "read_agent1_report" in user_msg
+    assert "round_idx=1" in user_msg
+    assert "conversation_id=conv-abc" in user_msg
 
 
-def test_summary_injection_total_sliding_window(monkeypatch):
-    """多轮 summary 总量超 MAX_HISTORY_TOTAL_CHARS → 丢弃最早轮,头部带省略标记。"""
-    from app.agents.agent2 import MAX_HISTORY_TOTAL_CHARS
+def test_summary_injection_short_no_label(monkeypatch):
+    """短 summary(未超摘录上限)原样注入,不加截断标注(避免噪声)。"""
+    from app.agents.agent2 import AGENT1_REPORT_EXCERPT_CHARS
 
     captured = _capture_user_msg(monkeypatch)
 
-    # 20 轮 × ~1400 字符 ≈ 28000,超 12000 上限 → 只保留最近若干轮
+    short_summary = "短" * (AGENT1_REPORT_EXCERPT_CHARS - 100)
+    run_agent2(
+        "审查这个仓库", [{"round": 1, "summary": short_summary}],
+        task_id="task-1", db=None, round_idx=1, client=MagicMock(), task=None,
+    )
+
+    user_msg = captured[0]
+    assert short_summary in user_msg          # 全文原样注入
+    assert "已截断" not in user_msg            # 无截断标注
+    assert "read_agent1_report" not in user_msg
+
+
+def test_summary_injection_total_sliding_window(monkeypatch):
+    """多轮 summary 总量超 AGENT1_REPORT_WINDOW_CHARS → 丢弃最早轮,头部带省略标记。
+
+    专用窗口上限与 agent2 自查记忆的 MAX_HISTORY_TOTAL_CHARS 解耦:摘录调大
+    后需放宽这个窗口,否则多轮早轮被很快挤出内联。
+    """
+    from app.agents.agent2 import AGENT1_REPORT_WINDOW_CHARS
+
+    captured = _capture_user_msg(monkeypatch)
+
+    # 每轮 ~1380 字符(远低于摘录上限,原样注入不触发截断标注),
+    # 轮数由窗口上限推导使总量明显超标 → 只保留最近若干轮
+    per_len = 1380
+    n_rounds = AGENT1_REPORT_WINDOW_CHARS // per_len + 8
     summaries = [
-        {"round": i, "summary": f"第{i}轮结论: " + "x" * 1380}
-        for i in range(1, 21)
+        {"round": i, "summary": f"第{i}轮结论: " + "x" * per_len}
+        for i in range(1, n_rounds + 1)
     ]
-    assert sum(len(s["summary"]) for s in summaries) > MAX_HISTORY_TOTAL_CHARS
+    assert sum(len(s["summary"]) for s in summaries) > AGENT1_REPORT_WINDOW_CHARS
 
     run_agent2(
         "审查这个仓库", summaries,
-        task_id="task-1", db=None, round_idx=20, client=MagicMock(), task=None,
+        task_id="task-1", db=None, round_idx=n_rounds, client=MagicMock(), task=None,
     )
 
     user_msg = captured[0]
     assert "已省略" in user_msg            # 头部省略标记
-    assert "### 第 20 轮 agent1 自然语言总结" in user_msg   # 最近轮保留
+    assert f"### 第 {n_rounds} 轮 agent1 自然语言总结" in user_msg   # 最近轮保留
     assert "### 第 1 轮 agent1 自然语言总结" not in user_msg  # 最早轮被丢弃
-    # summary 段总量受控(粗略:不含意图/指令头的 x 字符总量不超上限)
-    assert user_msg.count("x") <= MAX_HISTORY_TOTAL_CHARS
+    # summary 段总量受控(粗略:不含意图/指令头的 x 字符总量不超窗口上限)
+    assert user_msg.count("x") <= AGENT1_REPORT_WINDOW_CHARS

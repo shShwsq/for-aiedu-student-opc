@@ -175,10 +175,14 @@ def run_agent2(
 
 > `agent1_summaries` 为空时走兜底分支（异常/降级路径）：只带意图 + 要求“基于意图给出审查结论，results 可为空、suggestions 建议补充执行”。
 
-> 轮次 summary 注入有长度上限(与 react_agent 侧历史压缩同常数):单条截断
-> `MAX_HISTORY_MSG_CHARS=3000`,总量超 `MAX_HISTORY_TOTAL_CHARS=12000` 时从
-> 最早轮开始丢弃(至少保留最近一轮,轮次编号保持原值),头部加省略标记
-> —— 多轮 resume 后轮次持续累积,不设上限会让 agent2 prompt 无界增长。
+> 轮次 summary 注入采用「摘录 + 截断标注 + 指针」形状(与旧的静默截断不同):
+> 每轮只取 `AGENT1_REPORT_EXCERPT_CHARS`(走 env `AGENT2_REPORT_EXCERPT_CHARS`,默认 4000)
+> 字作概览,超出则强制追加「已截断 + `read_agent1_report` 全文指针」标注。
+> 总量超专用窗口 `AGENT1_REPORT_WINDOW_CHARS`(env `AGENT2_REPORT_WINDOW_TOTAL_CHARS`,默认 24000)
+> 时从最早轮开始丢弃(至少保留最近一轮,轮次编号保持原值),头部加省略标记
+> —— 被丢轮仍可经 `read_agent1_report(round_idx=轮号)` 按轮号读回,指针不失效。
+> 该窗口与 agent2 自查记忆的 `MAX_HISTORY_TOTAL_CHARS` 解耦(摘录调大后需相应放宽窗口,
+> 但不应连带放大下方 2.5 节的 agent2 跨轮记忆)。
 
 ### 2.5 跨轮记忆（`_build_agent2_history`）
 
@@ -1067,7 +1071,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 
 ### 8.1 职责分离
 
-- **agent2 不直接执行审查**：只做核查与提炼；可用只读核查工具（`read_file` / `list_files` / `find_files` / `search_code`，单轮上限 `MAX_READ_TOOL_CALLS=300`）核对 agent1 的发现，可选经 verifier_agent 生成 PoC 验证（单轮额度按审查计划联动 3–8），但不执行写操作，避免与 agent1 职责重叠
+- **agent2 不直接执行审查**：只做核查与提炼；可用只读核查工具（`read_file` / `list_files` / `find_files` / `search_code`，单轮上限 `MAX_READ_TOOL_CALLS=300`）核对 agent1 的发现，可用 `read_agent1_report`（不依赖 `repo_path`、不计入只读额度）读 agent1 某轮报告全文为「未覆盖」类负向断言取证，可选经 verifier_agent 生成 PoC 验证（单轮额度按审查计划联动 3–8），但不执行写操作，避免与 agent1 职责重叠
 - **react_agent 不管理 task 状态**：只跑一轮返回结果，由 orchestrator 控制 task 状态
 - **结构化结果由 agent2 整理**：react_agent 只输出自然语言 summary，`results + grouping` 由 agent2 审查完成时输出
 - **执行器抽象**：orchestrator 通过 `get_executor(task)` 拿 provider，无需关心底层是内置 LLM 循环还是外部 CLI 协议

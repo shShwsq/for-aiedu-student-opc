@@ -269,6 +269,24 @@ class Settings(BaseSettings):
     # REACT_FACET_SUMMARY_MAX_TOKENS:并行放大的是"份数",每份必须有界)
     AGENT2_PLAN_ITEM_SUMMARY_MAX_TOKENS: int = 3000
 
+    # read_agent1_report 单页返回字符数(agent1 报告全文分页读取)。
+    # 交付路径已绕过 _bound_for_llm(见 agent2 read_agent1_report 分发),
+    # 不再受 _MAX_TOOL_RESULT_CHARS=3000 天花板约束,可按部署调大:多数
+    # 审查模型上下文 ≥128k,一页几千字远未触顶,调大能减少分页轮次、
+    # 降低墙钟与工具额度压力。设为过小会增加续读次数,设为过大全量注入
+    # 才会挤占思考预算,6000 是"典型报告 2-3 页读完"的折中默认。
+    AGENT2_REPORT_PAGE_CHARS: int = 6000
+
+    # agent1 报告回灌 agent2 时,每轮内联摘录的字符数(仅作概览,超出仍带
+    # 「已截断 + read_agent1_report 全文指针」标注)。旧值 1200 对动辄上万的
+    # 安全/方案报告只剩开头,agent2 需多次工具往返才能拿齐;现代审查
+    # 模型上下文 ≥128k,摘录可大胆调大以少跑工具。调大不会倒退成静默截断。
+    AGENT2_REPORT_EXCERPT_CHARS: int = 4000
+    # agent1 总结内联回灌的跨轮总字符上限(滑窗丢弃最早轮,被丢轮仍可经
+    # read_agent1_report 读回)。与 AGENT2_*_HISTORY 用的总上限解耦:后者还管
+    # agent2 自查记忆;摘录调大后需相应放宽此窗口,否则多轮早轮被很快挤出。
+    AGENT2_REPORT_WINDOW_TOTAL_CHARS: int = 24000
+
     # ---- 动态验证(PoC verifier)额度与授权 ----
     # 单轮审查里调用动态验证的次数上限(下限固定 3,实际额度按审查计划里
     # 声明 planned_evidence=verify 的条目数联动)。每次验证内部最多 10 轮工具

@@ -54,7 +54,13 @@ from sqlalchemy.orm import Session
 # 共享运行时原语(runtime 层):与 react_agent / verifier_agent 同源的
 # 流式调用、落库推送、工具意图、截断常量——消除三处手抄实现
 from app.agents.runtime.conversation import record_conversation
-from app.agents.runtime.constants import MAX_HISTORY_MSG_CHARS, MAX_HISTORY_TOTAL_CHARS
+from app.agents.runtime.constants import (
+    AGENT1_REPORT_EXCERPT_CHARS,
+    AGENT1_REPORT_PAGE_CHARS,
+    AGENT1_REPORT_WINDOW_CHARS,
+    MAX_HISTORY_MSG_CHARS,
+    MAX_HISTORY_TOTAL_CHARS,
+)
 from app.agents.runtime.llm_stream import (
     extract_text_tool_calls,
     stream_llm,
@@ -99,6 +105,7 @@ from app.prompts.agent2 import (
     AGENT2_REVIEW_PROMPT,
     AGENT2_SYSTEM_PROMPT,
     KNOWLEDGE_CONTENT_DESCRIPTION_TEMPLATE,
+    _READ_AGENT1_REPORT_TOOL,
     _READ_ONLY_TOOL_DEFINITIONS,
     _REFERENCE_TOOL_DEFINITION,
     _VERIFY_TOOL_DEFINITION,
@@ -420,23 +427,49 @@ def run_agent2(
     else:
         # 把 agent1 的自然语言总结给 agent2 质检
         # 注意:agent1 只输出自然语言 summary,不再有结构化 results 字段
-        # 单条截断 + 总量滑动窗口(与 react_agent 侧历史压缩同常数):
-        # 多轮 resume 后轮次持续累积,不设上限会让 agent2 prompt 无界增长
+        # 呈现形状:「短摘录 + 截断标注 + 指针」。旧写法把 summary 头部截断到
+        # MAX_HISTORY_MSG_CHARS=3000 后直接当全文注入,长报告(安全审查/方案评审
+        # 动辄上万字)只剩开头,agent2 会把「自己没看到」误判成「agent1 未覆盖」
+        # (假阴性)。改为:每轮只取 AGENT1_REPORT_EXCERPT_CHARS 字摘录作概览,超出则
+        # 强制追加「已截断 + 全文指针(read_agent1_report)」标注,负向断言须读全文取证。
+        # 总量滑动窗口兜底保留(多轮 resume 后轮次持续累积,不设上限会让 prompt 无界增长;
+        # 专用窗口上限 AGENT1_REPORT_WINDOW_CHARS 与 agent2 自查记忆的 MAX_HISTORY_TOTAL_CHARS 解耦)。
         rounds_text = []
         for i, r in enumerate(agent1_summaries, 1):
-            summary = (r.get("summary") or "(无 summary)")[:MAX_HISTORY_MSG_CHARS]
+            full_summary = r.get("summary") or "(无 summary)"
             cid = r.get("conversation_id") if isinstance(r, dict) else None
+            r_round = r.get("round") if isinstance(r, dict) else None
+            try:
+                r_round = int(r_round) if r_round is not None else i
+            except (TypeError, ValueError):
+                r_round = i
             header = f"### 第 {i} 轮 agent1 自然语言总结"
             if cid:
                 # 暴露被审对话 ID,供 submit_review_item.agent1_ref 锚定(可追溯)
                 header += f"(对话ID: {cid},可作为 agent1_ref)"
-            rounds_text.append(f"{header}\n{summary}")
+            total = len(full_summary)
+            if total > AGENT1_REPORT_EXCERPT_CHARS:
+                excerpt = full_summary[:AGENT1_REPORT_EXCERPT_CHARS]
+                pointer_cid = f",conversation_id={cid}" if cid else ""
+                label = (
+                    f"\n\n[本轮报告约 {total} 字,以上仅为开头 {AGENT1_REPORT_EXCERPT_CHARS} "
+                    f"字摘录,已截断;完整报告见第 {r_round} 轮{pointer_cid}。"
+                    f"请用 read_agent1_report(round_idx={r_round}) 分页读取全文。"
+                    f"凡涉及「是否覆盖 / 是否出现在报告中 / 报告只列了 X 条」的判断,"
+                    f"必须读取全文后再下结论。]"
+                )
+                rounds_text.append(f"{header}\n{excerpt}{label}")
+            else:
+                # 短 summary 未超摘录上限:原样注入,不加标注(避免噪声)
+                rounds_text.append(f"{header}\n{full_summary}")
         total_chars = sum(len(s) for s in rounds_text)
-        if total_chars > MAX_HISTORY_TOTAL_CHARS:
+        if total_chars > AGENT1_REPORT_WINDOW_CHARS:
             # 超总量上限:从最早轮开始丢弃(至少保留最近一轮;轮次编号保持
-            # 原值,便于与 agent2 自己的跨轮评估记录对齐),头部加省略标记
+            # 原值,便于与 agent2 自己的跨轮评估记录对齐),头部加省略标记。
+            # 丢弃的是整轮(含其截断标注);被丢轮的全文仍可经
+            # read_agent1_report(round_idx=N) 按轮号查到,指针不失效。
             dropped = 0
-            while len(rounds_text) > 1 and total_chars > MAX_HISTORY_TOTAL_CHARS:
+            while len(rounds_text) > 1 and total_chars > AGENT1_REPORT_WINDOW_CHARS:
                 total_chars -= len(rounds_text[0])
                 rounds_text.pop(0)
                 dropped += 1
@@ -444,7 +477,8 @@ def run_agent2(
             rounds_text.insert(
                 0,
                 f"[...早期 {dropped} 轮 agent1 总结已省略(超长度上限),"
-                f"以下仅保留最近 {kept} 轮...]",
+                f"以下仅保留最近 {kept} 轮;被省略轮的全文仍可用 "
+                f"read_agent1_report(round_idx=轮号) 读取...]",
             )
 
         # 跨轮记忆注入:agent2 看到自己之前各轮的评估记录,
@@ -520,6 +554,11 @@ def run_agent2(
     )
     if repo_path:
         tools.extend(_READ_ONLY_TOOL_DEFINITIONS)
+    # read_agent1_report:不依赖 repo_path,任何任务都无条件注入。
+    # agent2 对「是否覆盖 / 是否出现在报告中」下负向断言前必须能读到
+    # agent1 报告全文,不能因任务没配仓库就被剥夺取证能力(数据源是
+    # Conversation 表,与被审工作区无关)。
+    tools.append(_READ_AGENT1_REPORT_TOOL)
     if verify_enabled:
         tools.append(_VERIFY_TOOL_DEFINITION)
     if reference_check_enabled:
@@ -641,6 +680,23 @@ def run_agent2(
             dict(m) for m in messages if m.get("role") in ("system", "user")
         ]
 
+        # 预加载 agent1 各轮报告全文供 worker 的 read_agent1_report 取用:
+        # worker 线程无 db 会话(SQLAlchemy session 非线程安全),不能在里面查库;
+        # 主线程把 agent1_summaries(与 _load_react_summaries 同源,全文无截断)
+        # 整成 {round_idx: (conversation_id, content)} 传进去,worker 只读切片。
+        reports_by_round: dict[int, tuple[str, str]] = {}
+        for r in (agent1_summaries or []):
+            try:
+                r_round = int(r.get("round") or 0)
+            except (TypeError, ValueError, AttributeError):
+                r_round = 0
+            if r_round <= 0:
+                continue
+            reports_by_round[r_round] = (
+                str(r.get("conversation_id") or ""),
+                r.get("summary") or "",
+            )
+
         logger.info(
             f"[task={task_id}] agent2 计划项并行核查启动:{len(plan_items)} 项"
             f"(max_workers={max_workers},max_iter/项={max_iter},"
@@ -658,6 +714,7 @@ def run_agent2(
                     read_cap=read_cap, max_iter=max_iter,
                     item_timeout=item_timeout, hard_deadline=hard_deadline,
                     stop_check=stop_check,
+                    reports_by_round=reports_by_round,
                 )
                 for it in plan_items
             ]
@@ -998,6 +1055,31 @@ def run_agent2(
                 emit_state["sug"] += 1
                 emit_state["emitted"] = True
                 _append_tool_receipt(messages, tc, {"ok": True, "count": len(emit_state["suggestions"])})
+                continue
+
+            # ---- 读取 agent1 报告全文(read_agent1_report) ----
+            # 不受 repo_path 门控(数据源是 Conversation 表,与被审工作区无关);
+            # 不计入 MAX_READ_TOOL_CALLS(那是工作区只读核查的额度,读全文不该
+            # 烧掉它),由主循环墙钟 AGENT2_REVIEW_MAX_SECONDS 兜底。
+            if fn_name == "read_agent1_report":
+                tool_result_str = _execute_read_agent1_report(
+                    args, str(task_id), db, task=task, round_idx=round_idx,
+                )
+                # 分配证据引用号并注入回灌内容(JSON 结果加 _evidence_ref 字段),
+                # 让负向断言的 evidence.*.call_ref 可指向本次读全文取证
+                tool_result_str = evidence.record_read(
+                    tool_result_str,
+                    args_brief=f"read_agent1_report:{json.dumps(args, ensure_ascii=False)[:120]}",
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"] or f"call_{tc['index']}",
+                    # read_agent1_report 分页长度已由 AGENT1_REPORT_PAGE_CHARS 自控,
+                    # 不再过 _bound_for_llm:其 _MAX_TOOL_RESULT_CHARS(3000) 阈值会在
+                    # 换行/引号密集的页砍掉页尾,使 next_offset(按真实页边界算)与实际
+                    # 交付内容不一致。绕过它保证整页 JSON 原样到达模型。
+                    "content": tool_result_str,
+                })
                 continue
 
             # ---- 只读核查工具 ----
@@ -1417,6 +1499,158 @@ def _execute_read_tool(
     return result_str
 
 
+def _execute_read_agent1_report(
+    args: dict[str, Any],
+    task_id: str,
+    db: Session | None,
+    task: Task | None = None,
+    round_idx: int = 0,
+) -> str:
+    """读取 agent1 某轮完整报告全文(分页),结果 JSON 序列化返回给 LLM
+
+    数据源是 Conversation 表(role=agent1, type=thinking)里已无截断落库的
+    summary 全文——与 orchestrator._load_react_summaries 「每轮最后一条 thinking」
+    语义对齐(按 created_at desc 取第一条)。不依赖 repo_path、不新增持久化,
+    任何任务都可用。
+
+    同时落库 tool_call / tool_result 对话记录(role="agent2"),供前端在核查侧栏
+    看到读全文的过程(与只读/引用复核工具同口径)。
+    """
+    intent = build_tool_intent("read_agent1_report", args, prefix="[agent2 质检]")
+
+    call_conv = None
+    if db is not None and task is not None:
+        try:
+            call_conv = record_conversation(
+                db, task, round_idx=round_idx,
+                role="agent2", type="tool_call",
+                content=f"{intent}\n{json.dumps(args, ensure_ascii=False, indent=2)}",
+            )
+        except Exception as e:
+            logger.warning(f"[task={task_id}] 落库 agent2 工具调用失败(忽略): {e}")
+
+    try:
+        target_round = int(args.get("round_idx") or 0)
+    except (TypeError, ValueError):
+        target_round = 0
+    if target_round <= 0:
+        result: dict[str, Any] = {
+            "ok": False,
+            "reason": "round_idx 必填且须为正整数(取回灌标注里给出的轮号)",
+        }
+        result_str = json.dumps(result, ensure_ascii=False, default=str)
+        _record_read_agent1_report_result(db, task, round_idx, call_conv, result_str, task_id)
+        return result_str
+
+    if db is None:
+        result = {"ok": False, "reason": "无数据库会话,无法读取报告全文"}
+        result_str = json.dumps(result, ensure_ascii=False, default=str)
+        _record_read_agent1_report_result(db, task, round_idx, call_conv, result_str, task_id)
+        return result_str
+
+    try:
+        conv = (
+            db.query(Conversation)
+            .filter(
+                Conversation.task_id == task_id,
+                Conversation.round_idx == target_round,
+                Conversation.role == "agent1",
+                Conversation.type == "thinking",
+            )
+            .order_by(Conversation.created_at.desc())
+            .first()
+        )
+    except Exception as e:
+        logger.error(f"[task={task_id}] 读取 agent1 报告查询失败: {e}")
+        conv = None
+
+    if conv is None or not (conv.content or "").strip():
+        result = {
+            "ok": False,
+            "reason": f"未找到第 {target_round} 轮 agent1 报告(该轮可能无 thinking 落库)",
+            "round_idx": target_round,
+        }
+        result_str = json.dumps(result, ensure_ascii=False, default=str)
+        _record_read_agent1_report_result(db, task, round_idx, call_conv, result_str, task_id)
+        return result_str
+
+    full = conv.content or ""
+    result = _build_report_page(full, str(conv.id), target_round, args)
+    result_str = json.dumps(result, ensure_ascii=False, default=str)
+    _record_read_agent1_report_result(db, task, round_idx, call_conv, result_str, task_id)
+    # 完整正文原样返回:证据台账须存全量(quote 校验对齐完整正文),
+    # 回灌 LLM 的有界化在调用方用 _bound_for_llm 做
+    return result_str
+
+
+def _build_report_page(
+    full: str,
+    conversation_id: str,
+    target_round: int,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    """纯分页逻辑:把报告全文按 offset/limit 切片,返回带元数据的结果 dict。
+
+    与数据源解耦:主循环走 db 查询后调本函数;计划项并行 worker 无 db 会话
+    (SQLAlchemy session 非线程安全),改由主线程预加载 reports_by_round 后调本函数。
+    单页上限 AGENT1_REPORT_PAGE_CHARS(走 env,交付已绕过 _bound_for_llm,
+    不再为避开 3000 阈值而刻意留余量)。
+    """
+    total_chars = len(full)
+    page_cap = max(1, int(AGENT1_REPORT_PAGE_CHARS))
+    try:
+        offset = max(0, int(args.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        limit = int(args.get("limit") or page_cap)
+    except (TypeError, ValueError):
+        limit = page_cap
+    limit = max(1, min(limit, page_cap))
+    if offset >= total_chars:
+        slice_text = ""
+        has_more = False
+        next_offset = offset
+    else:
+        end = min(offset + limit, total_chars)
+        slice_text = full[offset:end]
+        has_more = end < total_chars
+        next_offset = end
+    return {
+        "ok": True,
+        "round_idx": target_round,
+        "conversation_id": conversation_id,
+        "offset": offset,
+        "returned": len(slice_text),
+        "total_chars": total_chars,
+        "has_more": has_more,
+        "next_offset": next_offset,
+        "content": slice_text,
+    }
+
+
+def _record_read_agent1_report_result(
+    db: Session | None,
+    task: Task | None,
+    round_idx: int,
+    call_conv: Conversation | None,
+    result_str: str,
+    task_id: str,
+) -> None:
+    """落库 read_agent1_report 的 tool_result(与只读工具同口径,best-effort)"""
+    if db is None or task is None or call_conv is None:
+        return
+    try:
+        record_conversation(
+            db, task, round_idx=round_idx,
+            role="agent2", type="tool_result",
+            content=result_str,
+            tool_call_id=str(call_conv.id),
+        )
+    except Exception as e:
+        logger.warning(f"[task={task_id}] 落库 agent2 工具结果失败(忽略): {e}")
+
+
 # 单次工具结果回传 LLM 的截断阈值(防上下文爆炸)
 _MAX_TOOL_RESULT_CHARS = 3000
 
@@ -1662,6 +1896,7 @@ def _run_plan_item_pass(
     item_timeout: int,
     hard_deadline: float = float("inf"),
     stop_check: Callable[[], bool] | None = None,
+    reports_by_round: dict[int, tuple[str, str]] | None = None,
 ) -> _PlanItemResult:
     """跑单个计划项的有界只读 ReAct 子循环(worker 线程执行,全程无共享副作用)。
 
@@ -1689,6 +1924,11 @@ def _run_plan_item_pass(
     worker_evidence = EvidenceRecorder()
     item_tools = list(_READ_ONLY_TOOL_DEFINITIONS)
     allowed_names = {(t.get("function") or {}).get("name") for t in item_tools}
+    # read_agent1_report:worker 无 db 会话,改从主线程预加载的 reports_by_round
+    # 取全文(与 _load_react_summaries 同源)。无条件注入:负向断言取证不该因
+    # 任务没配仓库就被剥夺。reports_by_round 为空时仍注册(调用时如实回告未找到)。
+    item_tools.append(_READ_AGENT1_REPORT_TOOL)
+    allowed_names.add("read_agent1_report")
     if planned == "reference":
         item_tools.append(_REFERENCE_TOOL_DEFINITION)
         allowed_names.add("check_reference")
@@ -1838,6 +2078,34 @@ def _run_plan_item_pass(
                     blocked = f"计划项并行核查只允许只读取证工具,已禁用: {fn}"
                     result.pending_rows.append({"type": "tool_result", "content": blocked})
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": blocked})
+                    continue
+                if fn == "read_agent1_report":
+                    # worker 无 db 会话:从主线程预加载的 reports_by_round 取全文分页。
+                    # 不计入 read_cap(那是工作区只读额度),受本项墙钟 item_timeout 兜底。
+                    try:
+                        target_round = int(fn_args.get("round_idx") or 0)
+                    except (TypeError, ValueError):
+                        target_round = 0
+                    entry = (reports_by_round or {}).get(target_round)
+                    if target_round <= 0:
+                        page = {"ok": False, "reason": "round_idx 必填且须为正整数"}
+                    elif entry is None:
+                        page = {
+                            "ok": False,
+                            "reason": f"未找到第 {target_round} 轮 agent1 报告",
+                            "round_idx": target_round,
+                        }
+                    else:
+                        conv_id, full = entry
+                        page = _build_report_page(full, conv_id, target_round, fn_args)
+                    out = json.dumps(page, ensure_ascii=False, default=str)
+                    out = worker_evidence.record_read(
+                        out,
+                        args_brief=f"read_agent1_report:{json.dumps(fn_args, ensure_ascii=False)[:120]}",
+                    )
+                    # 同主循环:分页长度已由 AGENT1_REPORT_PAGE_CHARS 自控,不过 _bound_for_llm
+                    result.pending_rows.append({"type": "tool_result", "content": out})
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": out})
                     continue
                 if fn == "check_reference":
                     if result.ref_calls >= read_cap:

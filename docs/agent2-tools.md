@@ -12,7 +12,7 @@ agent2 是**幕后复核者**,职责是"核查优先":核实 agent1(AI助手)的
 
 工具分**取证**与**发射**两族:
 
-- **取证工具(当前已实现)**:三类共 6 个可调用函数(其中 `verify` 内部再委派 2 个子工具 + 1 个结论申报工具),见 §1–§3;
+- **取证工具(当前已实现)**:三类共 7 个可调用函数(其中 `verify` 内部再委派 2 个子工具 + 1 个结论申报工具),见 §1–§3;
 - **发射/输出工具(后端已落地,UI/出题接入中)**:`submit_review_plan`(审查规划,先行且可修订)/ `submit_review_item`(审查项,按核实结果三分档)/ `submit_knowledge_point`(知识点)/ `submit_suggestion`,是"证据驱动的可信审查"改造的**四个即时发射原语**,见 §4。
 
 下表为**取证工具**(§1–§3):
@@ -23,6 +23,7 @@ agent2 是**幕后复核者**,职责是"核查优先":核实 agent1(AI助手)的
 | 只读取证 | `list_files` | 核对声称检查过的文件是否真实存在 | `repo_path` 存在 | 共用 100 |
 | 只读取证 | `find_files` | 按文件名 glob 递归定位文件 | `repo_path` 存在 | 共用 100 |
 | 只读取证 | `search_code` | 按内容正则搜索代码 | `repo_path` 存在 | 共用 100 |
+| 报告取证 | `read_agent1_report` | 读 agent1 某轮报告全文(负向断言取证) | 无条件(不依赖 `repo_path`) | 不计入只读额度 |
 | 动态验证 | `verify` | 对疑似漏洞生成 PoC 到测试环境实触发 | verifier_enabled + test_env_url + allow_verify | 按计划联动(3–8) |
 | 引用复核 | `check_reference` | 核对 agent1 引用的外部 URL 真实性与权威性 | allow_reference_check(默认 True) | 3 |
 
@@ -81,6 +82,16 @@ agent2 是**幕后复核者**,职责是"核查优先":核实 agent1(AI助手)的
   - `content`:`{"matches":[{file,line,content,context_before,context_after}], "total_matches", "truncated", "offset"}`
   - `files_with_matches`:`{"files":[...], "total_files", "truncated", "offset"}`
   - `count`:`{"counts":{file:count}, "total_matches"}`
+
+### 1.5 `read_agent1_report`
+- 作用:读取 AI助手(agent1)某轮的**完整报告全文**。回灌给 agent2 的总结只给摘录(超 `AGENT1_REPORT_EXCERPT_CHARS`——走 env `AGENT2_REPORT_EXCERPT_CHARS`,默认 4000——即截断并标注「已截断 + 指针」),任何「未覆盖某维度 / 该结论未出现在报告中 / 报告只列了 X 条」的**负向断言**必须先用本工具读到全文核实,并把该次取证的 `_evidence_ref` 填进 `evidence.*.call_ref`。修复的是旧版把 summary 头部截断到 3000 字当全文注入、导致长报告被误判「未覆盖」的假阴性。
+- **不依赖 `repo_path`**:数据源是 `Conversation` 表(`role=agent1, type=thinking`)里已无截断落库的 summary 全文(与 `orchestrator._load_react_summaries` 「每轮最后一条 thinking」同源),与被审工作区无关,故任何任务都无条件注册。执行入口 [`_execute_read_agent1_report()`](../backend/app/agents/agent2.py);计划项并行 worker 无 db 会话,改由主线程预加载 `reports_by_round` 后经纯函数 `_build_report_page()` 切片。
+- 参数:
+  - `round_idx`(必填):轮次编号(取回灌标注里给出的轮号)
+  - `offset`:起始字符偏移,默认 0;续读时填上一页回传的 `next_offset`
+  - `limit`:本页最多返回字符数,默认/上限 `AGENT1_REPORT_PAGE_CHARS`(走 env `AGENT2_REPORT_PAGE_CHARS`,默认 6000)。分页长度由该常量自控,交付路径已绕过 `_bound_for_llm`,不再为避开 `_MAX_TOOL_RESULT_CHARS=3000` 而刻意留余量;调大可减少分页轮次、更省墙钟。
+- 返回:`{ "ok", "round_idx", "conversation_id", "offset", "returned", "total_chars", "has_more", "next_offset", "content" }`;`has_more=true` 时用 `next_offset` 续读。未找到该轮报告时 `ok=false` + `reason`。
+- 额度:**不计入** `MAX_READ_TOOL_CALLS`(那是工作区只读核查的额度,读全文不该烧掉它),由主循环墙钟 `AGENT2_REVIEW_MAX_SECONDS` 与计划项 `AGENT2_PLAN_ITEM_TIMEOUT_SECONDS` 兜底。结果同样经 `EvidenceRecorder.record_read` 登记 `E#` 引用号。
 
 ---
 

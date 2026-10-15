@@ -108,6 +108,8 @@ _TOOL_INTENT_BUILDERS: dict[str, IntentBuilder] = {
     "skill": lambda a: f"获取技能指令: {a.get('skill_name', '?')}",
     # agent2 引用复核
     "check_reference": _b_check_reference,
+    # agent2 读取 agent1 报告全文(负向断言取证)
+    "read_agent1_report": lambda a: f"读取 AI助手第 {a.get('round_idx', '?')} 轮完整报告",
     # verifier 动态验证
     "http_request": _b_http_request,
     # agent1 子任务按需派发
