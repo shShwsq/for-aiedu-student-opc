@@ -34,7 +34,7 @@ from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
 
 from app.database import Base
 from app.models.task import Task
@@ -184,7 +184,16 @@ class ReviewItem(Base):
     )
 
     # backref:Task.review_items(不改 task.py,靠 backref 挂上)
-    task: Mapped[Task] = relationship(backref="review_items")
+    # 删除语义必须显式声明:默认 cascade 仅 save-update/merge,删 Task 时 ORM 会
+    # 抢先发 UPDATE review_items SET task_id=NULL 去"断开"子行,而 task_id 非空 →
+    # NotNullViolation → 删除任务 500。FK 已带 ondelete=CASCADE,故用
+    # passive_deletes=True 让 ORM 不碰子行、交数据库级联删除(与 user.git_bindings 同套路);
+    # cascade=all,delete-orphan 与 Task 其它关系(Conversations/Results/Artifacts)口径一致。
+    task: Mapped[Task] = relationship(
+        backref=backref(
+            "review_items", cascade="all, delete-orphan", passive_deletes=True,
+        )
+    )
 
     # ---- 三分档只读判读(复用集中口径 classify_status) ----
 
