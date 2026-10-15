@@ -24,7 +24,7 @@ from app.deps import get_current_user
 from app.llm.client import LLMClient, _load_catalog
 from app.llm.embedding import EmbeddingClient
 from app.models.user import User
-from app.models.user_llm_config import UserLLMConfig
+from app.models.user_llm_config import UserLLMConfig, decrypt_config_api_keys
 from app.schemas.model_configs import (
     EmbeddingConfigItemOut,
     LLMConfigItemOut,
@@ -180,7 +180,16 @@ def test_llm(
     if cfg is None:
         raise HTTPException(status_code=404, detail="未找到配置")
 
-    target = _find_config(cfg.llm_configs, req.config_id)
+    # 先解密再查配:密文损坏/密钥轮换时 decrypt 会抛 ValueError,不能冒到 500
+    try:
+        llm_configs = decrypt_config_api_keys(cfg.llm_configs)
+    except ValueError:
+        return TestResponse(
+            success=False,
+            message="api_key 解密失败(加密密钥已轮换或密文损坏),请重新填写并保存 api_key",
+        )
+
+    target = _find_config(llm_configs, req.config_id)
     if target is None:
         raise HTTPException(status_code=404, detail=f"未找到 LLM 配置: {req.config_id}")
 
@@ -215,7 +224,16 @@ def test_embedding(
     if cfg is None:
         raise HTTPException(status_code=404, detail="未找到配置")
 
-    target = _find_config(cfg.embedding_configs, req.config_id)
+    # 同 test_llm:解密失败转友好 TestResponse，不冒 500
+    try:
+        emb_configs = decrypt_config_api_keys(cfg.embedding_configs)
+    except ValueError:
+        return TestResponse(
+            success=False,
+            message="api_key 解密失败(加密密钥已轮换或密文损坏),请重新填写并保存 api_key",
+        )
+
+    target = _find_config(emb_configs, req.config_id)
     if target is None:
         raise HTTPException(status_code=404, detail=f"未找到 Embedding 配置: {req.config_id}")
 
@@ -279,7 +297,10 @@ def _merge_llm_configs(existing: list[dict], new_items) -> list[dict]:
 
     策略:整体替换,但 api_key 为空串时从旧配置(按 id 匹配)保留。
     新项(config_id 不匹配任何旧项)且 api_key 为空 → 报错。
+    落库的 api_key 经 enc:v1 信封加密;保留的旧值已是密文,幂等不会二次加密。
     """
+    from app.security import encrypt_secret_envelope
+
     old_map = {c["id"]: c for c in existing if "id" in c}
     result: list[dict] = []
     for item in new_items:
@@ -299,7 +320,7 @@ def _merge_llm_configs(existing: list[dict], new_items) -> list[dict]:
             "id": item.id or str(uuid.uuid4()),
             "name": item.name,
             "provider": item.provider,
-            "api_key": api_key,
+            "api_key": encrypt_secret_envelope(api_key),
             "model": item.model,
             "enable_thinking": item.enable_thinking,
             "base_url": item.base_url,
@@ -309,7 +330,9 @@ def _merge_llm_configs(existing: list[dict], new_items) -> list[dict]:
 
 
 def _merge_embedding_configs(existing: list[dict], new_items) -> list[dict]:
-    """合并 Embedding 配置列表(策略同 _merge_llm_configs)"""
+    """合并 Embedding 配置列表(策略同 _merge_llm_configs,api_key 同样 enc:v1 加密)"""
+    from app.security import encrypt_secret_envelope
+
     old_map = {c["id"]: c for c in existing if "id" in c}
     result: list[dict] = []
     for item in new_items:
@@ -327,7 +350,7 @@ def _merge_embedding_configs(existing: list[dict], new_items) -> list[dict]:
             "id": item.id or str(uuid.uuid4()),
             "name": item.name,
             "provider": item.provider,
-            "api_key": api_key,
+            "api_key": encrypt_secret_envelope(api_key),
             "model": item.model,
             "base_url": item.base_url,
             "dimension": item.dimension,

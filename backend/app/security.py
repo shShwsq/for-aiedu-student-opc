@@ -13,6 +13,13 @@ JWT payload:
 对称加密(Fernet):用于加密存储第三方 OAuth token(如 GitHub / Gitee access_token),
 避免凭据明文落库。密钥来自 settings.GITHUB_TOKEN_SECRET(与 provider 无关,所有
 git provider token 共用同一把 Fernet 密钥),留空则启动时随机生成。
+
+该密钥实际保护三类数据(名字已偏窄,只管 GitHub 是误解):
+- git OAuth token(user_git_bindings);
+- 智能体凭证(user_agent_configs.credentials_encrypted);
+- 用户 LLM/Embedding api_key(user_llm_configs 的 enc:v1 信封字段级加密)。
+留空时后两者会与 OAuth token 一样面临「重启换随机 key → 旧密文永久不可解」,
+故 encrypt_secret_envelope / 相关迁移对空密钥做了防呆(宁存明文不存死密文)。
 """
 import functools
 import uuid
@@ -185,3 +192,46 @@ def decrypt_secret(ciphertext: str) -> str:
         return f.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
     except InvalidToken as e:
         raise ValueError(f"密文解密失败(密钥不匹配或数据损坏): {e}") from e
+
+
+# ============================================================
+# 信封加密(enc:v1)——用于 JSONB 内字段级密钥(如用户 LLM/Embedding api_key)
+# ============================================================
+
+# 密文前缀标记。存进 JSONB 的值形如 "enc:v1:gAAAA...(Fernet base64)"。
+# 前缀让读取端能区分「已加密」与「历史明文」,保证:
+# - 加密幂等:对已带前缀的值不再二次加密(避免「空串保留旧 key」时把密文再包一层)
+# - 平滑兼容:迁移未跑完 / 新老数据共存时,无前缀的明文原样透传,不误解密
+_ENVELOPE_PREFIX = "enc:v1:"
+
+
+def is_enveloped(value: str) -> bool:
+    """判断值是否为 enc:v1 信封密文"""
+    return bool(value) and value.startswith(_ENVELOPE_PREFIX)
+
+
+def encrypt_secret_envelope(plaintext: str) -> str:
+    """加密并加 enc:v1 前缀;空值或已带前缀(已加密)的值原样返回(幂等)。
+
+    与 encrypt_secret 的区别:带前缀便于读取端识别密文/明文,支持字段级、
+    可重入的加密(同一值多次调用结果稳定,不会双重包裹)。
+
+    空密钥防呆:GITHUB_TOKEN_SECRET 留空时 _get_fernet 每进程随机生成,用它加密
+    会得到「重启即不可解」的死密文。此时宁存明文(无前缀,decrypt 原样透传)也不
+    落死密文——与改造前的明文存储行为一致。生产环境必须固定该密钥才能真加密。
+    """
+    if not plaintext or is_enveloped(plaintext):
+        return plaintext
+    if not settings.GITHUB_TOKEN_SECRET:
+        return plaintext
+    return _ENVELOPE_PREFIX + encrypt_secret(plaintext)
+
+
+def decrypt_secret_envelope(value: str) -> str:
+    """解密 enc:v1 信封密文;空值或无前缀(历史明文)原样返回。
+
+    抛出 ValueError(密钥不匹配/密文损坏)由调用方决定回退策略。
+    """
+    if not value or not is_enveloped(value):
+        return value
+    return decrypt_secret(value[len(_ENVELOPE_PREFIX):])

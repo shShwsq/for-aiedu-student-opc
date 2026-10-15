@@ -221,6 +221,12 @@ async def lifespan(app: FastAPI):
     # 清掉旧版规划对账(target 子串匹配全失配)伪造的"[计划回填]"假缺口
     purge_legacy_plan_backfill_items()
 
+    # 用户 LLM/Embedding api_key 字段级加密:把 JSONB 里的历史明文 api_key 就地加密
+    # 为 enc:v1 信封密文(幂等,已加密的跳过;须晚于 create_all 建表)
+    from app.models.user_llm_config import migrate_encrypt_llm_api_keys
+
+    migrate_encrypt_llm_api_keys()
+
     # 领域事件:注册审计订阅者(所有事件 append-only 落库 domain_event_logs;
     # 建表已完成,后续扩展按同样方式 subscribe,见 app/domain_events.py)
     from app.services.domain_event_audit import register_audit_subscriber

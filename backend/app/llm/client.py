@@ -345,8 +345,14 @@ class LLMClient:
         { id, name, provider, api_key, model, enable_thinking, base_url }
 
         失败时(如缺 api_key)抛 ValueError,由调用方决定是否回退到 env 默认。
+
+        api_key 存的是 enc:v1 信封密文(见 app.security),此处透明解密为明文;
+        历史明文(无前缀)原样使用。这样所有走 from_config_dict 的消费方
+        (router / generator / orchestrator / model_slots)无需各自解密。
         """
-        api_key = cfg.get("api_key", "")
+        from app.security import decrypt_secret_envelope
+
+        api_key = decrypt_secret_envelope(cfg.get("api_key", ""))
         if not api_key:
             raise ValueError("配置缺少 api_key")
         return cls(
