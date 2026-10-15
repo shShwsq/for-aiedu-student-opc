@@ -119,9 +119,16 @@ class Task(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    # 关联
+    # 关联。三个子关系均带 passive_deletes=True:删 Task 时 ORM 不逐行预删子表,
+    # 只发一条 DELETE FROM tasks、其余全交 FK 的 ON DELETE CASCADE。
+    # 不能省:线上库(PolarDB)里 practice_questions 的 source_task_id SET NULL 动作
+    # 触发器先于 review_items 级联触发器执行,若 ORM 先逐行删 results(触发对
+    # practice_questions 的 SET NULL 更新)再删 task,排队的 FK 检查会落在
+    # review_items 已被级联删除之后,校验 source_review_item_id 时引用已消失
+    # → ForeignKeyViolation → 删除任务 500(全新 schema 建表顺序不同,本地测不出;
+    # 复现与二分见 2026-10-15 服务器日志分析)。
     conversations: Mapped[list["Conversation"]] = relationship(
-        back_populates="task", cascade="all, delete-orphan",
+        back_populates="task", cascade="all, delete-orphan", passive_deletes=True,
         # 显式排序:按轮次 + 创建时间升序,保证刷新页面/任务完成后重载时
         # 对话顺序与 SSE 实时推送顺序一致。
         # 否则 PostgreSQL 在无 ORDER BY 时返回顺序未定义,会导致后写入的
@@ -130,10 +137,10 @@ class Task(Base):
         order_by="Conversation.round_idx, Conversation.created_at",
     )
     results: Mapped[list["Result"]] = relationship(
-        back_populates="task", cascade="all, delete-orphan"
+        back_populates="task", cascade="all, delete-orphan", passive_deletes=True
     )
     artifacts: Mapped[list["TaskArtifact"]] = relationship(
-        back_populates="task", cascade="all, delete-orphan"
+        back_populates="task", cascade="all, delete-orphan", passive_deletes=True
     )
 
     # ============================================================
