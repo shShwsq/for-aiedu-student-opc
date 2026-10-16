@@ -424,6 +424,29 @@ export interface QuestionListItem {
   created_at: string
 }
 
+/** 题库列表/分页共用的筛选参数(GET /practice/questions 与 /questions/page) */
+export interface QuestionFilterParams {
+  status?: 'draft' | 'active' | 'archived'
+  knowledge_point?: string
+  mistake?: boolean
+  /** 题干关键字(ILIKE) */
+  q?: string
+  /** 知识点语言标签 */
+  language?: string
+  origin?: 'repo' | 'synthetic'
+  qtype?: 'single_choice' | 'true_false'
+  difficulty_min?: number
+  difficulty_max?: number
+}
+
+/** 题库分页结果(GET /practice/questions/page) */
+export interface QuestionPage {
+  items: QuestionListItem[]
+  total: number
+  page: number
+  page_size: number
+}
+
 /**
  * 题目完整信息(GET /practice/questions/{id})
  *

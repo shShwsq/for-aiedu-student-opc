@@ -32,8 +32,10 @@ import app.models.task_artifact  # noqa: F401
 import app.models.practice  # noqa: F401
 
 from app.models.practice import (
+    Attempt,
     KnowledgePoint,
     LearningTopic,
+    PracticeSession,
     Question,
     QuestionStatus,
     QuestionType,
@@ -1076,3 +1078,230 @@ def test_kp_learning_topic_migration_backfill(test_engine, ctx, monkeypatch):
     ).one()
     assert kp.learning_topic == "contract"
     s.close()
+
+
+# ============================================================
+# 题库分页 / 搜索 / 筛选(GET /practice/questions/page)
+# ============================================================
+
+
+def _seed_questions(ctx, specs):
+    """直接向库内造题(specs: dict 列表)。
+
+    每项支持 stem/key/name/languages/origin/qtype/difficulty/status;
+    同 key 复用同一知识点行(生产语义:user_id+key 唯一);
+    created_at 按顺序递增 1s,保证 order_by(created_at desc) 确定性
+    (最新一条排最前),避免同秒写入导致翻页错乱。
+    """
+    db = ctx.session_factory()
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    try:
+        kp_cache: dict[str, KnowledgePoint] = {}
+        for i, s in enumerate(specs):
+            key = s.get("key", f"K-{uuid.uuid4().hex[:6]}")
+            kp = kp_cache.get(key)
+            if kp is None:
+                kp = KnowledgePoint(
+                    user_id=ctx.user.id,
+                    key=key,
+                    name=s.get("name", f"知识点{i}"),
+                    category="cwe",
+                    languages=s.get("languages", []),
+                )
+                db.add(kp)
+                db.flush()
+                kp_cache[key] = kp
+            db.add(Question(
+                user_id=ctx.user.id,
+                knowledge_point_id=kp.id,
+                qtype=s.get("qtype", QuestionType.SINGLE_CHOICE),
+                stem=s["stem"],
+                options=["甲", "乙"],
+                answer_idx=0,
+                explanation="解析",
+                difficulty=s.get("difficulty", 1.5),
+                origin=s.get("origin", "repo"),
+                status=s.get("status", QuestionStatus.ACTIVE),
+                dedup_hash=uuid.uuid4().hex,
+                created_at=base + timedelta(seconds=i),
+            ))
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_questions_page_pagination(ctx):
+    """分页:total 不受分页影响;跨页不重叠;越界页空 items 但 total 不变"""
+    ctx.login()
+    _seed_questions(ctx, [{"stem": f"题干{i:02d}"} for i in range(25)])
+
+    r = ctx.client.get("/practice/questions/page", params={
+        "status": "active", "page": 1, "page_size": 10,
+    })
+    assert r.status_code == 200
+    p1 = r.json()
+    assert p1["total"] == 25 and p1["page"] == 1 and p1["page_size"] == 10
+    assert len(p1["items"]) == 10
+
+    p2 = ctx.client.get("/practice/questions/page", params={
+        "status": "active", "page": 2, "page_size": 10,
+    }).json()
+    p3 = ctx.client.get("/practice/questions/page", params={
+        "status": "active", "page": 3, "page_size": 10,
+    }).json()
+    assert len(p2["items"]) == 10 and len(p3["items"]) == 5
+    ids = [it["id"] for it in p1["items"] + p2["items"] + p3["items"]]
+    assert len(set(ids)) == 25  # 跨页不重复,合并覆盖全部
+
+    # 越界页:空 items,total 不变
+    p10 = ctx.client.get("/practice/questions/page", params={
+        "status": "active", "page": 10, "page_size": 10,
+    }).json()
+    assert p10["items"] == [] and p10["total"] == 25
+
+
+def test_questions_page_same_created_at_tiebreaker(ctx):
+    """同一批出题是单事务批量插入,created_at 完全相同(事务时间戳):
+    排序必须带唯一决胜键 id,否则同批题跨页边界可能重复/漏题。"""
+    ctx.login()
+    db = ctx.session_factory()
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    try:
+        # 12 题全部同一 created_at(模拟一批生成)
+        for i in range(12):
+            kp = KnowledgePoint(
+                user_id=ctx.user.id, key=f"K-TIE-{i}", name=f"tie{i}",
+                category="cwe", languages=[],
+            )
+            db.add(kp)
+            db.flush()
+            db.add(Question(
+                user_id=ctx.user.id,
+                knowledge_point_id=kp.id,
+                qtype=QuestionType.SINGLE_CHOICE,
+                stem=f"同批题{i:02d}",
+                options=["甲", "乙"], answer_idx=0, explanation="解析",
+                difficulty=1.5, origin="repo",
+                status=QuestionStatus.ACTIVE,
+                dedup_hash=uuid.uuid4().hex,
+                created_at=base,  # 同一时间戳
+            ))
+        db.commit()
+    finally:
+        db.close()
+
+    seen = []
+    page = 1
+    while True:
+        body = ctx.client.get("/practice/questions/page", params={
+            "status": "active", "page": page, "page_size": 5,
+        }).json()
+        seen.extend(it["id"] for it in body["items"])
+        if not body["items"] or page * 5 >= body["total"]:
+            break
+        page += 1
+    assert body["total"] == 12
+    assert len(seen) == 12 and len(set(seen)) == 12  # 不重复
+    assert page == 3  # 12 题 / 5 每页 = 3 页
+
+
+def test_questions_page_page_size_cap(ctx):
+    """page_size 上限 100:超限 422 校验失败"""
+    ctx.login()
+    r = ctx.client.get("/practice/questions/page", params={"page_size": 101})
+    assert r.status_code == 422
+
+
+def test_questions_page_search_q_and_ilike_escape(ctx):
+    """题干搜索命中/不命中;关键字里的 % 当纯文本而非通配符"""
+    ctx.login()
+    _seed_questions(ctx, [
+        {"stem": "100% 通过校验"},
+        {"stem": "常规题干甲"},
+        {"stem": "常规题干乙"},
+    ])
+    # 精确片段命中
+    hit = ctx.client.get("/practice/questions/page", params={"q": "通过校验"}).json()
+    assert hit["total"] == 1 and hit["items"][0]["stem"] == "100% 通过校验"
+    # 不命中
+    miss = ctx.client.get("/practice/questions/page", params={"q": "不存在XYZ"}).json()
+    assert miss["total"] == 0 and miss["items"] == []
+    # % 转义:只匹配含字面 % 的那条,不会像通配符那样匹配全部
+    pct = ctx.client.get("/practice/questions/page", params={"q": "%"}).json()
+    assert pct["total"] == 1 and pct["items"][0]["stem"] == "100% 通过校验"
+
+
+def test_questions_page_filters(ctx):
+    """语言/来源/题型/难度各自命中断言"""
+    ctx.login()
+    _seed_questions(ctx, [
+        {"stem": "A", "key": "K-PY", "languages": ["python"], "origin": "repo",
+         "qtype": QuestionType.SINGLE_CHOICE, "difficulty": 1.2},
+        {"stem": "B", "key": "K-SQL", "languages": ["sql"], "origin": "synthetic",
+         "qtype": QuestionType.TRUE_FALSE, "difficulty": 4.6},
+    ])
+    stems = lambda body: {it["stem"] for it in body["items"]}
+
+    assert stems(ctx.client.get("/practice/questions/page",
+               params={"language": "python"}).json()) == {"A"}
+    assert stems(ctx.client.get("/practice/questions/page",
+               params={"origin": "synthetic"}).json()) == {"B"}
+    assert stems(ctx.client.get("/practice/questions/page",
+               params={"qtype": "true_false"}).json()) == {"B"}
+    # 难度区间 [4, 5] 只含 B
+    assert stems(ctx.client.get("/practice/questions/page",
+               params={"difficulty_min": 4, "difficulty_max": 5}).json()) == {"B"}
+
+
+def test_questions_knowledge_point_matches_full_and_page(ctx):
+    """knowledge_point 下推 SQL 后,全量接口与分页接口结果一致"""
+    ctx.login()
+    _seed_questions(ctx, [
+        {"stem": "X1", "key": "CWE-999"},
+        {"stem": "X2", "key": "CWE-999"},
+        {"stem": "Y1", "key": "CWE-111"},
+    ])
+    full = ctx.client.get("/practice/questions",
+                          params={"knowledge_point": "CWE-999"}).json()
+    page = ctx.client.get("/practice/questions/page",
+                          params={"knowledge_point": "CWE-999"}).json()
+    assert {it["stem"] for it in full} == {"X1", "X2"}
+    assert page["total"] == 2
+    assert {it["stem"] for it in page["items"]} == {"X1", "X2"}
+
+
+def test_questions_attempt_stats_consistent_between_endpoints(ctx):
+    """作答统计在分页/全量两条路径下一致(enrichment 收敛到当页后仍正确)"""
+    ctx.login()
+    _seed_questions(ctx, [{"stem": "有作答的题"}])
+    db = ctx.session_factory()
+    q = db.query(Question).filter(Question.user_id == ctx.user.id).one()
+    sess = PracticeSession(user_id=ctx.user.id, question_count=1, question_ids=[str(q.id)])
+    db.add(sess)
+    db.flush()
+    db.add(Attempt(user_id=ctx.user.id, session_id=sess.id, question_id=q.id,
+                   chosen_idx=1, is_correct=False))
+    db.commit()
+    db.close()
+
+    full = ctx.client.get("/practice/questions", params={"status": "active"}).json()[0]
+    paged = ctx.client.get("/practice/questions/page",
+                           params={"status": "active"}).json()["items"][0]
+    assert full["attempts"] == paged["attempts"] == 1
+    assert full["accuracy"] == paged["accuracy"] == 0.0
+
+
+def test_old_questions_endpoint_still_array(ctx):
+    """回归:老 /questions 仍返回数组;mistake=true 仍返回全量数组(保护错题重练)"""
+    ctx.login()
+    _seed_questions(ctx, [{"stem": f"题{i}"} for i in range(30)])
+    body = ctx.client.get("/practice/questions", params={"status": "active"}).json()
+    assert isinstance(body, list) and len(body) == 30  # 全量,不受分页影响
+    mistake_body = ctx.client.get("/practice/questions", params={"mistake": True}).json()
+    assert isinstance(mistake_body, list)
+
+
+def test_questions_page_unauthenticated_401(ctx):
+    ctx.login()
+    ctx.logout()
+    assert ctx.client.get("/practice/questions/page").status_code == 401

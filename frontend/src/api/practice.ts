@@ -27,7 +27,9 @@ import type {
   PracticeStats,
   PracticeSummary,
   QuestionDetail,
+  QuestionFilterParams,
   QuestionListItem,
+  QuestionPage,
   SessionDetail,
   SessionListItem,
   StartSessionRequest,
@@ -200,13 +202,16 @@ export function deleteLearningTopic(id: string): Promise<void> {
   return client.delete(`/practice/topics/${id}`).then(() => undefined)
 }
 
-/** 题库列表(可按状态 / 知识点筛选;mistake=true 只返回答错过的 active 题) */
-export function listQuestions(params?: {
-  status?: string
-  knowledge_point?: string
-  mistake?: boolean
-}): Promise<QuestionListItem[]> {
+/** 题库列表(全量数组,不分页;可按状态/知识点/搜索/筛选;mistake=true 只返回答错过的 active 题) */
+export function listQuestions(params?: QuestionFilterParams): Promise<QuestionListItem[]> {
   return client.get('/practice/questions', { params }).then((r) => r.data)
+}
+
+/** 题库分页浏览(题库管理页用):同套筛选 + page/page_size,返回带 total 的分页对象 */
+export function listQuestionsPage(
+  params?: QuestionFilterParams & { page?: number; page_size?: number },
+): Promise<QuestionPage> {
+  return client.get('/practice/questions/page', { params }).then((r) => r.data)
 }
 
 /** 题目完整信息(含正确答案与解析;列表项只有一行摘要,点开单行时按需拉取) */

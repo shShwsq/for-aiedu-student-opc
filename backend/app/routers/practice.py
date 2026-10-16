@@ -30,6 +30,7 @@ from app.models.practice import (
     PracticeSettings,
     Question,
     QuestionStatus,
+    QuestionType,
     UserKnowledgeState,
     ensure_user_topics,
 )
@@ -57,6 +58,7 @@ from app.schemas.practice import (
     PracticeSummaryResponse,
     QuestionDetailResponse,
     QuestionListItem,
+    QuestionPage,
     SaveKnowledgeExplanationRequest,
     SetKnowledgeTopicRequest,
     SessionAttemptItem,
@@ -1450,19 +1452,35 @@ def set_knowledge_topic(
     )
 
 
-@router.get("/questions", response_model=list[QuestionListItem])
-def list_questions(
-    status: str | None = Query(default=None, pattern="^(draft|active|archived)$"),
-    knowledge_point: str | None = Query(default=None),
-    mistake: bool = Query(default=False),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[QuestionListItem]:
+def _ilike_escape(term: str) -> str:
+    """转义 ILIKE 通配符(\\ % _),把用户输入当纯文本匹配,避免关键字里的
+    % / _ 被当成通配符误命中。"""
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _apply_question_filters(
+    db: Session,
+    current_user: User,
+    *,
+    status: str | None = None,
+    mistake: bool = False,
+    q: str | None = None,
+    knowledge_point: str | None = None,
+    language: str | None = None,
+    origin: str | None = None,
+    qtype: str | None = None,
+    difficulty_min: float | None = None,
+    difficulty_max: float | None = None,
+):
+    """构造题库查询(所有筛选下推到 SQL,供全量/分页两接口复用)。
+
+    返回 db.query(Question)(未排序/未分页);调用方自行 order_by/limit。
+    """
     query = db.query(Question).filter(Question.user_id == current_user.id)
     if status:
         query = query.filter(Question.status == QuestionStatus(status))
     if mistake:
-        # 错题本:答错过的 active 题(去重)
+        # 错题本:答错过的 active 题(去重);无错题时 in_([]) 自然得空集
         wrong_ids = [
             qid for (qid,) in db.query(Attempt.question_id)
             .filter(
@@ -1472,30 +1490,57 @@ def list_questions(
             .distinct()
             .all()
         ]
-        if not wrong_ids:
-            return []
         query = query.filter(
             Question.status == QuestionStatus.ACTIVE,
             Question.id.in_(wrong_ids),
         )
-    questions = query.order_by(Question.created_at.desc()).all()
-
+    if q:
+        query = query.filter(
+            Question.stem.ilike(f"%{_ilike_escape(q)}%", escape="\\")
+        )
     if knowledge_point:
-        kp_ids = {
-            kp.id
-            for kp in db.query(KnowledgePoint).filter(
-                KnowledgePoint.user_id == current_user.id,
-                KnowledgePoint.key == knowledge_point,
-            ).all()
-        }
-        questions = [q for q in questions if q.knowledge_point_id in kp_ids]
+        # 下推到 SQL 子查询(取代旧的"全量捣取后 Python 过滤")
+        kp_sub = db.query(KnowledgePoint.id).filter(
+            KnowledgePoint.user_id == current_user.id,
+            KnowledgePoint.key == knowledge_point,
+        )
+        query = query.filter(Question.knowledge_point_id.in_(kp_sub))
+    if language:
+        # languages 为 JSONB 数组,用 @> 包含语义命中
+        kp_sub = db.query(KnowledgePoint.id).filter(
+            KnowledgePoint.user_id == current_user.id,
+            KnowledgePoint.languages.contains([language]),
+        )
+        query = query.filter(Question.knowledge_point_id.in_(kp_sub))
+    if origin:
+        query = query.filter(Question.origin == origin)
+    if qtype:
+        query = query.filter(Question.qtype == QuestionType(qtype))
+    if difficulty_min is not None:
+        query = query.filter(Question.difficulty >= difficulty_min)
+    if difficulty_max is not None:
+        query = query.filter(Question.difficulty <= difficulty_max)
+    return query
 
+
+def _enrich_questions(
+    db: Session, current_user: User, questions: list[Question]
+) -> list[QuestionListItem]:
+    """把 Question ORM 行拼为列表项(知识点名 + 作答统计)。
+
+    kps / attempt_stats 都只围绕**本批 questions** 的 id 查(in_),
+    不再全表扫该用户知识点/作答流水。
+    """
+    if not questions:
+        return []
+    kp_ids = list({q.knowledge_point_id for q in questions})
     kps = {
         kp.id: kp
         for kp in db.query(KnowledgePoint).filter(
-            KnowledgePoint.user_id == current_user.id
+            KnowledgePoint.id.in_(kp_ids)
         ).all()
     }
+    q_ids = [q.id for q in questions]
     attempt_stats = {
         qid: (cnt or 0, corr or 0)
         for qid, cnt, corr in db.query(
@@ -1503,11 +1548,13 @@ def list_questions(
             sa_func.count(Attempt.id),
             sa_func.sum(cast(Attempt.is_correct, Integer)),
         )
-        .filter(Attempt.user_id == current_user.id)
+        .filter(
+            Attempt.user_id == current_user.id,
+            Attempt.question_id.in_(q_ids),
+        )
         .group_by(Attempt.question_id)
         .all()
-    } if questions else {}
-
+    }
     items = []
     for q in questions:
         attempts, correct = attempt_stats.get(q.id, (0, 0))
@@ -1526,6 +1573,85 @@ def list_questions(
             created_at=q.created_at,
         ))
     return items
+
+
+@router.get("/questions", response_model=list[QuestionListItem])
+def list_questions(
+    status: str | None = Query(default=None, pattern="^(draft|active|archived)$"),
+    knowledge_point: str | None = Query(default=None),
+    mistake: bool = Query(default=False),
+    q: str | None = Query(default=None, description="题干关键字(ILIKE,已转义通配符)"),
+    language: str | None = Query(default=None, description="按知识点语言标签筛选"),
+    origin: str | None = Query(default=None, pattern="^(repo|synthetic)$"),
+    qtype: str | None = Query(default=None, pattern="^(single_choice|true_false)$"),
+    difficulty_min: float | None = Query(default=None),
+    difficulty_max: float | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[QuestionListItem]:
+    """题库/错题列表(全量数组,不分页)。
+
+    错题回顾(mistake=true)与知识点看板依赖本接口返回**全部**命中项
+    (错题重练需把全部错题 id 组卷);题库管理页的浏览/搜索走分页版
+    GET /practice/questions/page。两接口共用同一过滤与富化逻辑。
+    """
+    query = _apply_question_filters(
+        db, current_user,
+        status=status, mistake=mistake, q=q, knowledge_point=knowledge_point,
+        language=language, origin=origin, qtype=qtype,
+        difficulty_min=difficulty_min, difficulty_max=difficulty_max,
+    )
+    # created_at 带唯一决胜键 id:同一批出题是单事务批量插入,
+    # created_at(事务时间戳)完全相同,只按时间排序时同批题跨页边界
+    # 可能重复/漏题;加 id 后顺序确定,offset 分页才稳定。
+    questions = query.order_by(
+        Question.created_at.desc(), Question.id.desc()
+    ).all()
+    return _enrich_questions(db, current_user, questions)
+
+
+@router.get("/questions/page", response_model=QuestionPage)
+def list_questions_page(
+    status: str | None = Query(default=None, pattern="^(draft|active|archived)$"),
+    knowledge_point: str | None = Query(default=None),
+    mistake: bool = Query(default=False),
+    q: str | None = Query(default=None, description="题干关键字(ILIKE,已转义通配符)"),
+    language: str | None = Query(default=None, description="按知识点语言标签筛选"),
+    origin: str | None = Query(default=None, pattern="^(repo|synthetic)$"),
+    qtype: str | None = Query(default=None, pattern="^(single_choice|true_false)$"),
+    difficulty_min: float | None = Query(default=None),
+    difficulty_max: float | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> QuestionPage:
+    """题库分页浏览(题库管理页用):全量筛选 + offset/limit。
+
+    total 为符合筛选条件的总数(不受分页影响);题目/作答统计只取当页,
+    避免全量捣取与全表扫。必须注册在 /questions/{question_id} 之前。
+    """
+    query = _apply_question_filters(
+        db, current_user,
+        status=status, mistake=mistake, q=q, knowledge_point=knowledge_point,
+        language=language, origin=origin, qtype=qtype,
+        difficulty_min=difficulty_min, difficulty_max=difficulty_max,
+    )
+    total = query.count()
+    # 排序同 list_questions:created_at + id 双键,保证同批(同时间戳)题
+    # 跨页不重复/不遗漏。
+    rows = (
+        query.order_by(Question.created_at.desc(), Question.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return QuestionPage(
+        items=_enrich_questions(db, current_user, rows),
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/questions/{question_id}", response_model=QuestionDetailResponse)

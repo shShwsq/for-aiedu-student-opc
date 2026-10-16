@@ -440,6 +440,18 @@ class QuestionListItem(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class QuestionPage(BaseModel):
+    """题库分页结果(GET /practice/questions/page)
+
+    items 为当页题目;total 为符合筛选条件的总数(不受分页影响)。
+    """
+
+    items: list[QuestionListItem] = []
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+
+
 class QuestionDetailResponse(QuestionContent):
     """题目完整信息(GET /practice/questions/{question_id})
 
