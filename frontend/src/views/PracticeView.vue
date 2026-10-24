@@ -35,6 +35,7 @@ import {
   getPracticeStats,
   listGenerateJobs,
   listQuestions,
+  listQuestionsPage,
   startSession,
   submitAnswer,
 } from '@/api/practice'
@@ -50,6 +51,7 @@ import {
 import type {
   GenerateJobSummary,
   PracticeStats,
+  QuestionFilterParams,
   QuestionListItem,
   SessionQuestion,
   SubmitAnswerResponse,
@@ -423,11 +425,57 @@ const bankQuestions = ref<QuestionListItem[]>([])
 const bankLoading = ref(false)
 const bankError = ref('')
 
+// ---- 分页 + 搜索/筛选状态(仅题库管理段) ----
+const bankPage = ref(1)
+const bankPageSize = ref(20)
+const bankTotal = ref(0)
+const bankQuery = ref('') // 搜索框实时文本
+const bankSearchDebounced = ref('') // 防抖后实际参与查询的关键字
+const bankLanguage = ref('')
+const bankOrigin = ref<'' | 'repo' | 'synthetic'>('')
+const bankQtype = ref<'' | 'single_choice' | 'true_false'>('')
+const bankDifficulty = ref('') // 粗分桶 "1-2" | "2-3" | "3-4" | "4-5"
+// 语言下拉选项:不新增 distinct 接口,从已加载题目的 languages 聚合
+const bankLanguageOptions = ref<string[]>([])
+
+const bankTotalPages = computed(() =>
+  Math.max(1, Math.ceil(bankTotal.value / bankPageSize.value)),
+)
+const hasBankActiveFilters = computed(() =>
+  !!(bankSearchDebounced.value || bankLanguage.value || bankOrigin.value
+    || bankQtype.value || bankDifficulty.value),
+)
+
+/** 组装当前状态/筛选/分页参数(只带上非空项) */
+function bankQueryParams(): QuestionFilterParams & { page: number; page_size: number } {
+  const p: QuestionFilterParams & { page: number; page_size: number } = {
+    status: bankFilter.value,
+    page: bankPage.value,
+    page_size: bankPageSize.value,
+  }
+  if (bankSearchDebounced.value) p.q = bankSearchDebounced.value
+  if (bankLanguage.value) p.language = bankLanguage.value
+  if (bankOrigin.value) p.origin = bankOrigin.value
+  if (bankQtype.value) p.qtype = bankQtype.value
+  if (bankDifficulty.value) {
+    const [min, max] = bankDifficulty.value.split('-').map(Number)
+    if (!Number.isNaN(min)) p.difficulty_min = min
+    if (!Number.isNaN(max)) p.difficulty_max = max
+  }
+  return p
+}
+
 async function loadQuestionBank(): Promise<void> {
   bankLoading.value = true
   bankError.value = ''
   try {
-    bankQuestions.value = await listQuestions({ status: bankFilter.value })
+    const res = await listQuestionsPage(bankQueryParams())
+    bankQuestions.value = res.items
+    bankTotal.value = res.total
+    // 聚合语言可选项(并集,跨页累积;下拉选项随浏览逐步丰富)
+    const seen = new Set(bankLanguageOptions.value)
+    for (const q of res.items) for (const l of q.languages || []) seen.add(l)
+    bankLanguageOptions.value = [...seen].sort()
   } catch (err) {
     bankError.value = extractErrorMessage(err)
   } finally {
@@ -435,17 +483,81 @@ async function loadQuestionBank(): Promise<void> {
   }
 }
 
+// 搜索防抖:输入停顿 300ms 后回到第 1 页重查
+// (值未变的回调直接跳过——重置/切页签清空搜索框时不重复请求)
+let bankSearchTimer: ReturnType<typeof setTimeout> | null = null
+watch(bankQuery, () => {
+  if (bankSearchTimer) clearTimeout(bankSearchTimer)
+  bankSearchTimer = setTimeout(() => {
+    const next = bankQuery.value.trim()
+    if (next === bankSearchDebounced.value) return
+    bankSearchDebounced.value = next
+    bankPage.value = 1
+    loadQuestionBank()
+  }, 300)
+})
+onBeforeUnmount(() => {
+  if (bankSearchTimer) clearTimeout(bankSearchTimer)
+})
+
+/** 下拉筛选变更:重置到第 1 页再查 */
+function applyBankFilterChange(): void {
+  bankPage.value = 1
+  loadQuestionBank()
+}
+
+/** 每页题数变更:回到第 1 页再查 */
+function onBankPageSizeChange(): void {
+  bankPage.value = 1
+  loadQuestionBank()
+}
+
+function gotoBankPage(target: number): void {
+  const p = Math.min(Math.max(1, target), bankTotalPages.value)
+  if (p === bankPage.value) return
+  bankPage.value = p
+  loadQuestionBank()
+}
+
+function resetBankFilters(): void {
+  bankQuery.value = ''
+  bankSearchDebounced.value = ''
+  bankLanguage.value = ''
+  bankOrigin.value = ''
+  bankQtype.value = ''
+  bankDifficulty.value = ''
+  bankPage.value = 1
+  loadQuestionBank()
+}
+
 function switchBankFilter(next: BankFilter): void {
   if (bankFilter.value === next) return
   bankFilter.value = next
+  // 切状态 = 换数据集:清空搜索/筛选并回到第 1 页
+  bankQuery.value = ''
+  bankSearchDebounced.value = ''
+  bankLanguage.value = ''
+  bankOrigin.value = ''
+  bankQtype.value = ''
+  bankDifficulty.value = ''
+  bankPage.value = 1
   loadQuestionBank()
+}
+
+/** 单条操作后重查:若当前页因删除变空且不在首页,回退一页避免停在空页 */
+async function reloadBankKeepingPage(): Promise<void> {
+  await loadQuestionBank()
+  if (bankQuestions.value.length === 0 && bankPage.value > 1) {
+    bankPage.value -= 1
+    loadQuestionBank()
+  }
 }
 
 async function handleArchive(q: QuestionListItem): Promise<void> {
   try {
     await archiveQuestion(q.id)
     showToast('已归档,该题不再参与组卷', 'success')
-    loadQuestionBank()
+    reloadBankKeepingPage()
   } catch (err) {
     showToast(extractErrorMessage(err), 'error')
   }
@@ -456,7 +568,7 @@ async function handleActivate(q: QuestionListItem): Promise<void> {
   try {
     await activateQuestions({ question_ids: [q.id] })
     showToast('已转正入库,可参与组卷', 'success')
-    loadQuestionBank()
+    reloadBankKeepingPage()
   } catch (err) {
     showToast(extractErrorMessage(err), 'error')
   }
@@ -929,9 +1041,48 @@ onBeforeUnmount(() => {
                 >{{ f[1] }}</button>
               </div>
             </div>
+            <!-- 搜索 / 筛选工具条(仅题库管理段) -->
+            <div class="bank-toolbar">
+              <input
+                v-model="bankQuery"
+                type="search"
+                class="bank-search"
+                placeholder="搜索题干关键字…"
+                aria-label="搜索题干"
+              />
+              <select v-model="bankLanguage" class="bank-select" aria-label="按语言筛选" @change="applyBankFilterChange">
+                <option value="">全部语言</option>
+                <option v-for="lang in bankLanguageOptions" :key="lang" :value="lang">{{ lang }}</option>
+              </select>
+              <select v-model="bankOrigin" class="bank-select" aria-label="按来源筛选" @change="applyBankFilterChange">
+                <option value="">全部来源</option>
+                <option value="repo">真实代码</option>
+                <option value="synthetic">改编</option>
+              </select>
+              <select v-model="bankQtype" class="bank-select" aria-label="按题型筛选" @change="applyBankFilterChange">
+                <option value="">全部题型</option>
+                <option value="single_choice">{{ qtypeLabel('single_choice') }}</option>
+                <option value="true_false">{{ qtypeLabel('true_false') }}</option>
+              </select>
+              <select v-model="bankDifficulty" class="bank-select" aria-label="按难度筛选" @change="applyBankFilterChange">
+                <option value="">全部难度</option>
+                <option value="1-2">难度 1–2</option>
+                <option value="2-3">难度 2–3</option>
+                <option value="3-4">难度 3–4</option>
+                <option value="4-5">难度 4–5</option>
+              </select>
+              <button
+                v-if="hasBankActiveFilters"
+                type="button"
+                class="btn-link"
+                @click="resetBankFilters"
+              >重置</button>
+            </div>
             <div v-if="bankLoading" class="placeholder"><span class="status-spinner" /> 加载中...</div>
             <p v-else-if="bankError" class="action-error">{{ bankError }}</p>
-            <p v-else-if="bankQuestions.length === 0" class="panel-empty">该状态下暂无题目</p>
+            <p v-else-if="bankQuestions.length === 0" class="panel-empty">
+              {{ hasBankActiveFilters ? '没有匹配的题目,试试放宽搜索或筛选条件' : '该状态下暂无题目' }}
+            </p>
             <div v-else class="bank-list">
               <div v-for="q in bankQuestions" :key="q.id" class="bank-item">
                 <button
@@ -970,6 +1121,38 @@ onBeforeUnmount(() => {
                   title="归档后不再参与组卷"
                   @click="handleArchive(q)"
                 >归档</button>
+              </div>
+            </div>
+            <!-- 分页条(总数 > 0 时展示) -->
+            <div v-if="bankTotal > 0 && !bankLoading && !bankError" class="bank-pagination">
+              <span class="bank-page-info">
+                共 {{ bankTotal }} 题 · 第 {{ bankPage }}/{{ bankTotalPages }} 页
+              </span>
+              <select
+                v-model.number="bankPageSize"
+                class="bank-select bank-page-size"
+                aria-label="每页题数"
+                @change="onBankPageSizeChange"
+              >
+                <option :value="20">20/页</option>
+                <option :value="50">50/页</option>
+                <option :value="100">100/页</option>
+              </select>
+              <div class="bank-page-nav">
+                <button
+                  type="button"
+                  class="btn-secondary btn-small"
+                  :disabled="bankPage <= 1"
+                  title="上一页"
+                  @click="gotoBankPage(bankPage - 1)"
+                >上一页</button>
+                <button
+                  type="button"
+                  class="btn-secondary btn-small"
+                  :disabled="bankPage >= bankTotalPages"
+                  title="下一页"
+                  @click="gotoBankPage(bankPage + 1)"
+                >下一页</button>
               </div>
             </div>
           </section>
@@ -1474,6 +1657,63 @@ onBeforeUnmount(() => {
 
 .bank-date {
   margin-left: auto;
+}
+
+/* 题库搜索/筛选工具条 */
+.bank-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+}
+
+.bank-search {
+  flex: 1 1 220px;
+  min-width: 160px;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-sm);
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.bank-search:focus-visible {
+  outline: 2px solid var(--color-primary-border);
+  outline-offset: 1px;
+}
+
+.bank-select {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+/* 题库分页条 */
+.bank-pagination {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+
+.bank-page-info {
+  margin-right: auto;
+}
+
+.bank-page-nav {
+  display: inline-flex;
+  gap: var(--space-2);
 }
 
 /* ============ 会话 ============ */
