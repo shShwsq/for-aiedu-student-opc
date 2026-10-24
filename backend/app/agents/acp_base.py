@@ -2598,6 +2598,12 @@ class _ACPCollector:
             return
 
         raw_output = update.get("rawOutput", "")
+        # Qoder/Kimi 在工具返回图片等二进制内容时,rawOutput 不是字符串,而是
+        # 多模态内容块列表([{"type":"text",…},{"type":"image","source":{…}}])。
+        # Conversation.content 是 Text 列,直接落库会让 psycopg 抛
+        # "cannot adapt type 'dict'",并把整个 Session 毒化成失败事务。
+        if not isinstance(raw_output, str):
+            raw_output = _tool_result_text(raw_output)
         if not raw_output:
             raw_output = _extract_text(update.get("content"))
         if not raw_output:
@@ -2626,15 +2632,23 @@ class _ACPCollector:
                 "content": new_content,
             })
 
-        _add_conversation(
-            self.db, self.task,
-            round_idx=self.round_idx,
-            role="agent1", type="tool_result",
-            content=raw_output,
-            # 关联对应 tool_call 会话记录(CLI 并行调用时 result 按完成顺序落库,
-            # 前端靠它精确配对;conv_id 缺失时留空,前端回退相邻配对)
-            tool_call_id=str(conv_id) if conv_id else None,
-        )
+        try:
+            _add_conversation(
+                self.db, self.task,
+                round_idx=self.round_idx,
+                role="agent1", type="tool_result",
+                content=raw_output,
+                # 关联对应 tool_call 会话记录(CLI 并行调用时 result 按完成顺序落库,
+                # 前端靠它精确配对;conv_id 缺失时留空,前端回退相邻配对)
+                tool_call_id=str(conv_id) if conv_id else None,
+            )
+        except Exception:
+            # 单条工具结果落库失败不应拖垮整个任务:回滚失败事务,否则后续所有
+            # 写库都会抛 PendingRollbackError,任务被判 failed(2026-10-23 事故)
+            self.db.rollback()
+            logger.exception(
+                "[task=%s] 工具结果落库失败 tool=%s", self.task.id, tool_name,
+            )
 
         # TodoList 计划工具:completed 时携带完整计划清单({todos: [...]}),
         # 全量替换语义,解析后直接覆盖式推送 plan 事件(与 _handle_plan 同款,
@@ -2843,6 +2857,28 @@ class _ACPCollector:
             "delta": text,
             "iteration": self.iteration,
         })
+
+
+def _tool_result_text(value: Any) -> str:
+    """把 ACP 工具结果转成可落库的纯文本
+
+    Qoder/Kimi 的工具结果在含图片等二进制内容时是多模态内容块列表,例如
+    [{"type": "text", "text": "Binary content provided (1 item(s))."},
+     {"type": "image", "source": {"type": "url", "url": "https://…png"}}]。
+    Conversation.content 是 Text 列,必须转成字符串才能落库(图片块降级为
+    带 URL 的占位文本,其余块沿用 _extract_text 的提取口径)。
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_tool_result_text(item) for item in value)
+    if isinstance(value, dict):
+        if value.get("type") == "image":
+            source = value.get("source")
+            url = source.get("url") if isinstance(source, dict) else ""
+            return f"[图片] {url}" if url else "[图片]"
+        return _extract_text(value)
+    return "" if value is None else str(value)
 
 
 def _extract_text(content: Any) -> str:
